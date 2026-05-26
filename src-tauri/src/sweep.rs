@@ -215,7 +215,7 @@ fn run_hardware_sweep(
     _total: usize,
 ) {
     let stress = StressTest::new();
-    let monitor = Monitor::new();
+    let mut monitor = Monitor::new();
     let duration = config.test_duration_secs;
     let threads = config.cpu_threads;
 

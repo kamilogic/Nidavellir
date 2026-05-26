@@ -43,6 +43,7 @@ pub struct BootStatus {
 pub struct Monitor {
     running: Arc<AtomicBool>,
     boot_flag_path: PathBuf,
+    sys: sysinfo::System,
 }
 
 impl Default for Monitor {
@@ -56,6 +57,7 @@ impl Monitor {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             boot_flag_path: PathBuf::from(BOOT_FLAG_PATH),
+            sys: sysinfo::System::new(),
         }
     }
 
@@ -72,7 +74,7 @@ impl Monitor {
         self.running.load(Ordering::SeqCst)
     }
 
-    pub fn read_sensors(&self) -> SensorReadings {
+    pub fn read_sensors(&mut self) -> SensorReadings {
         SensorReadings {
             cpu: self.read_cpu_sensors(),
             memory: self.read_memory_sensors(),
@@ -81,19 +83,18 @@ impl Monitor {
         }
     }
 
-    fn read_cpu_sensors(&self) -> CpuSensors {
+    fn read_cpu_sensors(&mut self) -> CpuSensors {
+        self.sys.refresh_cpu_usage();
         CpuSensors {
-            utilization_pct: read_cpu_utilization(),
+            utilization_pct: self.sys.global_cpu_usage() as f64,
             clock_mhz: read_cpu_clock(),
         }
     }
 
-    fn read_memory_sensors(&self) -> MemorySensors {
-        use sysinfo::System;
-        let mut sys = System::new();
-        sys.refresh_memory();
-        let total = sys.total_memory() / 1024;
-        let used = sys.used_memory() / 1024;
+    fn read_memory_sensors(&mut self) -> MemorySensors {
+        self.sys.refresh_memory();
+        let total = self.sys.total_memory() / (1024 * 1024);
+        let used = self.sys.used_memory() / (1024 * 1024);
         let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
         MemorySensors { used_mb: used, total_mb: total, used_pct: pct }
     }
@@ -129,12 +130,6 @@ impl Monitor {
     }
 }
 
-fn read_cpu_utilization() -> f64 {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu_usage();
-    sys.global_cpu_usage() as f64
-}
-
 fn read_cpu_clock() -> Option<u32> {
     use winreg::enums::*;
     use winreg::RegKey;
@@ -148,12 +143,18 @@ fn check_whea_errors() -> WheaInfo {
     let output = std::process::Command::new("wevtutil")
         .args(["qe", "Microsoft-Windows-Kernel-WHEA/Operational", "/c:5", "/rd:true", "/f:text"])
         .output();
-    let error_count = match &output {
+    match &output {
         Ok(o) if o.status.success() => {
             let text = String::from_utf8_lossy(&o.stdout);
-            text.matches("Event ID").count() as u32
+            let error_count = text.matches("Event ID").count() as u32;
+            let last_error = text.lines()
+                .skip_while(|l| !l.contains("Event ID"))
+                .skip(1)
+                .find(|l| l.contains(":"))
+                .or_else(|| text.lines().find(|l| l.contains("Error")))
+                .map(|l| l.trim().to_string());
+            WheaInfo { error_count, last_error }
         }
-        _ => 0,
-    };
-    WheaInfo { error_count, last_error: None }
+        _ => WheaInfo { error_count: 0, last_error: None },
+    }
 }

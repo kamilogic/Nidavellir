@@ -109,6 +109,8 @@ fn detect_gpu() -> Vec<GpuInfo> {
         return vec![];
     };
 
+    let vram_map = query_vram_wmic();
+
     let mut gpus = Vec::new();
     for i in 0..32 {
         let path = format!("{i:04}");
@@ -116,10 +118,8 @@ fn detect_gpu() -> Vec<GpuInfo> {
             continue;
         };
         let model: Option<String> = sub.get_value("DriverDesc").ok();
-        let vram: Option<u32> = sub
-            .get_value("HardwareInformation.AdapterRAM")
-            .ok()
-            .map(|bytes: u32| bytes / (1024 * 1024));
+        let vram_reg: Option<u32> = sub.get_value("HardwareInformation.AdapterRAM").ok();
+        let vram_wmic = model.as_ref().and_then(|m| vram_map.get(m.as_str())).copied();
 
         if let Some(model) = model {
             let vendor = if model.to_lowercase().contains("nvidia") {
@@ -138,14 +138,41 @@ fn detect_gpu() -> Vec<GpuInfo> {
             }
             .to_string();
 
+            let vram_mb = vram_wmic
+                .or_else(|| vram_reg.map(|b| b / (1024 * 1024)))
+                .unwrap_or(0);
+
             gpus.push(GpuInfo {
                 vendor,
                 model: model.trim().to_string(),
-                vram_mb: vram.unwrap_or(0),
+                vram_mb,
             });
         }
     }
     gpus
+}
+
+fn query_vram_wmic() -> std::collections::HashMap<String, u32> {
+    let mut map = std::collections::HashMap::new();
+    let output = std::process::Command::new("wmic")
+        .args(["path", "Win32_VideoController", "get", "Name,AdapterRAM", "/format:csv"])
+        .output();
+    if let Ok(o) = output {
+        if o.status.success() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            for line in text.lines().skip(1) {
+                let mut parts = line.split(',');
+                let _node = parts.next();
+                let name = parts.next().unwrap_or("").trim().to_string();
+                let vram_str = parts.next().unwrap_or("0").trim().to_string();
+                let vram_bytes: u64 = vram_str.parse().unwrap_or(0);
+                if !name.is_empty() && vram_bytes > 0 {
+                    map.insert(name, (vram_bytes / (1024 * 1024)) as u32);
+                }
+            }
+        }
+    }
+    map
 }
 
 fn detect_ram() -> RamInfo {

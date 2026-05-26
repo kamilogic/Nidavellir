@@ -11,6 +11,7 @@
   let activeTab = $state("hardware");
   let autoRefresh = $state(false);
   let refreshInterval = $state(null);
+  let hwRefreshInterval = $state(null);
   let sweepPoll = $state(null);
   let profiles = $state(null);
   let profileLoading = $state(false);
@@ -133,8 +134,10 @@
     loadHw();
     loadSensors();
     loadSavedProfiles();
+    hwRefreshInterval = setInterval(loadHw, 5000);
     return () => {
       if (refreshInterval) clearInterval(refreshInterval);
+      if (hwRefreshInterval) clearInterval(hwRefreshInterval);
       if (sweepPoll) clearInterval(sweepPoll);
     };
   });
@@ -230,7 +233,7 @@
         <div class="card">
           <h2>Memory</h2>
           <table><tbody>
-            <tr><td>Used</td><td>{sensorData.memory.used_mb} MB / {sensorData.memory.total_mb} MB</td></tr>
+            <tr><td>Used</td><td>{(sensorData.memory.used_mb / 1024).toFixed(1)} GB / {(sensorData.memory.total_mb / 1024).toFixed(1)} GB</td></tr>
             <tr><td>Usage</td><td>{sensorData.memory.used_pct.toFixed(1)}%</td></tr>
           </tbody></table>
         </div>
@@ -238,6 +241,9 @@
           <h2>WHEA</h2>
           <table><tbody>
             <tr><td>Errors</td><td>{sensorData.whea.error_count}</td></tr>
+            {#if sensorData.whea.last_error}
+              <tr><td>Last Error</td><td class="small">{sensorData.whea.last_error}</td></tr>
+            {/if}
           </tbody></table>
         </div>
         <div class="card">
@@ -421,6 +427,7 @@
   .table-scroll { max-height: 300px; overflow-y: auto; }
   .table-scroll td { padding: 0.25rem 0.5rem; }
   .section-title { margin: 1.5rem 0 0.8rem; font-size: 1.1rem; color: #f0c040; }
+  .small { font-size: 0.8rem; word-break: break-all; max-width: 200px; }
   .profile-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
   .profile-card { background: #16213e; border-radius: 8px; padding: 1.2rem; border: 1px solid #0f3460; }
   .profile-header { margin-bottom: 0.5rem; }
