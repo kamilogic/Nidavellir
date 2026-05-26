@@ -2,10 +2,16 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const BOOT_FLAG_PATH: &str = "C:\\ProgramData\\Nidavellir\\boot_flag";
 const BOOT_FLAG_CLEAN: &str = "CLEAN";
 const BOOT_FLAG_CRASH: &str = "CRASH";
+
+/// TTL for expensive Windows queries (wmic/wevtutil). Sensor refresh hits at 2s,
+/// so anything cheaper-to-cache-than-recompute should outlive several frames.
+const WMIC_CACHE_TTL: Duration = Duration::from_secs(5);
+const WHEA_CACHE_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SensorReadings {
@@ -46,6 +52,9 @@ pub struct Monitor {
     boot_flag_path: PathBuf,
     sys: sysinfo::System,
     base_freq_mhz: u32,
+    // Caches so we don't spawn `wmic`/`wevtutil` on every 2s sensor tick.
+    cached_clock: Option<(Instant, Option<u32>)>,
+    cached_whea: Option<(Instant, WheaInfo)>,
 }
 
 impl Default for Monitor {
@@ -62,6 +71,8 @@ impl Monitor {
             boot_flag_path: PathBuf::from(BOOT_FLAG_PATH),
             sys: sysinfo::System::new(),
             base_freq_mhz,
+            cached_clock: None,
+            cached_whea: None,
         }
     }
 
@@ -82,7 +93,7 @@ impl Monitor {
         SensorReadings {
             cpu: self.read_cpu_sensors(),
             memory: self.read_memory_sensors(),
-            whea: check_whea_errors(),
+            whea: self.read_whea_cached(),
             boot_status: self.check_boot_status(),
         }
     }
@@ -91,9 +102,33 @@ impl Monitor {
         self.sys.refresh_cpu_usage();
         CpuSensors {
             utilization_pct: self.sys.global_cpu_usage() as f64,
-            clock_mhz: read_cpu_clock_wmi(self.base_freq_mhz),
+            clock_mhz: self.read_clock_cached(),
             voltage_mv: read_cpu_voltage(),
         }
+    }
+
+    fn read_clock_cached(&mut self) -> Option<u32> {
+        let now = Instant::now();
+        if let Some((ts, val)) = &self.cached_clock {
+            if now.duration_since(*ts) < WMIC_CACHE_TTL {
+                return *val;
+            }
+        }
+        let val = read_cpu_clock_wmi(self.base_freq_mhz);
+        self.cached_clock = Some((now, val));
+        val
+    }
+
+    fn read_whea_cached(&mut self) -> WheaInfo {
+        let now = Instant::now();
+        if let Some((ts, val)) = &self.cached_whea {
+            if now.duration_since(*ts) < WHEA_CACHE_TTL {
+                return val.clone();
+            }
+        }
+        let val = check_whea_errors();
+        self.cached_whea = Some((now, val.clone()));
+        val
     }
 
     fn read_memory_sensors(&mut self) -> MemorySensors {
