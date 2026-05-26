@@ -3,3 +3,5 @@ dist/
 target/
 *.log
 .DS_Store
+src-tauri/resources/*.dll
+src-tauri/resources/*.sys
