@@ -14,9 +14,9 @@ Após a fase de aprendizado (30min–4h), o modelo da curva de silício do seu h
 
 | Perfil | Objetivo | CPU | GPU | RAM |
 |---|---|---|---|---|
-| **Mjolnir** ⚡ | Máxima performance sustentada | Turbo máx, PL alto, C-states OFF | Clock máx estável, PL alto | Timing mais agressivo validado |
-| **Draupnir** ♻️ | Máxima eficiência (perf/watt) | Undervolt ótimo, PL no joelho da curva | V/F sweet spot eficiente | Timings equilibrados |
-| **Gungnir** 🍃 | Economia sem perda perceptível (≥95% stock) | Undervolt + underclock leve, PL baixo | Power limit reduzido | JEDEC ou XMP conservador |
+| **Godforge** (Max) ⚡ | Máxima performance sustentada | Turbo máx, PL alto, C-states OFF | Clock máx estável, PL alto | Melhores timings validados |
+| **Brokkr's Best** (Efficient) ♻️ | Máxima eficiência (perf/watt) | Undervolt ótimo, PL no joelho da curva | V/F sweet spot eficiente | Melhores timings validados |
+| **Deep Calm** (Eco) 🍃 | Economia sem perda perceptível (≥95% stock) | Undervolt + underclock leve, PL baixo | Power limit reduzido | Melhores timings validados |
 
 Os nomes dos perfis podem ser alterados. O ponto central: são **derivados do aprendizado**, não presets genéricos.
 
