@@ -247,15 +247,7 @@
           <table><tbody>
             <tr><td>Used</td><td>{(sensorData.memory.used_mb / 1024).toFixed(1)} GB / {(sensorData.memory.total_mb / 1024).toFixed(1)} GB</td></tr>
             <tr><td>Usage</td><td>{sensorData.memory.used_pct.toFixed(1)}%</td></tr>
-          </tbody></table>
-        </div>
-        <div class="card">
-          <h2>WHEA</h2>
-          <table><tbody>
-            <tr><td>Errors</td><td>{sensorData.whea.error_count}</td></tr>
-            {#if sensorData.whea.last_error}
-              <tr><td>Last Error</td><td class="small">{sensorData.whea.last_error}</td></tr>
-            {/if}
+            <tr><td>Voltage</td><td>{sensorData.memory.voltage_mv ? (sensorData.memory.voltage_mv / 1000).toFixed(3) + " V" : "N/A"}</td></tr>
           </tbody></table>
         </div>
         <div class="card">
@@ -263,6 +255,28 @@
           <table><tbody>
             <tr><td>Previous crash</td><td>{sensorData.boot_status.previous_boot_crashed ? "Yes ⚠️" : "No ✅"}</td></tr>
           </tbody></table>
+        </div>
+        <div class="card whea-card">
+          <h2>WHEA</h2>
+          <table><tbody>
+            <tr><td>Errors</td><td>{sensorData.whea.error_count}</td></tr>
+          </tbody></table>
+          {#if sensorData.whea.events && sensorData.whea.events.length > 0}
+            <div class="whea-list">
+              {#each sensorData.whea.events as evt, i}
+                <div class="whea-event">
+                  <div class="whea-meta">
+                    <span class="whea-idx">#{i + 1}</span>
+                    {#if evt.event_id}<span class="whea-id">ID {evt.event_id}</span>{/if}
+                    {#if evt.timestamp}<span class="whea-time">{evt.timestamp}</span>{/if}
+                  </div>
+                  <div class="whea-desc">{evt.description ?? "No description available"}</div>
+                </div>
+              {/each}
+            </div>
+          {:else if sensorData.whea.error_count === 0}
+            <p class="whea-ok">No WHEA errors recorded</p>
+          {/if}
         </div>
       </div>
     {/if}
@@ -440,6 +454,15 @@
   .table-scroll td { padding: 0.25rem 0.5rem; }
   .section-title { margin: 1.5rem 0 0.8rem; font-size: 1.1rem; color: #f0c040; }
   .small { font-size: 0.8rem; word-break: break-all; max-width: 200px; }
+  .whea-card { grid-column: 1 / -1; }
+  .whea-list { margin-top: 0.8rem; max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.4rem; }
+  .whea-event { background: rgba(233, 69, 96, 0.08); border: 1px solid rgba(233, 69, 96, 0.25); border-radius: 4px; padding: 0.5rem 0.7rem; }
+  .whea-meta { display: flex; gap: 0.6rem; align-items: center; margin-bottom: 0.25rem; font-size: 0.75rem; }
+  .whea-idx { color: #e94560; font-weight: 700; }
+  .whea-id { background: #0f3460; color: #f0c040; padding: 0.1rem 0.4rem; border-radius: 3px; font-weight: 600; }
+  .whea-time { color: #888; }
+  .whea-desc { font-size: 0.82rem; color: #e0e0e0; line-height: 1.4; }
+  .whea-ok { margin: 0.5rem 0 0; font-size: 0.85rem; color: #4caf50; }
   .profile-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
   .profile-card { background: #16213e; border-radius: 8px; padding: 1.2rem; border: 1px solid #0f3460; }
   .profile-header { margin-bottom: 0.5rem; }
