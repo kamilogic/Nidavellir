@@ -51,7 +51,7 @@
   }
 
   async function loadSensors() {
-    sensorLoading = true;
+    if (!sensorData) sensorLoading = true;
     try { sensorData = await invoke("read_sensors"); }
     catch (e) { error = String(e); }
     finally { sensorLoading = false; }
@@ -453,7 +453,6 @@
   .table-scroll { max-height: 300px; overflow-y: auto; }
   .table-scroll td { padding: 0.25rem 0.5rem; }
   .section-title { margin: 1.5rem 0 0.8rem; font-size: 1.1rem; color: #f0c040; }
-  .small { font-size: 0.8rem; word-break: break-all; max-width: 200px; }
   .whea-card { grid-column: 1 / -1; }
   .whea-list { margin-top: 0.8rem; max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.4rem; }
   .whea-event { background: rgba(233, 69, 96, 0.08); border: 1px solid rgba(233, 69, 96, 0.25); border-radius: 4px; padding: 0.5rem 0.7rem; }
