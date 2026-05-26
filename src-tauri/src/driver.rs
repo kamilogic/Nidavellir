@@ -118,6 +118,7 @@ impl Drop for DriverManager {
 }
 
 // Well-known MSR indices
+pub const IA32_PERF_STATUS: u32 = 0x198;
 pub const IA32_PERF_CTL: u32 = 0x199;
 pub const IA32_CLOCK_MODULATION: u32 = 0x19A;
 pub const IA32_THERM_INTERRUPT: u32 = 0x19B;

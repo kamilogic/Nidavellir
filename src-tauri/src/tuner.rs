@@ -84,8 +84,7 @@ fn set_power_limits(dm: &crate::driver::DriverManager, pl1: u32, pl2: u32) -> Re
     let edx = (new_value >> 32) as u32;
 
     if current.eax != eax || current.edx != edx {
-        let _ = current;
-        dm.write_msr(driver::MSR_PKG_CST_CONFIG_CONTROL, eax, edx)?;
+        dm.write_msr(driver::IA32_PACKAGE_POWER_LIMIT, eax, edx)?;
     }
 
     // Actually write to power limit MSR

@@ -16,8 +16,23 @@ fn detect_hardware() -> detector::HardwareInfo {
 }
 
 #[tauri::command]
-fn read_sensors(state: tauri::State<'_, MonitorState>) -> monitor::SensorReadings {
-    state.0.lock().unwrap().read_sensors()
+fn read_sensors(
+    state: tauri::State<'_, MonitorState>,
+    driver_state: tauri::State<'_, DriverState>,
+) -> monitor::SensorReadings {
+    let mut sensors = state.0.lock().unwrap().read_sensors();
+    // Inject voltage reading from the shared driver
+    if let Ok(dm) = driver_state.0.lock() {
+        if dm.is_loaded() {
+            if let Ok(msr) = dm.read_msr(driver::IA32_PERF_STATUS) {
+                let vid = msr.eax & 0x1FFF;
+                if vid > 0 {
+                    sensors.cpu.voltage_mv = Some((vid as f64 * 5.0 + 245.0) as u32);
+                }
+            }
+        }
+    }
+    sensors
 }
 
 #[tauri::command]
