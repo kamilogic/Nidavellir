@@ -94,17 +94,15 @@ Next iteration avoids the unstable region
 ## Roadmap
 
 | Release | Modules | Deliverable |
-|---|---|---|
-| v0.1 | HW Detector + Monitor | Detect and display sensors |
-| v0.2 | Manual Tuning | CPU/GPU sliders via MSR+NVAPI |
-| v0.3 | Stress Test Engine | CPU FFT, GPU compute, RAM patterns |
-| v0.4 | Auto Sweep (Layer 1) | Automated CPU+GPU sweep |
-| v0.5 | 3 Profiles Generated | Modeled curve → functional profiles |
-| v0.6 | ReBAR checker | Notification if OFF |
-| v0.7 | UEFI Boot Driver | RAM timing tuning + validation |
-| v0.8 | Full Auto Pipeline | Phase1→reboot→Phase2→profiles ready |
-| v0.9 | Background Learning | Collect data during normal use |
-| v1.0 | Community Database | Bootstrap + anonymous submission |
+|---|---|---|---|
+| v0.1 | HW Detector + Dashboard | Detect and display hardware info |
+| v0.2 | Monitor + Sensors | CPU utilization, clock, memory, WHEA, boot flag |
+| v0.3 | Auto Sweep Engine (Layer 1) | Automated MSR/PCIe sweep + stability testing |
+| v0.4 | Profile Generator | Silicon curve model → 3 profiles (Godforge, Brokkr's Best, Deep Calm) |
+| v0.5 | UEFI Boot Driver | RAM timing tuning + isolated validation |
+| v0.6 | Full Auto Pipeline | Phase 1 (Windows) → reboot → Phase 2 (UEFI) → profiles ready |
+| v0.7 | Background Learning | Collect data during normal use, refine profiles |
+| v0.8 | Community Database | Bootstrap + anonymous submission, motherboard settings DB |
 
 ---
 
@@ -114,25 +112,28 @@ Next iteration avoids the unstable region
 nidavellir/
 ├── src-tauri/              # Rust backend
 │   ├── src/
-│   │   ├── detector/       # HW detection (CPUID, WMI, SPD, SMBus)
-│   │   ├── tuner/          # MSR, NVAPI, ADLX control
-│   │   ├── stress/         # CPU/GPU/RAM stress tests
-│   │   ├── optimizer/      # Bayesian optimization engine
-│   │   ├── profile/        # Profile save/load/apply
-│   │   ├── monitor/        # WHEA, watchdog, sensors
-│   │   └── service/        # Windows service (auto-apply on boot)
-│   ├── driver/             # WinRing0/PawnIO integration
-│   └── Cargo.toml
+│   │   ├── detector.rs    # HW detection (CPUID, WMI, SPD, SMBus)
+│   │   ├── tuner.rs       # MSR, NVAPI, ADLX control
+│   │   ├── stress.rs      # CPU/GPU/RAM stress tests
+│   │   ├── optimizer.rs   # Bayesian optimization engine
+│   │   ├── profile.rs     # Profile save/load/apply
+│   │   ├── monitor.rs     # WHEA, watchdog, sensors
+│   │   ├── service.rs     # Windows service (auto-apply on boot)
+│   │   ├── lib.rs         # Tauri app builder + IPC commands
+│   │   └── main.rs        # Entry point
+│   ├── build.rs            # Tauri build script
+│   ├── Cargo.toml
+│   └── icons/
 ├── src/                    # Svelte 5 frontend (Tauri webview)
-│   ├── lib/
-│   │   ├── components/     # UI components
-│   │   ├── stores/         # Svelte stores (reactive state)
-│   │   └── views/          # Page views (Dashboard, Tuner, Benchmark)
-│   └── App.svelte
-├── uefi/                   # EDK2 UEFI boot driver
-│   ├── src/
-│   ├── nidavellir.dsc      # EDK2 package declaration
-│   └── nidavellir.inf      # EDK2 module definition
+│   ├── lib/views/
+│   │   └── Dashboard.svelte
+│   ├── App.svelte
+│   └── main.js
+├── uefi/                   # UEFI boot driver (future)
+│   └── src/main.rs
+├── index.html
+├── package.json
+├── vite.config.js
 └── README.md
 ```
 
