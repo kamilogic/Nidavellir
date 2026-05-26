@@ -51,7 +51,7 @@
   }
 
   async function loadSensors() {
-    sensorLoading = true;
+    if (!sensorData) sensorLoading = true;
     try { sensorData = await invoke("read_sensors"); }
     catch (e) { error = String(e); }
     finally { sensorLoading = false; }
@@ -250,6 +250,16 @@
             <tr><td>Voltage</td><td>{sensorData.memory.voltage_mv ? (sensorData.memory.voltage_mv / 1000).toFixed(3) + " V" : "N/A"}</td></tr>
           </tbody></table>
         </div>
+        {#if sensorData.superio_voltages && sensorData.superio_voltages.length > 0}
+        <div class="card">
+          <h2>Voltages (Super I/O)</h2>
+          <table><tbody>
+            {#each sensorData.superio_voltages as v}
+              <tr><td>VIN{v.channel} {v.name}</td><td>{v.voltage_v.toFixed(3)} V</td></tr>
+            {/each}
+          </tbody></table>
+        </div>
+        {/if}
         <div class="card">
           <h2>Boot Status</h2>
           <table><tbody>
@@ -453,7 +463,6 @@
   .table-scroll { max-height: 300px; overflow-y: auto; }
   .table-scroll td { padding: 0.25rem 0.5rem; }
   .section-title { margin: 1.5rem 0 0.8rem; font-size: 1.1rem; color: #f0c040; }
-  .small { font-size: 0.8rem; word-break: break-all; max-width: 200px; }
   .whea-card { grid-column: 1 / -1; }
   .whea-list { margin-top: 0.8rem; max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.4rem; }
   .whea-event { background: rgba(233, 69, 96, 0.08); border: 1px solid rgba(233, 69, 96, 0.25); border-radius: 4px; padding: 0.5rem 0.7rem; }

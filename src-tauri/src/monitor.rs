@@ -20,6 +20,8 @@ pub struct SensorReadings {
     pub memory: MemorySensors,
     pub whea: WheaInfo,
     pub boot_status: BootStatus,
+    /// Super I/O voltage channels — populated by lib.rs after driver injection.
+    pub superio_voltages: Vec<crate::superio::SuperIoVoltage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +109,7 @@ impl Monitor {
             memory: self.read_memory_sensors(),
             whea: self.read_whea_cached(),
             boot_status: self.check_boot_status(),
+            superio_voltages: vec![],
         }
     }
 
@@ -205,48 +208,36 @@ fn read_cpu_base_freq() -> u32 {
 }
 
 fn read_cpu_clock_wmi(base_freq_mhz: u32) -> Option<u32> {
-    // Win32_Processor.CurrentClockSpeed is the most reliable dynamic clock source
-    if let Ok(output) = std::process::Command::new("wmic")
-        .args(["cpu", "get", "CurrentClockSpeed", "/format:list"])
-        .output()
-    {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                if let Some(val) = line.trim().strip_prefix("CurrentClockSpeed=") {
-                    if let Ok(mhz) = val.trim().parse::<u32>() {
-                        if mhz > 0 {
-                            return Some(mhz);
-                        }
+    // PercentProcessorPerformance tracks turbo boost and gives the real running clock.
+    // wmic.exe is deprecated on Win11 22H2+; use PowerShell CIM instead.
+    if base_freq_mhz > 0 {
+        let ps_cmd = "Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ProcessorInformation \
+                      -Filter \"Name='_Total'\" | Select-Object -ExpandProperty PercentProcessorPerformance";
+        if let Ok(output) = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if let Ok(pct) = text.trim().parse::<f64>() {
+                    if pct > 0.0 {
+                        return Some((base_freq_mhz as f64 * pct / 100.0) as u32);
                     }
                 }
             }
         }
     }
-    // Fallback: PercentProcessorPerformance * base_freq (requires perf counters)
-    if base_freq_mhz > 0 {
-        if let Ok(output) = std::process::Command::new("wmic")
-            .args([
-                "path",
-                "Win32_PerfFormattedData_Counters_ProcessorInformation",
-                "where",
-                "Name='_Total'",
-                "get",
-                "PercentProcessorPerformance",
-                "/format:list",
-            ])
-            .output()
-        {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines() {
-                    if let Some(val) = line.trim().strip_prefix("PercentProcessorPerformance=") {
-                        if let Ok(pct) = val.trim().parse::<f64>() {
-                            if pct > 0.0 {
-                                return Some((base_freq_mhz as f64 * pct / 100.0) as u32);
-                            }
-                        }
-                    }
+    // Fallback: CurrentClockSpeed (static on many systems, but always available)
+    let ps_cmd = "Get-CimInstance Win32_Processor | Select-Object -ExpandProperty CurrentClockSpeed";
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Ok(mhz) = text.trim().parse::<u32>() {
+                if mhz > 0 {
+                    return Some(mhz);
                 }
             }
         }
@@ -261,24 +252,21 @@ fn read_cpu_clock_wmi(base_freq_mhz: u32) -> Option<u32> {
 }
 
 fn read_ram_voltage() -> Option<u32> {
-    let output = std::process::Command::new("wmic")
-        .args(["memorychip", "get", "ConfiguredVoltage", "/format:list"])
+    // ConfiguredVoltage preferred; fall back to MinVoltage then MaxVoltage.
+    // Outputs a single number so no CSV parsing is needed.
+    let ps_cmd = "$m = Get-CimInstance Win32_PhysicalMemory | Select-Object -First 1; \
+                  if ($m.ConfiguredVoltage -gt 0) { $m.ConfiguredVoltage } \
+                  elseif ($m.MinVoltage -gt 0) { $m.MinVoltage } \
+                  else { $m.MaxVoltage }";
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        if let Some(val) = line.trim().strip_prefix("ConfiguredVoltage=") {
-            if let Ok(mv) = val.trim().parse::<u32>() {
-                if mv > 0 {
-                    return Some(mv);
-                }
-            }
-        }
-    }
-    None
+    text.trim().parse::<u32>().ok().filter(|&mv| mv > 0)
 }
 
 fn read_cpu_voltage() -> Option<u32> {
