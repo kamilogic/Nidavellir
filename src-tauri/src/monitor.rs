@@ -12,6 +12,7 @@ const BOOT_FLAG_CRASH: &str = "CRASH";
 /// so anything cheaper-to-cache-than-recompute should outlive several frames.
 const WMIC_CACHE_TTL: Duration = Duration::from_secs(5);
 const WHEA_CACHE_TTL: Duration = Duration::from_secs(10);
+const RAM_VOLTAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SensorReadings {
@@ -33,12 +34,21 @@ pub struct MemorySensors {
     pub used_mb: u64,
     pub total_mb: u64,
     pub used_pct: f64,
+    pub voltage_mv: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WheaEvent {
+    pub timestamp: Option<String>,
+    pub event_id: Option<u32>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WheaInfo {
     pub error_count: u32,
     pub last_error: Option<String>,
+    pub events: Vec<WheaEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +65,7 @@ pub struct Monitor {
     // Caches so we don't spawn `wmic`/`wevtutil` on every 2s sensor tick.
     cached_clock: Option<(Instant, Option<u32>)>,
     cached_whea: Option<(Instant, WheaInfo)>,
+    cached_ram_voltage: Option<(Instant, Option<u32>)>,
 }
 
 impl Default for Monitor {
@@ -73,6 +84,7 @@ impl Monitor {
             base_freq_mhz,
             cached_clock: None,
             cached_whea: None,
+            cached_ram_voltage: None,
         }
     }
 
@@ -136,7 +148,19 @@ impl Monitor {
         let total = self.sys.total_memory() / (1024 * 1024);
         let used = self.sys.used_memory() / (1024 * 1024);
         let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
-        MemorySensors { used_mb: used, total_mb: total, used_pct: pct }
+        MemorySensors { used_mb: used, total_mb: total, used_pct: pct, voltage_mv: self.read_ram_voltage_cached() }
+    }
+
+    fn read_ram_voltage_cached(&mut self) -> Option<u32> {
+        let now = Instant::now();
+        if let Some((ts, val)) = &self.cached_ram_voltage {
+            if now.duration_since(*ts) < RAM_VOLTAGE_CACHE_TTL {
+                return *val;
+            }
+        }
+        let val = read_ram_voltage();
+        self.cached_ram_voltage = Some((now, val));
+        val
     }
 
     fn check_boot_status(&self) -> BootStatus {
@@ -181,32 +205,53 @@ fn read_cpu_base_freq() -> u32 {
 }
 
 fn read_cpu_clock_wmi(base_freq_mhz: u32) -> Option<u32> {
-    // Try WMI PercentProcessorPerformance first
-    if base_freq_mhz > 0 {
-        let output = std::process::Command::new("wmic")
-            .args([
-                "path",
-                "Win32_PerfFormattedData_Counters_ProcessorInformation",
-                "get",
-                "PercentProcessorPerformance",
-                "/format:list",
-            ])
-            .output()
-            .ok()?;
+    // Win32_Processor.CurrentClockSpeed is the most reliable dynamic clock source
+    if let Ok(output) = std::process::Command::new("wmic")
+        .args(["cpu", "get", "CurrentClockSpeed", "/format:list"])
+        .output()
+    {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
-                let line = line.trim();
-                if let Some(val) = line.strip_prefix("PercentProcessorPerformance=") {
-                    if let Ok(pct) = val.trim().parse::<f64>() {
-                        let mhz = (base_freq_mhz as f64 * pct / 100.0) as u32;
-                        return Some(mhz);
+                if let Some(val) = line.trim().strip_prefix("CurrentClockSpeed=") {
+                    if let Ok(mhz) = val.trim().parse::<u32>() {
+                        if mhz > 0 {
+                            return Some(mhz);
+                        }
                     }
                 }
             }
         }
     }
-    // Fallback: read current frequency from Registry ~MHz
+    // Fallback: PercentProcessorPerformance * base_freq (requires perf counters)
+    if base_freq_mhz > 0 {
+        if let Ok(output) = std::process::Command::new("wmic")
+            .args([
+                "path",
+                "Win32_PerfFormattedData_Counters_ProcessorInformation",
+                "where",
+                "Name='_Total'",
+                "get",
+                "PercentProcessorPerformance",
+                "/format:list",
+            ])
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    if let Some(val) = line.trim().strip_prefix("PercentProcessorPerformance=") {
+                        if let Ok(pct) = val.trim().parse::<f64>() {
+                            if pct > 0.0 {
+                                return Some((base_freq_mhz as f64 * pct / 100.0) as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Last resort: static base freq from registry
     use winreg::enums::*;
     use winreg::RegKey;
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
@@ -215,55 +260,109 @@ fn read_cpu_clock_wmi(base_freq_mhz: u32) -> Option<u32> {
         .and_then(|k| k.get_value("~MHz").ok())
 }
 
+fn read_ram_voltage() -> Option<u32> {
+    let output = std::process::Command::new("wmic")
+        .args(["memorychip", "get", "ConfiguredVoltage", "/format:list"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        if let Some(val) = line.trim().strip_prefix("ConfiguredVoltage=") {
+            if let Ok(mv) = val.trim().parse::<u32>() {
+                if mv > 0 {
+                    return Some(mv);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn read_cpu_voltage() -> Option<u32> {
     None // voltage injected from shared driver in lib.rs
 }
 
 fn check_whea_errors() -> WheaInfo {
-    // Use /f:text for simpler line-based output (XML is unreliable to parse line-by-line)
     let output = std::process::Command::new("wevtutil")
-        .args(["qe", "Microsoft-Windows-Kernel-WHEA/Operational", "/c:10", "/rd:true", "/f:text"])
+        .args(["qe", "Microsoft-Windows-Kernel-WHEA/Operational", "/c:20", "/rd:true", "/f:text"])
         .output();
-    match &output {
+    match output {
         Ok(o) if o.status.success() => {
             let text = String::from_utf8_lossy(&o.stdout);
-            let mut error_count: u32 = 0;
-            let mut event_lines: Vec<String> = Vec::new();
-            let mut in_event = false;
+            let mut events: Vec<WheaEvent> = Vec::new();
+
+            let mut cur_timestamp: Option<String> = None;
+            let mut cur_event_id: Option<u32> = None;
+            let mut desc_lines: Vec<String> = Vec::new();
+            let mut in_description = false;
+            let mut has_event = false;
+
+            let flush = |events: &mut Vec<WheaEvent>,
+                          ts: &mut Option<String>,
+                          eid: &mut Option<u32>,
+                          desc: &mut Vec<String>,
+                          has: &mut bool| {
+                if *has {
+                    events.push(WheaEvent {
+                        timestamp: ts.take(),
+                        event_id: eid.take(),
+                        description: if desc.is_empty() { None } else { Some(desc.join(" ")) },
+                    });
+                    desc.clear();
+                    *has = false;
+                }
+            };
+
             for line in text.lines() {
                 let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                // In /f:text format, events are separated by blank lines
-                // and start with "Event[0]:", "Event[1]:", etc.
                 if trimmed.starts_with("Event[") {
-                    error_count += 1;
-                    in_event = true;
-                    event_lines.push(trimmed.to_string());
-                } else if in_event {
-                    event_lines.push(trimmed.to_string());
+                    flush(&mut events, &mut cur_timestamp, &mut cur_event_id, &mut desc_lines, &mut has_event);
+                    has_event = true;
+                    in_description = false;
+                } else if in_description {
+                    // Stop description on blank line or a new known field
+                    if trimmed.is_empty()
+                        || trimmed.starts_with("Log Name:")
+                        || trimmed.starts_with("Source:")
+                        || trimmed.starts_with("Event ID:")
+                        || trimmed.starts_with("Task:")
+                        || trimmed.starts_with("Level:")
+                        || trimmed.starts_with("Opcode:")
+                        || trimmed.starts_with("Keyword:")
+                        || trimmed.starts_with("User:")
+                        || trimmed.starts_with("Computer:")
+                    {
+                        in_description = false;
+                    } else {
+                        desc_lines.push(trimmed.to_string());
+                    }
+                }
+                if !in_description {
+                    if let Some(val) = trimmed.strip_prefix("Date:") {
+                        cur_timestamp = Some(val.trim().to_string());
+                    } else if let Some(val) = trimmed.strip_prefix("Event ID:") {
+                        cur_event_id = val.trim().parse().ok();
+                    } else if let Some(val) = trimmed.strip_prefix("Description:") {
+                        desc_lines.clear();
+                        let inline = val.trim();
+                        if !inline.is_empty() {
+                            desc_lines.push(inline.to_string());
+                        }
+                        in_description = true;
+                    }
                 }
             }
-            // Find a non-empty, non-zero description from the last event
-            let last_error = event_lines.iter()
-                .find(|l| {
-                    !l.contains("Event[") // skip the header
-                    && !l.contains(": 0") // skip zero values
-                    && l.contains(':')
-                })
-                .map(|l| {
-                    let parts: Vec<&str> = l.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        format!("{}: {}", parts[0].trim(), parts[1].trim())
-                    } else {
-                        l.to_string()
-                    }
-                })
-                // If no field found, show the last event header
-                .or_else(|| event_lines.last().map(|l| l.to_string()));
-            WheaInfo { error_count, last_error }
+            flush(&mut events, &mut cur_timestamp, &mut cur_event_id, &mut desc_lines, &mut has_event);
+
+            let error_count = events.len() as u32;
+            let last_error = events.first()
+                .and_then(|e| e.description.clone())
+                .or_else(|| events.first().and_then(|e| e.timestamp.as_ref().map(|t| format!("Error at {t}"))));
+            WheaInfo { error_count, last_error, events }
         }
-        _ => WheaInfo { error_count: 0, last_error: None },
+        _ => WheaInfo { error_count: 0, last_error: None, events: vec![] },
     }
 }

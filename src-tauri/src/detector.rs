@@ -135,11 +135,12 @@ fn detect_gpu() -> Vec<GpuInfo> {
         return vec![];
     };
 
-    // Build WMIC VRAM map keyed by normalized GPU name
-    let wmic_vram = query_vram_wmic();
-
-    // Also build a fallback normalized map from registry (u32, wraps at 4GB)
+    // nvidia-smi: most accurate for NVIDIA (avoids uint32 WMI overflow)
+    let smi_vram = query_vram_nvidia_smi();
+    // Registry: try QWORD keys (handles >4GB correctly for NVIDIA)
     let reg_vram = query_vram_registry();
+    // WMIC AdapterRAM: uint32 fallback, wraps to 0 for cards >4GB
+    let wmic_vram = query_vram_wmic();
 
     let mut gpus = Vec::new();
     for i in 0..32 {
@@ -167,11 +168,16 @@ fn detect_gpu() -> Vec<GpuInfo> {
         .to_string();
 
         let normalized = model.trim().to_lowercase();
-        // WMIC first (handles >4GB), fall back to registry u32
-        let vram_mb = wmic_vram
+        // Priority: nvidia-smi > registry QWORD > wmic uint32 (filters 0 to avoid overflow artifacts)
+        let vram_mb = smi_vram
             .get(&normalized)
             .copied()
-            .or_else(|| reg_vram.get(&normalized).copied().map(|b| (b / (1024 * 1024)) as u32))
+            .or_else(|| {
+                reg_vram.get(&normalized).copied()
+                    .filter(|&b| b > 0)
+                    .map(|b| (b / (1024 * 1024)) as u32)
+            })
+            .or_else(|| wmic_vram.get(&normalized).copied().filter(|&v| v > 0))
             .unwrap_or(0);
 
         gpus.push(GpuInfo {
@@ -239,18 +245,36 @@ fn query_vram_registry() -> std::collections::HashMap<String, u64> {
             continue;
         };
         let normalized = model.trim().to_lowercase();
-        // Try u32 (REG_DWORD) first, then u64 (REG_QWORD for >4GB)
-        let vram: Option<u64> = sub
-            .get_value("HardwareInformation.AdapterRAM")
-            .ok()
-            .map(|b: u32| b as u64)
-            .or_else(|| {
-                sub.get_value("HardwareInformation.AdapterRAM")
-                    .ok()
-                    .map(|b: u64| b)
-            });
+        // qwMemorySize is a NVIDIA-specific QWORD that stores the correct size for >4GB cards.
+        // Fall back to AdapterRAM as QWORD, then as DWORD (which wraps at 4GB).
+        let vram: Option<u64> = sub.get_value::<u64, _>("HardwareInformation.qwMemorySize").ok()
+            .or_else(|| sub.get_value::<u64, _>("HardwareInformation.AdapterRAM").ok())
+            .or_else(|| sub.get_value::<u32, _>("HardwareInformation.AdapterRAM").ok().map(|b| b as u64));
         if let Some(bytes) = vram {
             map.insert(normalized, bytes);
+        }
+    }
+    map
+}
+
+fn query_vram_nvidia_smi() -> std::collections::HashMap<String, u32> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        .output() else { return map; };
+    if !output.status.success() { return map; }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        // Format: "NVIDIA GeForce RTX 3060 Ti, 8192"
+        if let Some(comma) = line.rfind(',') {
+            let name = line[..comma].trim().to_lowercase();
+            if let Ok(mib) = line[comma + 1..].trim().parse::<u32>() {
+                if mib > 0 {
+                    map.insert(name, mib);
+                }
+            }
         }
     }
     map
