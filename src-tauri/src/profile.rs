@@ -46,11 +46,11 @@ pub struct ProfileSet {
 }
 
 pub fn generate_profiles(steps: &[StepResult], param: &SweepParam) -> ProfileSet {
-    let _base = find_baseline_throughput(steps);
+    let baseline = find_baseline_throughput(steps, param);
     let stable: Vec<&StepResult> = steps.iter().filter(|s| s.stable).collect();
     let sorted: Vec<&StepResult> = if stable.is_empty() {
         let mut s: Vec<&StepResult> = steps.iter().collect();
-        s.sort_by(|a, b| a.whea_errors.cmp(&b.whea_errors));
+        s.sort_by_key(|s| s.whea_errors);
         s
     } else {
         let mut s = stable;
@@ -58,9 +58,9 @@ pub fn generate_profiles(steps: &[StepResult], param: &SweepParam) -> ProfileSet
         s
     };
 
-    let godforge = select_godforge(&sorted, param);
-    let brokkr = select_brokkr(&sorted, param);
-    let deep_calm = select_deep_calm(&sorted, param);
+    let godforge = select_godforge(&sorted, param, baseline);
+    let brokkr = select_brokkr(&sorted, param, baseline);
+    let deep_calm = select_deep_calm(&sorted, param, baseline);
 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -71,27 +71,52 @@ pub fn generate_profiles(steps: &[StepResult], param: &SweepParam) -> ProfileSet
     }
 }
 
-fn find_baseline_throughput(steps: &[StepResult]) -> f64 {
+/// Pick the throughput at the parameter's "stock" value (closest to nominal/0)
+/// as a baseline for percentage calculations.
+fn find_baseline_throughput(steps: &[StepResult], param: &SweepParam) -> f64 {
     if steps.is_empty() {
         return 1.0;
     }
-    let mid = steps.len() / 2;
-    if mid < steps.len() {
-        steps[mid].throughput
+    let nominal = nominal_value(param);
+    let closest = steps
+        .iter()
+        .min_by(|a, b| {
+            (a.step.value - nominal)
+                .abs()
+                .partial_cmp(&(b.step.value - nominal).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|s| s.throughput)
+        .unwrap_or(1.0);
+    if closest > 0.0 {
+        closest
     } else {
-        steps[0].throughput
+        1.0
     }
 }
 
-fn select_godforge(sorted: &[&StepResult], param: &SweepParam) -> Profile {
+/// Stock/nominal value for each tunable, used as the baseline anchor.
+fn nominal_value(param: &SweepParam) -> f64 {
+    match param {
+        SweepParam::CpuCoreVoltage | SweepParam::CpuCacheVoltage => 0.0,
+        SweepParam::CpuPowerLimit => 95.0,
+        SweepParam::CpuTurboRatio => 50.0,
+    }
+}
+
+fn perf_pct(throughput: f64, baseline: f64) -> f64 {
+    ((throughput / baseline) * 100.0).round()
+}
+
+fn select_godforge(sorted: &[&StepResult], param: &SweepParam, baseline: f64) -> Profile {
     let best = sorted.first().map(|s| s.step.value).unwrap_or(0.0);
-    let perf = sorted.first().map(|s| s.throughput).unwrap_or(1.0);
+    let perf = sorted.first().map(|s| s.throughput).unwrap_or(baseline);
 
     Profile {
         kind: ProfileKind::Godforge,
         name: ProfileKind::Godforge.label().to_string(),
         tuning: tuning_from_value(param, best),
-        expected_performance_pct: ((perf / 1_000_000.0) * 100.0).round(),
+        expected_performance_pct: perf_pct(perf, baseline),
         notes: format!(
             "Peak performance at {} = {:.1}. Best raw throughput.",
             param.label(),
@@ -100,7 +125,7 @@ fn select_godforge(sorted: &[&StepResult], param: &SweepParam) -> Profile {
     }
 }
 
-fn select_brokkr(sorted: &[&StepResult], param: &SweepParam) -> Profile {
+fn select_brokkr(sorted: &[&StepResult], param: &SweepParam, baseline: f64) -> Profile {
     let best = sorted
         .iter()
         .copied()
@@ -116,18 +141,18 @@ fn select_brokkr(sorted: &[&StepResult], param: &SweepParam) -> Profile {
             kind: ProfileKind::BrokkrsBest,
             name: ProfileKind::BrokkrsBest.label().to_string(),
             tuning: tuning_from_value(param, s.step.value),
-            expected_performance_pct: ((s.throughput / 1_000_000.0) * 100.0).round(),
+            expected_performance_pct: perf_pct(s.throughput, baseline),
             notes: format!(
                 "Best efficiency at {} = {:.1}. Score/value ratio is optimal.",
                 param.label(),
                 s.step.value
             ),
         },
-        None => select_godforge(sorted, param),
+        None => select_godforge(sorted, param, baseline),
     }
 }
 
-fn select_deep_calm(sorted: &[&StepResult], param: &SweepParam) -> Profile {
+fn select_deep_calm(sorted: &[&StepResult], param: &SweepParam, baseline: f64) -> Profile {
     let best = sorted
         .iter()
         .copied()
@@ -145,14 +170,14 @@ fn select_deep_calm(sorted: &[&StepResult], param: &SweepParam) -> Profile {
             kind: ProfileKind::DeepCalm,
             name: ProfileKind::DeepCalm.label().to_string(),
             tuning: tuning_from_value(param, s.step.value),
-            expected_performance_pct: ((s.throughput / 1_000_000.0) * 100.0).round(),
+            expected_performance_pct: perf_pct(s.throughput, baseline),
             notes: format!(
                 "Lowest power at {} = {:.1}. Minimal voltage while stable.",
                 param.label(),
                 s.step.value
             ),
         },
-        None => select_godforge(sorted, param),
+        None => select_godforge(sorted, param, baseline),
     }
 }
 
