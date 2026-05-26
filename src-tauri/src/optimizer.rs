@@ -1,5 +1,4 @@
 use crate::profile::Profile;
-use crate::tuner::TuningParams;
 
 pub enum OptimizerState {
     Idle,

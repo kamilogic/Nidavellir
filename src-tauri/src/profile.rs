@@ -16,10 +16,10 @@ pub struct Profile {
     pub ram_timings_fastest: bool,
 }
 
-pub fn save_profile(profile: &Profile, path: &str) -> Result<(), String> {
+pub fn save_profile(_profile: &Profile, _path: &str) -> Result<(), String> {
     Err("Not implemented".into())
 }
 
-pub fn load_profile(path: &str) -> Result<Profile, String> {
+pub fn load_profile(_path: &str) -> Result<Profile, String> {
     Err("Not implemented".into())
 }

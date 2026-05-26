@@ -1,3 +1,6 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuningParams {
     pub cpu_voltage_offset_mv: i32,
     pub pl1_watts: u32,
@@ -9,7 +12,7 @@ pub struct TuningParams {
     pub gpu_power_limit_pct: u8,
 }
 
-pub fn apply_tuning(params: &TuningParams) -> Result<(), String> {
+pub fn apply_tuning(_params: &TuningParams) -> Result<(), String> {
     Err("Not implemented".into())
 }
 

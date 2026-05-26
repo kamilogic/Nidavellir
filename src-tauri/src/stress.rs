@@ -11,7 +11,7 @@ pub enum TestResult {
     Crash { bugcheck: Option<u32> },
 }
 
-pub fn run_stress_test(target: TestTarget, duration_secs: u32) -> TestResult {
+pub fn run_stress_test(_target: TestTarget, _duration_secs: u32) -> TestResult {
     TestResult::Unstable {
         details: "Not implemented".into(),
     }

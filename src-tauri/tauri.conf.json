@@ -3,13 +3,9 @@
   "version": "0.1.0",
   "identifier": "dev.nidavellir.app",
   "build": {
-    "frontendDist": "../dist",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "frontendDist": "../dist"
   },
   "app": {
-    "title": "Nidavellir",
     "windows": [
       {
         "title": "Nidavellir",
