@@ -27,6 +27,8 @@ type DeinitializeOls = unsafe extern "system" fn();
 type ReadMsr = unsafe extern "system" fn(index: ols_dword, eax: *mut ols_dword, edx: *mut ols_dword) -> ols_bool;
 type WriteMsr = unsafe extern "system" fn(index: ols_dword, eax: ols_dword, edx: ols_dword) -> ols_bool;
 type ReadPciConfig = unsafe extern "system" fn(pci_addr: ols_dword, reg_size: ols_dword, reg_offset: ols_dword) -> ols_dword;
+type ReadIoPortByte = unsafe extern "system" fn(port: u16, value: *mut u8) -> ols_bool;
+type WriteIoPortByte = unsafe extern "system" fn(port: u16, value: u8) -> ols_bool;
 
 impl DriverManager {
     pub fn new() -> Self {
@@ -95,6 +97,23 @@ impl DriverManager {
         } else {
             Ok(())
         }
+    }
+
+    pub fn read_io_port_byte(&self, port: u16) -> Result<u8, String> {
+        let lib = self.lib.as_ref().ok_or("Driver not loaded")?;
+        let func: libloading::Symbol<ReadIoPortByte> =
+            unsafe { lib.get(b"ReadIoPortByte") }.map_err(|e| e.to_string())?;
+        let mut value: u8 = 0;
+        let ok = unsafe { func(port, &mut value) };
+        if ok == 0 { Err(format!("ReadIoPortByte(0x{port:04X}) failed")) } else { Ok(value) }
+    }
+
+    pub fn write_io_port_byte(&self, port: u16, value: u8) -> Result<(), String> {
+        let lib = self.lib.as_ref().ok_or("Driver not loaded")?;
+        let func: libloading::Symbol<WriteIoPortByte> =
+            unsafe { lib.get(b"WriteIoPortByte") }.map_err(|e| e.to_string())?;
+        let ok = unsafe { func(port, value) };
+        if ok == 0 { Err(format!("WriteIoPortByte(0x{port:04X}, 0x{value:02X}) failed")) } else { Ok(()) }
     }
 
     pub fn read_pci_config(&self, bus: u8, device: u8, function: u8, offset: u8, size: u32) -> Result<u32, String> {

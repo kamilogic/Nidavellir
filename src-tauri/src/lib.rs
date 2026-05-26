@@ -7,6 +7,7 @@ pub mod monitor;
 pub mod sweep;
 pub mod driver;
 pub mod service;
+pub mod superio;
 
 use std::sync::Mutex;
 
@@ -21,11 +22,11 @@ fn read_sensors(
     driver_state: tauri::State<'_, DriverState>,
 ) -> monitor::SensorReadings {
     let mut sensors = state.0.lock().unwrap().read_sensors();
-    // Inject voltage reading from the shared driver — vendor-aware.
-    // Intel pre-Haswell VID formula does NOT apply to AMD or modern Intel FIVR CPUs.
+    // Inject readings that require kernel driver access.
     if let Ok(dm) = driver_state.0.lock() {
         if dm.is_loaded() {
             sensors.cpu.voltage_mv = read_vcore_vendor_aware(&dm);
+            sensors.superio_voltages = superio::read_ite_voltages(&dm);
         }
     }
     sensors

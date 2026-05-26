@@ -250,6 +250,16 @@
             <tr><td>Voltage</td><td>{sensorData.memory.voltage_mv ? (sensorData.memory.voltage_mv / 1000).toFixed(3) + " V" : "N/A"}</td></tr>
           </tbody></table>
         </div>
+        {#if sensorData.superio_voltages && sensorData.superio_voltages.length > 0}
+        <div class="card">
+          <h2>Voltages (Super I/O)</h2>
+          <table><tbody>
+            {#each sensorData.superio_voltages as v}
+              <tr><td>VIN{v.channel} {v.name}</td><td>{v.voltage_v.toFixed(3)} V</td></tr>
+            {/each}
+          </tbody></table>
+        </div>
+        {/if}
         <div class="card">
           <h2>Boot Status</h2>
           <table><tbody>

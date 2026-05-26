@@ -20,6 +20,8 @@ pub struct SensorReadings {
     pub memory: MemorySensors,
     pub whea: WheaInfo,
     pub boot_status: BootStatus,
+    /// Super I/O voltage channels — populated by lib.rs after driver injection.
+    pub superio_voltages: Vec<crate::superio::SuperIoVoltage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +109,7 @@ impl Monitor {
             memory: self.read_memory_sensors(),
             whea: self.read_whea_cached(),
             boot_status: self.check_boot_status(),
+            superio_voltages: vec![],
         }
     }
 
