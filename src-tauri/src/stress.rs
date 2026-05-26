@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::f64::consts::{PI, SQRT_2};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -52,12 +53,12 @@ impl StressTest {
                     let mut ops: u64 = 0;
                     while active.load(Ordering::SeqCst) {
                         for _ in 0..2048 {
-                            x = (x * 3.141592653589793).sin();
-                            x = x.mul_add(1.41421356237, 0.5772156649);
+                            x = (x * PI).sin();
+                            x = x.mul_add(SQRT_2, 0.5772156649);
                             x = x.sqrt().mul_add(x, x.recip());
                         }
                         ops += 2048;
-                        if ops % 81920 == 0 {
+                        if ops.is_multiple_of(81920) {
                             total_ops.fetch_add(81920, Ordering::Relaxed);
                             ops = 0;
                         }
