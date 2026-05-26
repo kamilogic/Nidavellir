@@ -1,114 +1,114 @@
 # Nidavellir ⚒️
 
-> *O reino dos anões ferreiros na mitologia nórdica. Foi lá que forjaram Mjolnir, Gungnir e Draupnir — armas e artefatos lendários que superavam os limites do material bruto.*
+> *The realm of the dwarf smiths in Norse mythology. Where Mjolnir, Gungnir, and Draupnir were forged — legendary weapons and artifacts that surpassed the limits of raw material.*
 
-**Nidavellir** é uma ferramenta open-source que analisa seu hardware, submete-o a testes de estresse, aprende seus limites individuais (silicon lottery) e gera 3 perfis de otimização aplicados em nível de hardware via UEFI + Windows.
+**Nidavellir** is an open-source tool that analyzes your hardware, stress-tests it, learns its individual silicon limits (silicon lottery), and generates 3 optimization profiles applied at hardware level via UEFI + Windows.
 
-Nenhum slider manual. Nenhum chute. Apenas o que seu silício pode entregar.
+No manual sliders. No guessing. Just what your silicon can deliver.
 
 ---
 
-## Os 3 Perfis
+## The 3 Profiles
 
-Após a fase de aprendizado (30min–4h), o modelo da curva de silício do seu hardware gera automaticamente:
+After the learning phase (30min–4h), the silicon curve model of your hardware automatically generates:
 
-| Perfil | Objetivo | CPU | GPU | RAM |
+| Profile | Goal | CPU | GPU | RAM |
 |---|---|---|---|---|
-| **Godforge** (Max) ⚡ | Máxima performance sustentada | Turbo máx, PL alto, C-states OFF | Clock máx estável, PL alto | Melhores timings validados |
-| **Brokkr's Best** (Efficient) ♻️ | Máxima eficiência (perf/watt) | Undervolt ótimo, PL no joelho da curva | V/F sweet spot eficiente | Melhores timings validados |
-| **Deep Calm** (Eco) 🍃 | Economia sem perda perceptível (≥95% stock) | Undervolt + underclock leve, PL baixo | Power limit reduzido | Melhores timings validados |
+| **Godforge** (Max) ⚡ | Maximum sustained performance | Max turbo, high PL, C-states OFF | Max stable clock, high PL | Best validated timings |
+| **Brokkr's Best** (Efficient) ♻️ | Maximum efficiency (perf/watt) | Optimal undervolt, PL at knee of curve | Efficient V/F sweet spot | Best validated timings |
+| **Deep Calm** (Eco) 🍃 | Savings with no perceptible loss (≥95% stock) | Undervolt + light underclock, low PL | Reduced power limit | Best validated timings |
 
-Os nomes dos perfis podem ser alterados. O ponto central: são **derivados do aprendizado**, não presets genéricos.
+Profile names can be customized. The key point: they are **derived from learning**, not generic presets.
 
 ---
 
-## Arquitetura
+## Architecture
 
-### 2 Fases Automatizadas
+### 2 Automated Phases
 
 ```
-FASE 1: WINDOWS
+PHASE 1: WINDOWS
   CPU: MSR sweep (FIVR offset, PL1/PL2, turbo ratios, C-states)
-  GPU: NVAPI/ADLX (curva V/F, power limit)
+  GPU: NVAPI/ADLX (V/F curve, power limit)
   RAM: diagnostics + SPD read (via SMBus)
-  ReBAR: detecção via PCIe + alerta se OFF
+  ReBAR: PCIe detection + alert if OFF
   Monitor: WHEA, watchdog, temp, power
-  Saída: silicon_profile.json
+  Output: silicon_profile.json
 
-  ──→ REBOOT AUTOMÁTICO ──→
+  ──→ AUTOMATIC REBOOT ──→
 
-FASE 2: UEFI
-  Carrega perfil do ESP
-  RAM: tuning de timings + frequência (memory controller)
-  CPU: validação em ambiente isolado
-  Refina perfil → marca confiança (Bronze/Silver/Gold)
-  Saída: silicon_profile_refined.json
+PHASE 2: UEFI
+  Load profile from ESP
+  RAM: timing tuning + frequency (memory controller)
+  CPU: validation in isolated environment
+  Refine profile → confidence rating (Bronze/Silver/Gold)
+  Output: silicon_profile_refined.json
 
-  ──→ REBOOT → WINDOWS → PERFIS PRONTOS
+  ──→ REBOOT → WINDOWS → PROFILES READY
 ```
 
-### 3 Layers de Acesso a Hardware
+### 3 Hardware Access Layers
 
 ```
-Layer 1 (Universal) — Cobre ~97% dos ganhos
+Layer 1 (Universal) — Covers ~97% of gains
   MSR, PCIe, SMBus, WMI, NVAPI, ADLX
-  ✅ Tudo que importa para os 3 perfis
-  ✅ Implementado 100% no Windows (sem reboot)
+  ✅ Everything that matters for all 3 profiles
+  ✅ 100% implemented on Windows (no reboot)
 
-Layer 2 (UEFI NVRAM DB) — Settings de BIOS
+Layer 2 (UEFI NVRAM DB) — BIOS settings
   Resizable BAR, XMP, C-state enables
-  Database comunitária por placa-mãe + versão de BIOS
-  Futuro: parser IFR automático para mapeamento
+  Community database per motherboard + BIOS version
+  Future: automatic IFR parser for mapping
 
-Layer 3 (VRM/EC) — Aprofundamento
+Layer 3 (VRM/EC) — Depth
   LLC, DIGI VRM, fan curves
-  Só implementado se houver contribuição na DB
-  ❌ Não necessário para nenhum perfil
+  Only implemented if community DB contributions exist
+  ❌ Not required for any profile
 ```
 
-### Crash Handling (Loop Seguro)
+### Crash Handling (Safe Loop)
 
 ```
-WHEA monitor → detecta erro corrigível → reverte ANTES do crash
-Boot flag    → detecta crash pós-reboot no próximo início
-Bugcheck     → analisado → parâmetro marcado inválido no modelo
-Próxima iteração evita a região de instabilidade
+WHEA monitor → detects correctable error → reverts BEFORE crash
+Boot flag    → detects post-reboot crash on next startup
+Bugcheck     → analyzed → parameter marked invalid in model
+Next iteration avoids the unstable region
 ```
 
 ---
 
-## Stack Tecnológica
+## Tech Stack
 
-| Camada | Tecnologia | Motivo |
+| Layer | Technology | Rationale |
 |---|---|---|
-| Desktop framework | Tauri v2 | ~5MB, seguro, IPC nativo Rust ↔ UI |
-| Backend | Rust | Memória safety, performance, acesso a MSR/IO |
-| Frontend | Svelte 5 | Reativo, compilado, baixo boilerplate |
+| Desktop framework | Tauri v2 | ~5MB, secure, native Rust ↔ UI IPC |
+| Backend | Rust | Memory safety, performance, MSR/IO access |
+| Frontend | Svelte 5 | Reactive, compiled, low boilerplate |
 | Kernel driver | WinRing0 / PawnIO | MSR + PCI config + SMBus |
-| GPU API | NVAPI + ADLX bindings Rust | Curva V/F, power limit |
-| Otimização | argmin crate (Rust) | Bayesian optimization + pattern search |
+| GPU API | NVAPI + ADLX Rust bindings | V/F curve, power limit |
+| Optimization | argmin crate (Rust) | Bayesian optimization + pattern search |
 | UEFI module | EDK2 / Rust UEFI | Memory controller, boot driver |
 
 ---
 
 ## Roadmap
 
-| Release | Módulos | Entrega |
+| Release | Modules | Deliverable |
 |---|---|---|
-| v0.1 | HW Detector + Monitor | Detecta e exibe sensores |
-| v0.2 | Manual Tuning | Sliders CPU/GPU via MSR+NVAPI |
+| v0.1 | HW Detector + Monitor | Detect and display sensors |
+| v0.2 | Manual Tuning | CPU/GPU sliders via MSR+NVAPI |
 | v0.3 | Stress Test Engine | CPU FFT, GPU compute, RAM patterns |
-| v0.4 | Auto Sweep (Layer 1) | Varredura automatizada CPU+GPU |
-| v0.5 | 3 Perfis Gerados | Curva modelada → perfis funcionais |
-| v0.6 | ReBAR checker | Notificação se OFF |
-| v0.7 | UEFI Boot Driver | RAM timing tuning + validação |
-| v0.8 | Full Auto Pipeline | Fase1→reboot→Fase2→perfis prontos |
-| v0.9 | Background Learning | Coleta dados durante uso normal |
-| v1.0 | Community Database | Bootstrap + envio anônimo |
+| v0.4 | Auto Sweep (Layer 1) | Automated CPU+GPU sweep |
+| v0.5 | 3 Profiles Generated | Modeled curve → functional profiles |
+| v0.6 | ReBAR checker | Notification if OFF |
+| v0.7 | UEFI Boot Driver | RAM timing tuning + validation |
+| v0.8 | Full Auto Pipeline | Phase1→reboot→Phase2→profiles ready |
+| v0.9 | Background Learning | Collect data during normal use |
+| v1.0 | Community Database | Bootstrap + anonymous submission |
 
 ---
 
-## Estrutura do Repositório
+## Repository Structure
 
 ```
 nidavellir/
@@ -138,6 +138,6 @@ nidavellir/
 
 ---
 
-## Licença
+## License
 
-**GPLv3** — aberto para forks, contribuições e auditoria.
+**GPLv3** — open for forks, contributions, and auditing.

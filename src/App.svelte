@@ -4,6 +4,6 @@
 
 <div>
   <h1>Nidavellir ⚒️</h1>
-  <p>Forjando seu silício para o máximo potencial</p>
-  <button onclick={() => count++}>Cliques: {count}</button>
+  <p>Forging your silicon to its maximum potential</p>
+  <button onclick={() => count++}>Clicks: {count}</button>
 </div>
