@@ -249,35 +249,21 @@ fn read_cpu_clock_wmi(base_freq_mhz: u32) -> Option<u32> {
 }
 
 fn read_ram_voltage() -> Option<u32> {
-    // wmic.exe is deprecated on Win11 22H2+; use PowerShell CIM which is always available.
     // ConfiguredVoltage preferred; fall back to MinVoltage then MaxVoltage.
+    // Outputs a single number so no CSV parsing is needed.
+    let ps_cmd = "$m = Get-CimInstance Win32_PhysicalMemory | Select-Object -First 1; \
+                  if ($m.ConfiguredVoltage -gt 0) { $m.ConfiguredVoltage } \
+                  elseif ($m.MinVoltage -gt 0) { $m.MinVoltage } \
+                  else { $m.MaxVoltage }";
     let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile", "-NonInteractive", "-Command",
-            "Get-CimInstance Win32_PhysicalMemory | Select-Object -First 1 ConfiguredVoltage,MinVoltage,MaxVoltage | ConvertTo-Csv -NoTypeInformation",
-        ])
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    // CSV output: header line then value line, e.g. "1200","1200","1400"
-    let values: Vec<&str> = text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .nth(1)?  // second non-empty line is the data row
-        .split(',')
-        .map(|s| s.trim().trim_matches('"'))
-        .collect();
-    // order: ConfiguredVoltage, MinVoltage, MaxVoltage
-    for val in &values {
-        if let Ok(mv) = val.parse::<u32>() {
-            if mv > 0 {
-                return Some(mv);
-            }
-        }
-    }
-    None
+    text.trim().parse::<u32>().ok().filter(|&mv| mv > 0)
 }
 
 fn read_cpu_voltage() -> Option<u32> {
