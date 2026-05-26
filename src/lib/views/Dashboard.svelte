@@ -3,12 +3,42 @@
 
   let hwData = $state(null);
   let sensorData = $state(null);
+  let sweepProgress = $state(null);
   let hwLoading = $state(true);
   let sensorLoading = $state(true);
+  let sweepLoading = $state(false);
   let error = $state(null);
   let activeTab = $state("hardware");
   let autoRefresh = $state(false);
   let refreshInterval = $state(null);
+  let sweepPoll = $state(null);
+
+  // Sweep config (editable)
+  let sweepParam = $state("CpuCoreVoltage");
+  let rangeStart = $state(-100);
+  let rangeEnd = $state(50);
+  let stepSize = $state(5);
+  let testDuration = $state(30);
+  let cpuThreads = $state(4);
+
+  const paramLabels = {
+    CpuCoreVoltage: "CPU Core Voltage (mV)",
+    CpuCacheVoltage: "CPU Cache Voltage (mV)",
+    CpuPowerLimit: "CPU Power Limit PL1 (W)",
+    CpuTurboRatio: "CPU Turbo Ratio (x)",
+  };
+
+  const paramDefaults = {
+    CpuCoreVoltage: [-100, 50, 5],
+    CpuCacheVoltage: [-100, 50, 5],
+    CpuPowerLimit: [65, 150, 5],
+    CpuTurboRatio: [40, 55, 1],
+  };
+
+  function updateDefaults() {
+    const d = paramDefaults[sweepParam];
+    if (d) { rangeStart = d[0]; rangeEnd = d[1]; stepSize = d[2]; }
+  }
 
   async function loadHw() {
     hwLoading = true;
@@ -35,10 +65,58 @@
     }
   }
 
+  async function startSweep() {
+    sweepLoading = true;
+    try {
+      await invoke("start_sweep", {
+        config: {
+          param: sweepParam,
+          range_start: rangeStart,
+          range_end: rangeEnd,
+          step: stepSize,
+          test_duration_secs: testDuration,
+          cpu_threads: cpuThreads,
+        },
+      });
+      sweepPoll = setInterval(pollSweep, 1000);
+    } catch (e) { error = String(e); }
+    finally { sweepLoading = false; }
+  }
+
+  async function stopSweep() {
+    clearInterval(sweepPoll);
+    sweepPoll = null;
+    await invoke("stop_sweep");
+  }
+
+  async function resetSweep() {
+    clearInterval(sweepPoll);
+    sweepPoll = null;
+    await invoke("reset_sweep");
+    sweepProgress = null;
+  }
+
+  async function pollSweep() {
+    try {
+      const p = await invoke("get_sweep_progress");
+      sweepProgress = p;
+      if (p.state === "Completed" || p.state === "Stopped" || p.state === "Failed") {
+        clearInterval(sweepPoll);
+        sweepPoll = null;
+      }
+    } catch (e) {
+      clearInterval(sweepPoll);
+      sweepPoll = null;
+    }
+  }
+
   $effect(() => {
     loadHw();
     loadSensors();
-    return () => { if (refreshInterval) clearInterval(refreshInterval); };
+    return () => {
+      if (refreshInterval) clearInterval(refreshInterval);
+      if (sweepPoll) clearInterval(sweepPoll);
+    };
   });
 </script>
 
@@ -51,6 +129,7 @@
   <nav class="tabs">
     <button class="tab" class:active={activeTab === "hardware"} onclick={() => activeTab = "hardware"}>Hardware</button>
     <button class="tab" class:active={activeTab === "sensors"} onclick={() => activeTab = "sensors"}>Sensors</button>
+    <button class="tab" class:active={activeTab === "sweep"} onclick={() => activeTab = "sweep"}>Sweep</button>
   </nav>
 
   {#if activeTab === "hardware"}
@@ -107,7 +186,7 @@
       </div>
       <button class="btn" onclick={loadHw}>Refresh</button>
     {/if}
-  {:else}
+  {:else if activeTab === "sensors"}
     <div class="sensor-bar">
       <span class="sensor-label">Auto-refresh</span>
       <button class="toggle" class:on={autoRefresh} onclick={toggleAutoRefresh}>
@@ -117,7 +196,6 @@
         <button class="btn" onclick={loadSensors}>Refresh</button>
       {/if}
     </div>
-
     {#if sensorLoading}
       <div class="loading">Reading sensors...</div>
     {:else if sensorData}
@@ -150,6 +228,103 @@
         </div>
       </div>
     {/if}
+  {:else}
+    <div class="sweep-config">
+      <h3>Sweep Configuration</h3>
+      <label class="field">
+        <span>Parameter</span>
+        <select bind:value={sweepParam} onchange={updateDefaults}>
+          {#each Object.keys(paramLabels) as k}
+            <option value={k}>{paramLabels[k]}</option>
+          {/each}
+        </select>
+      </label>
+      <div class="row">
+        <label class="field">
+          <span>Start</span>
+          <input type="number" bind:value={rangeStart} />
+        </label>
+        <label class="field">
+          <span>End</span>
+          <input type="number" bind:value={rangeEnd} />
+        </label>
+        <label class="field">
+          <span>Step</span>
+          <input type="number" bind:value={stepSize} step="any" />
+        </label>
+      </div>
+      <div class="row">
+        <label class="field">
+          <span>Duration (s)</span>
+          <input type="number" bind:value={testDuration} min="5" />
+        </label>
+        <label class="field">
+          <span>CPU Threads</span>
+          <input type="number" bind:value={cpuThreads} min="1" max="64" />
+        </label>
+      </div>
+      <div class="sweep-actions">
+        {#if !sweepProgress || sweepProgress.state === "Idle" || sweepProgress.state === "Completed" || sweepProgress.state === "Stopped"}
+          <button class="btn primary" onclick={startSweep} disabled={sweepLoading}>
+            {sweepLoading ? "Starting..." : "Start Sweep"}
+          </button>
+        {:else if sweepProgress.state === "Running"}
+          <button class="btn danger" onclick={stopSweep}>Stop</button>
+        {/if}
+        {#if sweepProgress && (sweepProgress.state === "Completed" || sweepProgress.state === "Stopped")}
+          <button class="btn" onclick={resetSweep}>Reset</button>
+        {/if}
+      </div>
+    </div>
+
+    {#if sweepProgress && sweepProgress.state !== "Idle"}
+      <div class="card">
+        <h2>Sweep Status</h2>
+        <table><tbody>
+          <tr><td>State</td><td>{sweepProgress.state}</td></tr>
+          <tr><td>Progress</td><td>{sweepProgress.current_step} / {sweepProgress.total_steps}</td></tr>
+          {#if sweepProgress.steps.length > 0}
+            <tr><td>Completed Steps</td><td>{sweepProgress.steps.length}</td></tr>
+            <tr><td>Best Score</td><td>{sweepProgress.best_score.toExponential(3)}</td></tr>
+            <tr><td>Best Value</td><td>{sweepProgress.best_value ?? "—"}</td></tr>
+          {/if}
+        </tbody></table>
+      </div>
+
+      {#if sweepProgress.steps.length > 0}
+        <div class="card">
+          <h2>Step Results</h2>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <td>Step</td>
+                  <td>Value</td>
+                  <td>Throughput</td>
+                  <td>CPU%</td>
+                  <td>WHEA</td>
+                  <td>Stable</td>
+                  <td>Score</td>
+                </tr>
+              </thead>
+              <tbody>
+                {#each sweepProgress.steps as r}
+                  <tr class:best={r.score === sweepProgress.best_score && r.score > 0}>
+                    <td>{r.step.index + 1}</td>
+                    <td>{r.step.value.toFixed(1)}</td>
+                    <td>{r.throughput.toExponential(3)}</td>
+                    <td>{r.cpu_utilization.toFixed(1)}</td>
+                    <td>{r.whea_errors}</td>
+                    <td>{r.stable ? "✓" : "✗"}</td>
+                    <td>{r.score.toExponential(3)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      {/if}
+    {/if}
   {/if}
 </div>
 
@@ -171,11 +346,27 @@
   td { padding: 0.25rem 0; }
   td:first-child { color: #888; width: 40%; }
   td:last-child { color: #e0e0e0; font-weight: 500; }
+  thead td { color: #888; font-weight: 600; font-size: 0.8rem; border-bottom: 1px solid #0f3460; }
+  .best td { background: rgba(240, 192, 64, 0.1); }
   .sensor-bar { display: flex; align-items: center; gap: 0.8rem; margin-bottom: 1rem; font-size: 0.9rem; }
   .sensor-label { color: #888; }
   .toggle { padding: 0.3rem 0.8rem; border-radius: 4px; border: 1px solid #0f3460; background: #16213e; color: #888; cursor: pointer; font-weight: 600; }
   .toggle.on { background: #0f3460; color: #f0c040; border-color: #f0c040; }
+  .sweep-config { background: #16213e; border-radius: 8px; padding: 1.2rem; border: 1px solid #0f3460; margin-bottom: 1rem; }
+  .sweep-config h3 { margin: 0 0 1rem; font-size: 1rem; color: #f0c040; }
+  .field { display: flex; flex-direction: column; gap: 0.3rem; flex: 1; }
+  .field span { font-size: 0.8rem; color: #888; }
+  .field select, .field input { padding: 0.4rem; border-radius: 4px; border: 1px solid #0f3460; background: #1a1a2e; color: #e0e0e0; font-size: 0.9rem; }
+  .row { display: flex; gap: 0.8rem; margin-bottom: 0.8rem; }
+  .sweep-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
   .btn { padding: 0.4rem 1.2rem; background: #0f3460; color: #f0c040; border: 1px solid #f0c040; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
   .btn:hover { background: #1a5276; }
+  .btn.primary { background: #f0c040; color: #1a1a2e; font-weight: 600; }
+  .btn.primary:hover { background: #f4d060; }
+  .btn.danger { background: #e94560; color: #fff; border-color: #e94560; }
+  .btn.danger:hover { background: #ff6b81; }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  .table-scroll { max-height: 300px; overflow-y: auto; }
+  .table-scroll td { padding: 0.25rem 0.5rem; }
   @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
 </style>
