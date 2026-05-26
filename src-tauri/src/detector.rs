@@ -74,7 +74,10 @@ fn detect_cpu() -> CpuInfo {
     let model = read_reg_str(&hklm, cpu_path, "ProcessorNameString")
         .unwrap_or_else(|| "Unknown".into());
 
-    let max_freq = read_reg_u32(&hklm, cpu_path, "~MHz").unwrap_or(0);
+    // Registry `~MHz` reports the rated base clock (not turbo).
+    // For turbo/max, we query WMI; fall back to base if unavailable.
+    let base_freq = read_reg_u32(&hklm, cpu_path, "~MHz").unwrap_or(0);
+    let max_freq = query_cpu_max_clock_wmic().unwrap_or(base_freq);
 
     let vendor = if model.to_lowercase().contains("intel") {
         "Intel".to_string()
@@ -96,9 +99,32 @@ fn detect_cpu() -> CpuInfo {
         model,
         cores,
         threads,
-        base_freq_mhz: max_freq / 2,
+        base_freq_mhz: base_freq,
         max_freq_mhz: max_freq,
     }
+}
+
+fn query_cpu_max_clock_wmic() -> Option<u32> {
+    // Win32_Processor.MaxClockSpeed reports the advertised max (base clock on many CPUs,
+    // but BIOS sometimes reports the boost clock). Better than max/2.
+    let output = std::process::Command::new("wmic")
+        .args(["cpu", "get", "MaxClockSpeed", "/format:list"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        if let Some(val) = line.trim().strip_prefix("MaxClockSpeed=") {
+            if let Ok(mhz) = val.trim().parse::<u32>() {
+                if mhz > 0 {
+                    return Some(mhz);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn detect_gpu() -> Vec<GpuInfo> {
