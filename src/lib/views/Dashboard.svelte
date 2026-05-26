@@ -12,6 +12,8 @@
   let autoRefresh = $state(false);
   let refreshInterval = $state(null);
   let sweepPoll = $state(null);
+  let profiles = $state(null);
+  let profileLoading = $state(false);
 
   // Sweep config (editable)
   let sweepParam = $state("CpuCoreVoltage");
@@ -110,9 +112,27 @@
     }
   }
 
+  async function generateProfiles() {
+    profileLoading = true;
+    try { profiles = await invoke("generate_profiles"); }
+    catch (e) { error = String(e); }
+    finally { profileLoading = false; }
+  }
+
+  async function loadSavedProfiles() {
+    try { profiles = await invoke("get_profiles"); }
+    catch (_) { /* no saved profiles yet */ }
+  }
+
+  async function applyProfile(profile) {
+    try { await invoke("apply_profile", { profile }); }
+    catch (e) { error = String(e); }
+  }
+
   $effect(() => {
     loadHw();
     loadSensors();
+    loadSavedProfiles();
     return () => {
       if (refreshInterval) clearInterval(refreshInterval);
       if (sweepPoll) clearInterval(sweepPoll);
@@ -323,7 +343,39 @@
             </table>
           </div>
         </div>
+
+        {#if sweepProgress.state === "Completed" || sweepProgress.state === "Stopped"}
+          <div class="sweep-actions">
+            <button class="btn primary" onclick={generateProfiles} disabled={profileLoading}>
+              {profileLoading ? "Generating..." : "Generate Profiles"}
+            </button>
+          </div>
+        {/if}
       {/if}
+    {/if}
+
+    {#if profiles}
+      <h3 class="section-title">Generated Profiles</h3>
+      <div class="profile-grid">
+        {#each profiles.profiles as p}
+          <div class="profile-card">
+            <div class="profile-header">
+              <span class="profile-name">{p.name}</span>
+            </div>
+            <p class="profile-desc">{p.notes}</p>
+            <table>
+              <tbody>
+                <tr><td>Perf</td><td>~{p.expected_performance_pct}%</td></tr>
+                <tr><td>Vcore Offset</td><td>{p.tuning.cpu_voltage_offset_mv} mV</td></tr>
+                <tr><td>PL1</td><td>{p.tuning.pl1_watts} W</td></tr>
+                <tr><td>PL2</td><td>{p.tuning.pl2_watts} W</td></tr>
+                <tr><td>Turbo Ratio</td><td>{p.tuning.turbo_ratio_limit}x</td></tr>
+                <tr><td>C-States</td><td>{p.tuning.c_states_enabled ? "Enabled" : "Disabled"}</td></tr>
+              </tbody>
+            </table>
+          </div>
+        {/each}
+      </div>
     {/if}
   {/if}
 </div>
@@ -368,5 +420,12 @@
   .btn:disabled { opacity: 0.5; cursor: default; }
   .table-scroll { max-height: 300px; overflow-y: auto; }
   .table-scroll td { padding: 0.25rem 0.5rem; }
+  .section-title { margin: 1.5rem 0 0.8rem; font-size: 1.1rem; color: #f0c040; }
+  .profile-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
+  .profile-card { background: #16213e; border-radius: 8px; padding: 1.2rem; border: 1px solid #0f3460; }
+  .profile-header { margin-bottom: 0.5rem; }
+  .profile-name { font-size: 1rem; font-weight: 600; color: #f0c040; }
+  .profile-desc { font-size: 0.8rem; color: #888; margin: 0 0 0.8rem; line-height: 1.4; }
+  @media (max-width: 700px) { .profile-grid { grid-template-columns: 1fr; } }
   @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
 </style>

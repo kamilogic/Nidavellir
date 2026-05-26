@@ -44,6 +44,33 @@ fn reset_sweep(state: tauri::State<'_, SweepState>) {
     state.0.lock().unwrap().reset();
 }
 
+#[tauri::command]
+fn generate_profiles(
+    sweep_state: tauri::State<'_, SweepState>,
+) -> Result<profile::ProfileSet, String> {
+    let progress = sweep_state.0.lock().unwrap().get_progress()?;
+    let steps = progress.steps;
+    let param = progress.param.ok_or("No sweep data available")?;
+    if steps.is_empty() {
+        return Err("No sweep steps recorded".into());
+    }
+    let set = profile::generate_profiles(&steps, &param);
+    profile::save_profile_set(&set)?;
+    Ok(set)
+}
+
+#[tauri::command]
+fn get_profiles() -> Result<profile::ProfileSet, String> {
+    profile::load_profile_set()
+}
+
+#[tauri::command]
+fn apply_profile(
+    _profile: profile::Profile,
+) -> Result<(), String> {
+    Err("Kernel driver not yet available".into())
+}
+
 struct MonitorState(Mutex<monitor::Monitor>);
 struct SweepState(Mutex<sweep::SweepEngine>);
 
@@ -60,6 +87,9 @@ pub fn run() {
             stop_sweep,
             get_sweep_progress,
             reset_sweep,
+            generate_profiles,
+            get_profiles,
+            apply_profile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running nidavellir");
