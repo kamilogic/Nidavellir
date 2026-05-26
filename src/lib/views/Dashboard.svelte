@@ -9,7 +9,7 @@
   let sweepLoading = $state(false);
   let error = $state(null);
   let activeTab = $state("hardware");
-  let autoRefresh = $state(false);
+  let autoRefresh = $state(true);
   let refreshInterval = $state(null);
   let hwRefreshInterval = $state(null);
   let sweepPoll = $state(null);
@@ -132,7 +132,6 @@
 
   $effect(() => {
     loadHw();
-    loadSensors();
     loadSavedProfiles();
     hwRefreshInterval = setInterval(loadHw, 5000);
     return () => {
@@ -140,6 +139,18 @@
       if (hwRefreshInterval) clearInterval(hwRefreshInterval);
       if (sweepPoll) clearInterval(sweepPoll);
     };
+  });
+
+  // Start/stop sensor refresh when switching tabs or toggling auto-refresh
+  $effect(() => {
+    const shouldRun = activeTab === "sensors" && autoRefresh;
+    if (shouldRun && !refreshInterval) {
+      loadSensors();
+      refreshInterval = setInterval(loadSensors, 2000);
+    } else if (!shouldRun && refreshInterval) {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+    }
   });
 </script>
 
@@ -228,6 +239,7 @@
           <table><tbody>
             <tr><td>Utilization</td><td>{sensorData.cpu.utilization_pct.toFixed(1)}%</td></tr>
             <tr><td>Clock</td><td>{sensorData.cpu.clock_mhz ?? "—"} MHz</td></tr>
+            <tr><td>Vcore</td><td>{sensorData.cpu.voltage_mv ? sensorData.cpu.voltage_mv + " mV" : "N/A (admin req.)"}</td></tr>
           </tbody></table>
         </div>
         <div class="card">

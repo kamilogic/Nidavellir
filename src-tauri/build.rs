@@ -1,4 +1,14 @@
 fn main() {
+    // Ensure MSYS2 mingw64 bin is in PATH for windres
+    let msys2 = "C:\\msys64\\mingw64\\bin";
+    if std::path::Path::new(msys2).exists() {
+        if let Ok(path) = std::env::var("PATH") {
+            if !path.contains(msys2) {
+                std::env::set_var("PATH", format!("{msys2};{path}"));
+            }
+        }
+    }
+
     // Retry loop for MSYS2 windres file-lock race on release profile.
     for attempt in 0..5 {
         match tauri_build::try_build(Default::default()) {
@@ -20,7 +30,6 @@ fn main() {
     }
 
     // Copy WinRing0 to target directory (workaround for MSYS2 resource bundling issue).
-    // The build script runs from src-tauri/ so target is at target/ relative to cwd.
     let resources = std::path::Path::new("resources");
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
     let target = std::path::Path::new("target").join(&profile);

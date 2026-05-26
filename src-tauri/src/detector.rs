@@ -74,7 +74,10 @@ fn detect_cpu() -> CpuInfo {
     let model = read_reg_str(&hklm, cpu_path, "ProcessorNameString")
         .unwrap_or_else(|| "Unknown".into());
 
-    let max_freq = read_reg_u32(&hklm, cpu_path, "~MHz").unwrap_or(0);
+    // Registry `~MHz` reports the rated base clock (not turbo).
+    // For turbo/max, we query WMI; fall back to base if unavailable.
+    let base_freq = read_reg_u32(&hklm, cpu_path, "~MHz").unwrap_or(0);
+    let max_freq = query_cpu_max_clock_wmic().unwrap_or(base_freq);
 
     let vendor = if model.to_lowercase().contains("intel") {
         "Intel".to_string()
@@ -96,9 +99,32 @@ fn detect_cpu() -> CpuInfo {
         model,
         cores,
         threads,
-        base_freq_mhz: max_freq / 2,
+        base_freq_mhz: base_freq,
         max_freq_mhz: max_freq,
     }
+}
+
+fn query_cpu_max_clock_wmic() -> Option<u32> {
+    // Win32_Processor.MaxClockSpeed reports the advertised max (base clock on many CPUs,
+    // but BIOS sometimes reports the boost clock). Better than max/2.
+    let output = std::process::Command::new("wmic")
+        .args(["cpu", "get", "MaxClockSpeed", "/format:list"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        if let Some(val) = line.trim().strip_prefix("MaxClockSpeed=") {
+            if let Ok(mhz) = val.trim().parse::<u32>() {
+                if mhz > 0 {
+                    return Some(mhz);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn detect_gpu() -> Vec<GpuInfo> {
@@ -109,7 +135,11 @@ fn detect_gpu() -> Vec<GpuInfo> {
         return vec![];
     };
 
-    let vram_map = query_vram_wmic();
+    // Build WMIC VRAM map keyed by normalized GPU name
+    let wmic_vram = query_vram_wmic();
+
+    // Also build a fallback normalized map from registry (u32, wraps at 4GB)
+    let reg_vram = query_vram_registry();
 
     let mut gpus = Vec::new();
     for i in 0..32 {
@@ -117,59 +147,110 @@ fn detect_gpu() -> Vec<GpuInfo> {
         let Ok(sub) = base.open_subkey_with_flags(&path, KEY_READ) else {
             continue;
         };
-        let model: Option<String> = sub.get_value("DriverDesc").ok();
-        let vram_reg: Option<u32> = sub.get_value("HardwareInformation.AdapterRAM").ok();
-        let vram_wmic = model.as_ref().and_then(|m| vram_map.get(m.as_str())).copied();
+        let Ok(model): Result<String, _> = sub.get_value("DriverDesc") else {
+            continue;
+        };
 
-        if let Some(model) = model {
-            let vendor = if model.to_lowercase().contains("nvidia") {
-                "NVIDIA"
-            } else if model.to_lowercase().contains("amd") || model.to_lowercase().contains("radeon")
-            {
-                "AMD"
-            } else if model.to_lowercase().contains("intel") {
-                "Intel"
-            } else if model.to_lowercase().contains("microsoft")
-                || model.to_lowercase().contains("basic")
-            {
-                continue;
-            } else {
-                "Unknown"
-            }
-            .to_string();
-
-            let vram_mb = vram_wmic
-                .or_else(|| vram_reg.map(|b| b / (1024 * 1024)))
-                .unwrap_or(0);
-
-            gpus.push(GpuInfo {
-                vendor,
-                model: model.trim().to_string(),
-                vram_mb,
-            });
+        let vendor = if model.to_lowercase().contains("nvidia") {
+            "NVIDIA"
+        } else if model.to_lowercase().contains("amd") || model.to_lowercase().contains("radeon") {
+            "AMD"
+        } else if model.to_lowercase().contains("intel") {
+            "Intel"
+        } else if model.to_lowercase().contains("microsoft")
+            || model.to_lowercase().contains("basic")
+        {
+            continue;
+        } else {
+            "Unknown"
         }
+        .to_string();
+
+        let normalized = model.trim().to_lowercase();
+        // WMIC first (handles >4GB), fall back to registry u32
+        let vram_mb = wmic_vram
+            .get(&normalized)
+            .copied()
+            .or_else(|| reg_vram.get(&normalized).copied().map(|b| (b / (1024 * 1024)) as u32))
+            .unwrap_or(0);
+
+        gpus.push(GpuInfo {
+            vendor,
+            model: model.trim().to_string(),
+            vram_mb,
+        });
     }
     gpus
 }
 
 fn query_vram_wmic() -> std::collections::HashMap<String, u32> {
     let mut map = std::collections::HashMap::new();
+    // Use /format:list to avoid comma-in-name parsing issues
     let output = std::process::Command::new("wmic")
-        .args(["path", "Win32_VideoController", "get", "Name,AdapterRAM", "/format:csv"])
+        .args([
+            "path", "Win32_VideoController",
+            "get", "Name,AdapterRAM",
+            "/format:list",
+        ])
         .output();
     if let Ok(o) = output {
         if o.status.success() {
             let text = String::from_utf8_lossy(&o.stdout);
-            for line in text.lines().skip(1) {
-                let mut parts = line.split(',');
-                let _node = parts.next();
-                let name = parts.next().unwrap_or("").trim().to_string();
-                let vram_str = parts.next().unwrap_or("0").trim().to_string();
-                let vram_bytes: u64 = vram_str.parse().unwrap_or(0);
-                if !name.is_empty() && vram_bytes > 0 {
-                    map.insert(name, (vram_bytes / (1024 * 1024)) as u32);
+            let mut current_name = String::new();
+            let mut current_vram: u64 = 0;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    if !current_name.is_empty() && current_vram > 0 {
+                        map.insert(current_name.clone(), (current_vram / (1024 * 1024)) as u32);
+                    }
+                    current_name.clear();
+                    current_vram = 0;
+                    continue;
+                }
+                if let Some(val) = line.strip_prefix("Name=") {
+                    current_name = val.trim().to_lowercase();
+                } else if let Some(val) = line.strip_prefix("AdapterRAM=") {
+                    current_vram = val.trim().parse().unwrap_or(0);
                 }
             }
+            // Last entry if no trailing blank line
+            if !current_name.is_empty() && current_vram > 0 {
+                map.insert(current_name, (current_vram / (1024 * 1024)) as u32);
+            }
+        }
+    }
+    map
+}
+
+fn query_vram_registry() -> std::collections::HashMap<String, u64> {
+    let mut map = std::collections::HashMap::new();
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let gpu_base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    let Ok(base) = hklm.open_subkey_with_flags(gpu_base, KEY_READ) else {
+        return map;
+    };
+    for i in 0..32 {
+        let path = format!("{i:04}");
+        let Ok(sub) = base.open_subkey_with_flags(&path, KEY_READ) else {
+            continue;
+        };
+        let Ok(model): Result<String, _> = sub.get_value("DriverDesc") else {
+            continue;
+        };
+        let normalized = model.trim().to_lowercase();
+        // Try u32 (REG_DWORD) first, then u64 (REG_QWORD for >4GB)
+        let vram: Option<u64> = sub
+            .get_value("HardwareInformation.AdapterRAM")
+            .ok()
+            .map(|b: u32| b as u64)
+            .or_else(|| {
+                sub.get_value("HardwareInformation.AdapterRAM")
+                    .ok()
+                    .map(|b: u64| b)
+            });
+        if let Some(bytes) = vram {
+            map.insert(normalized, bytes);
         }
     }
     map

@@ -16,8 +16,57 @@ fn detect_hardware() -> detector::HardwareInfo {
 }
 
 #[tauri::command]
-fn read_sensors(state: tauri::State<'_, MonitorState>) -> monitor::SensorReadings {
-    state.0.lock().unwrap().read_sensors()
+fn read_sensors(
+    state: tauri::State<'_, MonitorState>,
+    driver_state: tauri::State<'_, DriverState>,
+) -> monitor::SensorReadings {
+    let mut sensors = state.0.lock().unwrap().read_sensors();
+    // Inject voltage reading from the shared driver — vendor-aware.
+    // Intel pre-Haswell VID formula does NOT apply to AMD or modern Intel FIVR CPUs.
+    if let Ok(dm) = driver_state.0.lock() {
+        if dm.is_loaded() {
+            sensors.cpu.voltage_mv = read_vcore_vendor_aware(&dm);
+        }
+    }
+    sensors
+}
+
+/// Read Vcore using the appropriate formula per CPU vendor.
+/// Returns `None` for unsupported architectures rather than producing a misleading value.
+fn read_vcore_vendor_aware(dm: &driver::DriverManager) -> Option<u32> {
+    let vendor = detect_cpu_vendor();
+    match vendor.as_deref() {
+        Some("GenuineIntel") => {
+            // IA32_PERF_STATUS bits 0-12 = VID. Pre-Haswell formula:
+            //   Vcore_mV ≈ vid * 5 + 245
+            // This is approximate and will be inaccurate on Haswell+ (FIVR).
+            // TODO: detect microarchitecture to pick correct formula.
+            let msr = dm.read_msr(driver::IA32_PERF_STATUS).ok()?;
+            let vid = msr.eax & 0x1FFF;
+            if vid == 0 {
+                return None;
+            }
+            Some((vid as f64 * 5.0 + 245.0) as u32)
+        }
+        Some("AuthenticAMD") => {
+            // AMD VID encoding differs by family (Zen uses SVI2 protocol via P-state MSRs).
+            // Not yet implemented — return None instead of an incorrect Intel value.
+            None
+        }
+        _ => None,
+    }
+}
+
+fn detect_cpu_vendor() -> Option<String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    hklm.open_subkey_with_flags(
+        r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+        KEY_READ,
+    )
+    .ok()
+    .and_then(|k| k.get_value::<String, _>("VendorIdentifier").ok())
 }
 
 #[tauri::command]

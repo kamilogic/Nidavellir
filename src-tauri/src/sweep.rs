@@ -108,7 +108,7 @@ impl Default for SweepEngine {
 impl SweepEngine {
     pub fn new() -> Self {
         Self {
-            active: Arc::new(AtomicBool::new(true)),
+            active: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(Mutex::new(SweepProgress {
                 state: SweepState::Idle,
                 current_step: 0,
@@ -130,6 +130,17 @@ impl SweepEngine {
             }
         }
 
+        // Validate input range — prevents empty-vec unwrap panic below.
+        if !config.step.is_finite() || config.step <= 0.0 {
+            return Err("Sweep step must be a positive number".into());
+        }
+        if !config.range_start.is_finite() || !config.range_end.is_finite() {
+            return Err("Sweep range bounds must be finite numbers".into());
+        }
+        if config.range_start > config.range_end {
+            return Err("Sweep range_start must be <= range_end".into());
+        }
+
         self.active.store(true, Ordering::SeqCst);
         let active = Arc::clone(&self.active);
         let progress = Arc::clone(&self.progress);
@@ -141,8 +152,15 @@ impl SweepEngine {
             values.push(v);
             v += config.step;
         }
-        if *values.last().unwrap() < config.range_end {
-            values.push(config.range_end);
+        // Safe last-value check — values is guaranteed non-empty by the validation above
+        // (range_start is always <= range_end and pushed at least once).
+        if let Some(&last) = values.last() {
+            if last < config.range_end {
+                values.push(config.range_end);
+            }
+        } else {
+            // Defensive fallback — should be unreachable given validation
+            values.push(config.range_start);
         }
 
         {

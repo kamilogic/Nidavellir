@@ -37,16 +37,37 @@ pub fn apply_tuning(params: &TuningParams, driver: &DriverState) -> Result<(), S
         return Err("Kernel driver not available".into());
     }
 
-    if params.pl1_watts != 95 || params.pl2_watts != 125 {
-        set_power_limits(&dm, params.pl1_watts, params.pl2_watts)?;
+    // Apply ALL parameters unconditionally — do not filter by default value.
+    // A profile with default values is still a valid profile to reapply.
+    set_power_limits(&dm, params.pl1_watts, params.pl2_watts)?;
+    set_turbo_ratio(&dm, params.turbo_ratio_limit)?;
+    set_c_states(&dm, params.c_states_enabled)?;
+
+    // CPU voltage offsets: requires Intel OC Mailbox (MSR 0x150) protocol
+    // or AMD-specific MSR sequencing. Implementing this incorrectly can
+    // brick the system. Until vendor-aware writers are added, log the intent.
+    if params.cpu_voltage_offset_mv != 0 {
+        eprintln!(
+            "[tuner] TODO: cpu_voltage_offset_mv = {} (Intel OC Mailbox / AMD P-state not yet implemented)",
+            params.cpu_voltage_offset_mv
+        );
+    }
+    if params.cpu_cache_offset_mv != 0 {
+        eprintln!(
+            "[tuner] TODO: cpu_cache_offset_mv = {} (Intel ring/cache offset not yet implemented)",
+            params.cpu_cache_offset_mv
+        );
     }
 
-    if params.turbo_ratio_limit != 50 {
-        set_turbo_ratio(&dm, params.turbo_ratio_limit)?;
-    }
-
-    if !params.c_states_enabled {
-        set_c_states(&dm, false)?;
+    // GPU tuning: requires NVAPI (NVIDIA) or ADLX (AMD) bindings. Not present yet.
+    if params.gpu_core_offset_mhz != 0
+        || params.gpu_mem_offset_mhz != 0
+        || params.gpu_power_limit_pct != 100
+    {
+        eprintln!(
+            "[tuner] TODO: GPU tuning (core={} mem={} pl={}%) — NVAPI/ADLX bindings not yet integrated",
+            params.gpu_core_offset_mhz, params.gpu_mem_offset_mhz, params.gpu_power_limit_pct
+        );
     }
 
     Ok(())
@@ -65,6 +86,7 @@ pub fn reset_tuning(driver: &DriverState) -> Result<(), String> {
 }
 
 fn set_power_limits(dm: &crate::driver::DriverManager, pl1: u32, pl2: u32) -> Result<(), String> {
+    // Read current value to detect no-op writes (saves an MSR transaction).
     let current: MsrValue = dm.read_msr(driver::IA32_PACKAGE_POWER_LIMIT)?;
 
     let pl1_power = (pl1 as f64 / 0.125) as u32;
@@ -83,12 +105,9 @@ fn set_power_limits(dm: &crate::driver::DriverManager, pl1: u32, pl2: u32) -> Re
     let eax = (new_value & 0xFFFF_FFFF) as u32;
     let edx = (new_value >> 32) as u32;
 
-    if current.eax != eax || current.edx != edx {
-        let _ = current;
-        dm.write_msr(driver::MSR_PKG_CST_CONFIG_CONTROL, eax, edx)?;
+    if current.eax == eax && current.edx == edx {
+        return Ok(()); // already at desired value
     }
-
-    // Actually write to power limit MSR
     dm.write_msr(driver::IA32_PACKAGE_POWER_LIMIT, eax, edx)
 }
 
