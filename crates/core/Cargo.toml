@@ -1,0 +1,19 @@
+[package]
+name = "nidavellir-core"
+version = "0.1.0"
+description = "Shared core logic for Nidavellir v2"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+sysinfo = { workspace = true }
+winreg = { workspace = true }
+chrono = { workspace = true }
+raw-cpuid = "11"
+nvml-wrapper = "0.10"

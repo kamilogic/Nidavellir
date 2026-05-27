@@ -1,6 +1,4 @@
-// Nidavellir UEFI Boot Driver
-// Phase 2: RAM tuning and validation at firmware level
+// Nidavellir UEFI module — v0.8 (stub)
+// One-shot BootNext apply + isolated memtest. See nidavellir-v2-plano.md §8.
 
-fn main() {
-    // UEFI entry point — will be implemented with uefi-rs crate
-}
+fn main() {}

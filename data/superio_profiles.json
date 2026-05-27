@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "board_rules": [
+    {
+      "profile_id": "asus_tuf_z690_plus_d4",
+      "vendor_contains": ["asustek"],
+      "product_contains": ["tuf", "z690"]
+    },
+    {
+      "profile_id": "nct6798d_generic",
+      "vendor_contains": ["asustek"],
+      "product_contains": ["z690"]
+    },
+    {
+      "profile_id": "nct6798d_generic",
+      "vendor_contains": ["asustek"],
+      "product_contains": ["tufgamingz690"]
+    },
+    {
+      "profile_id": "ite8688_asus_z690",
+      "vendor_contains": ["asustek"],
+      "product_contains": ["z790"],
+      "chip_ids": ["0x8688", "0x8689"]
+    },
+    {
+      "profile_id": "ite8688_generic",
+      "vendor_contains": ["msi"],
+      "product_contains": ["b650"]
+    },
+    {
+      "profile_id": "ite8688_generic",
+      "vendor_contains": ["gigabyte"],
+      "product_contains": ["b550"]
+    }
+  ],
+  "profiles": {
+    "asus_tuf_z690_plus_d4": {
+      "vendor": "nuvoton",
+      "chip_ids": ["0xD428", "0xD420", "0xD42B"],
+      "vin": [
+        { "index": 0, "label": "CPU Vcore", "role": "cpu_vcore", "scale": 800 },
+        { "index": 1, "label": "+5V", "role": "5v", "scale": 800, "r1": 4, "r2": 1 },
+        { "index": 2, "label": "AVSB", "role": "avcc", "scale": 1600, "r1": 34, "r2": 34 },
+        { "index": 3, "label": "+3.3V", "role": "3v3", "scale": 1600, "r1": 34, "r2": 34 },
+        { "index": 4, "label": "+12V", "role": "12v", "scale": 1600, "r1": 11, "r2": 1 },
+        { "index": 7, "label": "3VSB", "role": "vsb", "scale": 800, "r1": 34, "r2": 34 },
+        { "index": 9, "label": "CPU VDDQ", "role": "cpu_vio", "scale": 800, "r1": 1, "r2": 1 },
+        { "index": 10, "label": "DRAM", "role": "dram", "scale": 800, "r1": 1, "r2": 1 }
+      ]
+    },
+    "nct6798d_generic": {
+      "vendor": "nuvoton",
+      "chip_ids": ["0xD428", "0xD420", "0xD42B", "0xD352", "0xD121", "0xC911", "0xC803"],
+      "vin": [
+        { "index": 0, "label": "VIN0", "role": "unknown", "scale": 800 },
+        { "index": 1, "label": "VIN1", "role": "unknown", "scale": 800 },
+        { "index": 2, "label": "VIN2", "role": "unknown", "scale": 1600 },
+        { "index": 3, "label": "VIN3", "role": "unknown", "scale": 1600 },
+        { "index": 4, "label": "VIN4", "role": "unknown", "scale": 800 },
+        { "index": 5, "label": "VIN5", "role": "unknown", "scale": 800 },
+        { "index": 6, "label": "VIN6", "role": "unknown", "scale": 800 },
+        { "index": 7, "label": "VIN7", "role": "unknown", "scale": 1600 },
+        { "index": 8, "label": "VIN8", "role": "unknown", "scale": 1600 },
+        { "index": 9, "label": "VIN9", "role": "unknown", "scale": 1600 },
+        { "index": 10, "label": "VIN10", "role": "unknown", "scale": 1600 },
+        { "index": 11, "label": "VIN11", "role": "unknown", "scale": 1600 },
+        { "index": 12, "label": "VIN12", "role": "unknown", "scale": 800 },
+        { "index": 13, "label": "VIN13", "role": "unknown", "scale": 800 },
+        { "index": 14, "label": "VIN14", "role": "unknown", "scale": 800 }
+      ]
+    },
+    "ite8688_asus_z690": {
+      "vendor": "ite",
+      "chip_ids": ["0x8686", "0x8688", "0x8689", "0x868A"],
+      "vin": [
+        { "index": 0, "label": "CPU Vcore", "role": "cpu_vcore", "divider": 1.0 },
+        { "index": 1, "label": "DRAM", "role": "dram", "divider": 1.0 },
+        { "index": 2, "label": "+12V", "role": "12v", "divider": 10.0 },
+        { "index": 3, "label": "CPU VCCIO", "role": "cpu_vio", "divider": 1.0 },
+        { "index": 4, "label": "CPU VCCSA", "role": "cpu_sa", "divider": 1.0 },
+        { "index": 5, "label": "+5V", "role": "5v", "divider": 3.0 },
+        { "index": 6, "label": "3VSB", "role": "vsb", "divider": 1.0 },
+        { "index": 7, "label": "+3.3V", "role": "3v3", "divider": 1.0 },
+        { "index": 8, "label": "AVCC", "role": "avcc", "divider": 1.0 }
+      ]
+    },
+    "ite8688_generic": {
+      "vendor": "ite",
+      "chip_ids": ["0x8686", "0x8688", "0x8689", "0x868A", "0x8622", "0x8625"],
+      "vin": [
+        { "index": 0, "label": "CPU Vcore", "role": "cpu_vcore", "divider": 1.0 },
+        { "index": 1, "label": "DRAM", "role": "dram", "divider": 1.0 },
+        { "index": 2, "label": "+12V", "role": "12v", "divider": 10.0 },
+        { "index": 3, "label": "CPU VCCIO", "role": "cpu_vio", "divider": 1.0 },
+        { "index": 4, "label": "CPU VCCSA", "role": "cpu_sa", "divider": 1.0 },
+        { "index": 5, "label": "+5V", "role": "5v", "divider": 3.0 },
+        { "index": 6, "label": "3VSB", "role": "vsb", "divider": 1.0 },
+        { "index": 7, "label": "+3.3V", "role": "3v3", "divider": 1.0 },
+        { "index": 8, "label": "AVCC", "role": "avcc", "divider": 1.0 }
+      ]
+    },
+    "ite8792_generic": {
+      "vendor": "ite",
+      "chip_ids": ["0x8790", "0x8792", "0x8794", "0x8795"],
+      "vin": [
+        { "index": 0, "label": "CPU Vcore", "role": "cpu_vcore", "divider": 1.0 },
+        { "index": 1, "label": "CPU VCCSA", "role": "cpu_sa", "divider": 1.0 },
+        { "index": 2, "label": "DRAM", "role": "dram", "divider": 1.0 },
+        { "index": 3, "label": "CPU VCCIO", "role": "cpu_vio", "divider": 1.0 },
+        { "index": 4, "label": "+12V", "role": "12v", "divider": 10.0 },
+        { "index": 5, "label": "+5V", "role": "5v", "divider": 3.0 },
+        { "index": 6, "label": "3VSB", "role": "vsb", "divider": 1.0 },
+        { "index": 7, "label": "+3.3V", "role": "3v3", "divider": 1.0 },
+        { "index": 8, "label": "AVCC", "role": "avcc", "divider": 1.0 }
+      ]
+    }
+  }
+}

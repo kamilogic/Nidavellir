@@ -1,0 +1,86 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::capability::CapabilityReport;
+use crate::detector::HardwareInfo;
+use crate::sensors::SensorReadings;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params")]
+pub enum IpcRequest {
+    Ping,
+    DetectHardware,
+    ReadSensors,
+    GetCapabilityReport,
+    GetDriverStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriverStatusPayload {
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponseData {
+    Pong,
+    Hardware(HardwareInfo),
+    Sensors(SensorReadings),
+    Capability(CapabilityReport),
+    DriverStatus(DriverStatusPayload),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<ResponseData>,
+}
+
+impl IpcResponse {
+    pub fn success(data: ResponseData) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            data: Some(data),
+        }
+    }
+
+    pub fn failure(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(message.into()),
+            data: None,
+        }
+    }
+}
+
+pub fn parse_request(line: &str) -> Result<IpcRequest, String> {
+    serde_json::from_str(line).map_err(|e| format!("Invalid request JSON: {e}"))
+}
+
+pub fn serialize_response(response: &IpcResponse) -> Result<String, String> {
+    serde_json::to_string(response).map_err(|e| format!("Failed to serialize response: {e}"))
+}
+
+pub fn response_to_value(response: &IpcResponse) -> Value {
+    serde_json::to_value(response).unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_ping() {
+        let req = parse_request(r#"{"method":"Ping"}"#).unwrap();
+        assert!(matches!(req, IpcRequest::Ping));
+        let resp = IpcResponse::success(ResponseData::Pong);
+        let json = serialize_response(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("\"type\":\"Pong\""));
+    }
+}

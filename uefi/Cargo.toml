@@ -2,3 +2,8 @@
 name = "nidavellir-uefi"
 version = "0.1.0"
 edition = "2021"
+publish = false
+
+[[bin]]
+name = "nidavellir-uefi"
+path = "src/main.rs"

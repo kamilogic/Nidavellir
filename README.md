@@ -43,10 +43,12 @@ You do **not** need Rust, Node, or a separate PawnIO download for normal use.
 ### Dev workflow
 
 ```powershell
-# Terminal 1 — Core Service (console mode)
-cargo run -p nidavellir-service -- console
+# Terminal 1 — Core Service (admin required for Super I/O / PawnIO LPC)
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-service-admin.ps1
+# Or: open PowerShell as Administrator, then:
+# cargo run -p nidavellir-service -- console
 
-# Terminal 2 — UI hot reload
+# Terminal 2 — UI hot reload (normal user is fine)
 cd apps/ui
 npm install
 npm run tauri:dev
