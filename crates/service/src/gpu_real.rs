@@ -5,13 +5,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use nidavellir_core::gpu_sweep::VfPoint;
-use nidavellir_core::ipc::{GpuCurveSnapshot, GpuValidationStatus};
+use nidavellir_core::gpu_sweep::{StabilityResult, VfPoint};
+use nidavellir_core::ipc::{GpuCurveSnapshot, GpuStageResult, GpuValidationStatus};
 use tracing::{info, warn};
-
-/// Validation workload size (debug builds are slow; release is far faster).
-const VAL_ELEMENTS: u32 = 500_000;
-const VAL_ITERS: u32 = 8_000;
 
 /// Read the live V/F curve via NVAPI (real hardware).
 #[cfg(windows)]
@@ -41,7 +37,26 @@ pub fn read_curve_snapshot() -> GpuCurveSnapshot {
 }
 
 fn idle_validation() -> GpuValidationStatus {
-    GpuValidationStatus { running: false, result: None, mismatches: 0, elapsed_ms: 0, adapter: None }
+    GpuValidationStatus {
+        running: false,
+        current_stage: None,
+        stage_index: 0,
+        total_stages: 0,
+        stages: Vec::new(),
+        result: None,
+        adapter: None,
+        error: None,
+    }
+}
+
+/// Combine stage verdicts into an overall one (Crash worst, then SilentError).
+fn worst(a: StabilityResult, b: StabilityResult) -> StabilityResult {
+    use StabilityResult::*;
+    match (a, b) {
+        (Crash, _) | (_, Crash) => Crash,
+        (SilentError, _) | (_, SilentError) => SilentError,
+        _ => Stable,
+    }
 }
 
 /// Background runner for the real GPU compute-validation battery.
@@ -65,36 +80,74 @@ impl GpuValidationHandle {
         self.status.lock().map(|s| s.clone()).unwrap_or_else(|_| idle_validation())
     }
 
-    /// Start a validation run if not already running. Returns false if busy.
+    /// Start the validation battery if not already running. Returns false if busy.
     pub fn start(&self) -> bool {
         if self.running.swap(true, Ordering::SeqCst) {
             return false;
         }
+
+        // The battery: (label, runner). Each runner targets a failure mode.
+        type Runner = Box<dyn Fn(&nidavellir_gpu_stress::GpuCtx) -> nidavellir_gpu_stress::StageReport + Send>;
+        let battery: Vec<(&'static str, Runner)> = vec![
+            ("ALU (known-answer)", Box::new(|c| c.run_alu("ALU (known-answer)", 800_000, 12_000, 1))),
+            ("Memória (gather)", Box::new(|c| c.run_memory("Memória (gather)", 400_000, 3_000))),
+            ("Rajada (transiente)", Box::new(|c| c.run_alu("Rajada (transiente)", 800_000, 1_500, 8))),
+        ];
+        let total = battery.len() as u32;
+
         if let Ok(mut s) = self.status.lock() {
-            *s = GpuValidationStatus { running: true, result: None, mismatches: 0, elapsed_ms: 0, adapter: None };
+            *s = idle_validation();
+            s.running = true;
+            s.total_stages = total;
+            s.current_stage = battery.first().map(|(n, _)| n.to_string());
         }
+
         let status = Arc::clone(&self.status);
         let running = Arc::clone(&self.running);
         std::thread::spawn(move || {
-            info!("GPU validation started ({VAL_ELEMENTS} lanes x {VAL_ITERS} iters)");
-            let out = nidavellir_gpu_stress::validate_kat(VAL_ELEMENTS, VAL_ITERS);
-            if let Ok(mut s) = status.lock() {
-                *s = match out {
-                    Ok(r) => GpuValidationStatus {
-                        running: false,
-                        result: Some(r.result),
-                        mismatches: r.mismatches,
-                        elapsed_ms: r.elapsed_ms as u64,
-                        adapter: Some(r.adapter),
-                    },
-                    Err(e) => {
-                        warn!("GPU validation error: {e}");
-                        GpuValidationStatus { running: false, result: None, mismatches: 0, elapsed_ms: 0, adapter: Some(format!("erro: {e}")) }
+            info!("GPU validation battery started ({total} estágios)");
+            let ctx = match nidavellir_gpu_stress::GpuCtx::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("GPU validation: device init failed: {e}");
+                    if let Ok(mut s) = status.lock() {
+                        s.running = false;
+                        s.error = Some(e);
                     }
-                };
+                    running.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            if let Ok(mut s) = status.lock() {
+                s.adapter = Some(ctx.adapter_name.clone());
+            }
+
+            let mut overall = StabilityResult::Stable;
+            for (idx, (name, run)) in battery.iter().enumerate() {
+                if let Ok(mut s) = status.lock() {
+                    s.stage_index = idx as u32;
+                    s.current_stage = Some(name.to_string());
+                }
+                let report = run(&ctx);
+                overall = worst(overall, report.result);
+                if let Ok(mut s) = status.lock() {
+                    s.stages.push(GpuStageResult {
+                        name: report.name,
+                        result: report.result,
+                        mismatches: report.mismatches,
+                        elapsed_ms: report.elapsed_ms,
+                    });
+                }
+            }
+
+            if let Ok(mut s) = status.lock() {
+                s.running = false;
+                s.current_stage = None;
+                s.stage_index = total;
+                s.result = Some(overall);
             }
             running.store(false, Ordering::SeqCst);
-            info!("GPU validation finished");
+            info!("GPU validation battery finished: {overall:?}");
         });
         true
     }

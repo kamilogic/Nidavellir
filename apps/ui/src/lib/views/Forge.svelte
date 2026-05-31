@@ -6,12 +6,39 @@
   let timer = $state(null);
   let realCurve = $state(null);
   let validation = $state(null);
+  let advanced = $state(false);
 
   const VAL_LABEL = {
     stable: "Estável (0 erros)",
     silent_error: "ERRO SILENCIOSO detectado",
     crash: "Crash / driver perdido",
   };
+
+  const STAGE_RESULT = {
+    stable: "✓ estável",
+    silent_error: "✗ erro silencioso",
+    crash: "✗ crash",
+  };
+
+  // Build an SVG line-chart model from the V/F curve points.
+  const chart = $derived.by(() => {
+    const pts = realCurve?.points;
+    if (!pts?.length) return null;
+    const W = 540, H = 230, padL = 46, padR = 12, padT = 12, padB = 28;
+    const vs = pts.map((p) => p.voltage_mv);
+    const vMin = Math.min(...vs), vMax = Math.max(...vs);
+    const fMax = Math.max(...pts.map((p) => p.freq_mhz));
+    const sx = (v) => padL + ((v - vMin) / (vMax - vMin || 1)) * (W - padL - padR);
+    const sy = (f) => H - padB - (f / (fMax || 1)) * (H - padT - padB);
+    const path = pts.map((p, i) => `${i ? "L" : "M"}${sx(p.voltage_mv).toFixed(1)},${sy(p.freq_mhz).toFixed(1)}`).join(" ");
+    const xticks = [vMin, (vMin + vMax) / 2, vMax].map((v) => ({ x: sx(v), label: Math.round(v) }));
+    const yStep = Math.max(300, Math.round(fMax / 3 / 100) * 100);
+    const yticks = [];
+    for (let f = 0; f <= fMax; f += yStep) yticks.push({ y: sy(f), label: f });
+    const pl = realCurve?.plateau;
+    const plateau = pl ? { cx: sx(pl.voltage_mv), cy: sy(pl.freq_mhz) } : null;
+    return { W, H, padL, padB, path, xticks, yticks, plateau };
+  });
 
   const PHASE_LABEL = {
     idle: "Ocioso",
@@ -179,7 +206,12 @@
   {/if}
 
   <div class="section real">
-    <h3 class="section-head">Comparação real (NVAPI) — sua GPU de verdade</h3>
+    <div class="real-head">
+      <h3 class="section-head">Comparação real (NVAPI) — sua GPU de verdade</h3>
+      <label class="adv-toggle">
+        <input type="checkbox" bind:checked={advanced} /> Avançado
+      </label>
+    </div>
     <div class="real-actions">
       <button class="btn" onclick={readRealCurve}>Ler curva real</button>
       <button class="btn go" onclick={startValidation} disabled={validation?.running}>
@@ -189,17 +221,38 @@
 
     {#if realCurve}
       {#if realCurve.real}
-        <p class="sub">{realCurve.name} · {realCurve.points.length} pontos na curva</p>
         {#if realCurve.plateau}
           <p class="point accent">
-            Plateau (UV travado): {realCurve.plateau.freq_mhz} MHz @ {realCurve.plateau.voltage_mv} mV
+            Plateau (clock travado): {realCurve.plateau.freq_mhz} MHz @ {realCurve.plateau.voltage_mv} mV
           </p>
         {/if}
-        <ul class="list">
-          {#each realCurve.points.filter((_, i) => i % 8 === 0) as p}
-            <li><span class="mono">{p.voltage_mv} mV</span><span class="mono accent">{p.freq_mhz} MHz</span></li>
-          {/each}
-        </ul>
+
+        {#if chart}
+          <svg class="chart" viewBox={`0 0 ${chart.W} ${chart.H}`} role="img" aria-label="Curva V/F">
+            {#each chart.yticks as t}
+              <line class="grid" x1={chart.padL} y1={t.y} x2={chart.W - 12} y2={t.y} />
+              <text class="axis" x={chart.padL - 6} y={t.y + 3} text-anchor="end">{t.label}</text>
+            {/each}
+            {#each chart.xticks as t}
+              <text class="axis" x={t.x} y={chart.H - 10} text-anchor="middle">{t.label}</text>
+            {/each}
+            <text class="axis-title" x={chart.padL} y={10}>MHz</text>
+            <text class="axis-title" x={chart.W - 12} y={chart.H - 10} text-anchor="end">mV</text>
+            <path class="curve-line" d={chart.path} />
+            {#if chart.plateau}
+              <circle class="plateau-dot" cx={chart.plateau.cx} cy={chart.plateau.cy} r="4" />
+            {/if}
+          </svg>
+        {/if}
+
+        {#if advanced}
+          <p class="sub">{realCurve.name} · {realCurve.points.length} pontos na curva</p>
+          <ul class="list">
+            {#each realCurve.points.filter((_, i) => i % 4 === 0) as p}
+              <li><span class="mono">{p.voltage_mv} mV</span><span class="mono accent">{p.freq_mhz} MHz</span></li>
+            {/each}
+          </ul>
+        {/if}
       {:else}
         <p class="err">{realCurve.name}</p>
       {/if}
@@ -207,18 +260,37 @@
 
     {#if validation}
       <div class="val">
+        {#if validation.error}
+          <p class="err">{validation.error}</p>
+        {/if}
+
+        {#if validation.total_stages}
+          <div class="stages">
+            {#each Array(validation.total_stages) as _, i}
+              {@const done = validation.stages[i]}
+              {@const active = validation.running && i === validation.stage_index}
+              <div class="stage" class:active class:done>
+                <span class="stage-ic">
+                  {#if done}{done.result === "stable" ? "✓" : "✗"}{:else if active}<span class="spin">◴</span>{:else}·{/if}
+                </span>
+                <span class="stage-name">{done?.name ?? (active ? validation.current_stage : `estágio ${i + 1}`)}</span>
+                {#if done}
+                  <span class="stage-meta" class:danger={done.result !== "stable"}>
+                    {STAGE_RESULT[done.result] ?? done.result} · {done.mismatches} mm · {done.elapsed_ms} ms
+                  </span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+
         {#if validation.running}
-          <p class="sub">Rodando known-answer test na GPU… (detecta erro silencioso sem crash)</p>
+          <p class="sub">Rodando bateria na GPU… detecta erro silencioso sem precisar de jogo.</p>
         {:else if validation.result}
           <p class="point" class:danger={validation.result !== "stable"} class:accent={validation.result === "stable"}>
-            {VAL_LABEL[validation.result] ?? validation.result}
+            Resultado: {VAL_LABEL[validation.result] ?? validation.result}
           </p>
-          <p class="sub">
-            mismatches: {validation.mismatches} · {validation.elapsed_ms} ms
-            {#if validation.adapter}· {validation.adapter}{/if}
-          </p>
-        {:else if validation.adapter}
-          <p class="err">{validation.adapter}</p>
+          {#if validation.adapter}<p class="sub">{validation.adapter}</p>{/if}
         {/if}
       </div>
     {/if}
@@ -419,5 +491,104 @@
   }
   .val {
     margin-top: 0.6rem;
+  }
+  .real-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+  }
+  .adv-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.75rem;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+  .chart {
+    width: 100%;
+    max-width: 560px;
+    height: auto;
+    margin: 0.4rem 0 0.2rem;
+    background: rgba(10, 16, 28, 0.5);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .chart .grid {
+    stroke: rgba(136, 192, 208, 0.1);
+    stroke-width: 1;
+  }
+  .chart .axis {
+    fill: var(--nord-dim);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .chart .axis-title {
+    fill: var(--muted);
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .chart .curve-line {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 2;
+    stroke-linejoin: round;
+  }
+  .chart .plateau-dot {
+    fill: var(--nord-ember-bright);
+    stroke: #0a101c;
+    stroke-width: 1.5;
+  }
+  .stages {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    margin: 0.5rem 0;
+  }
+  .stage {
+    display: grid;
+    grid-template-columns: 1.4rem 1fr auto;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 0.7rem;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    font-size: 0.82rem;
+    opacity: 0.7;
+  }
+  .stage.active {
+    opacity: 1;
+    border-color: rgba(163, 190, 140, 0.45);
+  }
+  .stage.done {
+    opacity: 1;
+  }
+  .stage-ic {
+    text-align: center;
+    color: var(--accent);
+    font-weight: 700;
+  }
+  .stage-name {
+    color: var(--text);
+  }
+  .stage-meta {
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    font-size: 0.75rem;
+  }
+  .stage-meta.danger {
+    color: var(--nord-danger);
+  }
+  .spin {
+    display: inline-block;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>

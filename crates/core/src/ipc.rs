@@ -36,14 +36,29 @@ pub struct GpuCurveSnapshot {
     pub real: bool,
 }
 
-/// Result of a real GPU compute-validation run.
+/// One completed stage of the validation battery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuStageResult {
+    pub name: String,
+    pub result: StabilityResult,
+    pub mismatches: u32,
+    pub elapsed_ms: u64,
+}
+
+/// Live status of the real GPU compute-validation battery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuValidationStatus {
     pub running: bool,
+    /// Name of the stage currently running (when `running`).
+    pub current_stage: Option<String>,
+    pub stage_index: u32,
+    pub total_stages: u32,
+    /// Stages completed so far.
+    pub stages: Vec<GpuStageResult>,
+    /// Overall verdict once finished (worst of all stages).
     pub result: Option<StabilityResult>,
-    pub mismatches: u32,
-    pub elapsed_ms: u64,
     pub adapter: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Read-only snapshot of the Safe Loop for the UI's "Segurança" view.
