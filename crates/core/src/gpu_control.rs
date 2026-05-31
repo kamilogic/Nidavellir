@@ -109,7 +109,7 @@ impl GpuTuner for SimulatedGpuTuner {
         false
     }
     fn backend_label(&self) -> &'static str {
-        "simulado"
+        "simulated"
     }
     fn read_current(&self) -> Option<VfPoint> {
         self.applied.or(self.stock)
@@ -138,7 +138,7 @@ impl GpuTuner for NvmlReadOnlyTuner {
         true
     }
     fn backend_label(&self) -> &'static str {
-        "NVAPI (somente leitura)"
+        "NVAPI (read-only)"
     }
     fn read_current(&self) -> Option<VfPoint> {
         let reading = crate::nvml_gpu::read_nvidia_gpus_nvml().into_iter().next()?;
@@ -150,8 +150,8 @@ impl GpuTuner for NvmlReadOnlyTuner {
         })
     }
     fn apply(&mut self, _point: VfPoint) -> Result<(), String> {
-        Err("Escrita real de curva V/F via NVAPI ainda não implementada (v0.3 entrega a engine; \
-             a escrita real entra quando os bindings NVAPI forem validados). Use o backend simulado."
+        Err("Real V/F curve writes via NVAPI are not wired yet (v0.3 ships the engine; real \
+             writes land once the NVAPI bindings are validated). Use the simulated backend."
             .into())
     }
     fn reset(&mut self) -> Result<(), String> {

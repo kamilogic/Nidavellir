@@ -1,5 +1,7 @@
 <script>
   import { serviceCall } from "../service.js";
+  import { t } from "../i18n.js";
+  import VfChart from "../components/VfChart.svelte";
 
   let progress = $state(null);
   let error = $state(null);
@@ -7,57 +9,12 @@
   let realCurve = $state(null);
   let validation = $state(null);
   let advanced = $state(false);
-
-  const VAL_LABEL = {
-    stable: "Estável (0 erros)",
-    silent_error: "ERRO SILENCIOSO detectado",
-    crash: "Crash / driver perdido",
-  };
-
-  const STAGE_RESULT = {
-    stable: "✓ estável",
-    silent_error: "✗ erro silencioso",
-    crash: "✗ crash",
-  };
-
-  // Build an SVG line-chart model from the V/F curve points.
-  const chart = $derived.by(() => {
-    const pts = realCurve?.points;
-    if (!pts?.length) return null;
-    const W = 540, H = 230, padL = 46, padR = 12, padT = 12, padB = 28;
-    const vs = pts.map((p) => p.voltage_mv);
-    const vMin = Math.min(...vs), vMax = Math.max(...vs);
-    const fMax = Math.max(...pts.map((p) => p.freq_mhz));
-    const sx = (v) => padL + ((v - vMin) / (vMax - vMin || 1)) * (W - padL - padR);
-    const sy = (f) => H - padB - (f / (fMax || 1)) * (H - padT - padB);
-    const path = pts.map((p, i) => `${i ? "L" : "M"}${sx(p.voltage_mv).toFixed(1)},${sy(p.freq_mhz).toFixed(1)}`).join(" ");
-    const xticks = [vMin, (vMin + vMax) / 2, vMax].map((v) => ({ x: sx(v), label: Math.round(v) }));
-    const yStep = Math.max(300, Math.round(fMax / 3 / 100) * 100);
-    const yticks = [];
-    for (let f = 0; f <= fMax; f += yStep) yticks.push({ y: sy(f), label: f });
-    const pl = realCurve?.plateau;
-    const plateau = pl ? { cx: sx(pl.voltage_mv), cy: sy(pl.freq_mhz) } : null;
-    return { W, H, padL, padB, path, xticks, yticks, plateau };
-  });
-
-  const PHASE_LABEL = {
-    idle: "Ocioso",
-    baseline: "Baseline (equilíbrio térmico)",
-    vram_diagnostic: "Diagnóstico de VRAM",
-    voltage_bisection: "Bisseção de voltagem",
-    synthesis: "Síntese dos perfis",
-    done: "Concluído",
-    aborted: "Abortado",
-  };
+  let expanded = $state(false);
 
   const running = $derived(
     progress &&
       ["baseline", "vram_diagnostic", "voltage_bisection", "synthesis"].includes(progress.phase),
   );
-
-  function phaseLabel(p) {
-    return PHASE_LABEL[p] ?? p ?? "—";
-  }
 
   function captureProgress(r) {
     progress = r?.data?.type === "GpuSweep" ? r.data : progress;
@@ -74,41 +31,22 @@
     }
   }
 
-  async function readRealCurve() {
+  async function call(method, set) {
     try {
-      const r = await serviceCall("GetGpuCurve");
-      realCurve = r?.data?.type === "GpuCurve" ? r.data : realCurve;
+      const r = await serviceCall(method);
+      set(r);
       error = null;
     } catch (e) {
       error = String(e);
     }
   }
 
-  async function startValidation() {
-    try {
-      const r = await serviceCall("StartGpuValidation");
-      validation = r?.data?.type === "GpuValidation" ? r.data : validation;
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function start() {
-    try {
-      captureProgress(await serviceCall("StartGpuSweep"));
-      error = null;
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function stop() {
-    try {
-      captureProgress(await serviceCall("StopGpuSweep"));
-    } catch (e) {
-      error = String(e);
-    }
-  }
+  const start = () => call("StartGpuSweep", captureProgress);
+  const stop = () => call("StopGpuSweep", captureProgress);
+  const readRealCurve = () =>
+    call("GetGpuCurve", (r) => (realCurve = r?.data?.type === "GpuCurve" ? r.data : realCurve));
+  const startValidation = () =>
+    call("StartGpuValidation", (r) => (validation = r?.data?.type === "GpuValidation" ? r.data : validation));
 
   $effect(() => {
     refresh();
@@ -120,68 +58,51 @@
 <section class="forge">
   <header class="forge-head">
     <div>
-      <h2>Forja — Sweep de GPU</h2>
-      <p class="lead">
-        Mapeia a voltagem mínima estável por frequência via bisseção da fronteira,
-        detectando erros computacionais silenciosos (não só crashes) e sintetiza os
-        três perfis. Cada passo passa pelo Safe Loop.
-      </p>
+      <h2>{$t("forge.title")}</h2>
+      <p class="lead">{$t("forge.lead")}</p>
     </div>
     <div class="actions">
       {#if progress?.simulated}
-        <span class="badge sim">simulado</span>
+        <span class="badge sim">{$t("forge.simulated")}</span>
       {/if}
       {#if running}
-        <button class="btn stop" onclick={stop}>Parar</button>
+        <button class="btn stop" onclick={stop}>{$t("forge.stop")}</button>
       {:else}
-        <button class="btn go" onclick={start}>Iniciar sweep</button>
+        <button class="btn go" onclick={start}>{$t("forge.start")}</button>
       {/if}
     </div>
   </header>
 
   {#if progress?.simulated}
-    <p class="note">
-      Backend simulado: a engine roda de ponta a ponta sem escrever na GPU. A escrita
-      real de curva V/F (NVAPI) entra num incremento futuro — nenhum offset é aplicado
-      ao hardware agora.
-    </p>
+    <p class="note">{$t("forge.simNote")}</p>
   {/if}
 
-  {#if error}
-    <p class="err">{error}</p>
-  {/if}
+  {#if error}<p class="err">{error}</p>{/if}
 
   {#if progress}
     <div class="grid">
       <article class="tile">
-        <span class="lab">Fase</span>
-        <p class="val">{phaseLabel(progress.phase)}</p>
+        <span class="lab">{$t("forge.phase")}</span>
+        <p class="val">{$t("phase." + progress.phase)}</p>
       </article>
       <article class="tile">
-        <span class="lab">Frequência</span>
+        <span class="lab">{$t("forge.frequency")}</span>
         <p class="val">{progress.freq_index} / {progress.total_freqs}</p>
       </article>
       <article class="tile">
-        <span class="lab">Testando agora</span>
+        <span class="lab">{$t("forge.testingNow")}</span>
         <p class="val">
-          {#if progress.current}
-            {progress.current.freq_mhz} MHz @ {progress.current.voltage_mv} mV
-          {:else}
-            —
-          {/if}
+          {#if progress.current}{progress.current.freq_mhz} MHz @ {progress.current.voltage_mv} mV{:else}—{/if}
         </p>
       </article>
     </div>
 
     {#if progress.tradeoffs?.length}
       <div class="section">
-        <h3 class="section-head">Mapa freq × voltagem mínima</h3>
+        <h3 class="section-head">{$t("forge.tradeoffs")}</h3>
         <ul class="list">
-          {#each progress.tradeoffs as t}
-            <li>
-              <span class="mono">{t.freq_mhz} MHz</span>
-              <span class="mono accent">{t.vmin_mv} mV</span>
-            </li>
+          {#each progress.tradeoffs as tp}
+            <li><span class="mono">{tp.freq_mhz} MHz</span><span class="mono accent">{tp.vmin_mv} mV</span></li>
           {/each}
         </ul>
       </div>
@@ -189,7 +110,7 @@
 
     {#if progress.profiles}
       <div class="section">
-        <h3 class="section-head">Perfis sintetizados</h3>
+        <h3 class="section-head">{$t("forge.profiles")}</h3>
         <div class="profiles">
           {#each [progress.profiles.godforge, progress.profiles.brokkrs_best, progress.profiles.deep_calm] as prof}
             <article class="profile">
@@ -201,52 +122,35 @@
         </div>
       </div>
     {/if}
-  {:else}
-    <p class="wait">Aguardando o serviço…</p>
   {/if}
 
   <div class="section real">
     <div class="real-head">
-      <h3 class="section-head">Comparação real (NVAPI) — sua GPU de verdade</h3>
+      <h3 class="section-head">{$t("forge.realTitle")}</h3>
       <label class="adv-toggle">
-        <input type="checkbox" bind:checked={advanced} /> Avançado
+        <input type="checkbox" bind:checked={advanced} /> {$t("forge.advanced")}
       </label>
     </div>
     <div class="real-actions">
-      <button class="btn" onclick={readRealCurve}>Ler curva real</button>
+      <button class="btn" onclick={readRealCurve}>{$t("forge.readCurve")}</button>
       <button class="btn go" onclick={startValidation} disabled={validation?.running}>
-        {validation?.running ? "Validando…" : "Validar estabilidade (real)"}
+        {validation?.running ? $t("forge.validating") : $t("forge.validate")}
       </button>
+      {#if realCurve?.real}
+        <button class="btn ghost" onclick={() => (expanded = true)}>{$t("forge.expand")}</button>
+      {/if}
     </div>
 
     {#if realCurve}
       {#if realCurve.real}
         {#if realCurve.plateau}
           <p class="point accent">
-            Plateau (clock travado): {realCurve.plateau.freq_mhz} MHz @ {realCurve.plateau.voltage_mv} mV
+            {$t("forge.plateau", { f: realCurve.plateau.freq_mhz, v: realCurve.plateau.voltage_mv })}
           </p>
         {/if}
-
-        {#if chart}
-          <svg class="chart" viewBox={`0 0 ${chart.W} ${chart.H}`} role="img" aria-label="Curva V/F">
-            {#each chart.yticks as t}
-              <line class="grid" x1={chart.padL} y1={t.y} x2={chart.W - 12} y2={t.y} />
-              <text class="axis" x={chart.padL - 6} y={t.y + 3} text-anchor="end">{t.label}</text>
-            {/each}
-            {#each chart.xticks as t}
-              <text class="axis" x={t.x} y={chart.H - 10} text-anchor="middle">{t.label}</text>
-            {/each}
-            <text class="axis-title" x={chart.padL} y={10}>MHz</text>
-            <text class="axis-title" x={chart.W - 12} y={chart.H - 10} text-anchor="end">mV</text>
-            <path class="curve-line" d={chart.path} />
-            {#if chart.plateau}
-              <circle class="plateau-dot" cx={chart.plateau.cx} cy={chart.plateau.cy} r="4" />
-            {/if}
-          </svg>
-        {/if}
-
+        <VfChart points={realCurve.points} plateau={realCurve.plateau} height={300} />
         {#if advanced}
-          <p class="sub">{realCurve.name} · {realCurve.points.length} pontos na curva</p>
+          <p class="sub">{$t("forge.curvePoints", { name: realCurve.name, n: realCurve.points.length })}</p>
           <ul class="list">
             {#each realCurve.points.filter((_, i) => i % 4 === 0) as p}
               <li><span class="mono">{p.voltage_mv} mV</span><span class="mono accent">{p.freq_mhz} MHz</span></li>
@@ -259,11 +163,8 @@
     {/if}
 
     {#if validation}
-      <div class="val">
-        {#if validation.error}
-          <p class="err">{validation.error}</p>
-        {/if}
-
+      <div class="val-box">
+        {#if validation.error}<p class="err">{validation.error}</p>{/if}
         {#if validation.total_stages}
           <div class="stages">
             {#each Array(validation.total_stages) as _, i}
@@ -273,22 +174,21 @@
                 <span class="stage-ic">
                   {#if done}{done.result === "stable" ? "✓" : "✗"}{:else if active}<span class="spin">◴</span>{:else}·{/if}
                 </span>
-                <span class="stage-name">{done?.name ?? (active ? validation.current_stage : `estágio ${i + 1}`)}</span>
+                <span class="stage-name">{done?.name ?? (active ? validation.current_stage : $t("forge.stageN", { n: i + 1 }))}</span>
                 {#if done}
                   <span class="stage-meta" class:danger={done.result !== "stable"}>
-                    {STAGE_RESULT[done.result] ?? done.result} · {done.mismatches} mm · {done.elapsed_ms} ms
+                    {$t("stage." + done.result)} · {done.mismatches} mm · {done.elapsed_ms} ms
                   </span>
                 {/if}
               </div>
             {/each}
           </div>
         {/if}
-
         {#if validation.running}
-          <p class="sub">Rodando bateria na GPU… detecta erro silencioso sem precisar de jogo.</p>
+          <p class="sub">{$t("forge.running")}</p>
         {:else if validation.result}
           <p class="point" class:danger={validation.result !== "stable"} class:accent={validation.result === "stable"}>
-            Resultado: {VAL_LABEL[validation.result] ?? validation.result}
+            {$t("forge.result", { r: $t("val." + validation.result) })}
           </p>
           {#if validation.adapter}<p class="sub">{validation.adapter}</p>{/if}
         {/if}
@@ -296,6 +196,18 @@
     {/if}
   </div>
 </section>
+
+{#if expanded && realCurve?.real}
+  <div class="overlay" onclick={() => (expanded = false)} role="presentation">
+    <div class="modal" onclick={(e) => e.stopPropagation()} role="presentation">
+      <div class="modal-head">
+        <strong>{realCurve.name}</strong>
+        <button class="btn ghost" onclick={() => (expanded = false)}>{$t("forge.close")}</button>
+      </div>
+      <VfChart points={realCurve.points} plateau={realCurve.plateau} height={560} />
+    </div>
+  </div>
+{/if}
 
 <style>
   .forge {
@@ -327,7 +239,7 @@
     font-size: 0.88rem;
     line-height: 1.5;
     color: var(--muted);
-    max-width: 60ch;
+    max-width: 64ch;
   }
   .actions {
     display: flex;
@@ -342,6 +254,8 @@
     font-weight: 600;
     font-size: 0.85rem;
     cursor: pointer;
+    background: rgba(10, 16, 28, 0.6);
+    color: var(--text);
   }
   .btn.go {
     background: rgba(163, 190, 140, 0.16);
@@ -352,6 +266,14 @@
     background: rgba(191, 97, 106, 0.16);
     color: #f3b9bd;
     border-color: rgba(191, 97, 106, 0.45);
+  }
+  .btn.ghost {
+    background: transparent;
+    color: var(--muted);
+  }
+  .btn:disabled {
+    opacity: 0.55;
+    cursor: default;
   }
   .badge.sim {
     font-size: 0.68rem;
@@ -456,32 +378,10 @@
     line-height: 1.45;
   }
   .point {
-    margin: 0;
+    margin: 0.3rem 0;
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     color: var(--text);
-  }
-  .wait,
-  .err {
-    color: var(--nord-dim);
-    font-size: 0.9rem;
-  }
-  .err {
-    color: var(--nord-danger);
-  }
-  .real {
-    border-top: 1px solid var(--border);
-    padding-top: 1rem;
-  }
-  .real-actions {
-    display: flex;
-    gap: 0.6rem;
-    margin-bottom: 0.75rem;
-    flex-wrap: wrap;
-  }
-  .btn:disabled {
-    opacity: 0.55;
-    cursor: default;
   }
   .point.accent {
     color: var(--accent);
@@ -489,8 +389,18 @@
   .point.danger {
     color: var(--nord-danger);
   }
-  .val {
-    margin-top: 0.6rem;
+  .sub {
+    margin: 0.25rem 0;
+    font-size: 0.82rem;
+    color: var(--muted);
+  }
+  .err {
+    color: var(--nord-danger);
+    font-size: 0.9rem;
+  }
+  .real {
+    border-top: 1px solid var(--border);
+    padding-top: 1rem;
   }
   .real-head {
     display: flex;
@@ -507,39 +417,14 @@
     cursor: pointer;
     user-select: none;
   }
-  .chart {
-    width: 100%;
-    max-width: 560px;
-    height: auto;
-    margin: 0.4rem 0 0.2rem;
-    background: rgba(10, 16, 28, 0.5);
-    border: 1px solid var(--border);
-    border-radius: 10px;
+  .real-actions {
+    display: flex;
+    gap: 0.6rem;
+    margin-bottom: 0.6rem;
+    flex-wrap: wrap;
   }
-  .chart .grid {
-    stroke: rgba(136, 192, 208, 0.1);
-    stroke-width: 1;
-  }
-  .chart .axis {
-    fill: var(--nord-dim);
-    font-size: 10px;
-    font-variant-numeric: tabular-nums;
-  }
-  .chart .axis-title {
-    fill: var(--muted);
-    font-size: 10px;
-    font-weight: 700;
-  }
-  .chart .curve-line {
-    fill: none;
-    stroke: var(--accent);
-    stroke-width: 2;
-    stroke-linejoin: round;
-  }
-  .chart .plateau-dot {
-    fill: var(--nord-ember-bright);
-    stroke: #0a101c;
-    stroke-width: 1.5;
+  .val-box {
+    margin-top: 0.6rem;
   }
   .stages {
     display: flex;
@@ -559,12 +444,12 @@
     font-size: 0.82rem;
     opacity: 0.7;
   }
-  .stage.active {
-    opacity: 1;
-    border-color: rgba(163, 190, 140, 0.45);
-  }
+  .stage.active,
   .stage.done {
     opacity: 1;
+  }
+  .stage.active {
+    border-color: rgba(163, 190, 140, 0.45);
   }
   .stage-ic {
     text-align: center;
@@ -590,5 +475,30 @@
     to {
       transform: rotate(360deg);
     }
+  }
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(4, 6, 12, 0.78);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+    z-index: 50;
+  }
+  .modal {
+    background: var(--nord-deep, #0e1726);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1.1rem;
+    width: min(1100px, 95vw);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  }
+  .modal-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.6rem;
+    color: var(--text);
   }
 </style>

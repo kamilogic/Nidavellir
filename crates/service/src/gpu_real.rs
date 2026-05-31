@@ -26,7 +26,7 @@ pub fn read_curve_snapshot() -> GpuCurveSnapshot {
         }
         Err(e) => {
             warn!("NVAPI read_curve failed: {e}");
-            GpuCurveSnapshot { name: format!("indisponível: {e}"), points: vec![], plateau: None, real: false }
+            GpuCurveSnapshot { name: format!("unavailable: {e}"), points: vec![], plateau: None, real: false }
         }
     }
 }
@@ -90,8 +90,8 @@ impl GpuValidationHandle {
         type Runner = Box<dyn Fn(&nidavellir_gpu_stress::GpuCtx) -> nidavellir_gpu_stress::StageReport + Send>;
         let battery: Vec<(&'static str, Runner)> = vec![
             ("ALU (known-answer)", Box::new(|c| c.run_alu("ALU (known-answer)", 800_000, 12_000, 1))),
-            ("Memória (gather)", Box::new(|c| c.run_memory("Memória (gather)", 400_000, 3_000))),
-            ("Rajada (transiente)", Box::new(|c| c.run_alu("Rajada (transiente)", 800_000, 1_500, 8))),
+            ("Memory (gather)", Box::new(|c| c.run_memory("Memory (gather)", 400_000, 3_000))),
+            ("Burst (transient)", Box::new(|c| c.run_alu("Burst (transient)", 800_000, 1_500, 8))),
         ];
         let total = battery.len() as u32;
 

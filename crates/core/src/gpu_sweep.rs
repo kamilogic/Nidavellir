@@ -217,17 +217,17 @@ pub fn synthesize_profiles(baseline_freq_mhz: u32, points: &[TradeoffPoint]) -> 
     Some(GpuProfileSet {
         godforge: GpuProfile {
             name: "Godforge".into(),
-            description: "Clock máximo sustentado com a menor voltagem estável.".into(),
+            description: "Highest sustained clock at the lowest stable voltage.".into(),
             point: VfPoint { freq_mhz: godforge.freq_mhz, voltage_mv: godforge.vmin_mv },
         },
         brokkrs_best: GpuProfile {
             name: "Brokkr's Best".into(),
-            description: "Joelho da curva perf/watt — cada MHz ainda vale o watt.".into(),
+            description: "Perf/watt knee — every MHz still worth the watt.".into(),
             point: VfPoint { freq_mhz: brokkrs.freq_mhz, voltage_mv: brokkrs.vmin_mv },
         },
         deep_calm: GpuProfile {
             name: "Deep Calm".into(),
-            description: "Mínimo de watt mantendo ≥95% do clock base — frio e silencioso.".into(),
+            description: "Lowest watts while holding >=95% of base clock — cool and quiet.".into(),
             point: VfPoint { freq_mhz: deep_calm.freq_mhz, voltage_mv: deep_calm.vmin_mv },
         },
     })

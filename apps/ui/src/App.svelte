@@ -4,6 +4,7 @@
   import Dashboard from "./lib/views/Dashboard.svelte";
   import SafeLoop from "./lib/views/SafeLoop.svelte";
   import Forge from "./lib/views/Forge.svelte";
+  import { t, locale, locales } from "./lib/i18n.js";
 
   let onboarded = $state(false);
   let onboardingStep = $state(1);
@@ -19,24 +20,31 @@
   <header class="top">
     <div>
       <h1>Nidavellir</h1>
-      <p class="tagline">Where silicon is forged to its prime.</p>
+      <p class="tagline">{$t("app.tagline")}</p>
     </div>
-    {#if onboarded}
-      <nav>
-        <button class:active={activeTab === "capability"} onclick={() => (activeTab = "capability")}>
-          Capacidades
-        </button>
-        <button class:active={activeTab === "forge"} onclick={() => (activeTab = "forge")}>
-          Forja
-        </button>
-        <button class:active={activeTab === "dashboard"} onclick={() => (activeTab = "dashboard")}>
-          Sensores
-        </button>
-        <button class:active={activeTab === "safety"} onclick={() => (activeTab = "safety")}>
-          Segurança
-        </button>
-      </nav>
-    {/if}
+    <div class="top-right">
+      {#if onboarded}
+        <nav>
+          <button class:active={activeTab === "capability"} onclick={() => (activeTab = "capability")}>
+            {$t("nav.capabilities")}
+          </button>
+          <button class:active={activeTab === "forge"} onclick={() => (activeTab = "forge")}>
+            {$t("nav.forge")}
+          </button>
+          <button class:active={activeTab === "dashboard"} onclick={() => (activeTab = "dashboard")}>
+            {$t("nav.sensors")}
+          </button>
+          <button class:active={activeTab === "safety"} onclick={() => (activeTab = "safety")}>
+            {$t("nav.safety")}
+          </button>
+        </nav>
+      {/if}
+      <select class="lang" bind:value={$locale} aria-label="Language">
+        {#each locales as l}
+          <option value={l.id}>{l.label}</option>
+        {/each}
+      </select>
+    </div>
   </header>
 
   {#if !onboarded}
@@ -127,6 +135,23 @@
     letter-spacing: 0.02em;
   }
 
+  .top-right {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .lang {
+    background: rgba(10, 16, 28, 0.75);
+    color: var(--nord-mist);
+    border: 1px solid var(--nord-border);
+    border-radius: 9px;
+    padding: 0.45rem 0.6rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
   nav {
     display: flex;
     gap: 0.35rem;
