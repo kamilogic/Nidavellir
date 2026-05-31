@@ -1,29 +1,37 @@
 <script>
   // Fixed domains so the curve is shown with headroom, like MSI Afterburner.
   const F_MIN = 500, F_MAX = 3500, F_GRID = 100, F_LABEL = 500;
-  const V_MIN = 700, V_MAX = 1250, V_GRID = 25, V_LABEL = 100;
+  const V_MIN = 700, V_MAX = 1250, V_GRID = 25;
 
   let { points = [], plateau = null, height = 440 } = $props();
 
   const W = 960;
-  const padL = 56, padR = 18, padT = 16, padB = 36;
+  const padL = 56, padR = 18, padT = 16, padB = 38;
 
   const H = $derived(height);
   const sx = (v) => padL + ((v - V_MIN) / (V_MAX - V_MIN)) * (W - padL - padR);
   const sy = (f) => H - padB - ((f - F_MIN) / (F_MAX - F_MIN)) * (H - padT - padB);
 
-  const inDomain = (p) => p.voltage_mv >= V_MIN && p.voltage_mv <= V_MAX && p.freq_mhz >= F_MIN && p.freq_mhz <= F_MAX;
+  const inDomain = (p) =>
+    p.voltage_mv >= V_MIN && p.voltage_mv <= V_MAX && p.freq_mhz >= F_MIN && p.freq_mhz <= F_MAX;
 
-  const path = $derived(
-    points
-      .filter(inDomain)
-      .map((p, i) => `${i ? "L" : "M"}${sx(p.voltage_mv).toFixed(1)},${sy(p.freq_mhz).toFixed(1)}`)
-      .join(" "),
-  );
+  // Points within the visible domain, sorted by voltage.
+  const pts = $derived([...points].filter(inDomain).sort((a, b) => a.voltage_mv - b.voltage_mv));
+
+  // Polyline path, extended as a flat line to both chart edges for visual
+  // consistency (the card's curve table ends well before 1250 mV).
+  const path = $derived.by(() => {
+    if (!pts.length) return "";
+    const first = pts[0], last = pts[pts.length - 1];
+    let d = `M${sx(V_MIN).toFixed(1)},${sy(first.freq_mhz).toFixed(1)}`;
+    for (const p of pts) d += ` L${sx(p.voltage_mv).toFixed(1)},${sy(p.freq_mhz).toFixed(1)}`;
+    d += ` L${sx(V_MAX).toFixed(1)},${sy(last.freq_mhz).toFixed(1)}`;
+    return d;
+  });
 
   const vLines = $derived.by(() => {
     const out = [];
-    for (let v = V_MIN; v <= V_MAX; v += V_GRID) out.push({ x: sx(v), v, label: v % V_LABEL === 0 });
+    for (let v = V_MIN; v <= V_MAX; v += V_GRID) out.push({ x: sx(v), v });
     return out;
   });
   const hLines = $derived.by(() => {
@@ -31,7 +39,9 @@
     for (let f = F_MIN; f <= F_MAX; f += F_GRID) out.push({ y: sy(f), f, label: f % F_LABEL === 0 });
     return out;
   });
-  const dot = $derived(plateau && inDomain(plateau) ? { cx: sx(plateau.voltage_mv), cy: sy(plateau.freq_mhz) } : null);
+  const dot = $derived(
+    plateau && inDomain(plateau) ? { cx: sx(plateau.voltage_mv), cy: sy(plateau.freq_mhz) } : null,
+  );
 </script>
 
 <svg class="vfchart" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Voltage/Frequency curve">
@@ -42,18 +52,27 @@
     {/if}
   {/each}
   {#each vLines as l}
-    <line class="grid" class:major={l.label} x1={l.x} y1={padT} x2={l.x} y2={H - padB} />
-    {#if l.label}
-      <text class="axis" x={l.x} y={H - 12} text-anchor="middle">{l.v}</text>
-    {/if}
+    <line class="grid major" x1={l.x} y1={padT} x2={l.x} y2={H - padB} />
+    <text class="axis vlabel" x={l.x} y={H - 13} text-anchor="middle">{l.v}</text>
   {/each}
   <text class="axis-title" x={padL} y={11}>MHz</text>
-  <text class="axis-title" x={W - padR} y={H - 12} text-anchor="end">mV</text>
+  <text class="axis-title" x={W - padR} y={H - 13} text-anchor="end">mV</text>
+
   {#if path}
     <path class="curve-line" d={path} />
   {/if}
+
+  <!-- Actual curve data points; hover shows the value -->
+  {#each pts as p}
+    <circle class="pt" cx={sx(p.voltage_mv)} cy={sy(p.freq_mhz)} r="2.6">
+      <title>{p.freq_mhz} MHz @ {p.voltage_mv} mV</title>
+    </circle>
+  {/each}
+
   {#if dot}
-    <circle class="plateau-dot" cx={dot.cx} cy={dot.cy} r="5" />
+    <circle class="plateau-dot" cx={dot.cx} cy={dot.cy} r="5">
+      <title>Plateau: {plateau.freq_mhz} MHz @ {plateau.voltage_mv} mV</title>
+    </circle>
   {/if}
 </svg>
 
@@ -78,6 +97,9 @@
     font-size: 11px;
     font-variant-numeric: tabular-nums;
   }
+  .vlabel {
+    font-size: 9px;
+  }
   .axis-title {
     fill: var(--nord-mist);
     font-size: 11px;
@@ -89,6 +111,17 @@
     stroke-width: 2.5;
     stroke-linejoin: round;
     stroke-linecap: round;
+  }
+  .pt {
+    fill: var(--nord-frost-bright);
+    stroke: #0a101c;
+    stroke-width: 0.75;
+    transition: r 0.1s ease;
+    cursor: crosshair;
+  }
+  .pt:hover {
+    r: 5;
+    fill: var(--nord-ember-bright);
   }
   .plateau-dot {
     fill: var(--nord-ember-bright);
