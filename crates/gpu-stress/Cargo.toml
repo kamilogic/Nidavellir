@@ -1,0 +1,13 @@
+[package]
+name = "nidavellir-gpu-stress"
+version = "0.1.0"
+description = "Real GPU compute-validation battery (wgpu) for Nidavellir stability testing"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+nidavellir-core = { workspace = true }
+wgpu = "0.20"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
