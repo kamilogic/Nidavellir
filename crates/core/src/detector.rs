@@ -374,8 +374,10 @@ fn detect_ram() -> RamInfo {
 }
 
 fn query_ram_speed() -> (u32, Option<u32>, bool) {
-    // Avoid table output; expand properties so parsing is robust.
-    let ps_cmd = "$m = Get-CimInstance Win32_PhysicalMemory | Select-Object -First 1; Write-Output ($m.ConfiguredClockSpeed); Write-Output ($m.Speed)";
+    // One line per module: ConfiguredClockSpeed|Speed|PartNumber.
+    // ConfiguredClockSpeed = what's running now; Speed = SMBIOS rated (often the
+    // running speed too); PartNumber = the kit's marketing speed (e.g. F4-4000).
+    let ps_cmd = "Get-CimInstance Win32_PhysicalMemory | ForEach-Object { \"$($_.ConfiguredClockSpeed)|$($_.Speed)|$($_.PartNumber)\" }";
     let Ok(output) = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
         .output()
@@ -386,21 +388,75 @@ fn query_ram_speed() -> (u32, Option<u32>, bool) {
         return (2133, None, false);
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut nums = text
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .take(2);
-    let configured = nums.next().unwrap_or(2133);
-    let rated = nums.next();
-    // If rated is known, consider XMP/EXPO enabled when configured is near rated.
-    // Otherwise, keep the old heuristic as a fallback.
+
+    let mut configured = 0u32;
+    let mut wmi_rated: Option<u32> = None;
+    let mut pn_rated: Option<u32> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('|');
+        let cfg = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+        let speed = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+        let part_no = parts.next().unwrap_or("").trim();
+
+        if configured == 0 {
+            if let Some(c) = cfg.filter(|&c| c > 0) {
+                configured = c;
+            }
+        }
+        if let Some(s) = speed.filter(|&s| s > 0) {
+            wmi_rated = Some(wmi_rated.map_or(s, |w| w.max(s)));
+        }
+        if let Some(r) = rated_speed_from_part_number(part_no) {
+            pn_rated = Some(pn_rated.map_or(r, |p| p.max(r)));
+        }
+    }
+    if configured == 0 {
+        configured = 2133;
+    }
+
+    // Prefer the highest credible rating: the marketing/XMP spec from the part
+    // number usually exceeds what SMBIOS reports for `Speed`.
+    let rated = [wmi_rated, pn_rated].into_iter().flatten().max();
+
+    // XMP/EXPO is effectively active when the module runs at (or near) its rating.
     let xmp_enabled = if let Some(rated_mts) = rated {
         rated_mts >= 2666 && configured + 50 >= rated_mts
     } else {
         configured >= 2666
     };
     (configured, rated, xmp_enabled)
+}
+
+/// Extract the rated transfer rate (MT/s) encoded in a DIMM part number.
+///
+/// Most vendors embed the speed as a 4-digit group, e.g. G.Skill `F4-4000C18`,
+/// `F5-6000J...`, Corsair `CMK32GX4M2D3600C18`. We take the first 4-digit group
+/// that falls in a plausible DDR range and ignore capacity digits like `16G`.
+fn rated_speed_from_part_number(pn: &str) -> Option<u32> {
+    let bytes = pn.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i - start == 4 {
+                if let Ok(n) = pn[start..i].parse::<u32>() {
+                    if (1600..=8400).contains(&n) {
+                        return Some(n);
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 fn detect_motherboard() -> MotherboardInfo {
@@ -414,5 +470,26 @@ fn detect_motherboard() -> MotherboardInfo {
             .unwrap_or_else(|| "Unknown".into()),
         bios_version: read_reg_str(&hklm, bios_path, "BIOSVersion")
             .unwrap_or_else(|| "Unknown".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_number_speed_parsing() {
+        assert_eq!(rated_speed_from_part_number("F4-4000C18-16GTZR"), Some(4000));
+        assert_eq!(rated_speed_from_part_number("F5-6000J3038F16G"), Some(6000));
+        assert_eq!(rated_speed_from_part_number("CMK32GX4M2D3600C18"), Some(3600));
+        // No plausible 4-digit speed group → None (fall back to WMI).
+        assert_eq!(rated_speed_from_part_number("BLS8G4D240FSB"), None);
+        assert_eq!(rated_speed_from_part_number(""), None);
+    }
+
+    #[test]
+    fn part_number_ignores_capacity_digits() {
+        // Leading capacity "16" / "32" must not be mistaken for a speed.
+        assert_eq!(rated_speed_from_part_number("16GB-3200"), Some(3200));
     }
 }

@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 use crate::AppState;
 use crate::PIPE_NAME;
+use nidavellir_driver_pawnio::DriverManager;
 
 pub fn run_pipe_server(state: Arc<Mutex<AppState>>) -> Result<(), String> {
     loop {
@@ -141,7 +142,8 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
     match request {
         IpcRequest::Ping => IpcResponse::success(ResponseData::Pong),
         IpcRequest::DetectHardware => {
-            let hw = nidavellir_core::detect_hardware();
+            let mut hw = nidavellir_core::detect_hardware();
+            refine_cpu_max_clock(&mut hw.cpu, &guard.driver);
             IpcResponse::success(ResponseData::Hardware(hw))
         }
         IpcRequest::ReadSensors => {
@@ -153,7 +155,8 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             IpcResponse::success(ResponseData::Sensors(sensors))
         }
         IpcRequest::GetCapabilityReport => {
-            let hw = nidavellir_core::detect_hardware();
+            let mut hw = nidavellir_core::detect_hardware();
+            refine_cpu_max_clock(&mut hw.cpu, &guard.driver);
             let report = nidavellir_core::build_capability_report(&hw);
             IpcResponse::success(ResponseData::Capability(report))
         }
@@ -163,6 +166,49 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                 status: status.code().to_string(),
                 detail: status.detail(),
             }))
+        }
+    }
+}
+
+/// Replace the CPUID/WMI base-clock fallback with the real factory max turbo,
+/// read from the silicon via MSR when the PawnIO driver is available.
+///
+/// Windows only exposes the base/rated clock (e.g. 3400 MHz on an i7-13700K).
+/// The actual turbo ceiling lives in MSR_TURBO_RATIO_LIMIT (0x1AD); we fall
+/// back to IA32_HWP_CAPABILITIES (0x771). Intel-only: AMD encodes ratios
+/// differently (COF), so we leave its value untouched.
+fn refine_cpu_max_clock(
+    cpu: &mut nidavellir_core::detector::CpuInfo,
+    driver: &DriverManager,
+) {
+    use nidavellir_core::msr;
+
+    if cpu.vendor != "Intel" {
+        return;
+    }
+
+    let to_core = |m: nidavellir_driver_pawnio::MsrValue| msr::MsrValue {
+        eax: m.eax,
+        edx: m.edx,
+    };
+
+    let ratio = driver
+        .read_msr(msr::MSR_TURBO_RATIO_LIMIT)
+        .ok()
+        .and_then(|m| msr::max_turbo_ratio_from_turbo_limit(to_core(m)))
+        .or_else(|| {
+            driver
+                .read_msr(msr::IA32_HWP_CAPABILITIES)
+                .ok()
+                .and_then(|m| msr::highest_perf_ratio_from_hwp(to_core(m)))
+        });
+
+    if let Some(ratio) = ratio {
+        let mhz = msr::turbo_ratio_to_mhz(ratio);
+        // Only override when it actually beats the base reading — a bogus MSR
+        // read should never make the reported max worse.
+        if mhz > cpu.base_freq_mhz {
+            cpu.max_freq_mhz = mhz;
         }
     }
 }
