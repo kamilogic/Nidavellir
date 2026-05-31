@@ -1,0 +1,10 @@
+[package]
+name = "nidavellir-gpu-nvapi"
+version = "0.1.0"
+description = "NVAPI-backed GPU tuning for Nidavellir (read now, write next)"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+nvapi = "0.1"

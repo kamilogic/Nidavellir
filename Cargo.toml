@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/driver-pawnio",
+    "crates/gpu-nvapi",
     "crates/service",
     "apps/ui/src-tauri",
 ]
