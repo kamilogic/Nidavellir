@@ -54,6 +54,7 @@ pub fn run_service() -> windows_service::Result<()> {
         sensor_engine: nidavellir_core::sensors::SensorEngine::new(),
         motherboard: hw.motherboard,
         safe_store,
+        gpu_sweep: crate::gpu_sweep_runtime::GpuSweepHandle::default(),
     }));
 
     let pipe_state = Arc::clone(&state);

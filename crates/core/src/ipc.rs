@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use crate::capability::CapabilityReport;
 use crate::detector::HardwareInfo;
+use crate::gpu_sweep::GpuSweepProgress;
 use crate::safe_loop::{BlacklistRegion, CrashClass, SafeLoopState, TuningPoint};
 use crate::sensors::SensorReadings;
 
@@ -15,6 +16,9 @@ pub enum IpcRequest {
     GetCapabilityReport,
     GetDriverStatus,
     GetSafeLoopStatus,
+    StartGpuSweep,
+    StopGpuSweep,
+    GetGpuSweepProgress,
 }
 
 /// Read-only snapshot of the Safe Loop for the UI's "Segurança" view.
@@ -45,6 +49,7 @@ pub enum ResponseData {
     Capability(CapabilityReport),
     DriverStatus(DriverStatusPayload),
     SafeLoop(SafeLoopStatus),
+    GpuSweep(GpuSweepProgress),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
