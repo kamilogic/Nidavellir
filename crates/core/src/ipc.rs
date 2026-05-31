@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::capability::CapabilityReport;
 use crate::detector::HardwareInfo;
-use crate::gpu_sweep::GpuSweepProgress;
+use crate::gpu_sweep::{GpuSweepProgress, StabilityResult, VfPoint};
 use crate::safe_loop::{BlacklistRegion, CrashClass, SafeLoopState, TuningPoint};
 use crate::sensors::SensorReadings;
 
@@ -19,6 +19,31 @@ pub enum IpcRequest {
     StartGpuSweep,
     StopGpuSweep,
     GetGpuSweepProgress,
+    GetGpuCurve,
+    StartGpuValidation,
+    GetGpuValidation,
+}
+
+/// The live V/F curve read from the GPU via NVAPI (the same data Afterburner's
+/// curve editor shows). `plateau` is where a flat-curve undervolt has locked
+/// the top clock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuCurveSnapshot {
+    pub name: String,
+    pub points: Vec<VfPoint>,
+    pub plateau: Option<VfPoint>,
+    /// True when read from real hardware (vs unavailable/simulated).
+    pub real: bool,
+}
+
+/// Result of a real GPU compute-validation run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuValidationStatus {
+    pub running: bool,
+    pub result: Option<StabilityResult>,
+    pub mismatches: u32,
+    pub elapsed_ms: u64,
+    pub adapter: Option<String>,
 }
 
 /// Read-only snapshot of the Safe Loop for the UI's "Segurança" view.
@@ -50,6 +75,8 @@ pub enum ResponseData {
     DriverStatus(DriverStatusPayload),
     SafeLoop(SafeLoopStatus),
     GpuSweep(GpuSweepProgress),
+    GpuCurve(GpuCurveSnapshot),
+    GpuValidation(GpuValidationStatus),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

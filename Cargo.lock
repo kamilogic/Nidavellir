@@ -2298,6 +2298,8 @@ version = "0.1.0"
 dependencies = [
  "nidavellir-core",
  "nidavellir-driver-pawnio",
+ "nidavellir-gpu-nvapi",
+ "nidavellir-gpu-stress",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

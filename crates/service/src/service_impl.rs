@@ -55,6 +55,7 @@ pub fn run_service() -> windows_service::Result<()> {
         motherboard: hw.motherboard,
         safe_store,
         gpu_sweep: crate::gpu_sweep_runtime::GpuSweepHandle::default(),
+        gpu_validation: crate::gpu_real::GpuValidationHandle::default(),
     }));
 
     let pipe_state = Arc::clone(&state);

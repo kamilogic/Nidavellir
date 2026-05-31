@@ -4,6 +4,14 @@
   let progress = $state(null);
   let error = $state(null);
   let timer = $state(null);
+  let realCurve = $state(null);
+  let validation = $state(null);
+
+  const VAL_LABEL = {
+    stable: "Estável (0 erros)",
+    silent_error: "ERRO SILENCIOSO detectado",
+    crash: "Crash / driver perdido",
+  };
 
   const PHASE_LABEL = {
     idle: "Ocioso",
@@ -31,7 +39,28 @@
   async function refresh() {
     try {
       captureProgress(await serviceCall("GetGpuSweepProgress"));
+      const v = await serviceCall("GetGpuValidation");
+      validation = v?.data?.type === "GpuValidation" ? v.data : validation;
       error = null;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function readRealCurve() {
+    try {
+      const r = await serviceCall("GetGpuCurve");
+      realCurve = r?.data?.type === "GpuCurve" ? r.data : realCurve;
+      error = null;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function startValidation() {
+    try {
+      const r = await serviceCall("StartGpuValidation");
+      validation = r?.data?.type === "GpuValidation" ? r.data : validation;
     } catch (e) {
       error = String(e);
     }
@@ -148,6 +177,52 @@
   {:else}
     <p class="wait">Aguardando o serviço…</p>
   {/if}
+
+  <div class="section real">
+    <h3 class="section-head">Comparação real (NVAPI) — sua GPU de verdade</h3>
+    <div class="real-actions">
+      <button class="btn" onclick={readRealCurve}>Ler curva real</button>
+      <button class="btn go" onclick={startValidation} disabled={validation?.running}>
+        {validation?.running ? "Validando…" : "Validar estabilidade (real)"}
+      </button>
+    </div>
+
+    {#if realCurve}
+      {#if realCurve.real}
+        <p class="sub">{realCurve.name} · {realCurve.points.length} pontos na curva</p>
+        {#if realCurve.plateau}
+          <p class="point accent">
+            Plateau (UV travado): {realCurve.plateau.freq_mhz} MHz @ {realCurve.plateau.voltage_mv} mV
+          </p>
+        {/if}
+        <ul class="list">
+          {#each realCurve.points.filter((_, i) => i % 8 === 0) as p}
+            <li><span class="mono">{p.voltage_mv} mV</span><span class="mono accent">{p.freq_mhz} MHz</span></li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="err">{realCurve.name}</p>
+      {/if}
+    {/if}
+
+    {#if validation}
+      <div class="val">
+        {#if validation.running}
+          <p class="sub">Rodando known-answer test na GPU… (detecta erro silencioso sem crash)</p>
+        {:else if validation.result}
+          <p class="point" class:danger={validation.result !== "stable"} class:accent={validation.result === "stable"}>
+            {VAL_LABEL[validation.result] ?? validation.result}
+          </p>
+          <p class="sub">
+            mismatches: {validation.mismatches} · {validation.elapsed_ms} ms
+            {#if validation.adapter}· {validation.adapter}{/if}
+          </p>
+        {:else if validation.adapter}
+          <p class="err">{validation.adapter}</p>
+        {/if}
+      </div>
+    {/if}
+  </div>
 </section>
 
 <style>
@@ -321,5 +396,28 @@
   }
   .err {
     color: var(--nord-danger);
+  }
+  .real {
+    border-top: 1px solid var(--border);
+    padding-top: 1rem;
+  }
+  .real-actions {
+    display: flex;
+    gap: 0.6rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .point.accent {
+    color: var(--accent);
+  }
+  .point.danger {
+    color: var(--nord-danger);
+  }
+  .val {
+    margin-top: 0.6rem;
   }
 </style>

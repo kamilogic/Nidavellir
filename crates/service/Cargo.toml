@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 nidavellir-core = { workspace = true }
 nidavellir-driver-pawnio = { workspace = true }
+nidavellir-gpu-stress = { path = "../gpu-stress" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -21,6 +22,7 @@ tracing-subscriber = { workspace = true }
 windows-service = "0.7"
 
 [target.'cfg(windows)'.dependencies]
+nidavellir-gpu-nvapi = { path = "../gpu-nvapi" }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",

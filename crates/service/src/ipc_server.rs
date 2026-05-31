@@ -187,6 +187,19 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetGpuSweepProgress => {
             IpcResponse::success(ResponseData::GpuSweep(guard.gpu_sweep.progress()))
         }
+        IpcRequest::GetGpuCurve => {
+            IpcResponse::success(ResponseData::GpuCurve(crate::gpu_real::read_curve_snapshot()))
+        }
+        IpcRequest::StartGpuValidation => {
+            if guard.gpu_validation.start() {
+                IpcResponse::success(ResponseData::GpuValidation(guard.gpu_validation.status()))
+            } else {
+                IpcResponse::failure("GPU validation already running")
+            }
+        }
+        IpcRequest::GetGpuValidation => {
+            IpcResponse::success(ResponseData::GpuValidation(guard.gpu_validation.status()))
+        }
     }
 }
 
