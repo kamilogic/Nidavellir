@@ -2,6 +2,7 @@
   import Onboarding from "./lib/views/Onboarding.svelte";
   import CapabilityReport from "./lib/views/CapabilityReport.svelte";
   import Dashboard from "./lib/views/Dashboard.svelte";
+  import SafeLoop from "./lib/views/SafeLoop.svelte";
 
   let onboarded = $state(false);
   let onboardingStep = $state(1);
@@ -27,6 +28,9 @@
         <button class:active={activeTab === "dashboard"} onclick={() => (activeTab = "dashboard")}>
           Sensores
         </button>
+        <button class:active={activeTab === "safety"} onclick={() => (activeTab = "safety")}>
+          Segurança
+        </button>
       </nav>
     {/if}
   </header>
@@ -35,8 +39,10 @@
     <Onboarding bind:step={onboardingStep} onComplete={finishOnboarding} />
   {:else if activeTab === "capability"}
     <CapabilityReport />
-  {:else}
+  {:else if activeTab === "dashboard"}
     <Dashboard />
+  {:else}
+    <SafeLoop />
   {/if}
 </main>
 

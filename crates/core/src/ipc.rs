@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use crate::capability::CapabilityReport;
 use crate::detector::HardwareInfo;
+use crate::safe_loop::{BlacklistRegion, CrashClass, SafeLoopState, TuningPoint};
 use crate::sensors::SensorReadings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +14,20 @@ pub enum IpcRequest {
     ReadSensors,
     GetCapabilityReport,
     GetDriverStatus,
+    GetSafeLoopStatus,
+}
+
+/// Read-only snapshot of the Safe Loop for the UI's "Segurança" view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeLoopStatus {
+    pub state: SafeLoopState,
+    pub safe_mode: bool,
+    pub consecutive_crashes: u32,
+    pub crash_threshold: u32,
+    pub boot_flag_armed: bool,
+    pub last_validated: Option<TuningPoint>,
+    pub blacklist: Vec<BlacklistRegion>,
+    pub recent_crashes: Vec<CrashClass>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +44,7 @@ pub enum ResponseData {
     Sensors(SensorReadings),
     Capability(CapabilityReport),
     DriverStatus(DriverStatusPayload),
+    SafeLoop(SafeLoopStatus),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

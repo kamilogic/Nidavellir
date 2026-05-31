@@ -1,4 +1,5 @@
 mod ipc_server;
+mod safe_loop_runtime;
 mod sensor_gather;
 mod service_impl;
 
@@ -7,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use windows_service::define_windows_service;
 
+use nidavellir_core::safe_loop::SafeLoopStore;
 use nidavellir_driver_pawnio::DriverManager;
 
 pub const SERVICE_NAME: &str = "NidavellirCore";
@@ -16,6 +18,7 @@ pub struct AppState {
     pub driver: DriverManager,
     pub sensor_engine: nidavellir_core::sensors::SensorEngine,
     pub motherboard: nidavellir_core::detector::MotherboardInfo,
+    pub safe_store: SafeLoopStore,
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -45,11 +48,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting Nidavellir Core Service in console mode");
+
+    // Parachute first: recover from any prior crash before doing anything else.
+    let safe_store = SafeLoopStore::system();
+    safe_loop_runtime::run_startup_recovery(&safe_store);
+    safe_loop_runtime::spawn_heartbeat(safe_store.clone());
+
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {
         driver: DriverManager::new(),
         sensor_engine: nidavellir_core::sensors::SensorEngine::new(),
         motherboard: hw.motherboard,
+        safe_store,
     }));
     ipc_server::run_pipe_server(state)?;
     Ok(())

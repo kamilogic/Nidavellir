@@ -42,11 +42,18 @@ pub fn run_service() -> windows_service::Result<()> {
 
     info!("Nidavellir Core Service started");
 
+    // Parachute first: the service boots before login, so it reads the
+    // boot-flag and recovers from any prior crash before touching hardware.
+    let safe_store = nidavellir_core::safe_loop::SafeLoopStore::system();
+    crate::safe_loop_runtime::run_startup_recovery(&safe_store);
+    crate::safe_loop_runtime::spawn_heartbeat(safe_store.clone());
+
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {
         driver: DriverManager::new(),
         sensor_engine: nidavellir_core::sensors::SensorEngine::new(),
         motherboard: hw.motherboard,
+        safe_store,
     }));
 
     let pipe_state = Arc::clone(&state);

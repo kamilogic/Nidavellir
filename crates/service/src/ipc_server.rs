@@ -167,6 +167,10 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                 detail: status.detail(),
             }))
         }
+        IpcRequest::GetSafeLoopStatus => {
+            let status = crate::safe_loop_runtime::status_snapshot(&guard.safe_store);
+            IpcResponse::success(ResponseData::SafeLoop(status))
+        }
     }
 }
 
