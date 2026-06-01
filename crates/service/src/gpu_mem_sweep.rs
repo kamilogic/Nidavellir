@@ -83,6 +83,20 @@ fn mem_clock_mhz() -> u32 {
         .unwrap_or(0)
 }
 
+/// Recover the GPU context after a TDR. The driver needs a few seconds to reset;
+/// recreating the device immediately fails ("lost during init"), so wait + retry.
+#[cfg(windows)]
+fn recover_ctx() -> Option<nidavellir_gpu_stress::GpuCtx> {
+    use nidavellir_gpu_stress::GpuCtx;
+    for _ in 0..6 {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        if let Ok(c) = GpuCtx::new() {
+            return Some(c);
+        }
+    }
+    None
+}
+
 #[cfg(windows)]
 fn run_mem_sweep(
     progress: Arc<Mutex<MemSweepProgress>>,
@@ -101,7 +115,7 @@ fn run_mem_sweep(
     };
 
     info!("Memory sweep starting (bandwidth-peak search)");
-    let ctx = match GpuCtx::new() {
+    let mut ctx = match GpuCtx::new() {
         Ok(c) => c,
         Err(e) => {
             warn!("mem sweep: GpuCtx init failed: {e}");
@@ -229,18 +243,32 @@ fn run_mem_sweep(
             let _ = gpu::set_mem_offset_mhz(off);
             let comb = match catch_unwind(AssertUnwindSafe(|| ctx.run_combined(40_000))) {
                 Ok(r) => r.result,
-                Err(_) => {
-                    crashed = true;
-                    nidavellir_core::gpu_sweep::StabilityResult::Crash
-                }
+                Err(_) => nidavellir_core::gpu_sweep::StabilityResult::Crash,
             };
-            let (peak, minbw) = if crashed { (0.0, 0.0) } else { ctx.measure_bandwidth_stats(20_000) };
-            let consistency = if peak > 0.0 { minbw / peak } else { 0.0 };
 
-            if crashed {
-                prog.validation_note = Some("Travou no soak combinado — recue mais".into());
-                break;
+            // A device-lost during the soak kills the context — recover it and
+            // recede, instead of giving up (the goal is to find a clock that
+            // survives the combined load, not to abort at the first TDR).
+            if matches!(comb, nidavellir_core::gpu_sweep::StabilityResult::Crash) {
+                let _ = gpu::set_mem_offset_mhz(0);
+                match recover_ctx() {
+                    Some(fresh) => {
+                        ctx = fresh;
+                        info!("mem sweep: recovered after soak TDR at +{off} MHz — receding");
+                        prog.peak_offset_mhz = (off - 2 * step).max(0);
+                        off -= 2 * step;
+                        continue;
+                    }
+                    None => {
+                        crashed = true;
+                        prog.validation_note = Some("GPU não recuperou no soak — pare".into());
+                        break;
+                    }
+                }
             }
+
+            let (peak, minbw) = ctx.measure_bandwidth_stats(20_000);
+            let consistency = if peak > 0.0 { minbw / peak } else { 0.0 };
             if comb.is_stable() && consistency >= 0.96 {
                 let _ = store.clear_boot_flag();
                 prog.peak_offset_mhz = off;

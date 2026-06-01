@@ -289,6 +289,17 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
     // 5. Final whole-package soak ------------------------------------------
     p.set("package-soak");
     p.log("5/5 · Soak final do pacote (core+mem juntos, ~2 min)…".into());
+    // The memory sweep may have left the device in a bad state (a hard
+    // bandwidth collapse at the cliff) — start this critical validation on a
+    // guaranteed-fresh device, recovering with backoff if it was lost.
+    match GpuCtx::new() {
+        Ok(fresh) => ctx = fresh,
+        Err(_) => {
+            if let Some(fresh) = recover_ctx() {
+                ctx = fresh;
+            }
+        }
+    }
     if core_freq > 0 {
         let _ = crate::gpu_apply::apply_core(core_point);
     }
@@ -306,6 +317,15 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
             break;
         }
         p.log(format!("Pacote instável em mem +{mem_final} ({res:?}) — recuando 100 MHz"));
+        // A crash kills the device — recover before the next attempt, else every
+        // remaining attempt crashes instantly on the dead context.
+        if matches!(res, StabilityResult::Crash) {
+            let _ = gpu::set_mem_offset_mhz(0);
+            if let Some(fresh) = recover_ctx() {
+                ctx = fresh;
+                let _ = crate::gpu_apply::apply_core(core_point);
+            }
+        }
         mem_final -= 100;
         if mem_final <= 0 && attempt >= 1 {
             mem_final = 0;
@@ -316,7 +336,9 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
     // Persist the validated package (re-applied on every boot).
     let label = "Forge All".to_string();
     let core_opt = if core_freq > 0 { Some(core_point) } else { None };
-    let mem_opt = if mem_final > 0 { Some(mem_final) } else { None };
+    // Only persist a memory offset that actually survived the package soak —
+    // never apply an unvalidated value just because the sweep had found it.
+    let mem_opt = if soak_ok && mem_final > 0 { Some(mem_final) } else { None };
     let _ = crate::gpu_apply::apply_and_persist(label, core_opt, mem_opt, &store);
     p.note(if soak_ok {
         "Forja completa e validada — aplicada e persistida. Confirme em jogo."
