@@ -186,6 +186,22 @@ fn run_real_sweep(
     let mut prog = idle();
     prog.total_freqs = q.voltages.len();
 
+    // Phase 1 gate: VRAM must be sound at stock, else tuning the core is moot.
+    prog.phase = SweepPhase::VramDiagnostic;
+    set_progress(&progress, prog.clone());
+    let vram = match catch_unwind(AssertUnwindSafe(|| ctx.run_vram_check(1024 * 1024 * 1024, 2))) {
+        Ok(r) => r.result,
+        Err(_) => StabilityResult::Crash,
+    };
+    if !vram.is_stable() {
+        warn!("real sweep: VRAM check failed at stock ({vram:?}) — aborting before tuning");
+        let _ = gpu::reset_all();
+        prog.phase = SweepPhase::Aborted;
+        prog.last_result = Some(vram);
+        set_progress(&progress, prog);
+        return;
+    }
+
     // Warm up to thermal equilibrium (the stability frontier moves with temp).
     prog.phase = SweepPhase::Baseline;
     set_progress(&progress, prog.clone());

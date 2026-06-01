@@ -20,7 +20,6 @@ use wgpu::util::DeviceExt;
 const C1: u32 = 1664525;
 const C2: u32 = 1013904223;
 const HASH1: u32 = 2654435761;
-const HASH2: u32 = 40503;
 const TABLE_INIT: u32 = 2246822519;
 
 #[repr(C)]
@@ -29,6 +28,16 @@ struct Params {
     a: u32,
     n: u32,
     _pad: [u32; 2],
+}
+
+/// Generic 4×u32 uniform block (16-byte aligned) reused by several kernels.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Quad {
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
 }
 
 /// Result of one battery stage.
@@ -56,21 +65,55 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// Each lane gathers from a LARGE (VRAM-resident) table, striding across the
+// whole table so accesses miss cache and hit the memory controller / DRAM —
+// the path that shares the core voltage rail.
 const MEM_SHADER: &str = r#"
-struct P { gathers: u32, n: u32, p0: u32, p1: u32 };
+struct P { gathers: u32, lanes: u32, table_len: u32, p1: u32 };
 @group(0) @binding(0) var<storage, read_write> data: array<u32>;
 @group(0) @binding(1) var<storage, read> table: array<u32>;
 @group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= p.n) { return; }
+    if (i >= p.lanes) { return; }
     var acc: u32 = 0u;
     for (var k: u32 = 0u; k < p.gathers; k = k + 1u) {
-        let idx = (i * 2654435761u + k * 40503u) % p.n;
+        let idx = (i * 2654435761u + k * 2246822519u) % p.table_len;
         acc = acc + table[idx];
     }
     data[i] = acc;
+}
+"#;
+
+// Fills the large table on the GPU so we don't upload hundreds of MB. Uses a
+// grid-stride loop so a bounded workgroup count covers a huge buffer (the X
+// dispatch dimension is capped at 65535).
+const FILL_SHADER: &str = r#"
+struct P { n: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read_write> table: array<u32>;
+@group(0) @binding(1) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * 64u;
+    var i = gid.x;
+    loop {
+        if (i >= p.n) { break; }
+        table[i] = i * 2246822519u;
+        i = i + stride;
+    }
+}
+"#;
+
+// VRAM integrity: write a deterministic pattern, then verify it bit-for-bit,
+// counting mismatches on the GPU (only the count is read back).
+const VRAM_PATTERN_FN: &str = r#"
+fn pattern(i: u32, mode: u32) -> u32 {
+    if (mode == 0u) { return i * 2654435761u; }       // address-in-cell
+    if (mode == 1u) { return 0xffffffffu; }           // all ones
+    if (mode == 2u) { return 0u; }                    // all zeros
+    if (mode == 3u) { if ((i & 1u) == 0u) { return 0xaaaaaaaau; } return 0x55555555u; } // checkerboard
+    return 1u << (i % 32u);                            // walking bit
 }
 "#;
 
@@ -115,6 +158,8 @@ pub struct GpuCtx {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub adapter_name: String,
+    /// Largest single storage buffer we may allocate (bytes).
+    pub max_buffer_bytes: u64,
     crashed: Arc<AtomicBool>,
 }
 
@@ -131,11 +176,15 @@ impl GpuCtx {
         }))
         .ok_or_else(|| "no suitable GPU adapter found".to_string())?;
         let adapter_name = adapter.get_info().name;
+        // Request the adapter's full limits so we can allocate large
+        // VRAM-resident buffers (cache-busting + VRAM coverage).
+        let limits = adapter.limits();
+        let max_buffer_bytes = limits.max_storage_buffer_binding_size as u64;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("nidavellir-gpu-stress"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: limits,
             },
             None,
         ))
@@ -149,7 +198,7 @@ impl GpuCtx {
                 crashed.store(true, Ordering::SeqCst);
             }));
         }
-        Ok(Self { device, queue, adapter_name, crashed })
+        Ok(Self { device, queue, adapter_name, max_buffer_bytes, crashed })
     }
 
     fn verdict(&self, mismatches: u32, mapped_ok: bool) -> StabilityResult {
@@ -238,28 +287,73 @@ impl GpuCtx {
         }
     }
 
-    /// Sustained memory-bound known-answer test: many pseudo-random gathers from
-    /// a table, dispatched back-to-back for ~`target_ms` (idempotent, so the CPU
-    /// reference is computed once regardless of how many dispatches ran).
-    pub fn run_memory(&self, name: &str, elements: u32, gathers: u32, target_ms: u64) -> StageReport {
+    /// Sustained memory-bound known-answer test. `lanes` output lanes each gather
+    /// `gathers` times from a LARGE (~256 MB) VRAM-resident table, striding so the
+    /// reads miss cache and traverse the memory controller — the path on the core
+    /// voltage rail. Idempotent → CPU reference computed once (table values via
+    /// the same on-the-fly hash, so it isn't stored on the CPU).
+    pub fn run_memory(&self, name: &str, lanes: u32, gathers: u32, target_ms: u64) -> StageReport {
         let start = std::time::Instant::now();
-        let table: Vec<u32> = (0..elements).map(|j| j.wrapping_mul(TABLE_INIT)).collect();
-        let byte_size = (elements as usize * 4) as u64;
 
+        // Large table sized to ~256 MB (capped by device limits), cache-busting.
+        let target_table_bytes = 256u64 * 1024 * 1024;
+        let table_bytes = target_table_bytes.min(self.max_buffer_bytes).max(64 * 1024 * 1024);
+        let table_len = (table_bytes / 4) as u32;
+        let out_bytes = (lanes as usize * 4) as u64;
+
+        let table = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mem-table"),
+            size: (table_len as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let data = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mem-data"),
-            size: byte_size,
+            size: out_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let table_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mem-table"),
-            contents: bytemuck::cast_slice(&table),
-            usage: wgpu::BufferUsages::STORAGE,
+
+        // Fill the table on the GPU (avoids a 256 MB upload).
+        let fill_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fill-params"),
+            contents: bytemuck::bytes_of(&Quad { a: table_len, b: 0, c: 0, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
         });
+        let fill_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fill"),
+            source: wgpu::ShaderSource::Wgsl(FILL_SHADER.into()),
+        });
+        let fill_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fill"),
+            layout: None,
+            module: &fill_mod,
+            entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let fill_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fill"),
+            layout: &fill_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: table.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: fill_params.as_entire_binding() },
+            ],
+        });
+        {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&fill_pipe);
+                cp.set_bind_group(0, &fill_bind, &[]);
+                cp.dispatch_workgroups(table_len.div_ceil(64).min(65535), 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            self.device.poll(wgpu::Maintain::Wait);
+        }
+
         let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mem-params"),
-            contents: bytemuck::bytes_of(&Params { a: gathers, n: elements, _pad: [0; 2] }),
+            contents: bytemuck::bytes_of(&Quad { a: gathers, b: lanes, c: table_len, d: 0 }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -278,20 +372,17 @@ impl GpuCtx {
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: data.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: table_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: table.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
             ],
         });
 
-        let groups = elements.div_ceil(64);
+        let groups = lanes.div_ceil(64);
         let mut k: u64 = 0;
         while (start.elapsed().as_millis() as u64) < target_ms {
             let mut enc = self.device.create_command_encoder(&Default::default());
             {
-                let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("mem"),
-                    timestamp_writes: None,
-                });
+                let mut cp = enc.begin_compute_pass(&Default::default());
                 cp.set_pipeline(&pipeline);
                 cp.set_bind_group(0, &bind, &[]);
                 cp.dispatch_workgroups(groups, 1, 1);
@@ -307,22 +398,162 @@ impl GpuCtx {
         }
         self.device.poll(wgpu::Maintain::Wait);
 
-        let expected: Vec<u32> = (0..elements)
+        // table[idx] = idx * TABLE_INIT (matches FILL_SHADER) — computed inline.
+        let expected: Vec<u32> = (0..lanes)
             .map(|i| {
                 let mut acc = 0u32;
-                for k in 0..gathers {
-                    let idx = (i.wrapping_mul(HASH1).wrapping_add(k.wrapping_mul(HASH2))) % elements;
-                    acc = acc.wrapping_add(table[idx as usize]);
+                for kk in 0..gathers {
+                    let idx = (i.wrapping_mul(HASH1).wrapping_add(kk.wrapping_mul(TABLE_INIT))) % table_len;
+                    acc = acc.wrapping_add(idx.wrapping_mul(TABLE_INIT));
                 }
                 acc
             })
             .collect();
-        let (mismatches, mapped_ok) = self.readback_compare(&data, byte_size, &expected);
+        let (mismatches, mapped_ok) = self.readback_compare(&data, out_bytes, &expected);
         StageReport {
             name: name.to_string(),
             result: self.verdict(mismatches, mapped_ok),
             mismatches,
             elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// VRAM integrity check (roadmap §12 Phase 1): allocate a large VRAM buffer,
+    /// write/verify deterministic patterns (address-in-cell, all-1/0,
+    /// checkerboard, walking-bit), counting mismatches on the GPU. Run at stock
+    /// before tuning — a failure here means the memory itself is unstable.
+    pub fn run_vram_check(&self, target_bytes: u64, passes: u32) -> StageReport {
+        let start = std::time::Instant::now();
+        let bytes = target_bytes.min(self.max_buffer_bytes).max(64 * 1024 * 1024);
+        let len = (bytes / 4) as u32;
+
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vram-buf"),
+            size: (len as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let result = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vram-result"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let fill_src = format!(
+            "{VRAM_PATTERN_FN}\nstruct P {{ mode: u32, n: u32, p0: u32, p1: u32 }};\n\
+             @group(0) @binding(0) var<storage, read_write> buf: array<u32>;\n\
+             @group(0) @binding(1) var<uniform> p: P;\n\
+             @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{\n\
+               let stride = nwg.x * 64u; var i = g.x; loop {{ if (i >= p.n) {{ break; }} buf[i] = pattern(i, p.mode); i = i + stride; }}\n}}"
+        );
+        let verify_src = format!(
+            "{VRAM_PATTERN_FN}\nstruct P {{ mode: u32, n: u32, p0: u32, p1: u32 }};\n\
+             @group(0) @binding(0) var<storage, read> buf: array<u32>;\n\
+             @group(0) @binding(1) var<uniform> p: P;\n\
+             @group(0) @binding(2) var<storage, read_write> res: atomic<u32>;\n\
+             @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{\n\
+               let stride = nwg.x * 64u; var i = g.x; loop {{ if (i >= p.n) {{ break; }} if (buf[i] != pattern(i, p.mode)) {{ atomicAdd(&res, 1u); }} i = i + stride; }}\n}}"
+        );
+        let fill_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("vram-fill"),
+            source: wgpu::ShaderSource::Wgsl(fill_src.into()),
+        });
+        let verify_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("vram-verify"),
+            source: wgpu::ShaderSource::Wgsl(verify_src.into()),
+        });
+        let fill_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vram-fill"),
+            layout: None,
+            module: &fill_mod,
+            entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let verify_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vram-verify"),
+            layout: None,
+            module: &verify_mod,
+            entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
+        let groups = len.div_ceil(64).min(65535);
+        let mut total_mismatches = 0u32;
+        'outer: for _ in 0..passes.max(1) {
+            for mode in 0u32..5 {
+                let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("vram-params"),
+                    contents: bytemuck::bytes_of(&Quad { a: mode, b: len, c: 0, d: 0 }),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                let fill_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("vram-fill"),
+                    layout: &fill_pipe.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
+                    ],
+                });
+                let verify_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("vram-verify"),
+                    layout: &verify_pipe.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: result.as_entire_binding() },
+                    ],
+                });
+                self.queue.write_buffer(&result, 0, &0u32.to_ne_bytes());
+                let mut enc = self.device.create_command_encoder(&Default::default());
+                {
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&fill_pipe);
+                    cp.set_bind_group(0, &fill_bind, &[]);
+                    cp.dispatch_workgroups(groups, 1, 1);
+                    cp.set_pipeline(&verify_pipe);
+                    cp.set_bind_group(0, &verify_bind, &[]);
+                    cp.dispatch_workgroups(groups, 1, 1);
+                }
+                self.queue.submit(Some(enc.finish()));
+                self.device.poll(wgpu::Maintain::Wait);
+                total_mismatches = total_mismatches.saturating_add(self.read_u32(&result));
+                if self.crashed.load(Ordering::SeqCst) {
+                    break 'outer;
+                }
+            }
+        }
+
+        StageReport {
+            name: format!("VRAM ({} MB)", bytes / (1024 * 1024)),
+            result: self.verdict(total_mismatches, !self.crashed.load(Ordering::SeqCst)),
+            mismatches: total_mismatches,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// Read a single u32 from a COPY_SRC buffer.
+    fn read_u32(&self, buffer: &wgpu::Buffer) -> u32 {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("u32-staging"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(buffer, 0, &staging, 0, 4);
+        self.queue.submit(Some(enc.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        if matches!(rx.recv(), Ok(Ok(()))) {
+            let data = slice.get_mapped_range();
+            u32::from_ne_bytes([data[0], data[1], data[2], data[3]])
+        } else {
+            0
         }
     }
 
