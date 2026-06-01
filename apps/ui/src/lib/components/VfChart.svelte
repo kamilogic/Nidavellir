@@ -6,7 +6,7 @@
   let { points = [], plateau = null, height = 440 } = $props();
 
   const W = 960;
-  const padL = 56, padR = 18, padT = 16, padB = 38;
+  const padL = 56, padR = 18, padT = 16, padB = 48;
 
   const H = $derived(height);
   const sx = (v) => padL + ((v - V_MIN) / (V_MAX - V_MIN)) * (W - padL - padR);
@@ -56,10 +56,10 @@
   {/each}
   {#each vLines as l}
     <line class="grid major" x1={l.x} y1={padT} x2={l.x} y2={H - padB} />
-    <text class="axis vlabel" x={l.x} y={H - 13} text-anchor="middle">{l.v}</text>
+    <text class="axis vlabel" x={l.x} y={H - padB + 16} text-anchor="middle">{l.v}</text>
   {/each}
   <text class="axis-title" x={padL} y={11}>MHz</text>
-  <text class="axis-title" x={W - padR} y={H - 13} text-anchor="end">mV</text>
+  <text class="axis-title" x={W - padR} y={H - 8} text-anchor="end">mV</text>
 
   {#if path}
     <path class="curve-line" d={path} />
