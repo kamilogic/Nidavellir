@@ -18,14 +18,41 @@
   // Points within the visible domain, sorted by voltage.
   const pts = $derived([...points].filter(inDomain).sort((a, b) => a.voltage_mv - b.voltage_mv));
 
-  // Polyline path, extended as a flat line to both chart edges for visual
-  // consistency (the card's curve table ends well before 1250 mV).
+  // Is there a chosen undervolt limit (plateau) to lock the curve at?
+  const hasPlateau = $derived(plateau && inDomain(plateau));
+
+  // The APPLIED curve. With an undervolt limit we lock the voltage at the
+  // plateau: the curve follows stock up to that voltage, then is FLAT at the
+  // locked frequency for every higher voltage (it does NOT keep climbing — the
+  // GPU is clamped). Without a limit it's the stock curve, extended flat at the
+  // last read point just to reach the right edge.
   const path = $derived.by(() => {
     if (!pts.length) return "";
-    const first = pts[0], last = pts[pts.length - 1];
+    const first = pts[0];
     let d = `M${sx(V_MIN).toFixed(1)},${sy(first.freq_mhz).toFixed(1)}`;
+    if (hasPlateau) {
+      const pv = plateau.voltage_mv, pf = plateau.freq_mhz;
+      for (const p of pts) {
+        if (p.voltage_mv < pv) d += ` L${sx(p.voltage_mv).toFixed(1)},${sy(p.freq_mhz).toFixed(1)}`;
+      }
+      d += ` L${sx(pv).toFixed(1)},${sy(pf).toFixed(1)}`;       // join the locked point
+      d += ` L${sx(V_MAX).toFixed(1)},${sy(pf).toFixed(1)}`;    // flat after the limit
+      return d;
+    }
+    const last = pts[pts.length - 1];
     for (const p of pts) d += ` L${sx(p.voltage_mv).toFixed(1)},${sy(p.freq_mhz).toFixed(1)}`;
     d += ` L${sx(V_MAX).toFixed(1)},${sy(last.freq_mhz).toFixed(1)}`;
+    return d;
+  });
+
+  // Faint "stock continuation" above the limit — where the curve WOULD go
+  // unclamped, shown dimmed so it's clear the limit flattened it (not lost it).
+  const stockTail = $derived.by(() => {
+    if (!hasPlateau || !pts.length) return "";
+    const tail = pts.filter((p) => p.voltage_mv >= plateau.voltage_mv);
+    if (!tail.length) return "";
+    let d = `M${sx(plateau.voltage_mv).toFixed(1)},${sy(plateau.freq_mhz).toFixed(1)}`;
+    for (const p of tail) d += ` L${sx(p.voltage_mv).toFixed(1)},${sy(p.freq_mhz).toFixed(1)}`;
     return d;
   });
 
@@ -61,6 +88,9 @@
   <text class="axis-title" x={padL} y={11}>MHz</text>
   <text class="axis-title" x={W - padR} y={H - 8} text-anchor="end">mV</text>
 
+  {#if stockTail}
+    <path class="stock-tail" d={stockTail} />
+  {/if}
   {#if path}
     <path class="curve-line" d={path} />
   {/if}
@@ -81,6 +111,7 @@
   {#each pts as p}
     <circle
       class="pt"
+      class:beyond={hasPlateau && p.voltage_mv > plateau.voltage_mv}
       cx={sx(p.voltage_mv)}
       cy={sy(p.freq_mhz)}
       r="2.6"
@@ -142,6 +173,17 @@
     stroke-width: 2.5;
     stroke-linejoin: round;
     stroke-linecap: round;
+  }
+  .stock-tail {
+    fill: none;
+    stroke: var(--nord-frost-dim);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 4;
+    opacity: 0.45;
+  }
+  .pt.beyond {
+    fill: var(--nord-frost-dim);
+    opacity: 0.4;
   }
   .pt {
     fill: var(--nord-frost-bright);

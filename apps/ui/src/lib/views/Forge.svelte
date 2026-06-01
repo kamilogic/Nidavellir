@@ -18,6 +18,16 @@
   let forgePreflight = $state(false);
   const forgeRunning = $derived(forge?.running);
 
+  // Keep a terminal pinned to its newest line (tail -f). The `dep` param makes
+  // the action re-run on every appended line so the latest is always in view.
+  function autoscroll(node, _dep) {
+    const toBottom = () => {
+      node.scrollTop = node.scrollHeight;
+    };
+    toBottom();
+    return { update: toBottom };
+  }
+
   const SWEEPING = ["baseline", "vram_diagnostic", "voltage_bisection", "synthesis"];
   const realRunning = $derived(realSweep && SWEEPING.includes(realSweep.phase));
   const memRunning = $derived(memSweep?.running);
@@ -122,12 +132,19 @@
     <p class="sub">{$t("forge.forgeAllDesc")}</p>
     {#if forge && forge.phase !== "idle" && (forge.log?.length || forge.running)}
       <div class="terminal">
-        {#each forge.log as line}
-          <div class="tline"><span class="tlead">{line}</span></div>
-        {/each}
-        {#if forge.running}
-          <div class="tline running"><span class="spin">◴</span><span class="tlead">{forge.phase}…</span></div>
-        {/if}
+        <div class="term-head">
+          <span class="dots"><i></i><i></i><i></i></span>
+          <span class="term-title">nidavellir · forge</span>
+          <span class="term-status" class:live={forge.running}>{forge.running ? forge.phase : "done"}</span>
+        </div>
+        <div class="term-body" use:autoscroll={(forge.log?.length ?? 0) + (forge.running ? 1 : 0)}>
+          {#each forge.log as line, i}
+            <div class="tline"><span class="gutter">{(i + 1).toString().padStart(2, "0")}</span><span class="tlead">{line}</span></div>
+          {/each}
+          {#if forge.running}
+            <div class="tline running"><span class="gutter">»</span><span class="cursor"></span><span class="tlead">{forge.phase}…</span></div>
+          {/if}
+        </div>
       </div>
       {#if forge.note}<p class="point" class:accent={!forge.running}>{forge.note}</p>{/if}
     {/if}
@@ -281,21 +298,30 @@
       </div>
       {#if memSweep && memSweep.phase !== "idle"}
         <div class="terminal">
-          <div class="tline base">Base · {memSweep.baseline_gbps.toFixed(0)} GB/s</div>
-          {#each memSweep.points as p}
-            <div class="tline">
-              <span class="tlead">+{p.offset_mhz} MHz · {p.mem_mhz} MHz</span>
-              <span class="tval" class:accent={p.stable} class:danger={!p.stable}>{p.bandwidth_gbps.toFixed(0)} GB/s</span>
-              {#if p.min_gbps > 0}<span class="tmin">min {p.min_gbps.toFixed(0)}</span>{/if}
-              <span class="tstatus" class:danger={!p.stable}>{p.stable ? "Done" : "✗ instável (queda)"}</span>
-            </div>
-          {/each}
-          {#if memRunning}
-            <div class="tline running">
-              <span class="spin">◴</span>
-              <span class="tlead">{memSweep.validation_note ?? "…"}</span>
-            </div>
-          {/if}
+          <div class="term-head">
+            <span class="dots"><i></i><i></i><i></i></span>
+            <span class="term-title">nidavellir · memory sweep</span>
+            <span class="term-status" class:live={memRunning}>{memRunning ? "running" : "done"}</span>
+          </div>
+          <div class="term-body" use:autoscroll={(memSweep.points?.length ?? 0) + (memRunning ? 1 : 0)}>
+            <div class="tline base"><span class="gutter">··</span><span class="tlead">base · {memSweep.baseline_gbps.toFixed(0)} GB/s</span></div>
+            {#each memSweep.points as p, i}
+              <div class="tline">
+                <span class="gutter">{(i + 1).toString().padStart(2, "0")}</span>
+                <span class="tlead">+{p.offset_mhz} MHz · {p.mem_mhz} MHz</span>
+                <span class="tval" class:accent={p.stable} class:danger={!p.stable}>{p.bandwidth_gbps.toFixed(0)} GB/s</span>
+                {#if p.min_gbps > 0}<span class="tmin">min {p.min_gbps.toFixed(0)}</span>{/if}
+                <span class="tstatus" class:danger={!p.stable}>{p.stable ? "ok" : "✗ queda"}</span>
+              </div>
+            {/each}
+            {#if memRunning}
+              <div class="tline running">
+                <span class="gutter">»</span>
+                <span class="cursor"></span>
+                <span class="tlead">{memSweep.validation_note ?? "…"}</span>
+              </div>
+            {/if}
+          </div>
         </div>
         {#if memSweep.peak_gbps > 0}
           <p class="point accent">
@@ -726,15 +752,74 @@
   .terminal {
     font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
     font-size: 0.8rem;
-    background: rgba(6, 9, 16, 0.85);
+    background: rgba(6, 9, 16, 0.92);
     border: 1px solid var(--border);
     border-radius: 10px;
-    padding: 0.6rem 0.8rem;
+    overflow: hidden;
+    box-shadow: inset 0 0 0 1px rgba(136, 192, 208, 0.04), 0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+  .term-head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.4rem 0.7rem;
+    background: rgba(136, 192, 208, 0.05);
+    border-bottom: 1px solid var(--border);
+  }
+  .dots {
+    display: inline-flex;
+    gap: 0.32rem;
+  }
+  .dots i {
+    width: 0.62rem;
+    height: 0.62rem;
+    border-radius: 50%;
+    background: var(--nord-dim);
+    opacity: 0.6;
+  }
+  .dots i:nth-child(1) {
+    background: var(--nord-danger);
+  }
+  .dots i:nth-child(2) {
+    background: var(--nord-ember-bright);
+  }
+  .dots i:nth-child(3) {
+    background: var(--nord-aurora);
+  }
+  .term-title {
+    color: var(--nord-mist);
+    font-size: 0.74rem;
+    letter-spacing: 0.04em;
+  }
+  .term-status {
+    margin-left: auto;
+    font-size: 0.68rem;
+    text-transform: lowercase;
+    color: var(--nord-dim);
+    padding: 0.08rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .term-status.live {
+    color: var(--nord-ember-bright);
+    border-color: rgba(235, 203, 139, 0.4);
+    background: rgba(235, 203, 139, 0.08);
+  }
+  .term-body {
     display: flex;
     flex-direction: column;
     gap: 0.1rem;
-    max-height: 360px;
+    padding: 0.55rem 0.7rem;
+    max-height: 340px;
     overflow-y: auto;
+    scroll-behavior: smooth;
+  }
+  .term-body::-webkit-scrollbar {
+    width: 8px;
+  }
+  .term-body::-webkit-scrollbar-thumb {
+    background: rgba(136, 192, 208, 0.18);
+    border-radius: 8px;
   }
   .tline {
     display: flex;
@@ -743,6 +828,15 @@
     padding: 0.12rem 0;
     color: var(--muted);
     font-variant-numeric: tabular-nums;
+    border-radius: 4px;
+  }
+  .gutter {
+    color: var(--nord-dim);
+    opacity: 0.55;
+    min-width: 1.4rem;
+    text-align: right;
+    user-select: none;
+    flex-shrink: 0;
   }
   .tline.base {
     color: var(--nord-dim);
@@ -753,6 +847,20 @@
   .tlead {
     min-width: 16rem;
     color: var(--text);
+  }
+  .cursor {
+    display: inline-block;
+    width: 0.5rem;
+    height: 0.85rem;
+    background: var(--nord-ember-bright);
+    align-self: center;
+    animation: blink 1s steps(2, start) infinite;
+    flex-shrink: 0;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
   }
   .tval {
     min-width: 5rem;
