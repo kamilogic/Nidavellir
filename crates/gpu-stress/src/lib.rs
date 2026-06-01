@@ -796,33 +796,44 @@ impl GpuCtx {
             self.device.poll(wgpu::Maintain::Wait);
         }
 
-        let start = std::time::Instant::now();
-        let mut passes: u64 = 0;
-        while (start.elapsed().as_millis() as u64) < target_ms {
-            let mut enc = self.device.create_command_encoder(&Default::default());
-            {
-                let mut cp = enc.begin_compute_pass(&Default::default());
-                cp.set_pipeline(&pipeline);
-                cp.set_bind_group(0, &bind, &[]);
-                cp.dispatch_workgroups(groups, 1, 1);
+        // Measure several sub-windows and take the PEAK: the memory clock boosts
+        // and throttles dynamically, so a single short window is noisy. The peak
+        // reflects the bandwidth the clock can actually deliver (downward noise =
+        // throttle dips, which we reject); it can't exceed real bandwidth.
+        let window_ms: u64 = 700;
+        let windows = (target_ms / window_ms).max(4);
+        let mut peak_gbps = 0.0f64;
+        for _ in 0..windows {
+            let ws = std::time::Instant::now();
+            let mut passes: u64 = 0;
+            while (ws.elapsed().as_millis() as u64) < window_ms {
+                let mut enc = self.device.create_command_encoder(&Default::default());
+                {
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&pipeline);
+                    cp.set_bind_group(0, &bind, &[]);
+                    cp.dispatch_workgroups(groups, 1, 1);
+                }
+                self.queue.submit(Some(enc.finish()));
+                passes += 1;
+                if passes % 8 == 0 {
+                    self.device.poll(wgpu::Maintain::Wait);
+                }
+                if self.crashed.load(Ordering::SeqCst) {
+                    return 0.0;
+                }
             }
-            self.queue.submit(Some(enc.finish()));
-            passes += 1;
-            if passes % 8 == 0 {
-                self.device.poll(wgpu::Maintain::Wait);
-            }
-            if self.crashed.load(Ordering::SeqCst) {
-                return 0.0;
+            self.device.poll(wgpu::Maintain::Wait);
+            let secs = ws.elapsed().as_secs_f64();
+            if secs > 0.0 {
+                // 8 bytes moved per element per pass (read + write).
+                let gbps = passes as f64 * len as f64 * 8.0 / secs / 1e9;
+                if gbps > peak_gbps {
+                    peak_gbps = gbps;
+                }
             }
         }
-        self.device.poll(wgpu::Maintain::Wait);
-        let secs = start.elapsed().as_secs_f64();
-        if secs <= 0.0 {
-            return 0.0;
-        }
-        // 8 bytes moved per element per pass (read + write).
-        let bytes_moved = passes as f64 * len as f64 * 8.0;
-        bytes_moved / secs / 1e9
+        peak_gbps
     }
 
     /// Read a single u32 from a COPY_SRC buffer.

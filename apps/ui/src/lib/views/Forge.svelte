@@ -244,37 +244,28 @@
         {/if}
       </div>
       {#if memSweep && memSweep.phase !== "idle"}
-        <div class="grid">
-          <article class="tile">
-            <span class="lab">{$t("forge.phase")}</span>
-            <p class="val">{$t("phase." + memSweep.phase)}</p>
-          </article>
-          <article class="tile">
-            <span class="lab">{$t("forge.baseline")}</span>
-            <p class="val">{memSweep.baseline_gbps.toFixed(0)} GB/s</p>
-          </article>
-          <article class="tile">
-            <span class="lab">{$t("forge.bandwidth")}</span>
-            <p class="val accent">{memSweep.current_gbps.toFixed(0)} GB/s</p>
-            <p class="sub">+{memSweep.current_offset_mhz} MHz · {memSweep.current_mem_mhz} MHz</p>
-          </article>
+        <div class="terminal">
+          <div class="tline base">Base · {memSweep.baseline_gbps.toFixed(0)} GB/s</div>
+          {#each memSweep.points as p}
+            <div class="tline">
+              <span class="tlead">+{p.offset_mhz} MHz · {p.mem_mhz} MHz</span>
+              <span class="tval" class:accent={p.stable} class:danger={!p.stable}>{p.bandwidth_gbps.toFixed(0)} GB/s</span>
+              <span class="tstatus" class:danger={!p.stable}>{p.stable ? "Done" : "✗ unstable"}</span>
+            </div>
+          {/each}
+          {#if memRunning}
+            <div class="tline running">
+              <span class="spin">◴</span>
+              <span class="tlead">{memSweep.validation_note ?? "…"}</span>
+            </div>
+          {/if}
         </div>
-        {#if memSweep.points?.length}
-          <ul class="list">
-            {#each memSweep.points as p}
-              <li>
-                <span class="mono">+{p.offset_mhz} MHz · {p.mem_mhz} MHz</span>
-                <span class="mono" class:accent={p.stable} class:danger={!p.stable}>{p.bandwidth_gbps.toFixed(0)} GB/s</span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
         {#if memSweep.peak_gbps > 0}
           <p class="point accent">
             {$t("forge.peakResult", { o: memSweep.peak_offset_mhz, g: memSweep.peak_gbps.toFixed(0) })}
           </p>
-          {#if memSweep.validation_note}<p class="sub">{memSweep.validation_note}</p>{/if}
-          <button class="btn go small" onclick={applyMem}>{$t("forge.applyMem")}</button>
+          {#if !memRunning && memSweep.validation_note}<p class="sub">{memSweep.validation_note}</p>{/if}
+          {#if !memRunning}<button class="btn go small" onclick={applyMem}>{$t("forge.applyMem")}</button>{/if}
         {/if}
       {/if}
     </div>
@@ -672,5 +663,55 @@
     margin: 0.1rem 0 0.4rem;
     font-size: 0.75rem;
     color: var(--nord-dim);
+  }
+  .terminal {
+    font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
+    font-size: 0.8rem;
+    background: rgba(6, 9, 16, 0.85);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.6rem 0.8rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    max-height: 360px;
+    overflow-y: auto;
+  }
+  .tline {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.12rem 0;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .tline.base {
+    color: var(--nord-dim);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.3rem;
+    margin-bottom: 0.2rem;
+  }
+  .tlead {
+    min-width: 16rem;
+    color: var(--text);
+  }
+  .tval {
+    min-width: 5rem;
+    text-align: right;
+  }
+  .tval.accent {
+    color: var(--accent);
+  }
+  .tval.danger,
+  .tstatus.danger {
+    color: var(--nord-danger);
+  }
+  .tstatus {
+    color: var(--nord-aurora);
+    font-size: 0.72rem;
+    opacity: 0.8;
+  }
+  .tline.running {
+    color: var(--nord-ember-bright);
   }
 </style>

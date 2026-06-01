@@ -143,6 +143,12 @@ fn run_mem_sweep(
             break;
         }
 
+        // Publish the running step so the UI shows what's executing now.
+        prog.current_offset_mhz = offset;
+        prog.current_gbps = 0.0;
+        prog.validation_note = Some(format!("Testando +{offset} MHz · integridade (chase 8s)…"));
+        set(&progress, prog.clone());
+
         // Pointer-chase integrity (sensitive to uncorrected errors), then bandwidth.
         // Longer dwell to give marginal errors time to surface at this clock.
         let integ = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(8000))) {
@@ -152,7 +158,11 @@ fn run_mem_sweep(
                 nidavellir_core::gpu_sweep::StabilityResult::Crash
             }
         };
-        let gbps = if crashed { 0.0 } else { ctx.measure_bandwidth_gbps(2000) };
+        if !crashed {
+            prog.validation_note = Some(format!("Testando +{offset} MHz · banda…"));
+            set(&progress, prog.clone());
+        }
+        let gbps = if crashed { 0.0 } else { ctx.measure_bandwidth_gbps(3500) };
         let mem_mhz = mem_clock_mhz();
         let stable = integ.is_stable() && !crashed && gbps > 0.0;
 
