@@ -39,8 +39,14 @@ cascade). Fixing Vcore first means memory is tuned against the final condition.
 
 **Why combined load every step:** in a game the core and memory work at once,
 loading the shared rail + power + thermals. Testing either axis in isolation
-passes clocks that stutter in games. Every dwell runs `run_combined` (ALU +
-pointer-chase simultaneously).
+passes clocks that stutter in games. Every dwell runs `run_combined`, which
+saturates three things simultaneously: **ALU** (shader cores), a
+**bandwidth-streaming VRAM kernel** (memory-controller / DRAM throughput — the
+real current draw through the shared rail, like a game), and a **pointer-chase**
+(memory latency/addressing). A latency-bound pointer-chase alone leaves memory
+util low (~20 %) and under-loads the rail; the bandwidth stream is what makes the
+dwell game-realistic. ALU + chase are known-answer checked; the bandwidth stream
+is load-only.
 
 ## Problems hit → solutions
 

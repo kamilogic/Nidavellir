@@ -745,11 +745,13 @@ impl GpuCtx {
         }
     }
 
-    /// Combined core+memory soak: hammers ALU (core) and the memory subsystem
-    /// (pointer-chase) **at the same time** for ~`target_ms`, loading the shared
-    /// voltage rail / power / thermals like a real game — the condition that
-    /// exposes memory instability a memory-only test misses. Both halves are
-    /// known-answer checked. Returns SilentError on any divergence.
+    /// Combined core+memory soak: hammers ALU (core), a **bandwidth-saturating**
+    /// VRAM stream (memory controller / DRAM throughput), and a pointer-chase
+    /// (memory latency/addressing) **at the same time** for ~`target_ms` —
+    /// loading the shared voltage rail / power / thermals like a real game, the
+    /// condition that exposes instability a single-axis test misses. ALU and
+    /// chase are known-answer checked (SilentError on any divergence); the
+    /// bandwidth stream is load-only.
     pub fn run_combined(&self, target_ms: u64) -> StageReport {
         let start = std::time::Instant::now();
 
@@ -843,7 +845,41 @@ impl GpuCtx {
             ],
         });
 
-        // Interleave ALU + chase so the core and memory are both busy at once.
+        // --- Bandwidth streaming (saturate the memory controller / DRAM, like a
+        // game) --- a large VRAM-resident buffer read+written every dispatch via
+        // a grid-stride loop. This is the heavy *bandwidth* load that pulls real
+        // current through the shared core voltage rail; the pointer-chase above
+        // is latency-bound and alone leaves memory util low. Load-only (the ALU
+        // and chase known-answer checks + device-lost flag detect instability).
+        let bw_bytes = (512u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
+        let bw_n = (bw_bytes / 4) as u32;
+        let bw_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c-bw"), size: (bw_n as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+        });
+        let bw_p = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("c-bw-p"),
+            contents: bytemuck::bytes_of(&Quad { a: bw_n, b: 0, c: 0, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bw_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("c-bw"), source: wgpu::ShaderSource::Wgsl(BW_SHADER.into()),
+        });
+        let bw_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("c-bw"), layout: None, module: &bw_mod, entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let bw_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("c-bw"), layout: &bw_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bw_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bw_p.as_entire_binding() },
+            ],
+        });
+        let bw_groups = bw_n.div_ceil(64).min(65535);
+
+        // Interleave ALU (core) + bandwidth streaming + pointer-chase so the
+        // shader cores AND the memory controller are saturated at once.
         let alu_groups = alu_n.div_ceil(64);
         let chase_groups = lanes.div_ceil(64);
         let mut k: u64 = 0;
@@ -854,6 +890,9 @@ impl GpuCtx {
                 cp.set_pipeline(&alu_pipe);
                 cp.set_bind_group(0, &alu_bind, &[]);
                 cp.dispatch_workgroups(alu_groups, 1, 1);
+                cp.set_pipeline(&bw_pipe);
+                cp.set_bind_group(0, &bw_bind, &[]);
+                cp.dispatch_workgroups(bw_groups, 1, 1);
                 cp.set_pipeline(&chase_pipe);
                 cp.set_bind_group(0, &chase_bind, &[]);
                 cp.dispatch_workgroups(chase_groups, 1, 1);
