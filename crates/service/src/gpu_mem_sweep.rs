@@ -25,6 +25,7 @@ fn idle() -> MemSweepProgress {
         points: Vec::new(),
         peak_offset_mhz: 0,
         peak_gbps: 0.0,
+        validation_note: None,
     }
 }
 
@@ -144,7 +145,7 @@ fn run_mem_sweep(
 
         // Pointer-chase integrity (sensitive to uncorrected errors), then bandwidth.
         // Longer dwell to give marginal errors time to surface at this clock.
-        let integ = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(5000))) {
+        let integ = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(8000))) {
             Ok(r) => r.result,
             Err(_) => {
                 crashed = true;
@@ -197,6 +198,32 @@ fn run_mem_sweep(
         if offset > cap {
             break;
         }
+    }
+
+    // Phase E — arduous soak at the recommended (peak) offset to confirm it.
+    if !crashed && !stop.load(Ordering::SeqCst) && prog.peak_offset_mhz > 0 {
+        prog.validation_note = Some("Validação longa em andamento…".into());
+        set(&progress, prog.clone());
+        let off = prog.peak_offset_mhz;
+        let _ = store.arm_boot_flag(&BootFlag::new(
+            TuningPoint::from_axes([("gpu_mem_offset_mhz", off as i64)]),
+            "gpu_mem_validate",
+        ));
+        let _ = gpu::set_mem_offset_mhz(off);
+        let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(90_000))) {
+            Ok(r) => r.result,
+            Err(_) => {
+                crashed = true;
+                nidavellir_core::gpu_sweep::StabilityResult::Crash
+            }
+        };
+        prog.validation_note = Some(if res.is_stable() {
+            let _ = store.clear_boot_flag();
+            format!("Validado: +{off} MHz estável no soak de 90s — confirme em jogo")
+        } else {
+            "Falhou no soak longo — recue o offset de memória".into()
+        });
+        set(&progress, prog.clone());
     }
 
     let _ = gpu::reset_all();

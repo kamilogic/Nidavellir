@@ -3,7 +3,6 @@
   import { t } from "../i18n.js";
   import VfChart from "../components/VfChart.svelte";
 
-  let progress = $state(null);
   let error = $state(null);
   let timer = $state(null);
   let realCurve = $state(null);
@@ -19,18 +18,8 @@
   const realRunning = $derived(realSweep && SWEEPING.includes(realSweep.phase));
   const memRunning = $derived(memSweep?.running);
 
-  const running = $derived(
-    progress &&
-      ["baseline", "vram_diagnostic", "voltage_bisection", "synthesis"].includes(progress.phase),
-  );
-
-  function captureProgress(r) {
-    progress = r?.data?.type === "GpuSweep" ? r.data : progress;
-  }
-
   async function refresh() {
     try {
-      captureProgress(await serviceCall("GetGpuSweepProgress"));
       const v = await serviceCall("GetGpuValidation");
       validation = v?.data?.type === "GpuValidation" ? v.data : validation;
       const rs = await serviceCall("GetRealSweepProgress");
@@ -53,8 +42,6 @@
     }
   }
 
-  const start = () => call("StartGpuSweep", captureProgress);
-  const stop = () => call("StopGpuSweep", captureProgress);
   const readRealCurve = () =>
     call("GetGpuCurve", (r) => (realCurve = r?.data?.type === "GpuCurve" ? r.data : realCurve));
   const startValidation = () =>
@@ -85,68 +72,9 @@
       <h2>{$t("forge.title")}</h2>
       <p class="lead">{$t("forge.lead")}</p>
     </div>
-    <div class="actions">
-      {#if progress?.simulated}
-        <span class="badge sim">{$t("forge.simulated")}</span>
-      {/if}
-      {#if running}
-        <button class="btn stop" onclick={stop}>{$t("forge.stop")}</button>
-      {:else}
-        <button class="btn go" onclick={start}>{$t("forge.start")}</button>
-      {/if}
-    </div>
   </header>
 
-  {#if progress?.simulated}
-    <p class="note">{$t("forge.simNote")}</p>
-  {/if}
-
   {#if error}<p class="err">{error}</p>{/if}
-
-  {#if progress}
-    <div class="grid">
-      <article class="tile">
-        <span class="lab">{$t("forge.phase")}</span>
-        <p class="val">{$t("phase." + progress.phase)}</p>
-      </article>
-      <article class="tile">
-        <span class="lab">{$t("forge.frequency")}</span>
-        <p class="val">{progress.freq_index} / {progress.total_freqs}</p>
-      </article>
-      <article class="tile">
-        <span class="lab">{$t("forge.testingNow")}</span>
-        <p class="val">
-          {#if progress.current}{progress.current.freq_mhz} MHz @ {progress.current.voltage_mv} mV{:else}—{/if}
-        </p>
-      </article>
-    </div>
-
-    {#if progress.tradeoffs?.length}
-      <div class="section">
-        <h3 class="section-head">{$t("forge.tradeoffs")}</h3>
-        <ul class="list">
-          {#each progress.tradeoffs as tp}
-            <li><span class="mono">{tp.freq_mhz} MHz</span><span class="mono accent">{tp.vmin_mv} mV</span></li>
-          {/each}
-        </ul>
-      </div>
-    {/if}
-
-    {#if progress.profiles}
-      <div class="section">
-        <h3 class="section-head">{$t("forge.profiles")}</h3>
-        <div class="profiles">
-          {#each [progress.profiles.godforge, progress.profiles.brokkrs_best, progress.profiles.deep_calm] as prof}
-            <article class="profile">
-              <h4>{prof.name}</h4>
-              <p class="desc">{prof.description}</p>
-              <p class="point">{prof.point.freq_mhz} MHz @ {prof.point.voltage_mv} mV</p>
-            </article>
-          {/each}
-        </div>
-      </div>
-    {/if}
-  {/if}
 
   <div class="section real">
     <div class="real-head">

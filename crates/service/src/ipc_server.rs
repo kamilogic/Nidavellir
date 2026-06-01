@@ -171,22 +171,6 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             let status = crate::safe_loop_runtime::status_snapshot(&guard.safe_store);
             IpcResponse::success(ResponseData::SafeLoop(status))
         }
-        IpcRequest::StartGpuSweep => {
-            let store = guard.safe_store.clone();
-            let started = guard.gpu_sweep.start(store);
-            if started {
-                IpcResponse::success(ResponseData::GpuSweep(guard.gpu_sweep.progress()))
-            } else {
-                IpcResponse::failure("GPU sweep already running")
-            }
-        }
-        IpcRequest::StopGpuSweep => {
-            guard.gpu_sweep.stop();
-            IpcResponse::success(ResponseData::GpuSweep(guard.gpu_sweep.progress()))
-        }
-        IpcRequest::GetGpuSweepProgress => {
-            IpcResponse::success(ResponseData::GpuSweep(guard.gpu_sweep.progress()))
-        }
         IpcRequest::GetGpuCurve => {
             IpcResponse::success(ResponseData::GpuCurve(crate::gpu_real::read_curve_snapshot()))
         }

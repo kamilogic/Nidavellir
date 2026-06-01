@@ -1,7 +1,6 @@
 mod gpu_mem_sweep;
 mod gpu_real;
 mod gpu_sweep_real;
-mod gpu_sweep_runtime;
 mod ipc_server;
 mod safe_loop_runtime;
 mod sensor_gather;
@@ -15,7 +14,6 @@ use windows_service::define_windows_service;
 use gpu_mem_sweep::MemSweepHandle;
 use gpu_real::GpuValidationHandle;
 use gpu_sweep_real::RealSweepHandle;
-use gpu_sweep_runtime::GpuSweepHandle;
 use nidavellir_core::safe_loop::SafeLoopStore;
 use nidavellir_driver_pawnio::DriverManager;
 
@@ -27,7 +25,6 @@ pub struct AppState {
     pub sensor_engine: nidavellir_core::sensors::SensorEngine,
     pub motherboard: nidavellir_core::detector::MotherboardInfo,
     pub safe_store: SafeLoopStore,
-    pub gpu_sweep: GpuSweepHandle,
     pub gpu_validation: GpuValidationHandle,
     pub real_sweep: RealSweepHandle,
     pub mem_sweep: MemSweepHandle,
@@ -72,7 +69,6 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         sensor_engine: nidavellir_core::sensors::SensorEngine::new(),
         motherboard: hw.motherboard,
         safe_store,
-        gpu_sweep: GpuSweepHandle::default(),
         gpu_validation: GpuValidationHandle::default(),
         real_sweep: RealSweepHandle::default(),
         mem_sweep: MemSweepHandle::default(),

@@ -16,9 +16,6 @@ pub enum IpcRequest {
     GetCapabilityReport,
     GetDriverStatus,
     GetSafeLoopStatus,
-    StartGpuSweep,
-    StopGpuSweep,
-    GetGpuSweepProgress,
     GetGpuCurve,
     StartGpuValidation,
     GetGpuValidation,
@@ -53,6 +50,8 @@ pub struct MemSweepProgress {
     pub points: Vec<MemSweepPoint>,
     pub peak_offset_mhz: i32,
     pub peak_gbps: f32,
+    #[serde(default)]
+    pub validation_note: Option<String>,
 }
 
 /// The live V/F curve read from the GPU via NVAPI (the same data Afterburner's

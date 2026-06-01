@@ -30,9 +30,9 @@ const dict = {
     "nav.safety": "Safety",
     "common.waiting": "Waiting for the service…",
 
-    "forge.title": "Forge — GPU sweep",
+    "forge.title": "GPU Forge",
     "forge.lead":
-      "Maps the minimum stable voltage per frequency by bisecting the stability frontier, detects silent compute errors (not just crashes), and synthesizes the three profiles. Every step goes through the Safe Loop.",
+      "Real GPU tuning on your hardware: read the V/F curve, validate stability (incl. VRAM), find the stable undervolt/OC and the memory bandwidth peak. Detects silent errors, applies a margin, and confirms with a long soak — every step through the Safe Loop.",
     "forge.simulated": "simulated",
     "forge.start": "Start sweep",
     "forge.stop": "Stop",
@@ -103,9 +103,9 @@ const dict = {
     "nav.safety": "Segurança",
     "common.waiting": "Aguardando o serviço…",
 
-    "forge.title": "Forja — sweep de GPU",
+    "forge.title": "Forja de GPU",
     "forge.lead":
-      "Mapeia a voltagem mínima estável por frequência via bisseção da fronteira, detecta erros computacionais silenciosos (não só crashes) e sintetiza os três perfis. Cada passo passa pelo Safe Loop.",
+      "Tuning real de GPU no seu hardware: lê a curva V/F, valida estabilidade (incl. VRAM), acha o undervolt/OC estável e o pico de banda da memória. Detecta erro silencioso, aplica margem e confirma com um soak longo — cada passo pelo Safe Loop.",
     "forge.simulated": "simulado",
     "forge.start": "Iniciar sweep",
     "forge.stop": "Parar",
