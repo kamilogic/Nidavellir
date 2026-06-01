@@ -7,6 +7,8 @@ fn main() {
             println!("bandwidth: {gbps:.1} GB/s");
             let chase = ctx.run_mem_chase(2000);
             println!("chase: {} -> {:?} (mismatches {}, {} ms)", chase.name, chase.result, chase.mismatches, chase.elapsed_ms);
+            let comb = ctx.run_combined(4000);
+            println!("combined: {} -> {:?} (mismatches {}, {} ms)", comb.name, comb.result, comb.mismatches, comb.elapsed_ms);
         }
         Err(e) => eprintln!("erro: {e}"),
     }

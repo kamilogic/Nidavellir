@@ -745,6 +745,152 @@ impl GpuCtx {
         }
     }
 
+    /// Combined core+memory soak: hammers ALU (core) and the memory subsystem
+    /// (pointer-chase) **at the same time** for ~`target_ms`, loading the shared
+    /// voltage rail / power / thermals like a real game — the condition that
+    /// exposes memory instability a memory-only test misses. Both halves are
+    /// known-answer checked. Returns SilentError on any divergence.
+    pub fn run_combined(&self, target_ms: u64) -> StageReport {
+        let start = std::time::Instant::now();
+
+        // --- ALU (core) ---
+        let alu_n: u32 = 1_000_000;
+        let alu_iters: u32 = 400_000;
+        let alu_data = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("c-alu"),
+            contents: bytemuck::cast_slice(&(0..alu_n).collect::<Vec<u32>>()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let alu_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("c-alu-p"),
+            contents: bytemuck::bytes_of(&Params { a: alu_iters, n: alu_n, _pad: [0; 2] }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let alu_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("c-alu"),
+            source: wgpu::ShaderSource::Wgsl(ALU_SHADER.into()),
+        });
+        let alu_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("c-alu"), layout: None, module: &alu_mod, entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let alu_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("c-alu"), layout: &alu_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: alu_data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: alu_params.as_entire_binding() },
+            ],
+        });
+
+        // --- Memory (pointer-chase) ---
+        let clen: u32 = 1 << 24; // 64 MB chain
+        let mask = clen - 1;
+        let lanes: u32 = 65_536;
+        let steps: u32 = 3_072;
+        let chain = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c-chain"), size: (clen as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+        });
+        let cout = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c-out"), size: (lanes as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+        });
+        let cfill_p = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("c-chain-fp"),
+            contents: bytemuck::bytes_of(&Quad { a: clen, b: mask, c: 0, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let cfill_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("c-chain-fill"), source: wgpu::ShaderSource::Wgsl(CHAIN_FILL_SHADER.into()),
+        });
+        let cfill_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("c-chain-fill"), layout: None, module: &cfill_mod, entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let cfill_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("c-chain-fill"), layout: &cfill_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: chain.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cfill_p.as_entire_binding() },
+            ],
+        });
+        {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            { let mut cp = enc.begin_compute_pass(&Default::default());
+              cp.set_pipeline(&cfill_pipe); cp.set_bind_group(0, &cfill_bind, &[]);
+              cp.dispatch_workgroups(clen.div_ceil(64).min(65535), 1, 1); }
+            self.queue.submit(Some(enc.finish()));
+            self.device.poll(wgpu::Maintain::Wait);
+        }
+        let chase_p = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("c-chase-p"),
+            contents: bytemuck::bytes_of(&Quad { a: steps, b: mask, c: lanes, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let chase_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("c-chase"), source: wgpu::ShaderSource::Wgsl(CHASE_SHADER.into()),
+        });
+        let chase_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("c-chase"), layout: None, module: &chase_mod, entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let chase_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("c-chase"), layout: &chase_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: chain.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cout.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: chase_p.as_entire_binding() },
+            ],
+        });
+
+        // Interleave ALU + chase so the core and memory are both busy at once.
+        let alu_groups = alu_n.div_ceil(64);
+        let chase_groups = lanes.div_ceil(64);
+        let mut k: u64 = 0;
+        while (start.elapsed().as_millis() as u64) < target_ms {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&alu_pipe);
+                cp.set_bind_group(0, &alu_bind, &[]);
+                cp.dispatch_workgroups(alu_groups, 1, 1);
+                cp.set_pipeline(&chase_pipe);
+                cp.set_bind_group(0, &chase_bind, &[]);
+                cp.dispatch_workgroups(chase_groups, 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            k += 1;
+            if k % 8 == 0 {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+            if self.crashed.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Verify ALU (lcg^(iters*k)) and chase (affine^steps).
+        let (aa, ac) = lcg_pow((alu_iters as u64).wrapping_mul(k));
+        let alu_exp: Vec<u32> = (0..alu_n).map(|i| aa.wrapping_mul(i).wrapping_add(ac)).collect();
+        let (am, mm) = self.readback_compare(&alu_data, (alu_n as u64) * 4, &alu_exp);
+        let (ca, cc) = affine_pow_mod(steps as u64, mask);
+        let chase_exp: Vec<u32> = (0..lanes)
+            .map(|l| {
+                let s = (l.wrapping_mul(CHAIN_CP).wrapping_add(CHAIN_CQ)) & mask;
+                (ca.wrapping_mul(s).wrapping_add(cc)) & mask
+            })
+            .collect();
+        let (cm, mok) = self.readback_compare(&cout, (lanes as u64) * 4, &chase_exp);
+
+        let mismatches = am.saturating_add(cm);
+        StageReport {
+            name: "Combined (core+mem)".into(),
+            result: self.verdict(mismatches, mm && mok),
+            mismatches,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
     /// Measure sustained memory bandwidth (GB/s) over ~`target_ms` by streaming
     /// a large VRAM buffer (read+write each element). Used to find the GDDR6
     /// *effective-bandwidth peak* — past it, ECC correction eats the gains.

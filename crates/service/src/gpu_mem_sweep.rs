@@ -210,40 +210,49 @@ fn run_mem_sweep(
         }
     }
 
-    // Phase E — arduous soak at the recommended (peak) offset to confirm it.
+    // Phase E — COMBINED core+memory soak with back-off. Memory-only tests pass
+    // clocks that stutter in games (the shared rail isn't loaded). Here we hammer
+    // core + memory together and recede until a clock survives that condition.
     if !crashed && !stop.load(Ordering::SeqCst) && prog.peak_offset_mhz > 0 {
-        prog.validation_note = Some("Validação longa em andamento…".into());
-        set(&progress, prog.clone());
-        let off = prog.peak_offset_mhz;
-        let _ = store.arm_boot_flag(&BootFlag::new(
-            TuningPoint::from_axes([("gpu_mem_offset_mhz", off as i64)]),
-            "gpu_mem_validate",
-        ));
-        let _ = gpu::set_mem_offset_mhz(off);
-        // Errors (chase) + a long bandwidth-consistency window to catch the
-        // *intermittent* dips that cause occasional in-game stutters.
-        let chase = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(45_000))) {
-            Ok(r) => r.result,
-            Err(_) => {
-                crashed = true;
-                nidavellir_core::gpu_sweep::StabilityResult::Crash
+        let mut off = prog.peak_offset_mhz;
+        loop {
+            if off <= 0 {
+                prog.validation_note = Some("Sem offset de memória estável sob carga combinada".into());
+                break;
             }
-        };
-        let (peak, minbw) = if crashed { (0.0, 0.0) } else { ctx.measure_bandwidth_stats(45_000) };
-        let consistency = if peak > 0.0 { minbw / peak } else { 0.0 };
-        prog.validation_note = Some(if crashed {
-            "Travou no soak longo — recue o offset de memória".into()
-        } else if !chase.is_stable() {
-            "Erro de memória no soak longo — recue o offset".into()
-        } else if consistency < 0.96 {
-            format!(
-                "Instável no soak: quedas de banda ({:.0}% consistência = stutters) — recue o offset",
-                consistency * 100.0
-            )
-        } else {
-            let _ = store.clear_boot_flag();
-            format!("Validado: +{off} MHz estável e consistente no soak de 90s — confirme em jogo")
-        });
+            prog.validation_note = Some(format!("Soak combinado (core+mem) em +{off} MHz…"));
+            set(&progress, prog.clone());
+            let _ = store.arm_boot_flag(&BootFlag::new(
+                TuningPoint::from_axes([("gpu_mem_offset_mhz", off as i64)]),
+                "gpu_mem_validate",
+            ));
+            let _ = gpu::set_mem_offset_mhz(off);
+            let comb = match catch_unwind(AssertUnwindSafe(|| ctx.run_combined(40_000))) {
+                Ok(r) => r.result,
+                Err(_) => {
+                    crashed = true;
+                    nidavellir_core::gpu_sweep::StabilityResult::Crash
+                }
+            };
+            let (peak, minbw) = if crashed { (0.0, 0.0) } else { ctx.measure_bandwidth_stats(20_000) };
+            let consistency = if peak > 0.0 { minbw / peak } else { 0.0 };
+
+            if crashed {
+                prog.validation_note = Some("Travou no soak combinado — recue mais".into());
+                break;
+            }
+            if comb.is_stable() && consistency >= 0.96 {
+                let _ = store.clear_boot_flag();
+                prog.peak_offset_mhz = off;
+                prog.validation_note =
+                    Some(format!("Validado: +{off} MHz sob carga combinada core+mem — confirme em jogo"));
+                break;
+            }
+            // Failed under combined load → recede 100 MHz and re-test.
+            info!("mem sweep: +{off} MHz failed combined soak (comb={comb:?}, {:.0}% consist) — receding", consistency * 100.0);
+            prog.peak_offset_mhz = (off - 2 * step).max(0);
+            off -= 2 * step;
+        }
         set(&progress, prog.clone());
     }
 
