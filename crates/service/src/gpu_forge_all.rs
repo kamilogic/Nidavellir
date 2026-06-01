@@ -143,7 +143,7 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
         }
     };
 
-    let ctx = match GpuCtx::new() {
+    let mut ctx = match GpuCtx::new() {
         Ok(c) => c,
         Err(e) => {
             p.log(format!("Falha ao iniciar GPU: {e}"));
@@ -199,7 +199,13 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
                 }
             }
             StabilityResult::Crash => {
-                p.log("   device-lost no core — recuando".into());
+                // Device lost / TDR. The ctx is dead — recover it so the memory
+                // and soak phases run against a live device, not garbage.
+                p.log("   device-lost no core — recuperando GPU e recuando".into());
+                let _ = gpu::set_core_offset_mhz(0);
+                if let Ok(fresh) = GpuCtx::new() {
+                    ctx = fresh;
+                }
                 break;
             }
             StabilityResult::SilentError => break,
@@ -249,6 +255,13 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
                 break;
             }
         } else {
+            // A crash here also kills the device — recover before the soak.
+            if matches!(res, StabilityResult::Crash) {
+                let _ = gpu::set_mem_offset_mhz(0);
+                if let Ok(fresh) = GpuCtx::new() {
+                    ctx = fresh;
+                }
+            }
             break;
         }
     }

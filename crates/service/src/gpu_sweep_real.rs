@@ -162,7 +162,7 @@ fn run_real_sweep(
 
     info!("Real GPU sweep starting (lock-voltage / raise-clock)");
 
-    let ctx = match GpuCtx::new() {
+    let mut ctx = match GpuCtx::new() {
         Ok(c) => c,
         Err(e) => {
             warn!("real sweep: GpuCtx init failed: {e}");
@@ -204,6 +204,14 @@ fn run_real_sweep(
     let mut crashed = false;
     // Best stable (voltage, offset) at the top voltage — the candidate to soak.
     let mut top_candidate: Option<(u32, i32)> = None;
+    // Lowest *real* clock (MHz) ever proven unstable (silent error or device
+    // lost), across all voltages. Climbing clock fails monotonically with the
+    // real boost clock, so once we know a cliff we slow the approach near it to
+    // surface a silent error before a hard TDR.
+    let mut min_unstable_real: Option<u32> = None;
+    // How close (MHz) to a known cliff before we shrink the step.
+    const CLIFF_APPROACH_MHZ: u32 = 75;
+    let fine_step = (q.step_mhz / 3).max(5);
 
     'voltages: for (vi, &v) in q.voltages.iter().enumerate() {
         if stop.load(Ordering::SeqCst) {
@@ -218,6 +226,7 @@ fn run_real_sweep(
 
         let mut best_stable: Option<u32> = None;
         let mut offset = 0i32;
+        let mut step = q.step_mhz;
 
         loop {
             if stop.load(Ordering::SeqCst) {
@@ -256,16 +265,47 @@ fn run_real_sweep(
                     if vi == 0 {
                         top_candidate = Some((v, offset));
                     }
-                    offset += q.step_mhz;
+                    // Near a known cliff? Shrink the step so the next probe is
+                    // more likely to land in the silent-error zone than to TDR.
+                    if let Some(u) = min_unstable_real {
+                        if peak + CLIFF_APPROACH_MHZ >= u {
+                            step = fine_step;
+                        }
+                    }
+                    offset += step;
                     if offset > q.cap_mhz {
                         break;
                     }
                 }
-                StabilityResult::SilentError => break, // cliff (gentle) — back off with margin
+                StabilityResult::SilentError => {
+                    // Gentle cliff — record it and back off with margin.
+                    min_unstable_real =
+                        Some(min_unstable_real.map_or(peak, |u| u.min(peak)));
+                    break;
+                }
                 StabilityResult::Crash => {
-                    warn!("real sweep: device lost at {v}mV +{offset}MHz");
-                    crashed = true;
-                    break 'voltages;
+                    // Hard cliff (device lost / TDR). The ceiling for this
+                    // voltage is the previous stable reading (already in
+                    // best_stable). Do NOT abort the whole sweep: recover the
+                    // GPU device and carry on to the remaining voltages + the
+                    // long validation, so we still deliver a profile.
+                    warn!("real sweep: device lost at {v}mV +{offset}MHz — recovering");
+                    min_unstable_real =
+                        Some(min_unstable_real.map_or(peak, |u| u.min(peak)));
+                    let _ = gpu::set_core_offset_mhz(0);
+                    let _ = gpu::unlock_core_voltage();
+                    match GpuCtx::new() {
+                        Ok(fresh) => {
+                            info!("real sweep: GPU device recovered after TDR");
+                            ctx = fresh;
+                            break; // move on to the next voltage
+                        }
+                        Err(e) => {
+                            warn!("real sweep: device unrecoverable ({e}) — stopping");
+                            crashed = true;
+                            break 'voltages;
+                        }
+                    }
                 }
             }
         }

@@ -52,9 +52,19 @@ pointer-chase simultaneously).
 
 - **Detecting instability before a crash.** Undervolt fails "gently" (silent
   compute errors — caught by known-answer tests *before* a hard hang). Raising
-  the clock fails "hard" (TDR / black screen, no warning). **Mitigations:**
-  longer dwell, stop at first silent error, large margin, and the **Safe Loop**
-  (boot-flag) so a crash recovers and the bad profile is not re-applied.
+  the clock fails "hard" (TDR / device lost, often with **no** silent-error
+  warning — a hung shader, not a wrong number). You cannot always pre-empt a
+  TDR; the goal is to make it rare, informative, and recoverable. **Mitigations:**
+  - **Near-cliff fine stepping:** once we know a cliff from a higher voltage,
+    the clock step shrinks (e.g. 15 → 5 MHz) as we approach it, so the next
+    probe is likelier to land in the silent-error zone than to TDR.
+  - **Device-lost is non-fatal:** a TDR sets the ceiling at the last stable
+    reading, the wgpu device is **recreated**, and the sweep continues with the
+    remaining voltages and the long validation — it never throws away the work
+    it already found, and the pipeline still delivers/persists a profile.
+  - longer dwell, stop at first silent error, large margin, and the **Safe Loop**
+    (boot-flag) so a crash that does reach the driver recovers on reboot and the
+    bad profile is not re-applied.
 
 - **VRAM truncated curve.** NVAPI splits the V/F table into two arrays; reading
   only the first cut the curve at ~943 mV. **Fix:** read both → full 450–1087 mV
