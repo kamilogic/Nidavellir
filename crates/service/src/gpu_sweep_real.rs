@@ -37,10 +37,10 @@ pub struct Quality {
 
 impl Quality {
     pub fn fast() -> Self {
-        Self { passes: 1, step_mhz: 30, margin_mhz: 30, warmup_s: 5, voltages: &[925, 875], cap_mhz: 360 }
+        Self { passes: 1, step_mhz: 30, margin_mhz: 60, warmup_s: 5, voltages: &[925, 875], cap_mhz: 330 }
     }
     pub fn thorough() -> Self {
-        Self { passes: 3, step_mhz: 15, margin_mhz: 45, warmup_s: 12, voltages: &[950, 925, 900, 875], cap_mhz: 420 }
+        Self { passes: 3, step_mhz: 15, margin_mhz: 90, warmup_s: 12, voltages: &[950, 925, 900, 875], cap_mhz: 390 }
     }
 }
 
@@ -149,8 +149,9 @@ fn validate_pass(ctx: &nidavellir_gpu_stress::GpuCtx, passes: u32) -> StabilityR
             _ => Stable,
         }
     }
-    // Dwell scales with quality (passes): longer sustained load catches drift.
-    let ms = 1500u64 * passes.max(1) as u64;
+    // Dwell scales with quality (passes): longer sustained load gives marginal
+    // instability time to surface as a silent error *before* a hard hang.
+    let ms = 2200u64 * passes.max(1) as u64;
     let a = ctx.run_alu("alu", 1_000_000, 1_000_000, ms).result;
     if !a.is_stable() {
         return a;

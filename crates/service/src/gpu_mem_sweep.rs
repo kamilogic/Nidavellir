@@ -143,14 +143,15 @@ fn run_mem_sweep(
         }
 
         // Pointer-chase integrity (sensitive to uncorrected errors), then bandwidth.
-        let integ = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(1500))) {
+        // Longer dwell to give marginal errors time to surface at this clock.
+        let integ = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(5000))) {
             Ok(r) => r.result,
             Err(_) => {
                 crashed = true;
                 nidavellir_core::gpu_sweep::StabilityResult::Crash
             }
         };
-        let gbps = if crashed { 0.0 } else { ctx.measure_bandwidth_gbps(1500) };
+        let gbps = if crashed { 0.0 } else { ctx.measure_bandwidth_gbps(2000) };
         let mem_mhz = mem_clock_mhz();
         let stable = integ.is_stable() && !crashed && gbps > 0.0;
 
