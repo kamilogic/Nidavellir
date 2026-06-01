@@ -36,6 +36,9 @@ fn idle_progress() -> GpuSweepProgress {
         tradeoffs: Vec::new(),
         profiles: None,
         simulated: true,
+        measured_mhz: None,
+        gpu_temp_c: None,
+        last_result: None,
     }
 }
 

@@ -288,7 +288,7 @@ pub enum SweepCommand {
 }
 
 /// Live, serializable progress snapshot for the UI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpuSweepProgress {
     pub phase: SweepPhase,
     pub current: Option<VfPoint>,
@@ -298,6 +298,15 @@ pub struct GpuSweepProgress {
     pub profiles: Option<GpuProfileSet>,
     /// True when running against the simulated tuner (no real hardware writes).
     pub simulated: bool,
+    /// Live measured core clock under load (real sweep only).
+    #[serde(default)]
+    pub measured_mhz: Option<u32>,
+    /// Live measured GPU temperature (real sweep only).
+    #[serde(default)]
+    pub gpu_temp_c: Option<f32>,
+    /// Result of the step currently shown (real sweep only).
+    #[serde(default)]
+    pub last_result: Option<StabilityResult>,
 }
 
 /// The pure sweep step machine: characterizes vmin per target frequency, then
@@ -408,6 +417,9 @@ impl GpuSweepEngine {
             tradeoffs: self.tradeoffs.clone(),
             profiles: self.profiles.clone(),
             simulated: self.simulated,
+            measured_mhz: None,
+            gpu_temp_c: None,
+            last_result: None,
         }
     }
 

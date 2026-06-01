@@ -57,9 +57,9 @@
   const startValidation = () =>
     call("StartGpuValidation", (r) => (validation = r?.data?.type === "GpuValidation" ? r.data : validation));
   const setReal = (r) => (realSweep = r?.data?.type === "GpuSweep" ? r.data : realSweep);
-  const startReal = () => {
+  const startReal = (method) => {
     preflight = false;
-    call("StartRealSweep", setReal);
+    call(method, setReal);
   };
   const stopReal = () => call("StopRealSweep", setReal);
 
@@ -227,14 +227,22 @@
             <p class="val">{$t("phase." + realSweep.phase)}</p>
           </article>
           <article class="tile">
-            <span class="lab">{$t("forge.frequency")}</span>
+            <span class="lab">{$t("forge.voltageIdx")}</span>
             <p class="val">{realSweep.freq_index} / {realSweep.total_freqs}</p>
           </article>
           <article class="tile">
             <span class="lab">{$t("forge.testingNow")}</span>
-            <p class="val">
-              {#if realSweep.current}{realSweep.current.freq_mhz} MHz @ {realSweep.current.voltage_mv} mV{:else}—{/if}
-            </p>
+            {#if realSweep.current}
+              <p class="val" class:accent={realSweep.last_result === "stable"} class:danger={realSweep.last_result && realSweep.last_result !== "stable"}>
+                {realSweep.current.freq_mhz} MHz @ {realSweep.current.voltage_mv} mV
+              </p>
+              <p class="sub">
+                {#if realSweep.gpu_temp_c != null}{$t("forge.tempC", { t: realSweep.gpu_temp_c.toFixed(0) })}{/if}
+                {#if realSweep.last_result} · {$t("stage." + realSweep.last_result)}{/if}
+              </p>
+            {:else}
+              <p class="val">—</p>
+            {/if}
           </article>
         </div>
 
@@ -273,7 +281,8 @@
       <p class="pre-body">{$t("forge.preBody")}</p>
       <div class="pre-actions">
         <button class="btn ghost" onclick={() => (preflight = false)}>{$t("forge.preCancel")}</button>
-        <button class="btn go" onclick={startReal}>{$t("forge.preConfirm")}</button>
+        <button class="btn" onclick={() => startReal("StartRealSweepFast")}>{$t("forge.preFast")}</button>
+        <button class="btn go" onclick={() => startReal("StartRealSweep")}>{$t("forge.preThorough")}</button>
       </div>
     </div>
   </div>

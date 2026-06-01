@@ -64,8 +64,12 @@ const dict = {
     "forge.preTitle": "Before the real sweep",
     "forge.preBody":
       "This writes real voltage/clock to your GPU and pushes toward the stability limit. Brief screen flickers are possible (the driver recovers). It's reversible and protected by the Safe Loop. For best results, close all other programs (games, browsers, overlays) first.",
-    "forge.preConfirm": "Programs closed — start",
     "forge.preCancel": "Cancel",
+    "forge.preFast": "Quick (Bronze)",
+    "forge.preThorough": "Thorough (Gold)",
+    "forge.voltageIdx": "Voltage",
+    "forge.measured": "Measured: {f} MHz @ {v} mV",
+    "forge.tempC": "Temp: {t} °C",
 
     "phase.idle": "Idle",
     "phase.baseline": "Baseline (thermal equilibrium)",
@@ -124,8 +128,12 @@ const dict = {
     "forge.preTitle": "Antes do sweep real",
     "forge.preBody":
       "Isto escreve voltagem/clock reais na sua GPU e empurra em direção ao limite de estabilidade. Pequenos flashes de tela são possíveis (o driver se recupera). É reversível e protegido pelo Safe Loop. Para melhores resultados, feche todos os outros programas (jogos, navegadores, overlays) antes.",
-    "forge.preConfirm": "Programas fechados — iniciar",
     "forge.preCancel": "Cancelar",
+    "forge.preFast": "Rápido (Bronze)",
+    "forge.preThorough": "Longo (Gold)",
+    "forge.voltageIdx": "Tensão",
+    "forge.measured": "Medido: {f} MHz @ {v} mV",
+    "forge.tempC": "Temp: {t} °C",
 
     "phase.idle": "Ocioso",
     "phase.baseline": "Baseline (equilíbrio térmico)",

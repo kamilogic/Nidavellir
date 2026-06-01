@@ -23,6 +23,7 @@ pub enum IpcRequest {
     StartGpuValidation,
     GetGpuValidation,
     StartRealSweep,
+    StartRealSweepFast,
     StopRealSweep,
     GetRealSweepProgress,
 }

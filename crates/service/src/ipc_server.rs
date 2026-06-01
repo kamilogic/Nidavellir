@@ -202,7 +202,15 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         }
         IpcRequest::StartRealSweep => {
             let store = guard.safe_store.clone();
-            if guard.real_sweep.start(store) {
+            if guard.real_sweep.start(store, crate::gpu_sweep_real::Quality::thorough()) {
+                IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
+            } else {
+                IpcResponse::failure("Real sweep already running")
+            }
+        }
+        IpcRequest::StartRealSweepFast => {
+            let store = guard.safe_store.clone();
+            if guard.real_sweep.start(store, crate::gpu_sweep_real::Quality::fast()) {
                 IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
             } else {
                 IpcResponse::failure("Real sweep already running")
