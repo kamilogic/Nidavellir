@@ -123,6 +123,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
+// Fused core+memory kernel: each lane runs heavy LCG rounds (core ALU) AND, in
+// the SAME loop, streams a large VRAM buffer with a read-modify-write (memory
+// bandwidth) — so the shader cores and the memory controller are loaded
+// *simultaneously per invocation*, like a real game shader. (Separate ALU and
+// bandwidth dispatches in one pass run sequentially and don't co-load: the
+// memory dispatch just adds bubbles that lower utilization.) `data[i]` is a
+// pure LCG of its seed (verifiable via jump-ahead); the `buf` RMW is load-only.
+const FUSED_SHADER: &str = r#"
+struct P { iters: u32, n: u32, buf_n: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read_write> data: array<u32>;
+@group(0) @binding(1) var<storage, read_write> buf: array<u32>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= p.n) { return; }
+    var x = data[i];
+    for (var k: u32 = 0u; k < p.iters; k = k + 1u) {
+        x = x * 1664525u + 1013904223u;
+        let idx = (i * 2654435761u + k * 2246822519u) % p.buf_n;
+        buf[idx] = buf[idx] + x;
+    }
+    data[i] = x;
+}
+"#;
+
 // Pointer-chasing chain: chain[i] = (i*CP + CQ) & mask — a permutation of a
 // power-of-two-sized buffer. Following it does data-dependent random reads
 // (memory-latency bound) where ANY uncorrected error sends the chase down a
@@ -755,32 +781,41 @@ impl GpuCtx {
     pub fn run_combined(&self, target_ms: u64) -> StageReport {
         let start = std::time::Instant::now();
 
-        // --- ALU (core) ---
-        let alu_n: u32 = 1_000_000;
-        let alu_iters: u32 = 400_000;
-        let alu_data = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("c-alu"),
-            contents: bytemuck::cast_slice(&(0..alu_n).collect::<Vec<u32>>()),
+        // --- Fused core+memory (ALU + bandwidth in one kernel) ---
+        // Each lane does `fused_iters` LCG rounds (core) and a memory RMW into a
+        // large VRAM buffer each round (bandwidth), co-loading both per dispatch.
+        let fused_n: u32 = 1 << 20; // 1,048,576 lanes
+        let fused_iters: u32 = 512; // LCG + memory RMW per lane per dispatch
+        let buf_bytes = (256u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
+        let buf_n = (buf_bytes / 4) as u32;
+        let fused_data = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("c-fused-data"),
+            contents: bytemuck::cast_slice(&(0..fused_n).collect::<Vec<u32>>()),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
-        let alu_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("c-alu-p"),
-            contents: bytemuck::bytes_of(&Params { a: alu_iters, n: alu_n, _pad: [0; 2] }),
+        let fused_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c-fused-buf"), size: (buf_n as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+        });
+        let fused_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("c-fused-p"),
+            contents: bytemuck::bytes_of(&Quad { a: fused_iters, b: fused_n, c: buf_n, d: 0 }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let alu_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("c-alu"),
-            source: wgpu::ShaderSource::Wgsl(ALU_SHADER.into()),
+            label: Some("c-fused"),
+            source: wgpu::ShaderSource::Wgsl(FUSED_SHADER.into()),
         });
         let alu_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("c-alu"), layout: None, module: &alu_mod, entry_point: "main",
+            label: Some("c-fused"), layout: None, module: &alu_mod, entry_point: "main",
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
         let alu_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("c-alu"), layout: &alu_pipe.get_bind_group_layout(0),
+            label: Some("c-fused"), layout: &alu_pipe.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: alu_data.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: alu_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: fused_data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: fused_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: fused_params.as_entire_binding() },
             ],
         });
 
@@ -845,42 +880,9 @@ impl GpuCtx {
             ],
         });
 
-        // --- Bandwidth streaming (saturate the memory controller / DRAM, like a
-        // game) --- a large VRAM-resident buffer read+written every dispatch via
-        // a grid-stride loop. This is the heavy *bandwidth* load that pulls real
-        // current through the shared core voltage rail; the pointer-chase above
-        // is latency-bound and alone leaves memory util low. Load-only (the ALU
-        // and chase known-answer checks + device-lost flag detect instability).
-        let bw_bytes = (512u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
-        let bw_n = (bw_bytes / 4) as u32;
-        let bw_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c-bw"), size: (bw_n as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
-        });
-        let bw_p = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("c-bw-p"),
-            contents: bytemuck::bytes_of(&Quad { a: bw_n, b: 0, c: 0, d: 0 }),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bw_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("c-bw"), source: wgpu::ShaderSource::Wgsl(BW_SHADER.into()),
-        });
-        let bw_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("c-bw"), layout: None, module: &bw_mod, entry_point: "main",
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        });
-        let bw_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("c-bw"), layout: &bw_pipe.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: bw_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: bw_p.as_entire_binding() },
-            ],
-        });
-        let bw_groups = bw_n.div_ceil(64).min(65535);
-
-        // Interleave ALU (core) + bandwidth streaming + pointer-chase so the
-        // shader cores AND the memory controller are saturated at once.
-        let alu_groups = alu_n.div_ceil(64);
+        // Run the fused core+memory kernel (co-loads cores + DRAM) alongside the
+        // pointer-chase (memory latency/addressing) each iteration.
+        let alu_groups = fused_n.div_ceil(64);
         let chase_groups = lanes.div_ceil(64);
         let mut k: u64 = 0;
         while (start.elapsed().as_millis() as u64) < target_ms {
@@ -890,9 +892,6 @@ impl GpuCtx {
                 cp.set_pipeline(&alu_pipe);
                 cp.set_bind_group(0, &alu_bind, &[]);
                 cp.dispatch_workgroups(alu_groups, 1, 1);
-                cp.set_pipeline(&bw_pipe);
-                cp.set_bind_group(0, &bw_bind, &[]);
-                cp.dispatch_workgroups(bw_groups, 1, 1);
                 cp.set_pipeline(&chase_pipe);
                 cp.set_bind_group(0, &chase_bind, &[]);
                 cp.dispatch_workgroups(chase_groups, 1, 1);
@@ -908,10 +907,10 @@ impl GpuCtx {
         }
         self.device.poll(wgpu::Maintain::Wait);
 
-        // Verify ALU (lcg^(iters*k)) and chase (affine^steps).
-        let (aa, ac) = lcg_pow((alu_iters as u64).wrapping_mul(k));
-        let alu_exp: Vec<u32> = (0..alu_n).map(|i| aa.wrapping_mul(i).wrapping_add(ac)).collect();
-        let (am, mm) = self.readback_compare(&alu_data, (alu_n as u64) * 4, &alu_exp);
+        // Verify fused ALU (lcg^(iters*k)) and chase (affine^steps).
+        let (aa, ac) = lcg_pow((fused_iters as u64).wrapping_mul(k));
+        let alu_exp: Vec<u32> = (0..fused_n).map(|i| aa.wrapping_mul(i).wrapping_add(ac)).collect();
+        let (am, mm) = self.readback_compare(&fused_data, (fused_n as u64) * 4, &alu_exp);
         let (ca, cc) = affine_pow_mod(steps as u64, mask);
         let chase_exp: Vec<u32> = (0..lanes)
             .map(|l| {

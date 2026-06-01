@@ -112,6 +112,25 @@ fn set_progress(progress: &Arc<Mutex<GpuSweepProgress>>, p: GpuSweepProgress) {
     }
 }
 
+/// Recover the GPU context after a TDR / device-lost. The driver needs a few
+/// seconds to reset the adapter; recreating the device immediately fails with
+/// "lost during initialization", so we wait and retry a handful of times.
+#[cfg(windows)]
+fn recover_gpu_ctx() -> Option<nidavellir_gpu_stress::GpuCtx> {
+    use nidavellir_gpu_stress::GpuCtx;
+    for attempt in 1..=6 {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        match GpuCtx::new() {
+            Ok(c) => {
+                info!("real sweep: GPU device recovered after TDR (attempt {attempt})");
+                return Some(c);
+            }
+            Err(e) => warn!("real sweep: recovery attempt {attempt}/6 failed: {e}"),
+        }
+    }
+    None
+}
+
 /// Peak core clock + temperature sampled via NVML while `body` runs (the load).
 #[cfg(windows)]
 fn measure_during<R>(body: impl FnOnce() -> R) -> (R, u32, Option<f32>) {
@@ -294,14 +313,13 @@ fn run_real_sweep(
                         Some(min_unstable_real.map_or(peak, |u| u.min(peak)));
                     let _ = gpu::set_core_offset_mhz(0);
                     let _ = gpu::unlock_core_voltage();
-                    match GpuCtx::new() {
-                        Ok(fresh) => {
-                            info!("real sweep: GPU device recovered after TDR");
+                    match recover_gpu_ctx() {
+                        Some(fresh) => {
                             ctx = fresh;
                             break; // move on to the next voltage
                         }
-                        Err(e) => {
-                            warn!("real sweep: device unrecoverable ({e}) — stopping");
+                        None => {
+                            warn!("real sweep: device unrecoverable after retries — stopping");
                             crashed = true;
                             break 'voltages;
                         }

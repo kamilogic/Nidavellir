@@ -93,6 +93,21 @@ impl P {
     }
 }
 
+/// Recover the GPU context after a TDR. The driver needs a few seconds to
+/// reset; recreating the device immediately fails ("lost during init"), so we
+/// wait and retry a few times.
+#[cfg(windows)]
+fn recover_ctx() -> Option<nidavellir_gpu_stress::GpuCtx> {
+    use nidavellir_gpu_stress::GpuCtx;
+    for _ in 0..6 {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        if let Ok(c) = GpuCtx::new() {
+            return Some(c);
+        }
+    }
+    None
+}
+
 /// Run a combined core+mem load while sampling the peak core clock.
 #[cfg(windows)]
 fn combined_clock(
@@ -203,8 +218,11 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
                 // and soak phases run against a live device, not garbage.
                 p.log("   device-lost no core — recuperando GPU e recuando".into());
                 let _ = gpu::set_core_offset_mhz(0);
-                if let Ok(fresh) = GpuCtx::new() {
+                if let Some(fresh) = recover_ctx() {
                     ctx = fresh;
+                    p.log("   GPU recuperada ✓".into());
+                } else {
+                    p.log("   GPU não recuperou — mantendo stock".into());
                 }
                 break;
             }
@@ -258,7 +276,7 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
             // A crash here also kills the device — recover before the soak.
             if matches!(res, StabilityResult::Crash) {
                 let _ = gpu::set_mem_offset_mhz(0);
-                if let Ok(fresh) = GpuCtx::new() {
+                if let Some(fresh) = recover_ctx() {
                     ctx = fresh;
                 }
             }
