@@ -13,6 +13,7 @@
   let preflight = $state(false);
   let memSweep = $state(null);
   let memPreflight = $state(false);
+  let applied = $state(null);
 
   const SWEEPING = ["baseline", "vram_diagnostic", "voltage_bisection", "synthesis"];
   const realRunning = $derived(realSweep && SWEEPING.includes(realSweep.phase));
@@ -26,6 +27,8 @@
       realSweep = rs?.data?.type === "GpuSweep" ? rs.data : realSweep;
       const ms = await serviceCall("GetMemSweepProgress");
       memSweep = ms?.data?.type === "MemSweep" ? ms.data : memSweep;
+      const ap = await serviceCall("GetAppliedProfile");
+      applied = ap?.data?.type === "GpuApply" ? ap.data : applied;
       error = null;
     } catch (e) {
       error = String(e);
@@ -58,6 +61,11 @@
     call("StartMemSweep", setMem);
   };
   const stopMem = () => call("StopMemSweep", setMem);
+  const setApplied = (r) => (applied = r?.data?.type === "GpuApply" ? r.data : applied);
+  const CORE_APPLY = ["ApplyGodforge", "ApplyBrokkrs", "ApplyDeepCalm"];
+  const applyCore = (i) => call(CORE_APPLY[i], setApplied);
+  const applyMem = () => call("ApplyMemPeak", setApplied);
+  const resetTuning = () => call("ResetGpuTuning", setApplied);
 
   $effect(() => {
     refresh();
@@ -75,6 +83,21 @@
   </header>
 
   {#if error}<p class="err">{error}</p>{/if}
+
+  <div class="applied-bar">
+    <div>
+      <span class="lab">{applied?.label ? $t("forge.appliedNow", { label: applied.label }) : $t("forge.appliedNone")}</span>
+      {#if applied?.core}
+        <span class="applied-detail">{applied.core.freq_mhz} MHz @ {applied.core.voltage_mv} mV</span>
+      {/if}
+      {#if applied?.mem_offset_mhz}
+        <span class="applied-detail">mem +{applied.mem_offset_mhz} MHz</span>
+      {/if}
+      {#if applied?.message}<span class="applied-msg">{applied.message}</span>{/if}
+    </div>
+    <button class="btn small" onclick={resetTuning}>{$t("forge.reset")}</button>
+  </div>
+  <p class="sub apply-hint">{$t("forge.applyHint")}</p>
 
   <div class="section real">
     <div class="real-head">
@@ -195,11 +218,12 @@
         {#if realSweep.profiles}
           <h5 class="section-head">{$t("forge.profiles")}</h5>
           <div class="profiles">
-            {#each [realSweep.profiles.godforge, realSweep.profiles.brokkrs_best, realSweep.profiles.deep_calm] as prof}
+            {#each [realSweep.profiles.godforge, realSweep.profiles.brokkrs_best, realSweep.profiles.deep_calm] as prof, i}
               <article class="profile">
                 <h4>{prof.name}</h4>
                 <p class="desc">{prof.description}</p>
                 <p class="point">{prof.point.freq_mhz} MHz @ {prof.point.voltage_mv} mV</p>
+                <button class="btn go small" onclick={() => applyCore(i)}>{$t("forge.apply")}</button>
               </article>
             {/each}
           </div>
@@ -249,6 +273,8 @@
           <p class="point accent">
             {$t("forge.peakResult", { o: memSweep.peak_offset_mhz, g: memSweep.peak_gbps.toFixed(0) })}
           </p>
+          {#if memSweep.validation_note}<p class="sub">{memSweep.validation_note}</p>{/if}
+          <button class="btn go small" onclick={applyMem}>{$t("forge.applyMem")}</button>
         {/if}
       {/if}
     </div>
@@ -606,5 +632,45 @@
     display: flex;
     justify-content: flex-end;
     gap: 0.6rem;
+  }
+  .btn.small {
+    padding: 0.35rem 0.8rem;
+    font-size: 0.78rem;
+    margin-top: 0.5rem;
+  }
+  .applied-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+    background: rgba(163, 190, 140, 0.08);
+    border: 1px solid rgba(163, 190, 140, 0.3);
+    border-radius: 10px;
+    padding: 0.6rem 0.9rem;
+  }
+  .applied-bar .lab {
+    margin: 0;
+    color: var(--accent);
+    letter-spacing: normal;
+    text-transform: none;
+    font-size: 0.9rem;
+  }
+  .applied-detail {
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+    font-size: 0.85rem;
+    margin-left: 0.6rem;
+  }
+  .applied-msg {
+    display: block;
+    color: var(--muted);
+    font-size: 0.78rem;
+    margin-top: 0.2rem;
+  }
+  .apply-hint {
+    margin: 0.1rem 0 0.4rem;
+    font-size: 0.75rem;
+    color: var(--nord-dim);
   }
 </style>

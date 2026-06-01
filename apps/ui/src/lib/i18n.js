@@ -79,6 +79,12 @@ const dict = {
     "forge.peakResult": "Bandwidth peak: +{o} MHz → {g} GB/s",
     "forge.memPreBody":
       "This writes the real memory clock and pushes toward the limit (artifacts/flicker possible; reversible, Safe Loop protected). It stops at the bandwidth peak — past it, GDDR6 error-correction reduces real throughput, so more MHz is pointless. Close other programs first.",
+    "forge.apply": "Apply",
+    "forge.applyMem": "Apply mem peak",
+    "forge.reset": "Reset to stock",
+    "forge.appliedNow": "Applied: {label}",
+    "forge.appliedNone": "Nothing applied (stock)",
+    "forge.applyHint": "Applied profiles are re-applied automatically on every boot (Safe Loop protected).",
 
     "phase.idle": "Idle",
     "phase.baseline": "Baseline (thermal equilibrium)",
@@ -152,6 +158,12 @@ const dict = {
     "forge.peakResult": "Pico de banda: +{o} MHz → {g} GB/s",
     "forge.memPreBody":
       "Isto escreve o clock real da memória e empurra até o limite (artefatos/flicker possíveis; reversível, protegido pelo Safe Loop). Para no pico de banda — depois dele, a correção de erro da GDDR6 reduz o throughput real, então mais MHz é inútil. Feche os outros programas antes.",
+    "forge.apply": "Aplicar",
+    "forge.applyMem": "Aplicar pico de mem",
+    "forge.reset": "Voltar ao stock",
+    "forge.appliedNow": "Aplicado: {label}",
+    "forge.appliedNone": "Nada aplicado (stock)",
+    "forge.applyHint": "Perfis aplicados são reaplicados automaticamente a cada boot (protegido pelo Safe Loop).",
 
     "phase.idle": "Ocioso",
     "phase.baseline": "Baseline (equilíbrio térmico)",

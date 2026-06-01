@@ -1,3 +1,4 @@
+mod gpu_apply;
 mod gpu_mem_sweep;
 mod gpu_real;
 mod gpu_sweep_real;
@@ -62,6 +63,9 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     let safe_store = SafeLoopStore::system();
     safe_loop_runtime::run_startup_recovery(&safe_store);
     safe_loop_runtime::spawn_heartbeat(safe_store.clone());
+    // Re-apply the persisted GPU profile (volatile offsets) unless a prior
+    // crash/Safe Mode says not to.
+    gpu_apply::reapply_on_boot(&safe_store);
 
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {

@@ -139,7 +139,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         Err(e) => return IpcResponse::failure(format!("State lock poisoned: {e}")),
     };
 
-    match request {
+    match &request {
         IpcRequest::Ping => IpcResponse::success(ResponseData::Pong),
         IpcRequest::DetectHardware => {
             let mut hw = nidavellir_core::detect_hardware();
@@ -222,6 +222,69 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetMemSweepProgress => {
             IpcResponse::success(ResponseData::MemSweep(guard.mem_sweep.progress()))
         }
+        IpcRequest::ApplyGodforge | IpcRequest::ApplyBrokkrs | IpcRequest::ApplyDeepCalm => {
+            let profiles = guard.real_sweep.progress().profiles;
+            let chosen = profiles.as_ref().map(|p| match &request {
+                IpcRequest::ApplyBrokkrs => (&p.brokkrs_best.name, p.brokkrs_best.point),
+                IpcRequest::ApplyDeepCalm => (&p.deep_calm.name, p.deep_calm.point),
+                _ => (&p.godforge.name, p.godforge.point),
+            });
+            match chosen {
+                Some((name, point)) => {
+                    let mut ap = crate::gpu_apply::load_applied().unwrap_or_default();
+                    ap.label = name.clone();
+                    ap.core = Some(point);
+                    let msg = match crate::gpu_apply::apply_and_persist(
+                        ap.label.clone(), ap.core, ap.mem_offset_mhz, &guard.safe_store,
+                    ) {
+                        Ok(()) => format!("Applied {} ({} MHz @ {} mV)", name, point.freq_mhz, point.voltage_mv),
+                        Err(e) => format!("Apply failed: {e}"),
+                    };
+                    IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+                }
+                None => IpcResponse::failure("Run the core sweep first"),
+            }
+        }
+        IpcRequest::ApplyMemPeak => {
+            let peak = guard.mem_sweep.progress().peak_offset_mhz;
+            if peak <= 0 {
+                IpcResponse::failure("Run the memory sweep first")
+            } else {
+                let mut ap = crate::gpu_apply::load_applied().unwrap_or_default();
+                ap.mem_offset_mhz = Some(peak);
+                if ap.label.is_empty() {
+                    ap.label = "Custom".into();
+                }
+                let msg = match crate::gpu_apply::apply_and_persist(
+                    ap.label.clone(), ap.core, ap.mem_offset_mhz, &guard.safe_store,
+                ) {
+                    Ok(()) => format!("Applied memory +{peak} MHz"),
+                    Err(e) => format!("Apply failed: {e}"),
+                };
+                IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+            }
+        }
+        IpcRequest::ResetGpuTuning => {
+            let msg = match crate::gpu_apply::reset(&guard.safe_store) {
+                Ok(()) => "Reset to stock".to_string(),
+                Err(e) => format!("Reset failed: {e}"),
+            };
+            IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+        }
+        IpcRequest::GetAppliedProfile => {
+            IpcResponse::success(ResponseData::GpuApply(applied_status(String::new())))
+        }
+    }
+}
+
+/// Build the apply-status payload from the persisted profile.
+fn applied_status(message: String) -> nidavellir_core::ipc::GpuApplyStatus {
+    let ap = crate::gpu_apply::load_applied().unwrap_or_default();
+    nidavellir_core::ipc::GpuApplyStatus {
+        label: if ap.label.is_empty() { None } else { Some(ap.label) },
+        core: ap.core,
+        mem_offset_mhz: ap.mem_offset_mhz,
+        message,
     }
 }
 

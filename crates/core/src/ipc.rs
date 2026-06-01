@@ -26,6 +26,21 @@ pub enum IpcRequest {
     StartMemSweep,
     StopMemSweep,
     GetMemSweepProgress,
+    ApplyGodforge,
+    ApplyBrokkrs,
+    ApplyDeepCalm,
+    ApplyMemPeak,
+    ResetGpuTuning,
+    GetAppliedProfile,
+}
+
+/// The GPU profile currently applied/persisted, plus the last action's message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuApplyStatus {
+    pub label: Option<String>,
+    pub core: Option<VfPoint>,
+    pub mem_offset_mhz: Option<i32>,
+    pub message: String,
 }
 
 /// One step of the memory sweep: a clock offset with its measured effective
@@ -123,6 +138,7 @@ pub enum ResponseData {
     GpuCurve(GpuCurveSnapshot),
     GpuValidation(GpuValidationStatus),
     MemSweep(MemSweepProgress),
+    GpuApply(GpuApplyStatus),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

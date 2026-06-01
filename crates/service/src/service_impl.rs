@@ -47,6 +47,7 @@ pub fn run_service() -> windows_service::Result<()> {
     let safe_store = nidavellir_core::safe_loop::SafeLoopStore::system();
     crate::safe_loop_runtime::run_startup_recovery(&safe_store);
     crate::safe_loop_runtime::spawn_heartbeat(safe_store.clone());
+    crate::gpu_apply::reapply_on_boot(&safe_store);
 
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {
