@@ -17,6 +17,32 @@ pub struct NvmlGpuReading {
     pub quality: SensorQuality,
 }
 
+/// Hard-cap the GPU core (graphics) clock at `max_mhz` via NVML locked clocks,
+/// so the boost curve is **flat after the validated limit**: the GPU can never
+/// clock above the point we proved stable, regardless of how much voltage is
+/// available. `min` is left low so it still downclocks at idle. Driver-level and
+/// independent of the V/F curve — the reliable way to flatten the top end.
+pub fn lock_core_clock_max_mhz(max_mhz: u32) -> Result<(), String> {
+    use nvml_wrapper::enums::device::GpuLockedClocksSetting;
+    let nvml = nvml_wrapper::Nvml::init().map_err(|e| format!("NVML init: {e}"))?;
+    let mut device = nvml.device_by_index(0).map_err(|e| format!("NVML device: {e}"))?;
+    device
+        .set_gpu_locked_clocks(GpuLockedClocksSetting::Numeric {
+            min_clock_mhz: 210,
+            max_clock_mhz: max_mhz,
+        })
+        .map_err(|e| format!("set_gpu_locked_clocks: {e}"))
+}
+
+/// Release the core clock cap (back to the stock boost ceiling).
+pub fn reset_core_clock_lock() -> Result<(), String> {
+    let nvml = nvml_wrapper::Nvml::init().map_err(|e| format!("NVML init: {e}"))?;
+    let mut device = nvml.device_by_index(0).map_err(|e| format!("NVML device: {e}"))?;
+    device
+        .reset_gpu_locked_clocks()
+        .map_err(|e| format!("reset_gpu_locked_clocks: {e}"))
+}
+
 pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
     let nvml = match nvml_wrapper::Nvml::init() {
         Ok(n) => n,

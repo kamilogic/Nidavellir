@@ -50,14 +50,23 @@ fn curve_freq_at(voltage_mv: u32) -> Option<u32> {
         .map(|p| p.freq_mhz)
 }
 
-/// Realize a core V/F point: lock the voltage and offset the clock so the GPU
-/// runs `point.freq_mhz` at `point.voltage_mv`.
+/// Realize a core V/F point: lock the voltage, offset the clock so the GPU runs
+/// `point.freq_mhz` at `point.voltage_mv`, **and hard-cap the max clock at that
+/// frequency** so the curve is flat after the validated limit — the GPU can
+/// never boost to a higher (unvalidated) freq/voltage point. The cap is the
+/// reliable flatten; the voltage lock pins the operating point we validated.
 #[cfg(windows)]
 pub fn apply_core(point: VfPoint) -> Result<(), String> {
     let base = curve_freq_at(point.voltage_mv).unwrap_or(point.freq_mhz);
     let offset = (point.freq_mhz as i64 - base as i64).clamp(-300, 400) as i32;
     nidavellir_gpu_nvapi::lock_core_voltage_mv(point.voltage_mv)?;
-    nidavellir_gpu_nvapi::set_core_offset_mhz(offset)
+    nidavellir_gpu_nvapi::set_core_offset_mhz(offset)?;
+    // Flatten the top of the curve at the validated frequency. Best-effort: if
+    // the driver rejects the lock the voltage lock + offset still clamp us.
+    if let Err(e) = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(point.freq_mhz) {
+        warn!("core clock cap at {} MHz failed (continuing): {e}", point.freq_mhz);
+    }
+    Ok(())
 }
 
 /// Apply a profile (core point and/or memory offset) and persist it. Arms the
@@ -103,6 +112,7 @@ pub fn apply_and_persist(
 pub fn reset(store: &SafeLoopStore) -> Result<(), String> {
     clear_applied();
     let _ = store.clear_boot_flag();
+    let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
     nidavellir_gpu_nvapi::reset_all()
 }
 
