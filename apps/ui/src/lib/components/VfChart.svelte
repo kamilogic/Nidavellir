@@ -42,6 +42,9 @@
   const dot = $derived(
     plateau && inDomain(plateau) ? { cx: sx(plateau.voltage_mv), cy: sy(plateau.freq_mhz) } : null,
   );
+
+  // MSI-style guide lines + axis value boxes for the hovered point.
+  let hovered = $state(null);
 </script>
 
 <svg class="vfchart" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Voltage/Frequency curve">
@@ -62,15 +65,43 @@
     <path class="curve-line" d={path} />
   {/if}
 
-  <!-- Actual curve data points; hover shows the value -->
+  <!-- Guide lines + axis value boxes for the hovered point (MSI-style) -->
+  {#if hovered}
+    {@const hx = sx(hovered.voltage_mv)}
+    {@const hy = sy(hovered.freq_mhz)}
+    <line class="guide" x1={hx} y1={hy} x2={hx} y2={H - padB} />
+    <line class="guide" x1={padL} y1={hy} x2={hx} y2={hy} />
+    <rect class="axbox" x={hx - 22} y={H - padB + 2} width="44" height="15" rx="3" />
+    <text class="axval" x={hx} y={H - padB + 13} text-anchor="middle">{hovered.voltage_mv}</text>
+    <rect class="axbox" x={2} y={hy - 8} width="48" height="15" rx="3" />
+    <text class="axval" x={26} y={hy + 3} text-anchor="middle">{hovered.freq_mhz}</text>
+  {/if}
+
+  <!-- Actual curve data points; hover shows the value + guides -->
   {#each pts as p}
-    <circle class="pt" cx={sx(p.voltage_mv)} cy={sy(p.freq_mhz)} r="2.6">
+    <circle
+      class="pt"
+      cx={sx(p.voltage_mv)}
+      cy={sy(p.freq_mhz)}
+      r="2.6"
+      role="presentation"
+      onmouseenter={() => (hovered = p)}
+      onmouseleave={() => (hovered = null)}
+    >
       <title>{p.freq_mhz} MHz @ {p.voltage_mv} mV</title>
     </circle>
   {/each}
 
   {#if dot}
-    <circle class="plateau-dot" cx={dot.cx} cy={dot.cy} r="5">
+    <circle
+      class="plateau-dot"
+      cx={dot.cx}
+      cy={dot.cy}
+      r="5"
+      role="presentation"
+      onmouseenter={() => (hovered = plateau)}
+      onmouseleave={() => (hovered = null)}
+    >
       <title>Plateau: {plateau.freq_mhz} MHz @ {plateau.voltage_mv} mV</title>
     </circle>
   {/if}
@@ -127,5 +158,20 @@
     fill: var(--nord-ember-bright);
     stroke: #0a101c;
     stroke-width: 1.5;
+  }
+  .guide {
+    stroke: var(--nord-frost-bright);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+    opacity: 0.7;
+  }
+  .axbox {
+    fill: var(--nord-frost-bright);
+  }
+  .axval {
+    fill: #0a101c;
+    font-size: 10px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
   }
 </style>

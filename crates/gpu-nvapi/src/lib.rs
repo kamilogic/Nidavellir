@@ -49,16 +49,25 @@ pub fn read_curve() -> Result<GpuCurve, String> {
         .vfp_curve(mask.mask)
         .map_err(|e| format!("vfp_curve failed: {e:?}"))?;
 
-    let points = curve
+    // The crate splits the (all-graphics) VF table into two arrays; both are
+    // core V/F points for these cards, so read both or the curve is truncated.
+    // `.0` of both Kilohertz2 and Kilohertz is kHz here (Display divides by
+    // 1000); read the field directly to avoid the From<Kilohertz2> halving.
+    let mut points: Vec<VfCurvePoint> = curve
         .graphics
         .iter()
-        .map(|(_, e)| VfCurvePoint {
-            voltage_mv: e.voltage.0 / 1000,
-            // Kilohertz2's `.0` is kHz here (its Display divides by 1000); the
-            // From<Kilohertz2> conversion halves, so read the field directly.
-            freq_mhz: e.frequency.0 / 1000,
-        })
+        .map(|(_, e)| VfCurvePoint { voltage_mv: e.voltage.0 / 1000, freq_mhz: e.frequency.0 / 1000 })
         .collect();
+    points.extend(
+        curve
+            .memory
+            .iter()
+            .map(|(_, e)| VfCurvePoint { voltage_mv: e.voltage.0 / 1000, freq_mhz: e.frequency.0 / 1000 })
+            // Guard against a card that truly reports memory clocks here.
+            .filter(|p| p.freq_mhz < 4000),
+    );
+    points.sort_by_key(|p| p.voltage_mv);
+    points.dedup();
 
     Ok(GpuCurve { name, points })
 }
@@ -66,6 +75,63 @@ pub fn read_curve() -> Result<GpuCurve, String> {
 #[cfg(not(windows))]
 pub fn read_curve() -> Result<GpuCurve, String> {
     Err("NVAPI is Windows-only".into())
+}
+
+/// Apply a core clock offset (MHz) to P0 graphics. Reversible (offset 0 = stock).
+#[cfg(windows)]
+pub fn set_core_offset_mhz(mhz: i32) -> Result<(), String> {
+    let gpu = first_gpu()?;
+    gpu.set_pstates(std::iter::once((
+        nvapi::PState::P0,
+        nvapi::ClockDomain::Graphics,
+        nvapi::KilohertzDelta(mhz * 1000),
+    )))
+    .map_err(|e| format!("set_pstates failed: {e:?}"))
+}
+
+/// Lock the core voltage to `mv` (the GPU runs at the curve frequency for that
+/// voltage). Reversible via [`unlock_core_voltage`].
+#[cfg(windows)]
+pub fn lock_core_voltage_mv(mv: u32) -> Result<(), String> {
+    let gpu = first_gpu()?;
+    gpu.set_vfp_locks(std::iter::once((0usize, Some(nvapi::Microvolts(mv * 1000)))))
+        .map_err(|e| format!("set_vfp_locks failed: {e:?}"))
+}
+
+/// Release any core voltage lock (back to the dynamic curve).
+#[cfg(windows)]
+pub fn unlock_core_voltage() -> Result<(), String> {
+    let gpu = first_gpu()?;
+    gpu.set_vfp_locks(std::iter::once((0usize, None)))
+        .map_err(|e| format!("set_vfp_locks(None) failed: {e:?}"))
+}
+
+/// Read the current core voltage in mV (parsed from NVAPI's formatted value).
+#[cfg(windows)]
+pub fn read_core_voltage_mv() -> Option<u32> {
+    let gpu = first_gpu().ok()?;
+    let v = gpu.core_voltage().ok()?;
+    // Displays as e.g. "875 mV"; take the leading number.
+    let s = format!("{v:?}");
+    s.split_whitespace().next()?.parse::<f32>().ok().map(|x| x as u32)
+}
+
+/// Full reset: unlock voltage and clear the clock offset.
+#[cfg(windows)]
+pub fn reset_all() -> Result<(), String> {
+    let a = unlock_core_voltage();
+    let b = set_core_offset_mhz(0);
+    a.and(b)
+}
+
+#[cfg(windows)]
+fn first_gpu() -> Result<nvapi::PhysicalGpu, String> {
+    nvapi::initialize().map_err(|e| format!("NvAPI_Initialize failed: {e:?}"))?;
+    nvapi::PhysicalGpu::enumerate()
+        .map_err(|e| format!("enumerate failed: {e:?}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no NVIDIA GPU found".to_string())
 }
 
 /// Count of NVIDIA GPUs (binding sanity check).
