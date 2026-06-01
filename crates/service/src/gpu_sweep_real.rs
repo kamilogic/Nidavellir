@@ -142,23 +142,11 @@ fn measure_during<R>(body: impl FnOnce() -> R) -> (R, u32, Option<f32>) {
 
 #[cfg(windows)]
 fn validate_pass(ctx: &nidavellir_gpu_stress::GpuCtx, passes: u32) -> StabilityResult {
-    fn worst(a: StabilityResult, b: StabilityResult) -> StabilityResult {
-        use StabilityResult::*;
-        match (a, b) {
-            (Crash, _) | (_, Crash) => Crash,
-            (SilentError, _) | (_, SilentError) => SilentError,
-            _ => Stable,
-        }
-    }
-    // Dwell scales with quality (passes): longer sustained load gives marginal
-    // instability time to surface as a silent error *before* a hard hang.
-    let ms = 2200u64 * passes.max(1) as u64;
-    let a = ctx.run_alu("alu", 1_000_000, 1_000_000, ms).result;
-    if !a.is_stable() {
-        return a;
-    }
-    let m = ctx.run_memory("mem", 262_144, 2_048, ms).result;
-    worst(a, m)
+    // Combined core+memory load each dwell — realistic (shared voltage rail,
+    // power, thermals) like a game. Dwell scales with quality so marginal
+    // instability surfaces as a silent error before a hard hang.
+    let ms = 2500u64 * passes.max(1) as u64;
+    ctx.run_combined(ms).result
 }
 
 #[cfg(windows)]
@@ -362,25 +350,9 @@ fn run_real_sweep(
     info!("Real GPU sweep finished (crashed={crashed})");
 }
 
-/// Long, hard confirmation soak for the chosen profile (Phase E).
+/// Long, hard confirmation soak for the chosen profile (Phase E) — combined
+/// core+memory load, like sustained gaming.
 #[cfg(windows)]
 fn arduous_validate(ctx: &nidavellir_gpu_stress::GpuCtx) -> StabilityResult {
-    fn worst(a: StabilityResult, b: StabilityResult) -> StabilityResult {
-        use StabilityResult::*;
-        match (a, b) {
-            (Crash, _) | (_, Crash) => Crash,
-            (SilentError, _) | (_, SilentError) => SilentError,
-            _ => Stable,
-        }
-    }
-    let a = ctx.run_alu("soak-alu", 1_000_000, 1_000_000, 30_000).result;
-    if !a.is_stable() {
-        return a;
-    }
-    let m = ctx.run_memory("soak-mem", 262_144, 2_048, 20_000).result;
-    if !m.is_stable() {
-        return m;
-    }
-    let c = ctx.run_mem_chase(15_000).result;
-    worst(worst(a, m), c)
+    ctx.run_combined(60_000).result
 }
