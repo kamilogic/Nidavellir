@@ -191,6 +191,57 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// Real RENDER-pipeline stress (not compute): a heavy fragment shader over many
+// overlapping instanced triangles (overdraw → raster + ROP + TMU + fragment ALU,
+// the game path compute never touches). The output is a deterministic function
+// of pixel position + instance, so a stable GPU renders the SAME frame every
+// time; a diverging frame checksum is a silent error before a hard crash.
+const RENDER_SHADER: &str = r#"
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) seed: f32 };
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    let a = f32(ii) * 0.137;
+    let s = sin(a); let c = cos(a);
+    let v = p[vi];
+    let r = vec2<f32>(v.x * c - v.y * s, v.x * s + v.y * c);
+    var o: VOut;
+    o.pos = vec4<f32>(r * 0.999, 0.0, 1.0);
+    o.uv = (v + vec2<f32>(1.0, 1.0)) * 0.5;
+    o.seed = f32(ii);
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    var x = in.uv.x * 64.0 + in.seed;
+    var y = in.uv.y * 64.0 - in.seed;
+    var acc = 0.0;
+    for (var k = 0; k < 320; k = k + 1) {
+        acc = acc + sin(x) * cos(y) + tanh(x * 0.01);
+        x = fma(x, 1.0001, 0.013);
+        y = fma(y, 0.9997, 0.017);
+    }
+    let v = fract(abs(acc) * 0.00137);
+    return vec4<f32>(v, fract(v * 7.0), fract(v * 13.0), 1.0);
+}
+"#;
+
+// Sum every texel (as u32) into one atomic — a whole-frame checksum read back as
+// 4 bytes, so frame-to-frame determinism is cheap to verify.
+const REDUCE_SHADER: &str = r#"
+struct P { n: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read> buf: array<u32>;
+@group(0) @binding(1) var<storage, read_write> res: atomic<u32>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * 64u;
+    var i = g.x; var acc = 0u;
+    loop { if (i >= p.n) { break; } acc = acc + buf[i]; i = i + stride; }
+    atomicAdd(&res, acc);
+}
+"#;
+
 // VRAM integrity: write a deterministic pattern, then verify it bit-for-bit,
 // counting mismatches on the GPU (only the count is read back).
 const VRAM_PATTERN_FN: &str = r#"
@@ -931,6 +982,145 @@ impl GpuCtx {
             name: "Combined (core+mem)".into(),
             result: self.verdict(mismatches, mm && mok),
             mismatches,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// Real graphics-pipeline stress with a frame-determinism check. Renders a
+    /// heavy, deterministic instanced scene (overdraw + fragment ALU) to an
+    /// offscreen target for ~`target_ms`, checksumming the framebuffer ~4×/s. A
+    /// stable GPU yields an identical checksum every time; a divergence is a
+    /// SilentError, a device-lost is a Crash. Closer to a game than any compute
+    /// test (raster + ROP + fragment units), so it catches instability that
+    /// compute-only validation passes.
+    pub fn run_render_stress(&self, target_ms: u64) -> StageReport {
+        let start = std::time::Instant::now();
+        const DIM: u32 = 1024; // 1024*4 = 4096 B/row (256-aligned for copy)
+        const INSTANCES: u32 = 64; // full-screen triangles → heavy overdraw
+
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("render-target"),
+            size: wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("render"), source: wgpu::ShaderSource::Wgsl(RENDER_SHADER.into()),
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("render"), layout: None,
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs", buffers: &[], compilation_options: Default::default() },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader, entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+        });
+
+        // Readback: copy the frame to a buffer, reduce to one checksum u32.
+        let px_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render-px"), size: (DIM as u64) * (DIM as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        let sum_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render-sum"), size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        let n = DIM * DIM;
+        let red_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("render-rp"), contents: bytemuck::bytes_of(&Quad { a: n, b: 0, c: 0, d: 0 }), usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let red_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("reduce"), source: wgpu::ShaderSource::Wgsl(REDUCE_SHADER.into()),
+        });
+        let red_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("reduce"), layout: None, module: &red_mod, entry_point: "main", compilation_options: Default::default(),
+        });
+        let red_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("reduce"), layout: &red_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: px_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: sum_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: red_params.as_entire_binding() },
+            ],
+        });
+
+        let mut reference: Option<u32> = None;
+        let mut diverged = false;
+        let mut last_check = std::time::Instant::now();
+
+        while (start.elapsed().as_millis() as u64) < target_ms {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("render"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view, resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                });
+                rp.set_pipeline(&pipeline);
+                rp.draw(0..3, 0..INSTANCES);
+            }
+            self.queue.submit(Some(enc.finish()));
+
+            if self.crashed.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if last_check.elapsed().as_millis() >= 250 {
+                last_check = std::time::Instant::now();
+                let mut enc = self.device.create_command_encoder(&Default::default());
+                enc.copy_texture_to_buffer(
+                    wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::ImageCopyBuffer { buffer: &px_buf, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(DIM * 4), rows_per_image: Some(DIM) } },
+                    wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
+                );
+                enc.clear_buffer(&sum_buf, 0, None);
+                {
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&red_pipe); cp.set_bind_group(0, &red_bind, &[]);
+                    cp.dispatch_workgroups(256, 1, 1);
+                }
+                self.queue.submit(Some(enc.finish()));
+                self.device.poll(wgpu::Maintain::Wait);
+                let sum = self.read_u32(&sum_buf);
+                match reference {
+                    None => reference = Some(sum),
+                    Some(r) => {
+                        if sum != r {
+                            diverged = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            self.device.poll(wgpu::Maintain::Wait);
+        }
+
+        let result = if self.crashed.load(Ordering::SeqCst) {
+            StabilityResult::Crash
+        } else if diverged {
+            StabilityResult::SilentError
+        } else {
+            StabilityResult::Stable
+        };
+        StageReport {
+            name: "Render".into(),
+            result,
+            mismatches: u32::from(diverged),
             elapsed_ms: start.elapsed().as_millis() as u64,
         }
     }
