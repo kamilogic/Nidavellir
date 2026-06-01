@@ -260,10 +260,22 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
         } else {
             ctx.measure_bandwidth_stats(3000)
         };
-        let consistent = peak > 0.0 && minbw / peak >= 0.93;
-        let ok = res.is_stable() && consistent;
+        let consistent = peak > 0.0 && minbw / peak >= 0.95;
+        // Strict bit-error gate: a too-high mem clock can keep bandwidth looking
+        // fine (GDDR6 link CRC masks the errors) while silently corrupting data.
+        // Verify integrity at this clock — any mismatch fails the offset.
+        let integ = if matches!(res, StabilityResult::Crash) {
+            StabilityResult::Crash
+        } else {
+            match catch_unwind(AssertUnwindSafe(|| ctx.run_vram_check(2 * 1024 * 1024 * 1024, 1))) {
+                Ok(r) => r.result,
+                Err(_) => StabilityResult::Crash,
+            }
+        };
+        let ok = res.is_stable() && integ.is_stable() && consistent;
         p.log(format!(
-            "   +{moff} MHz → {peak:.0} GB/s (min {minbw:.0}) : {}",
+            "   +{moff} MHz → {peak:.0} GB/s (min {minbw:.0}) · int {} : {}",
+            if integ.is_stable() { "ok" } else { "ERRO" },
             if ok { "ok" } else { "instável/queda" }
         ));
         if ok {

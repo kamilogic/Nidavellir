@@ -587,6 +587,10 @@ impl GpuCtx {
         });
 
         let groups = len.div_ceil(64).min(65535);
+        // Repeat write+read cycles per pattern so the memory is actually
+        // hammered at its clock (a single fill→verify is too quick to surface
+        // marginal instability — exactly why a too-high mem OC used to pass).
+        const VRAM_REPS: u32 = 10;
         let mut total_mismatches = 0u32;
         'outer: for _ in 0..passes.max(1) {
             for mode in 0u32..5 {
@@ -616,12 +620,14 @@ impl GpuCtx {
                 let mut enc = self.device.create_command_encoder(&Default::default());
                 {
                     let mut cp = enc.begin_compute_pass(&Default::default());
-                    cp.set_pipeline(&fill_pipe);
-                    cp.set_bind_group(0, &fill_bind, &[]);
-                    cp.dispatch_workgroups(groups, 1, 1);
-                    cp.set_pipeline(&verify_pipe);
-                    cp.set_bind_group(0, &verify_bind, &[]);
-                    cp.dispatch_workgroups(groups, 1, 1);
+                    for _ in 0..VRAM_REPS {
+                        cp.set_pipeline(&fill_pipe);
+                        cp.set_bind_group(0, &fill_bind, &[]);
+                        cp.dispatch_workgroups(groups, 1, 1);
+                        cp.set_pipeline(&verify_pipe);
+                        cp.set_bind_group(0, &verify_bind, &[]);
+                        cp.dispatch_workgroups(groups, 1, 1);
+                    }
                 }
                 self.queue.submit(Some(enc.finish()));
                 self.device.poll(wgpu::Maintain::Wait);

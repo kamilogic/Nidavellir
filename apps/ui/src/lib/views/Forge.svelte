@@ -32,6 +32,16 @@
   const realRunning = $derived(realSweep && SWEEPING.includes(realSweep.phase));
   const memRunning = $derived(memSweep?.running);
 
+  // The point the chart should flatten the curve at. When a profile is applied
+  // the GPU is hard-capped there (clock lock), so the *effective* curve is flat
+  // from that voltage on — show THAT, not the silicon curve's natural plateau
+  // (which is the uncapped top, e.g. 2175 MHz @ 1075 mV, and is misleading once
+  // a lower undervolt limit like 1920 @ 900 is locked in).
+  const appliedLimit = $derived(
+    applied?.core ? { voltage_mv: applied.core.voltage_mv, freq_mhz: applied.core.freq_mhz } : null,
+  );
+  const chartLimit = $derived(appliedLimit ?? realCurve?.plateau ?? null);
+
   async function refresh() {
     try {
       const v = await serviceCall("GetGpuValidation");
@@ -171,12 +181,16 @@
 
     {#if realCurve}
       {#if realCurve.real}
-        {#if realCurve.plateau}
+        {#if appliedLimit}
           <p class="point accent">
+            ⚑ {$t("forge.plateau", { f: appliedLimit.freq_mhz, v: appliedLimit.voltage_mv })}
+          </p>
+        {:else if realCurve.plateau}
+          <p class="point">
             {$t("forge.plateau", { f: realCurve.plateau.freq_mhz, v: realCurve.plateau.voltage_mv })}
           </p>
         {/if}
-        <VfChart points={realCurve.points} plateau={realCurve.plateau} height={300} />
+        <VfChart points={realCurve.points} plateau={chartLimit} height={300} />
         {#if advanced}
           <p class="sub">{$t("forge.curvePoints", { name: realCurve.name, n: realCurve.points.length })}</p>
           <ul class="list">
@@ -384,7 +398,7 @@
         <strong>{realCurve.name}</strong>
         <button class="btn ghost" onclick={() => (expanded = false)}>{$t("forge.close")}</button>
       </div>
-      <VfChart points={realCurve.points} plateau={realCurve.plateau} height={560} />
+      <VfChart points={realCurve.points} plateau={chartLimit} height={560} />
     </div>
   </div>
 {/if}
