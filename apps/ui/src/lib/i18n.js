@@ -57,6 +57,16 @@ const dict = {
     "forge.result": "Result: {r}",
     "forge.stageN": "stage {n}",
 
+    "forge.realSweep": "Real sweep — finds your card's stable undervolt (writes voltage)",
+    "forge.runReal": "Run real sweep",
+    "forge.stopReal": "Stop sweep",
+    "forge.realResult": "Min stable voltage per top frequency",
+    "forge.preTitle": "Before the real sweep",
+    "forge.preBody":
+      "This writes real voltage/clock to your GPU and pushes toward the stability limit. Brief screen flickers are possible (the driver recovers). It's reversible and protected by the Safe Loop. For best results, close all other programs (games, browsers, overlays) first.",
+    "forge.preConfirm": "Programs closed — start",
+    "forge.preCancel": "Cancel",
+
     "phase.idle": "Idle",
     "phase.baseline": "Baseline (thermal equilibrium)",
     "phase.vram_diagnostic": "VRAM diagnostic",
@@ -106,6 +116,16 @@ const dict = {
     "forge.running": "Rodando a bateria na GPU… detecta erro silencioso sem precisar de jogo.",
     "forge.result": "Resultado: {r}",
     "forge.stageN": "estágio {n}",
+
+    "forge.realSweep": "Sweep real — acha o undervolt estável da sua placa (escreve voltagem)",
+    "forge.runReal": "Rodar sweep real",
+    "forge.stopReal": "Parar sweep",
+    "forge.realResult": "Voltagem mínima estável por frequência de topo",
+    "forge.preTitle": "Antes do sweep real",
+    "forge.preBody":
+      "Isto escreve voltagem/clock reais na sua GPU e empurra em direção ao limite de estabilidade. Pequenos flashes de tela são possíveis (o driver se recupera). É reversível e protegido pelo Safe Loop. Para melhores resultados, feche todos os outros programas (jogos, navegadores, overlays) antes.",
+    "forge.preConfirm": "Programas fechados — iniciar",
+    "forge.preCancel": "Cancelar",
 
     "phase.idle": "Ocioso",
     "phase.baseline": "Baseline (equilíbrio térmico)",

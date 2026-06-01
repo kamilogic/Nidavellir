@@ -22,6 +22,9 @@ pub enum IpcRequest {
     GetGpuCurve,
     StartGpuValidation,
     GetGpuValidation,
+    StartRealSweep,
+    StopRealSweep,
+    GetRealSweepProgress,
 }
 
 /// The live V/F curve read from the GPU via NVAPI (the same data Afterburner's

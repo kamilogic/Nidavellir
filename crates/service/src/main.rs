@@ -1,4 +1,5 @@
 mod gpu_real;
+mod gpu_sweep_real;
 mod gpu_sweep_runtime;
 mod ipc_server;
 mod safe_loop_runtime;
@@ -11,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 use windows_service::define_windows_service;
 
 use gpu_real::GpuValidationHandle;
+use gpu_sweep_real::RealSweepHandle;
 use gpu_sweep_runtime::GpuSweepHandle;
 use nidavellir_core::safe_loop::SafeLoopStore;
 use nidavellir_driver_pawnio::DriverManager;
@@ -25,6 +27,7 @@ pub struct AppState {
     pub safe_store: SafeLoopStore,
     pub gpu_sweep: GpuSweepHandle,
     pub gpu_validation: GpuValidationHandle,
+    pub real_sweep: RealSweepHandle,
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -68,6 +71,7 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         safe_store,
         gpu_sweep: GpuSweepHandle::default(),
         gpu_validation: GpuValidationHandle::default(),
+        real_sweep: RealSweepHandle::default(),
     }));
     ipc_server::run_pipe_server(state)?;
     Ok(())

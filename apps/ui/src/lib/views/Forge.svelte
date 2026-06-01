@@ -10,6 +10,13 @@
   let validation = $state(null);
   let advanced = $state(false);
   let expanded = $state(false);
+  let realSweep = $state(null);
+  let preflight = $state(false);
+
+  const realRunning = $derived(
+    realSweep &&
+      ["baseline", "vram_diagnostic", "voltage_bisection", "synthesis"].includes(realSweep.phase),
+  );
 
   const running = $derived(
     progress &&
@@ -25,6 +32,8 @@
       captureProgress(await serviceCall("GetGpuSweepProgress"));
       const v = await serviceCall("GetGpuValidation");
       validation = v?.data?.type === "GpuValidation" ? v.data : validation;
+      const rs = await serviceCall("GetRealSweepProgress");
+      realSweep = rs?.data?.type === "GpuSweep" ? rs.data : realSweep;
       error = null;
     } catch (e) {
       error = String(e);
@@ -47,6 +56,12 @@
     call("GetGpuCurve", (r) => (realCurve = r?.data?.type === "GpuCurve" ? r.data : realCurve));
   const startValidation = () =>
     call("StartGpuValidation", (r) => (validation = r?.data?.type === "GpuValidation" ? r.data : validation));
+  const setReal = (r) => (realSweep = r?.data?.type === "GpuSweep" ? r.data : realSweep);
+  const startReal = () => {
+    preflight = false;
+    call("StartRealSweep", setReal);
+  };
+  const stopReal = () => call("StopRealSweep", setReal);
 
   $effect(() => {
     refresh();
@@ -194,8 +209,75 @@
         {/if}
       </div>
     {/if}
+
+    <div class="realsweep">
+      <div class="real-head">
+        <h4 class="section-head">{$t("forge.realSweep")}</h4>
+        {#if realRunning}
+          <button class="btn stop" onclick={stopReal}>{$t("forge.stopReal")}</button>
+        {:else}
+          <button class="btn go" onclick={() => (preflight = true)}>{$t("forge.runReal")}</button>
+        {/if}
+      </div>
+
+      {#if realSweep && realSweep.phase !== "idle"}
+        <div class="grid">
+          <article class="tile">
+            <span class="lab">{$t("forge.phase")}</span>
+            <p class="val">{$t("phase." + realSweep.phase)}</p>
+          </article>
+          <article class="tile">
+            <span class="lab">{$t("forge.frequency")}</span>
+            <p class="val">{realSweep.freq_index} / {realSweep.total_freqs}</p>
+          </article>
+          <article class="tile">
+            <span class="lab">{$t("forge.testingNow")}</span>
+            <p class="val">
+              {#if realSweep.current}{realSweep.current.freq_mhz} MHz @ {realSweep.current.voltage_mv} mV{:else}—{/if}
+            </p>
+          </article>
+        </div>
+
+        {#if realSweep.tradeoffs?.length}
+          <h5 class="section-head">{$t("forge.realResult")}</h5>
+          <ul class="list">
+            {#each realSweep.tradeoffs as tp}
+              <li><span class="mono">{tp.freq_mhz} MHz</span><span class="mono accent">{tp.vmin_mv} mV</span></li>
+            {/each}
+          </ul>
+        {/if}
+
+        {#if realSweep.profiles}
+          <h5 class="section-head">{$t("forge.profiles")}</h5>
+          <div class="profiles">
+            {#each [realSweep.profiles.godforge, realSweep.profiles.brokkrs_best, realSweep.profiles.deep_calm] as prof}
+              <article class="profile">
+                <h4>{prof.name}</h4>
+                <p class="desc">{prof.description}</p>
+                <p class="point">{prof.point.freq_mhz} MHz @ {prof.point.voltage_mv} mV</p>
+              </article>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
   </div>
 </section>
+
+{#if preflight}
+  <div class="overlay" onclick={() => (preflight = false)} role="presentation">
+    <div class="modal" onclick={(e) => e.stopPropagation()} role="presentation">
+      <div class="modal-head">
+        <strong>⚠ {$t("forge.preTitle")}</strong>
+      </div>
+      <p class="pre-body">{$t("forge.preBody")}</p>
+      <div class="pre-actions">
+        <button class="btn ghost" onclick={() => (preflight = false)}>{$t("forge.preCancel")}</button>
+        <button class="btn go" onclick={startReal}>{$t("forge.preConfirm")}</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if expanded && realCurve?.real}
   <div class="overlay" onclick={() => (expanded = false)} role="presentation">
@@ -500,5 +582,24 @@
     align-items: center;
     margin-bottom: 0.6rem;
     color: var(--text);
+  }
+  .realsweep {
+    margin-top: 1rem;
+    padding-top: 0.85rem;
+    border-top: 1px dashed var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+  .pre-body {
+    color: var(--muted);
+    font-size: 0.9rem;
+    line-height: 1.55;
+    margin: 0 0 1rem;
+  }
+  .pre-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.6rem;
   }
 </style>

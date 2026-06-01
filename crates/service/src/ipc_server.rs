@@ -200,6 +200,21 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetGpuValidation => {
             IpcResponse::success(ResponseData::GpuValidation(guard.gpu_validation.status()))
         }
+        IpcRequest::StartRealSweep => {
+            let store = guard.safe_store.clone();
+            if guard.real_sweep.start(store) {
+                IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
+            } else {
+                IpcResponse::failure("Real sweep already running")
+            }
+        }
+        IpcRequest::StopRealSweep => {
+            guard.real_sweep.stop();
+            IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
+        }
+        IpcRequest::GetRealSweepProgress => {
+            IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
+        }
     }
 }
 
