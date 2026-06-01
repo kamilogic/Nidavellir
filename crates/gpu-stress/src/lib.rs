@@ -123,6 +123,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
+// Pointer-chasing chain: chain[i] = (i*CP + CQ) & mask — a permutation of a
+// power-of-two-sized buffer. Following it does data-dependent random reads
+// (memory-latency bound) where ANY uncorrected error sends the chase down a
+// wrong address and cascades into a totally different result — far more
+// sensitive to memory/addressing faults than a linear read/verify (which the
+// GDDR6 link CRC tends to mask).
+const CHAIN_CP: u32 = 2654435761;
+const CHAIN_CQ: u32 = 1442695041;
+
+const CHAIN_FILL_SHADER: &str = r#"
+struct P { n: u32, mask: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read_write> chain: array<u32>;
+@group(0) @binding(1) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * 64u;
+    var i = gid.x;
+    loop {
+        if (i >= p.n) { break; }
+        chain[i] = (i * 2654435761u + 1442695041u) & p.mask;
+        i = i + stride;
+    }
+}
+"#;
+
+const CHASE_SHADER: &str = r#"
+struct P { steps: u32, mask: u32, lanes: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read> chain: array<u32>;
+@group(0) @binding(1) var<storage, read_write> out: array<u32>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let lane = gid.x;
+    if (lane >= p.lanes) { return; }
+    var idx = (lane * 2654435761u + 1442695041u) & p.mask;
+    for (var k: u32 = 0u; k < p.steps; k = k + 1u) {
+        idx = chain[idx] & p.mask;
+    }
+    out[lane] = idx;
+}
+"#;
+
 // VRAM integrity: write a deterministic pattern, then verify it bit-for-bit,
 // counting mismatches on the GPU (only the count is read back).
 const VRAM_PATTERN_FN: &str = r#"
@@ -169,6 +211,28 @@ fn lcg_pow(n: u64) -> (u32, u32) {
 fn lcg_jump(seed: u32, n: u64) -> u32 {
     let (a, c) = lcg_pow(n);
     a.wrapping_mul(seed).wrapping_add(c)
+}
+
+/// (A, C) for `f^n` where f(x) = (CHAIN_CP*x + CHAIN_CQ) mod (mask+1), so the
+/// pointer-chase result is `(A*start + C) & mask` — verified in O(log n).
+fn affine_pow_mod(n: u64, mask: u32) -> (u32, u32) {
+    fn compose(h: (u32, u32), g: (u32, u32), mask: u32) -> (u32, u32) {
+        (
+            g.0.wrapping_mul(h.0) & mask,
+            (g.0.wrapping_mul(h.1).wrapping_add(g.1)) & mask,
+        )
+    }
+    let mut result = (1u32 & mask, 0u32);
+    let mut base = (CHAIN_CP & mask, CHAIN_CQ & mask);
+    let mut e = n;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = compose(result, base, mask);
+        }
+        base = compose(base, base, mask);
+        e >>= 1;
+    }
+    result
 }
 
 /// A live GPU device for running the battery (set up once, reused per stage).
@@ -546,6 +610,137 @@ impl GpuCtx {
             name: format!("VRAM ({} MB)", bytes / (1024 * 1024)),
             result: self.verdict(total_mismatches, !self.crashed.load(Ordering::SeqCst)),
             mismatches: total_mismatches,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// Pointer-chasing memory test: data-dependent random reads through a chain
+    /// in a large VRAM buffer, sustained for ~`target_ms`. Catches uncorrected
+    /// memory/addressing errors that a linear read/verify misses (a wrong read
+    /// derails the whole chase). Returns SilentError on any divergence.
+    pub fn run_mem_chase(&self, target_ms: u64) -> StageReport {
+        let start = std::time::Instant::now();
+        let want_bytes = (256u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
+        // Chain length must be a power of two (mask = len-1).
+        let mut len: u32 = 1 << 26; // 64M = 256 MB
+        while (len as u64) * 4 > want_bytes && len > (1 << 20) {
+            len >>= 1;
+        }
+        let mask = len - 1;
+        let lanes: u32 = 65_536;
+        let steps: u32 = 8_192;
+
+        let chain = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chain"),
+            size: (len as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let out = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chase-out"),
+            size: (lanes as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Fill the chain.
+        let fill_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chain-fill-params"),
+            contents: bytemuck::bytes_of(&Quad { a: len, b: mask, c: 0, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let fill_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("chain-fill"),
+            source: wgpu::ShaderSource::Wgsl(CHAIN_FILL_SHADER.into()),
+        });
+        let fill_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("chain-fill"),
+            layout: None,
+            module: &fill_mod,
+            entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let fill_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chain-fill"),
+            layout: &fill_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: chain.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: fill_params.as_entire_binding() },
+            ],
+        });
+        {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&fill_pipe);
+                cp.set_bind_group(0, &fill_bind, &[]);
+                cp.dispatch_workgroups(len.div_ceil(64).min(65535), 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            self.device.poll(wgpu::Maintain::Wait);
+        }
+
+        // Chase.
+        let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chase-params"),
+            contents: bytemuck::bytes_of(&Quad { a: steps, b: mask, c: lanes, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("chase"),
+            source: wgpu::ShaderSource::Wgsl(CHASE_SHADER.into()),
+        });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("chase"),
+            layout: None,
+            module: &module,
+            entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chase"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: chain.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+            ],
+        });
+
+        let groups = lanes.div_ceil(64);
+        let mut k = 0u64;
+        while (start.elapsed().as_millis() as u64) < target_ms {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipeline);
+                cp.set_bind_group(0, &bind, &[]);
+                cp.dispatch_workgroups(groups, 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            k += 1;
+            if k % 8 == 0 {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+            if self.crashed.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Reference: out[lane] = f^steps(start_lane), start_lane = (lane*CP+CQ)&mask.
+        let (a, c) = affine_pow_mod(steps as u64, mask);
+        let expected: Vec<u32> = (0..lanes)
+            .map(|lane| {
+                let s = (lane.wrapping_mul(CHAIN_CP).wrapping_add(CHAIN_CQ)) & mask;
+                (a.wrapping_mul(s).wrapping_add(c)) & mask
+            })
+            .collect();
+        let (mismatches, mapped_ok) = self.readback_compare(&out, (lanes as u64) * 4, &expected);
+        StageReport {
+            name: format!("Mem chase ({} MB)", (len as u64 * 4) / (1024 * 1024)),
+            result: self.verdict(mismatches, mapped_ok),
+            mismatches,
             elapsed_ms: start.elapsed().as_millis() as u64,
         }
     }

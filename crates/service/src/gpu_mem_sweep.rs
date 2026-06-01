@@ -142,8 +142,8 @@ fn run_mem_sweep(
             break;
         }
 
-        // Integrity at this clock (catch artifacts), then bandwidth.
-        let integ = match catch_unwind(AssertUnwindSafe(|| ctx.run_vram_check(512 * 1024 * 1024, 1))) {
+        // Pointer-chase integrity (sensitive to uncorrected errors), then bandwidth.
+        let integ = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(1500))) {
             Ok(r) => r.result,
             Err(_) => {
                 crashed = true;
@@ -174,15 +174,18 @@ fn run_mem_sweep(
             break; // artifacts / crash → cliff
         }
 
-        if gbps > best * 1.002 {
+        // Knee detection: an *additive* improvement threshold. Once each step
+        // stops adding real bandwidth (CRC retries eating the gain), we're at
+        // the ECC wall — stop and recommend the knee, not the flat top.
+        if gbps > best + 2.0 {
             best = gbps;
             prog.peak_gbps = gbps as f32;
             prog.peak_offset_mhz = offset;
             no_improve = 0;
         } else {
             no_improve += 1;
-            if no_improve >= 2 {
-                info!("mem sweep: bandwidth peaked (ECC wall) at +{} MHz", prog.peak_offset_mhz);
+            if no_improve >= 3 {
+                info!("mem sweep: bandwidth knee (CRC wall) — peak at +{} MHz", prog.peak_offset_mhz);
                 set(&progress, prog.clone());
                 break;
             }
