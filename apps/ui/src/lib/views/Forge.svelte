@@ -250,7 +250,8 @@
             <div class="tline">
               <span class="tlead">+{p.offset_mhz} MHz · {p.mem_mhz} MHz</span>
               <span class="tval" class:accent={p.stable} class:danger={!p.stable}>{p.bandwidth_gbps.toFixed(0)} GB/s</span>
-              <span class="tstatus" class:danger={!p.stable}>{p.stable ? "Done" : "✗ unstable"}</span>
+              {#if p.min_gbps > 0}<span class="tmin">min {p.min_gbps.toFixed(0)}</span>{/if}
+              <span class="tstatus" class:danger={!p.stable}>{p.stable ? "Done" : "✗ instável (queda)"}</span>
             </div>
           {/each}
           {#if memRunning}
@@ -705,6 +706,12 @@
   .tval.danger,
   .tstatus.danger {
     color: var(--nord-danger);
+  }
+  .tmin {
+    min-width: 5rem;
+    text-align: right;
+    color: var(--nord-dim);
+    font-size: 0.72rem;
   }
   .tstatus {
     color: var(--nord-aurora);

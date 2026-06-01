@@ -50,6 +50,8 @@ pub struct MemSweepPoint {
     pub offset_mhz: i32,
     pub mem_mhz: u32,
     pub bandwidth_gbps: f32,
+    #[serde(default)]
+    pub min_gbps: f32,
     pub stable: bool,
 }
 

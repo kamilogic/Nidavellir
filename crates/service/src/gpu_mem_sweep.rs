@@ -126,7 +126,6 @@ fn run_mem_sweep(
     let step = 50i32;
     let cap = 1500i32;
     let mut best = baseline;
-    let mut no_improve = 0u32;
     let mut crashed = false;
     let mut offset = step;
 
@@ -162,9 +161,13 @@ fn run_mem_sweep(
             prog.validation_note = Some(format!("Testando +{offset} MHz · banda…"));
             set(&progress, prog.clone());
         }
-        let gbps = if crashed { 0.0 } else { ctx.measure_bandwidth_gbps(3500) };
+        let (peak, minbw) = if crashed { (0.0, 0.0) } else { ctx.measure_bandwidth_stats(4000) };
         let mem_mhz = mem_clock_mhz();
-        let stable = integ.is_stable() && !crashed && gbps > 0.0;
+        // Consistency is the real signal: GDDR6 CRC retries cause intermittent
+        // bandwidth dips (the in-game stutters). A clean clock holds steady.
+        let consistency = if peak > 0.0 { minbw / peak } else { 0.0 };
+        let consistent = consistency >= 0.93;
+        let stable = integ.is_stable() && !crashed && peak > 0.0 && consistent;
 
         if stable {
             let _ = store.clear_boot_flag();
@@ -172,36 +175,33 @@ fn run_mem_sweep(
 
         prog.current_offset_mhz = offset;
         prog.current_mem_mhz = mem_mhz;
-        prog.current_gbps = gbps as f32;
+        prog.current_gbps = peak as f32;
+        prog.validation_note = None;
         prog.points.push(MemSweepPoint {
             offset_mhz: offset,
             mem_mhz,
-            bandwidth_gbps: gbps as f32,
+            bandwidth_gbps: peak as f32,
+            min_gbps: minbw as f32,
             stable,
         });
-        info!("mem sweep: +{offset}MHz -> {mem_mhz}MHz, {gbps:.1} GB/s, stable={stable}");
+        info!(
+            "mem sweep: +{offset}MHz -> {mem_mhz}MHz peak {peak:.0} min {minbw:.0} ({:.0}% consistent) chase={:?}",
+            consistency * 100.0, integ
+        );
 
-        if !stable {
+        if !integ.is_stable() || crashed {
             set(&progress, prog.clone());
-            break; // artifacts / crash → cliff
+            break; // hard cliff: artifacts / device lost
+        }
+        if !consistent {
+            info!("mem sweep: bandwidth inconsistent (CRC-retry/stutter onset) at +{offset} — stopping");
+            set(&progress, prog.clone());
+            break; // stutter onset — the previous clean clock is the recommendation
         }
 
-        // Knee detection: an *additive* improvement threshold. Once each step
-        // stops adding real bandwidth (CRC retries eating the gain), we're at
-        // the ECC wall — stop and recommend the knee, not the flat top.
-        if gbps > best + 2.0 {
-            best = gbps;
-            prog.peak_gbps = gbps as f32;
-            prog.peak_offset_mhz = offset;
-            no_improve = 0;
-        } else {
-            no_improve += 1;
-            if no_improve >= 3 {
-                info!("mem sweep: bandwidth knee (CRC wall) — peak at +{} MHz", prog.peak_offset_mhz);
-                set(&progress, prog.clone());
-                break;
-            }
-        }
+        best = best.max(peak);
+        prog.peak_gbps = peak as f32;
+        prog.peak_offset_mhz = offset;
         set(&progress, prog.clone());
 
         offset += step;
@@ -220,18 +220,29 @@ fn run_mem_sweep(
             "gpu_mem_validate",
         ));
         let _ = gpu::set_mem_offset_mhz(off);
-        let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(90_000))) {
+        // Errors (chase) + a long bandwidth-consistency window to catch the
+        // *intermittent* dips that cause occasional in-game stutters.
+        let chase = match catch_unwind(AssertUnwindSafe(|| ctx.run_mem_chase(45_000))) {
             Ok(r) => r.result,
             Err(_) => {
                 crashed = true;
                 nidavellir_core::gpu_sweep::StabilityResult::Crash
             }
         };
-        prog.validation_note = Some(if res.is_stable() {
-            let _ = store.clear_boot_flag();
-            format!("Validado: +{off} MHz estável no soak de 90s — confirme em jogo")
+        let (peak, minbw) = if crashed { (0.0, 0.0) } else { ctx.measure_bandwidth_stats(45_000) };
+        let consistency = if peak > 0.0 { minbw / peak } else { 0.0 };
+        prog.validation_note = Some(if crashed {
+            "Travou no soak longo — recue o offset de memória".into()
+        } else if !chase.is_stable() {
+            "Erro de memória no soak longo — recue o offset".into()
+        } else if consistency < 0.96 {
+            format!(
+                "Instável no soak: quedas de banda ({:.0}% consistência = stutters) — recue o offset",
+                consistency * 100.0
+            )
         } else {
-            "Falhou no soak longo — recue o offset de memória".into()
+            let _ = store.clear_boot_flag();
+            format!("Validado: +{off} MHz estável e consistente no soak de 90s — confirme em jogo")
         });
         set(&progress, prog.clone());
     }

@@ -749,6 +749,14 @@ impl GpuCtx {
     /// a large VRAM buffer (read+write each element). Used to find the GDDR6
     /// *effective-bandwidth peak* — past it, ECC correction eats the gains.
     pub fn measure_bandwidth_gbps(&self, target_ms: u64) -> f64 {
+        self.measure_bandwidth_stats(target_ms).0
+    }
+
+    /// Bandwidth over sub-windows → `(peak, min)` GB/s. A large gap between peak
+    /// and min means the clock is *inconsistent* (GDDR6 CRC retries / throttle
+    /// dips) — the real signal for the intermittent stutters a peak-only number
+    /// hides.
+    pub fn measure_bandwidth_stats(&self, target_ms: u64) -> (f64, f64) {
         let bytes = (256u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
         let len = (bytes / 4) as u32;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -800,9 +808,10 @@ impl GpuCtx {
         // and throttles dynamically, so a single short window is noisy. The peak
         // reflects the bandwidth the clock can actually deliver (downward noise =
         // throttle dips, which we reject); it can't exceed real bandwidth.
-        let window_ms: u64 = 700;
-        let windows = (target_ms / window_ms).max(4);
+        let window_ms: u64 = 500;
+        let windows = (target_ms / window_ms).max(8);
         let mut peak_gbps = 0.0f64;
+        let mut min_gbps = f64::INFINITY;
         for _ in 0..windows {
             let ws = std::time::Instant::now();
             let mut passes: u64 = 0;
@@ -820,7 +829,7 @@ impl GpuCtx {
                     self.device.poll(wgpu::Maintain::Wait);
                 }
                 if self.crashed.load(Ordering::SeqCst) {
-                    return 0.0;
+                    return (0.0, 0.0);
                 }
             }
             self.device.poll(wgpu::Maintain::Wait);
@@ -831,9 +840,15 @@ impl GpuCtx {
                 if gbps > peak_gbps {
                     peak_gbps = gbps;
                 }
+                if gbps < min_gbps {
+                    min_gbps = gbps;
+                }
             }
         }
-        peak_gbps
+        if !min_gbps.is_finite() {
+            min_gbps = peak_gbps;
+        }
+        (peak_gbps, min_gbps)
     }
 
     /// Read a single u32 from a COPY_SRC buffer.
