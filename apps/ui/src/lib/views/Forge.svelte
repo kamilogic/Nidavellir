@@ -14,6 +14,9 @@
   let memSweep = $state(null);
   let memPreflight = $state(false);
   let applied = $state(null);
+  let forge = $state(null);
+  let forgePreflight = $state(false);
+  const forgeRunning = $derived(forge?.running);
 
   const SWEEPING = ["baseline", "vram_diagnostic", "voltage_bisection", "synthesis"];
   const realRunning = $derived(realSweep && SWEEPING.includes(realSweep.phase));
@@ -29,6 +32,8 @@
       memSweep = ms?.data?.type === "MemSweep" ? ms.data : memSweep;
       const ap = await serviceCall("GetAppliedProfile");
       applied = ap?.data?.type === "GpuApply" ? ap.data : applied;
+      const fa = await serviceCall("GetForgeAllProgress");
+      forge = fa?.data?.type === "ForgeAll" ? fa.data : forge;
       error = null;
     } catch (e) {
       error = String(e);
@@ -66,6 +71,12 @@
   const applyCore = (i) => call(CORE_APPLY[i], setApplied);
   const applyMem = () => call("ApplyMemPeak", setApplied);
   const resetTuning = () => call("ResetGpuTuning", setApplied);
+  const setForge = (r) => (forge = r?.data?.type === "ForgeAll" ? r.data : forge);
+  const startForge = () => {
+    forgePreflight = false;
+    call("StartForgeAll", setForge);
+  };
+  const stopForge = () => call("StopForgeAll", setForge);
 
   $effect(() => {
     refresh();
@@ -98,6 +109,31 @@
     <button class="btn small" onclick={resetTuning}>{$t("forge.reset")}</button>
   </div>
   <p class="sub apply-hint">{$t("forge.applyHint")}</p>
+
+  <div class="forge-all">
+    <div class="real-head">
+      <h3 class="section-head">⚒ {$t("forge.forgeAll")}</h3>
+      {#if forgeRunning}
+        <button class="btn stop" onclick={stopForge}>{$t("forge.stopForge")}</button>
+      {:else}
+        <button class="btn go" onclick={() => (forgePreflight = true)}>{$t("forge.runForge")}</button>
+      {/if}
+    </div>
+    <p class="sub">{$t("forge.forgeAllDesc")}</p>
+    {#if forge && forge.phase !== "idle" && (forge.log?.length || forge.running)}
+      <div class="terminal">
+        {#each forge.log as line}
+          <div class="tline"><span class="tlead">{line}</span></div>
+        {/each}
+        {#if forge.running}
+          <div class="tline running"><span class="spin">◴</span><span class="tlead">{forge.phase}…</span></div>
+        {/if}
+      </div>
+      {#if forge.note}<p class="point" class:accent={!forge.running}>{forge.note}</p>{/if}
+    {/if}
+  </div>
+
+  <p class="sub apply-hint">{$t("forge.orderHint")}</p>
 
   <div class="section real">
     <div class="real-head">
@@ -297,6 +333,19 @@
       <div class="pre-actions">
         <button class="btn ghost" onclick={() => (memPreflight = false)}>{$t("forge.preCancel")}</button>
         <button class="btn go" onclick={startMem}>{$t("forge.runMem")}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if forgePreflight}
+  <div class="overlay" onclick={() => (forgePreflight = false)} role="presentation">
+    <div class="modal" onclick={(e) => e.stopPropagation()} role="presentation">
+      <div class="modal-head"><strong>⚒ {$t("forge.preTitle")}</strong></div>
+      <p class="pre-body">{$t("forge.forgePreBody")}</p>
+      <div class="pre-actions">
+        <button class="btn ghost" onclick={() => (forgePreflight = false)}>{$t("forge.preCancel")}</button>
+        <button class="btn go" onclick={startForge}>{$t("forge.runForge")}</button>
       </div>
     </div>
   </div>
@@ -664,6 +713,15 @@
     margin: 0.1rem 0 0.4rem;
     font-size: 0.75rem;
     color: var(--nord-dim);
+  }
+  .forge-all {
+    background: rgba(163, 190, 140, 0.06);
+    border: 1px solid rgba(163, 190, 140, 0.28);
+    border-radius: 12px;
+    padding: 0.85rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
   }
   .terminal {
     font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;

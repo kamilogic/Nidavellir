@@ -274,6 +274,21 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetAppliedProfile => {
             IpcResponse::success(ResponseData::GpuApply(applied_status(String::new())))
         }
+        IpcRequest::StartForgeAll => {
+            let store = guard.safe_store.clone();
+            if guard.forge_all.start(store) {
+                IpcResponse::success(ResponseData::ForgeAll(guard.forge_all.progress()))
+            } else {
+                IpcResponse::failure("Forge-all already running")
+            }
+        }
+        IpcRequest::StopForgeAll => {
+            guard.forge_all.stop();
+            IpcResponse::success(ResponseData::ForgeAll(guard.forge_all.progress()))
+        }
+        IpcRequest::GetForgeAllProgress => {
+            IpcResponse::success(ResponseData::ForgeAll(guard.forge_all.progress()))
+        }
     }
 }
 

@@ -32,6 +32,18 @@ pub enum IpcRequest {
     ApplyMemPeak,
     ResetGpuTuning,
     GetAppliedProfile,
+    StartForgeAll,
+    StopForgeAll,
+    GetForgeAllProgress,
+}
+
+/// Live status of the full auto pipeline (VRAM gate → core → memory → soak).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeAllProgress {
+    pub running: bool,
+    pub phase: String,
+    pub log: Vec<String>,
+    pub note: Option<String>,
 }
 
 /// The GPU profile currently applied/persisted, plus the last action's message.
@@ -141,6 +153,7 @@ pub enum ResponseData {
     GpuValidation(GpuValidationStatus),
     MemSweep(MemSweepProgress),
     GpuApply(GpuApplyStatus),
+    ForgeAll(ForgeAllProgress),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

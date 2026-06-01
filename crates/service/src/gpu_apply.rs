@@ -53,7 +53,7 @@ fn curve_freq_at(voltage_mv: u32) -> Option<u32> {
 /// Realize a core V/F point: lock the voltage and offset the clock so the GPU
 /// runs `point.freq_mhz` at `point.voltage_mv`.
 #[cfg(windows)]
-fn apply_core(point: VfPoint) -> Result<(), String> {
+pub fn apply_core(point: VfPoint) -> Result<(), String> {
     let base = curve_freq_at(point.voltage_mv).unwrap_or(point.freq_mhz);
     let offset = (point.freq_mhz as i64 - base as i64).clamp(-300, 400) as i32;
     nidavellir_gpu_nvapi::lock_core_voltage_mv(point.voltage_mv)?;
