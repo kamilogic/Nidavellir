@@ -39,6 +39,7 @@ fn idle_progress() -> GpuSweepProgress {
         measured_mhz: None,
         gpu_temp_c: None,
         last_result: None,
+        validation_note: None,
     }
 }
 

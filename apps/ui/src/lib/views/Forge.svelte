@@ -276,6 +276,9 @@
             {/each}
           </div>
         {/if}
+        {#if realSweep.validation_note}
+          <p class="note">{realSweep.validation_note}</p>
+        {/if}
       {/if}
     </div>
 

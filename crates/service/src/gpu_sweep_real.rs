@@ -56,6 +56,7 @@ fn idle() -> GpuSweepProgress {
         measured_mhz: None,
         gpu_temp_c: None,
         last_result: None,
+        validation_note: None,
     }
 }
 
@@ -213,6 +214,8 @@ fn run_real_sweep(
 
     let mut points: Vec<TradeoffPoint> = Vec::new();
     let mut crashed = false;
+    // Best stable (voltage, offset) at the top voltage — the candidate to soak.
+    let mut top_candidate: Option<(u32, i32)> = None;
 
     'voltages: for (vi, &v) in q.voltages.iter().enumerate() {
         if stop.load(Ordering::SeqCst) {
@@ -262,6 +265,9 @@ fn run_real_sweep(
                 StabilityResult::Stable => {
                     let _ = store.clear_boot_flag();
                     best_stable = Some(peak);
+                    if vi == 0 {
+                        top_candidate = Some((v, offset));
+                    }
                     offset += q.step_mhz;
                     if offset > q.cap_mhz {
                         break;
@@ -295,10 +301,86 @@ fn run_real_sweep(
 
     let baseline = points.iter().map(|p| p.freq_mhz).max().unwrap_or(0);
     prog.profiles = synthesize_profiles(baseline, &points);
-    prog.tradeoffs = points;
+    prog.tradeoffs = points.clone();
+    prog.current = None;
+    set_progress(&progress, prog.clone());
+
+    // Phase E — arduous validation: re-apply the top candidate (backed off by
+    // margin) and soak it hard until we trust it (or it fails → back off more).
+    if !crashed && !stop.load(Ordering::SeqCst) {
+        if let Some((v0, off0)) = top_candidate {
+            prog.phase = SweepPhase::Synthesis;
+            prog.validation_note = Some("Validação longa em andamento…".into());
+            set_progress(&progress, prog.clone());
+
+            let mut val_off = (off0 - q.margin_mhz as i32).max(0);
+            let mut note = "Falhou na validação longa".to_string();
+            for attempt in 0..2 {
+                let intent = TuningPoint::from_axes([
+                    ("gpu_voltage_mv", v0 as i64),
+                    ("gpu_offset_mhz", val_off as i64),
+                ]);
+                let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_real_validate"));
+                let _ = gpu::lock_core_voltage_mv(v0);
+                if gpu::set_core_offset_mhz(val_off).is_err() {
+                    break;
+                }
+                let (res, peak, temp) =
+                    measure_during(|| match catch_unwind(AssertUnwindSafe(|| arduous_validate(&ctx))) {
+                        Ok(r) => r,
+                        Err(_) => StabilityResult::Crash,
+                    });
+                prog.measured_mhz = Some(peak);
+                prog.gpu_temp_c = temp;
+                prog.last_result = Some(res);
+                set_progress(&progress, prog.clone());
+                if res.is_stable() {
+                    let _ = store.clear_boot_flag();
+                    note = format!(
+                        "Validado (Silver): {peak} MHz @ {v0} mV estável no soak longo — confirme em jogo",
+                    );
+                    break;
+                } else if matches!(res, StabilityResult::Crash) {
+                    crashed = true;
+                    note = "Travou na validação longa — recue mais".into();
+                    break;
+                } else {
+                    note = format!("Erro silencioso no soak — recuando (tentativa {})", attempt + 1);
+                    val_off = (val_off - q.step_mhz * 2).max(0);
+                }
+            }
+            prog.validation_note = Some(note);
+        }
+    }
+
+    let _ = gpu::reset_all();
+    let _ = store.clear_boot_flag();
     prog.current = None;
     prog.phase = if crashed { SweepPhase::Aborted } else { SweepPhase::Done };
     prog.freq_index = prog.total_freqs;
     set_progress(&progress, prog);
     info!("Real GPU sweep finished (crashed={crashed})");
+}
+
+/// Long, hard confirmation soak for the chosen profile (Phase E).
+#[cfg(windows)]
+fn arduous_validate(ctx: &nidavellir_gpu_stress::GpuCtx) -> StabilityResult {
+    fn worst(a: StabilityResult, b: StabilityResult) -> StabilityResult {
+        use StabilityResult::*;
+        match (a, b) {
+            (Crash, _) | (_, Crash) => Crash,
+            (SilentError, _) | (_, SilentError) => SilentError,
+            _ => Stable,
+        }
+    }
+    let a = ctx.run_alu("soak-alu", 1_000_000, 1_000_000, 30_000).result;
+    if !a.is_stable() {
+        return a;
+    }
+    let m = ctx.run_memory("soak-mem", 262_144, 2_048, 20_000).result;
+    if !m.is_stable() {
+        return m;
+    }
+    let c = ctx.run_mem_chase(15_000).result;
+    worst(worst(a, m), c)
 }

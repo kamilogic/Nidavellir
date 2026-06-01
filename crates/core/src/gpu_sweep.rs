@@ -307,6 +307,9 @@ pub struct GpuSweepProgress {
     /// Result of the step currently shown (real sweep only).
     #[serde(default)]
     pub last_result: Option<StabilityResult>,
+    /// Final arduous-validation verdict / confidence note (real sweep only).
+    #[serde(default)]
+    pub validation_note: Option<String>,
 }
 
 /// The pure sweep step machine: characterizes vmin per target frequency, then
@@ -420,6 +423,7 @@ impl GpuSweepEngine {
             measured_mhz: None,
             gpu_temp_c: None,
             last_result: None,
+            validation_note: None,
         }
     }
 
