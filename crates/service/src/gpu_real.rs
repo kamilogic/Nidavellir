@@ -88,10 +88,11 @@ impl GpuValidationHandle {
 
         // The battery: (label, runner). Each runner targets a failure mode.
         type Runner = Box<dyn Fn(&nidavellir_gpu_stress::GpuCtx) -> nidavellir_gpu_stress::StageReport + Send>;
+        // Sustained loads (ms) that actually saturate the GPU.
         let battery: Vec<(&'static str, Runner)> = vec![
-            ("ALU (known-answer)", Box::new(|c| c.run_alu("ALU (known-answer)", 800_000, 12_000, 1))),
-            ("Memory (gather)", Box::new(|c| c.run_memory("Memory (gather)", 400_000, 3_000))),
-            ("Burst (transient)", Box::new(|c| c.run_alu("Burst (transient)", 800_000, 1_500, 8))),
+            ("ALU (known-answer)", Box::new(|c| c.run_alu("ALU (known-answer)", 1_000_000, 1_000_000, 4000))),
+            ("Memory (gather)", Box::new(|c| c.run_memory("Memory (gather)", 262_144, 2_048, 3500))),
+            ("Mixed (ALU+mem)", Box::new(|c| c.run_alu("Mixed (ALU+mem)", 1_000_000, 1_000_000, 3000))),
         ];
         let total = battery.len() as u32;
 

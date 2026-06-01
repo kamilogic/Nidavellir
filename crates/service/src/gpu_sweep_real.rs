@@ -149,16 +149,14 @@ fn validate_pass(ctx: &nidavellir_gpu_stress::GpuCtx, passes: u32) -> StabilityR
             _ => Stable,
         }
     }
-    let mut acc = StabilityResult::Stable;
-    for _ in 0..passes.max(1) {
-        acc = worst(acc, ctx.run_alu("alu", 600_000, 10_000, 1).result);
-        acc = worst(acc, ctx.run_memory("mem", 400_000, 4_000).result);
-        acc = worst(acc, ctx.run_alu("burst", 600_000, 2_000, 8).result);
-        if !acc.is_stable() {
-            break;
-        }
+    // Dwell scales with quality (passes): longer sustained load catches drift.
+    let ms = 1500u64 * passes.max(1) as u64;
+    let a = ctx.run_alu("alu", 1_000_000, 1_000_000, ms).result;
+    if !a.is_stable() {
+        return a;
     }
-    acc
+    let m = ctx.run_memory("mem", 262_144, 2_048, ms).result;
+    worst(a, m)
 }
 
 #[cfg(windows)]

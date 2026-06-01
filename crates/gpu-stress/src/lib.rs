@@ -74,12 +74,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+#[cfg(test)]
 fn lcg(seed: u32, iters: u32) -> u32 {
     let mut x = seed;
     for _ in 0..iters {
         x = x.wrapping_mul(C1).wrapping_add(C2);
     }
     x
+}
+
+/// f(x) = C1*x + C2 (mod 2^32). Returns (A, C) for f^n via fast exponentiation,
+/// so `f^n(seed) = A*seed + C` — lets us verify any number of GPU rounds in
+/// O(log n) on the CPU instead of replaying the loop.
+fn lcg_pow(n: u64) -> (u32, u32) {
+    // Compose: apply `h` then `g` → g(h(x)) = (g.A*h.A)*x + (g.A*h.C + g.C).
+    fn compose(h: (u32, u32), g: (u32, u32)) -> (u32, u32) {
+        (g.0.wrapping_mul(h.0), g.0.wrapping_mul(h.1).wrapping_add(g.1))
+    }
+    let mut result = (1u32, 0u32); // identity
+    let mut base = (C1, C2); // f^1
+    let mut e = n;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = compose(result, base);
+        }
+        base = compose(base, base);
+        e >>= 1;
+    }
+    result
+}
+
+#[cfg(test)]
+fn lcg_jump(seed: u32, n: u64) -> u32 {
+    let (a, c) = lcg_pow(n);
+    a.wrapping_mul(seed).wrapping_add(c)
 }
 
 /// A live GPU device for running the battery (set up once, reused per stage).
@@ -134,12 +162,12 @@ impl GpuCtx {
         }
     }
 
-    /// ALU known-answer test. `bursts` > 1 applies the load in on/off pulses
-    /// (with gaps) to exercise power transients; the buffer persists across
-    /// bursts so the reference is `lcg(i, iters * bursts)`.
-    pub fn run_alu(&self, name: &str, elements: u32, iters: u32, bursts: u32) -> StageReport {
+    /// Sustained ALU known-answer test: dispatches the LCG kernel back-to-back
+    /// for ~`target_ms`, keeping the GPU **saturated** (the buffer accumulates,
+    /// so after K dispatches every lane has had `iters*K` LCG rounds). Verified
+    /// via LCG jump-ahead, so the CPU reference is O(log n) regardless of load.
+    pub fn run_alu(&self, name: &str, elements: u32, iters: u32, target_ms: u64) -> StageReport {
         let start = std::time::Instant::now();
-        let bursts = bursts.max(1);
         let input: Vec<u32> = (0..elements).collect();
         let byte_size = (elements as usize * 4) as u64;
 
@@ -174,7 +202,9 @@ impl GpuCtx {
         });
 
         let groups = elements.div_ceil(64);
-        for b in 0..bursts {
+        let mut k: u64 = 0;
+        // Keep the queue fed back-to-back; bound depth with an occasional wait.
+        while (start.elapsed().as_millis() as u64) < target_ms {
             let mut enc = self.device.create_command_encoder(&Default::default());
             {
                 let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -186,13 +216,19 @@ impl GpuCtx {
                 cp.dispatch_workgroups(groups, 1, 1);
             }
             self.queue.submit(Some(enc.finish()));
-            self.device.poll(wgpu::Maintain::Wait);
-            if bursts > 1 && b + 1 < bursts {
-                std::thread::sleep(std::time::Duration::from_millis(30));
+            k += 1;
+            if k % 8 == 0 {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+            if self.crashed.load(Ordering::SeqCst) {
+                break;
             }
         }
+        self.device.poll(wgpu::Maintain::Wait);
 
-        let expected: Vec<u32> = (0..elements).map(|i| lcg(i, iters.wrapping_mul(bursts))).collect();
+        // expected[i] = f^(iters*k)(i) where f(x)=a*x+c, via fast exponentiation.
+        let (a, c) = lcg_pow((iters as u64).wrapping_mul(k));
+        let expected: Vec<u32> = (0..elements).map(|i| a.wrapping_mul(i).wrapping_add(c)).collect();
         let (mismatches, mapped_ok) = self.readback_compare(&data, byte_size, &expected);
         StageReport {
             name: name.to_string(),
@@ -202,8 +238,10 @@ impl GpuCtx {
         }
     }
 
-    /// Memory-bound known-answer test: many pseudo-random gathers from a table.
-    pub fn run_memory(&self, name: &str, elements: u32, gathers: u32) -> StageReport {
+    /// Sustained memory-bound known-answer test: many pseudo-random gathers from
+    /// a table, dispatched back-to-back for ~`target_ms` (idempotent, so the CPU
+    /// reference is computed once regardless of how many dispatches ran).
+    pub fn run_memory(&self, name: &str, elements: u32, gathers: u32, target_ms: u64) -> StageReport {
         let start = std::time::Instant::now();
         let table: Vec<u32> = (0..elements).map(|j| j.wrapping_mul(TABLE_INIT)).collect();
         let byte_size = (elements as usize * 4) as u64;
@@ -245,17 +283,28 @@ impl GpuCtx {
             ],
         });
 
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mem"),
-                timestamp_writes: None,
-            });
-            cp.set_pipeline(&pipeline);
-            cp.set_bind_group(0, &bind, &[]);
-            cp.dispatch_workgroups(elements.div_ceil(64), 1, 1);
+        let groups = elements.div_ceil(64);
+        let mut k: u64 = 0;
+        while (start.elapsed().as_millis() as u64) < target_ms {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mem"),
+                    timestamp_writes: None,
+                });
+                cp.set_pipeline(&pipeline);
+                cp.set_bind_group(0, &bind, &[]);
+                cp.dispatch_workgroups(groups, 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            k += 1;
+            if k % 8 == 0 {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+            if self.crashed.load(Ordering::SeqCst) {
+                break;
+            }
         }
-        self.queue.submit(Some(enc.finish()));
         self.device.poll(wgpu::Maintain::Wait);
 
         let expected: Vec<u32> = (0..elements)
@@ -318,5 +367,16 @@ mod tests {
     fn lcg_reference_is_deterministic() {
         assert_eq!(lcg(0, 1), C2);
         assert_eq!(lcg(123, 1000), lcg(123, 1000));
+    }
+
+    #[test]
+    fn lcg_jump_matches_loop() {
+        for &(seed, n) in &[(0u32, 0u64), (0, 1), (123, 7), (999, 1000), (42, 65536)] {
+            let mut x = seed;
+            for _ in 0..n {
+                x = x.wrapping_mul(C1).wrapping_add(C2);
+            }
+            assert_eq!(lcg_jump(seed, n), x, "seed={seed} n={n}");
+        }
     }
 }

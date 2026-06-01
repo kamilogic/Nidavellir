@@ -11,9 +11,9 @@ fn main() {
     println!("adapter: {}", ctx.adapter_name);
 
     let stages = [
-        ctx.run_alu("ALU (known-answer)", 1_000_000, 20_000, 1),
-        ctx.run_memory("Memory-bound", 500_000, 4_096),
-        ctx.run_alu("Rajada (transiente)", 1_000_000, 2_500, 8),
+        ctx.run_alu("ALU (known-answer)", 1_000_000, 1_000_000, 4000),
+        ctx.run_memory("Memory-bound", 262_144, 2_048, 3500),
+        ctx.run_alu("Mixed", 1_000_000, 1_000_000, 3000),
     ];
     for s in &stages {
         println!(
