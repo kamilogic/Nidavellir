@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::capability::CapabilityReport;
 use crate::detector::HardwareInfo;
-use crate::gpu_sweep::{GpuSweepProgress, StabilityResult, VfPoint};
+use crate::gpu_sweep::{GpuSweepProgress, StabilityResult, SweepPhase, VfPoint};
 use crate::safe_loop::{BlacklistRegion, CrashClass, SafeLoopState, TuningPoint};
 use crate::sensors::SensorReadings;
 
@@ -26,6 +26,33 @@ pub enum IpcRequest {
     StartRealSweepFast,
     StopRealSweep,
     GetRealSweepProgress,
+    StartMemSweep,
+    StopMemSweep,
+    GetMemSweepProgress,
+}
+
+/// One step of the memory sweep: a clock offset with its measured effective
+/// bandwidth and integrity verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemSweepPoint {
+    pub offset_mhz: i32,
+    pub mem_mhz: u32,
+    pub bandwidth_gbps: f32,
+    pub stable: bool,
+}
+
+/// Memory sweep that finds the GDDR6 effective-bandwidth peak (not max clock).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemSweepProgress {
+    pub phase: SweepPhase,
+    pub running: bool,
+    pub current_offset_mhz: i32,
+    pub current_mem_mhz: u32,
+    pub current_gbps: f32,
+    pub baseline_gbps: f32,
+    pub points: Vec<MemSweepPoint>,
+    pub peak_offset_mhz: i32,
+    pub peak_gbps: f32,
 }
 
 /// The live V/F curve read from the GPU via NVAPI (the same data Afterburner's
@@ -96,6 +123,7 @@ pub enum ResponseData {
     GpuSweep(GpuSweepProgress),
     GpuCurve(GpuCurveSnapshot),
     GpuValidation(GpuValidationStatus),
+    MemSweep(MemSweepProgress),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

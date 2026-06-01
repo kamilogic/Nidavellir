@@ -11,3 +11,6 @@ nidavellir-core = { workspace = true }
 wgpu = "0.20"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+nidavellir-gpu-nvapi = { path = "../gpu-nvapi" }

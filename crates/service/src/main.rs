@@ -1,3 +1,4 @@
+mod gpu_mem_sweep;
 mod gpu_real;
 mod gpu_sweep_real;
 mod gpu_sweep_runtime;
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use windows_service::define_windows_service;
 
+use gpu_mem_sweep::MemSweepHandle;
 use gpu_real::GpuValidationHandle;
 use gpu_sweep_real::RealSweepHandle;
 use gpu_sweep_runtime::GpuSweepHandle;
@@ -28,6 +30,7 @@ pub struct AppState {
     pub gpu_sweep: GpuSweepHandle,
     pub gpu_validation: GpuValidationHandle,
     pub real_sweep: RealSweepHandle,
+    pub mem_sweep: MemSweepHandle,
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -72,6 +75,7 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         gpu_sweep: GpuSweepHandle::default(),
         gpu_validation: GpuValidationHandle::default(),
         real_sweep: RealSweepHandle::default(),
+        mem_sweep: MemSweepHandle::default(),
     }));
     ipc_server::run_pipe_server(state)?;
     Ok(())

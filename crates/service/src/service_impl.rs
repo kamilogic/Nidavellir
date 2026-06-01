@@ -57,6 +57,7 @@ pub fn run_service() -> windows_service::Result<()> {
         gpu_sweep: crate::gpu_sweep_runtime::GpuSweepHandle::default(),
         gpu_validation: crate::gpu_real::GpuValidationHandle::default(),
         real_sweep: crate::gpu_sweep_real::RealSweepHandle::default(),
+        mem_sweep: crate::gpu_mem_sweep::MemSweepHandle::default(),
     }));
 
     let pipe_state = Arc::clone(&state);

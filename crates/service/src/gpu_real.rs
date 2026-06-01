@@ -90,7 +90,7 @@ impl GpuValidationHandle {
         type Runner = Box<dyn Fn(&nidavellir_gpu_stress::GpuCtx) -> nidavellir_gpu_stress::StageReport + Send>;
         // Sustained loads that actually saturate the GPU; VRAM integrity first.
         let battery: Vec<(&'static str, Runner)> = vec![
-            ("VRAM integrity", Box::new(|c| c.run_vram_check(1024 * 1024 * 1024, 2))),
+            ("VRAM integrity", Box::new(|c| c.run_vram_check(4 * 1024 * 1024 * 1024, 2))),
             ("ALU (known-answer)", Box::new(|c| c.run_alu("ALU (known-answer)", 1_000_000, 1_000_000, 4000))),
             ("Memory (VRAM gather)", Box::new(|c| c.run_memory("Memory (VRAM gather)", 262_144, 4_096, 3500))),
             ("Mixed (ALU+mem)", Box::new(|c| c.run_alu("Mixed (ALU+mem)", 1_000_000, 1_000_000, 3000))),

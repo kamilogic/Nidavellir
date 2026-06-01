@@ -223,6 +223,21 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetRealSweepProgress => {
             IpcResponse::success(ResponseData::GpuSweep(guard.real_sweep.progress()))
         }
+        IpcRequest::StartMemSweep => {
+            let store = guard.safe_store.clone();
+            if guard.mem_sweep.start(store) {
+                IpcResponse::success(ResponseData::MemSweep(guard.mem_sweep.progress()))
+            } else {
+                IpcResponse::failure("Memory sweep already running")
+            }
+        }
+        IpcRequest::StopMemSweep => {
+            guard.mem_sweep.stop();
+            IpcResponse::success(ResponseData::MemSweep(guard.mem_sweep.progress()))
+        }
+        IpcRequest::GetMemSweepProgress => {
+            IpcResponse::success(ResponseData::MemSweep(guard.mem_sweep.progress()))
+        }
     }
 }
 

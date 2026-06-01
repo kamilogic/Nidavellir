@@ -12,11 +12,12 @@
   let expanded = $state(false);
   let realSweep = $state(null);
   let preflight = $state(false);
+  let memSweep = $state(null);
+  let memPreflight = $state(false);
 
-  const realRunning = $derived(
-    realSweep &&
-      ["baseline", "vram_diagnostic", "voltage_bisection", "synthesis"].includes(realSweep.phase),
-  );
+  const SWEEPING = ["baseline", "vram_diagnostic", "voltage_bisection", "synthesis"];
+  const realRunning = $derived(realSweep && SWEEPING.includes(realSweep.phase));
+  const memRunning = $derived(memSweep?.running);
 
   const running = $derived(
     progress &&
@@ -34,6 +35,8 @@
       validation = v?.data?.type === "GpuValidation" ? v.data : validation;
       const rs = await serviceCall("GetRealSweepProgress");
       realSweep = rs?.data?.type === "GpuSweep" ? rs.data : realSweep;
+      const ms = await serviceCall("GetMemSweepProgress");
+      memSweep = ms?.data?.type === "MemSweep" ? ms.data : memSweep;
       error = null;
     } catch (e) {
       error = String(e);
@@ -62,6 +65,12 @@
     call(method, setReal);
   };
   const stopReal = () => call("StopRealSweep", setReal);
+  const setMem = (r) => (memSweep = r?.data?.type === "MemSweep" ? r.data : memSweep);
+  const startMem = () => {
+    memPreflight = false;
+    call("StartMemSweep", setMem);
+  };
+  const stopMem = () => call("StopMemSweep", setMem);
 
   $effect(() => {
     refresh();
@@ -269,6 +278,49 @@
         {/if}
       {/if}
     </div>
+
+    <div class="realsweep">
+      <div class="real-head">
+        <h4 class="section-head">{$t("forge.memSweep")}</h4>
+        {#if memRunning}
+          <button class="btn stop" onclick={stopMem}>{$t("forge.stopMem")}</button>
+        {:else}
+          <button class="btn go" onclick={() => (memPreflight = true)}>{$t("forge.runMem")}</button>
+        {/if}
+      </div>
+      {#if memSweep && memSweep.phase !== "idle"}
+        <div class="grid">
+          <article class="tile">
+            <span class="lab">{$t("forge.phase")}</span>
+            <p class="val">{$t("phase." + memSweep.phase)}</p>
+          </article>
+          <article class="tile">
+            <span class="lab">{$t("forge.baseline")}</span>
+            <p class="val">{memSweep.baseline_gbps.toFixed(0)} GB/s</p>
+          </article>
+          <article class="tile">
+            <span class="lab">{$t("forge.bandwidth")}</span>
+            <p class="val accent">{memSweep.current_gbps.toFixed(0)} GB/s</p>
+            <p class="sub">+{memSweep.current_offset_mhz} MHz · {memSweep.current_mem_mhz} MHz</p>
+          </article>
+        </div>
+        {#if memSweep.points?.length}
+          <ul class="list">
+            {#each memSweep.points as p}
+              <li>
+                <span class="mono">+{p.offset_mhz} MHz · {p.mem_mhz} MHz</span>
+                <span class="mono" class:accent={p.stable} class:danger={!p.stable}>{p.bandwidth_gbps.toFixed(0)} GB/s</span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        {#if memSweep.peak_gbps > 0}
+          <p class="point accent">
+            {$t("forge.peakResult", { o: memSweep.peak_offset_mhz, g: memSweep.peak_gbps.toFixed(0) })}
+          </p>
+        {/if}
+      {/if}
+    </div>
   </div>
 </section>
 
@@ -283,6 +335,19 @@
         <button class="btn ghost" onclick={() => (preflight = false)}>{$t("forge.preCancel")}</button>
         <button class="btn" onclick={() => startReal("StartRealSweepFast")}>{$t("forge.preFast")}</button>
         <button class="btn go" onclick={() => startReal("StartRealSweep")}>{$t("forge.preThorough")}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if memPreflight}
+  <div class="overlay" onclick={() => (memPreflight = false)} role="presentation">
+    <div class="modal" onclick={(e) => e.stopPropagation()} role="presentation">
+      <div class="modal-head"><strong>⚠ {$t("forge.preTitle")}</strong></div>
+      <p class="pre-body">{$t("forge.memPreBody")}</p>
+      <div class="pre-actions">
+        <button class="btn ghost" onclick={() => (memPreflight = false)}>{$t("forge.preCancel")}</button>
+        <button class="btn go" onclick={startMem}>{$t("forge.runMem")}</button>
       </div>
     </div>
   </div>

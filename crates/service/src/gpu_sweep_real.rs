@@ -189,7 +189,7 @@ fn run_real_sweep(
     // Phase 1 gate: VRAM must be sound at stock, else tuning the core is moot.
     prog.phase = SweepPhase::VramDiagnostic;
     set_progress(&progress, prog.clone());
-    let vram = match catch_unwind(AssertUnwindSafe(|| ctx.run_vram_check(1024 * 1024 * 1024, 2))) {
+    let vram = match catch_unwind(AssertUnwindSafe(|| ctx.run_vram_check(4 * 1024 * 1024 * 1024, 2))) {
         Ok(r) => r.result,
         Err(_) => StabilityResult::Crash,
     };

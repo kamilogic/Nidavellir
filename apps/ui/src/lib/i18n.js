@@ -70,6 +70,15 @@ const dict = {
     "forge.voltageIdx": "Voltage",
     "forge.measured": "Measured: {f} MHz @ {v} mV",
     "forge.tempC": "Temp: {t} °C",
+    "forge.memSweep": "Memory sweep — finds the GDDR6 effective-bandwidth peak (writes mem clock)",
+    "forge.runMem": "Run memory sweep",
+    "forge.stopMem": "Stop",
+    "forge.baseline": "Baseline",
+    "forge.bandwidth": "Bandwidth",
+    "forge.memOffset": "Mem offset",
+    "forge.peakResult": "Bandwidth peak: +{o} MHz → {g} GB/s",
+    "forge.memPreBody":
+      "This writes the real memory clock and pushes toward the limit (artifacts/flicker possible; reversible, Safe Loop protected). It stops at the bandwidth peak — past it, GDDR6 error-correction reduces real throughput, so more MHz is pointless. Close other programs first.",
 
     "phase.idle": "Idle",
     "phase.baseline": "Baseline (thermal equilibrium)",
@@ -134,6 +143,15 @@ const dict = {
     "forge.voltageIdx": "Tensão",
     "forge.measured": "Medido: {f} MHz @ {v} mV",
     "forge.tempC": "Temp: {t} °C",
+    "forge.memSweep": "Sweep de memória — acha o pico de banda efetiva da GDDR6 (escreve clock de mem)",
+    "forge.runMem": "Rodar sweep de memória",
+    "forge.stopMem": "Parar",
+    "forge.baseline": "Base",
+    "forge.bandwidth": "Banda",
+    "forge.memOffset": "Offset de mem",
+    "forge.peakResult": "Pico de banda: +{o} MHz → {g} GB/s",
+    "forge.memPreBody":
+      "Isto escreve o clock real da memória e empurra até o limite (artefatos/flicker possíveis; reversível, protegido pelo Safe Loop). Para no pico de banda — depois dele, a correção de erro da GDDR6 reduz o throughput real, então mais MHz é inútil. Feche os outros programas antes.",
 
     "phase.idle": "Ocioso",
     "phase.baseline": "Baseline (equilíbrio térmico)",

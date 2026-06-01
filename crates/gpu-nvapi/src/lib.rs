@@ -89,6 +89,18 @@ pub fn set_core_offset_mhz(mhz: i32) -> Result<(), String> {
     .map_err(|e| format!("set_pstates failed: {e:?}"))
 }
 
+/// Apply a memory clock offset (MHz) to P0. Reversible (offset 0 = stock).
+#[cfg(windows)]
+pub fn set_mem_offset_mhz(mhz: i32) -> Result<(), String> {
+    let gpu = first_gpu()?;
+    gpu.set_pstates(std::iter::once((
+        nvapi::PState::P0,
+        nvapi::ClockDomain::Memory,
+        nvapi::KilohertzDelta(mhz * 1000),
+    )))
+    .map_err(|e| format!("set_pstates(memory) failed: {e:?}"))
+}
+
 /// Lock the core voltage to `mv` (the GPU runs at the curve frequency for that
 /// voltage). Reversible via [`unlock_core_voltage`].
 #[cfg(windows)]
@@ -116,12 +128,13 @@ pub fn read_core_voltage_mv() -> Option<u32> {
     s.split_whitespace().next()?.parse::<f32>().ok().map(|x| x as u32)
 }
 
-/// Full reset: unlock voltage and clear the clock offset.
+/// Full reset: unlock voltage and clear the core + memory clock offsets.
 #[cfg(windows)]
 pub fn reset_all() -> Result<(), String> {
     let a = unlock_core_voltage();
     let b = set_core_offset_mhz(0);
-    a.and(b)
+    let c = set_mem_offset_mhz(0);
+    a.and(b).and(c)
 }
 
 #[cfg(windows)]

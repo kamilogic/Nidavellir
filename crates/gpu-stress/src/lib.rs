@@ -105,6 +105,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
+// Memory-bandwidth kernel: read+write every element (8 bytes moved/elem) with
+// minimal compute → DRAM-bandwidth bound. Grid-stride for huge buffers.
+const BW_SHADER: &str = r#"
+struct P { n: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read_write> buf: array<u32>;
+@group(0) @binding(1) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * 64u;
+    var i = gid.x;
+    loop {
+        if (i >= p.n) { break; }
+        buf[i] = buf[i] * 1664525u + 1013904223u;
+        i = i + stride;
+    }
+}
+"#;
+
 // VRAM integrity: write a deterministic pattern, then verify it bit-for-bit,
 // counting mismatches on the GPU (only the count is read back).
 const VRAM_PATTERN_FN: &str = r#"
@@ -530,6 +548,86 @@ impl GpuCtx {
             mismatches: total_mismatches,
             elapsed_ms: start.elapsed().as_millis() as u64,
         }
+    }
+
+    /// Measure sustained memory bandwidth (GB/s) over ~`target_ms` by streaming
+    /// a large VRAM buffer (read+write each element). Used to find the GDDR6
+    /// *effective-bandwidth peak* — past it, ECC correction eats the gains.
+    pub fn measure_bandwidth_gbps(&self, target_ms: u64) -> f64 {
+        let bytes = (256u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
+        let len = (bytes / 4) as u32;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bw-buf"),
+            size: (len as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bw-params"),
+            contents: bytemuck::bytes_of(&Quad { a: len, b: 0, c: 0, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bw"),
+            source: wgpu::ShaderSource::Wgsl(BW_SHADER.into()),
+        });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("bw"),
+            layout: None,
+            module: &module,
+            entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bw"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
+            ],
+        });
+        let groups = len.div_ceil(64).min(65535);
+
+        // Warm-up pass (not timed).
+        {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipeline);
+                cp.set_bind_group(0, &bind, &[]);
+                cp.dispatch_workgroups(groups, 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            self.device.poll(wgpu::Maintain::Wait);
+        }
+
+        let start = std::time::Instant::now();
+        let mut passes: u64 = 0;
+        while (start.elapsed().as_millis() as u64) < target_ms {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipeline);
+                cp.set_bind_group(0, &bind, &[]);
+                cp.dispatch_workgroups(groups, 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            passes += 1;
+            if passes % 8 == 0 {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+            if self.crashed.load(Ordering::SeqCst) {
+                return 0.0;
+            }
+        }
+        self.device.poll(wgpu::Maintain::Wait);
+        let secs = start.elapsed().as_secs_f64();
+        if secs <= 0.0 {
+            return 0.0;
+        }
+        // 8 bytes moved per element per pass (read + write).
+        let bytes_moved = passes as f64 * len as f64 * 8.0;
+        bytes_moved / secs / 1e9
     }
 
     /// Read a single u32 from a COPY_SRC buffer.
