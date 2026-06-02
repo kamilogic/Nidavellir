@@ -25,9 +25,6 @@ use nidavellir_core::ipc::{PowerSweepPoint, PowerSweepProgress};
 use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
 use tracing::{info, warn};
 
-/// Voltages (mV) to characterize, low → high. Stock V/F points (offset 0) — all
-/// inherently stable; we never overclock past stock here.
-const VOLTAGES: &[u32] = &[850, 875, 900, 925, 950, 975, 1000];
 const DWELL_MS: u64 = 5000;
 
 fn idle() -> PowerSweepProgress {
@@ -242,93 +239,110 @@ fn run_power_sweep(
         }
     };
 
-    // Voltages to characterize: derive from the card's REAL V/F curve so this
-    // adapts to any GPU (a 3060 Ti tops ~1075 mV, a bigger card differs). Sample
-    // the top ~200 mV window (where the useful high clocks live) in 7 steps.
-    let volts: Vec<u32> = match gpu::read_curve() {
+    // Voltage range from the card's REAL V/F curve (adapts to any GPU). We never
+    // undervolt more than ~250 mV below the top, to bound how far past the cliff
+    // a step can go.
+    let (vmax, vfloor) = match gpu::read_curve() {
         Ok(c) if c.points.len() >= 2 => {
-            let vmax = c.points.iter().map(|p| p.voltage_mv).max().unwrap_or(1000);
-            let vmin_curve = c.points.iter().map(|p| p.voltage_mv).min().unwrap_or(800);
-            let lo = vmax.saturating_sub(200).max(vmin_curve);
-            let n = 7u32;
-            let span = vmax.saturating_sub(lo);
-            (0..n).map(|i| lo + span * i / (n - 1)).collect()
+            let vx = c.points.iter().map(|p| p.voltage_mv).max().unwrap_or(1050);
+            let vn = c.points.iter().map(|p| p.voltage_mv).min().unwrap_or(800);
+            (vx, vn.max(vx.saturating_sub(250)))
         }
-        _ => VOLTAGES.to_vec(),
+        _ => (1050u32, 850u32),
     };
-    prog.log.push(format!(
-        "Faixa de tensão (da curva): {}–{} mV",
-        volts.first().copied().unwrap_or(0),
-        volts.last().copied().unwrap_or(0)
-    ));
 
-    // Stock baseline (no voltage lock) under the same max load — likely power-
-    // capped, so its sustained clock is the bar Deep Calm/undervolt must beat.
-    // Also our CALIBRATION: how much of this card's cap does the load saturate?
+    let cap = prog.power_limit_w;
+
+    // Stock baseline (unlocked) under the max load → the clock we KEEP (target),
+    // and the calibration of how much of the cap the load saturates.
     let _ = gpu::set_core_offset_mhz(0);
+    let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
     let sm = load_and_measure(&ctx, DWELL_MS);
     prog.stock_clock_mhz = sm.clock_mhz;
-    let cap = prog.power_limit_w;
+    let target = sm.clock_mhz;
     let sat_pct = if cap > 0.0 { sm.max_power_w / cap * 100.0 } else { 0.0 };
     prog.log.push(format!(
         "Stock → {} MHz · {:.0} W (pico {:.0}, {:.0}% do cap){}",
         sm.clock_mhz, sm.power_w, sm.max_power_w, sat_pct,
         if sm.capped_frac > 0.1 { " · power-cap ✓" } else { "" }
     ));
-    if cap > 0.0 && sm.capped_frac < 0.05 && sat_pct < 85.0 {
-        prog.log.push(format!(
-            "⚠ A carga só atingiu {sat_pct:.0}% do cap ({cap:.0} W) — esta placa precisa de um kernel mais pesado para saturar; o mapa de potência subestima o real."
-        ));
+    if target == 0 {
+        let _ = gpu::reset_all();
+        prog.running = false;
+        prog.phase = "done".into();
+        prog.note = Some("Não foi possível ler o clock do stock.".into());
+        set(&progress, prog);
+        return;
     }
+    prog.log.push(format!(
+        "Alvo: manter {target} MHz e baixar a tensão de {vmax} mV ↓ até a mínima estável."
+    ));
     set(&progress, prog.clone());
 
-    // Always offset 0 — we measure each card's own stock clock at the locked
-    // voltage. No overclocking: stock V/F points are stable, so this can't
-    // hard-lock the machine (the +offset OC approach crashed the PC at 937mV).
-    for &v in &volts {
-        if stop.load(Ordering::SeqCst) {
+    // REAL undervolt: pin the clock at the stock target and descend the voltage
+    // in small steps from a safe high one, measuring the (now realistic) power at
+    // each voltage. Stop at the first instability — that's the cliff; the last
+    // stable voltage is the undervolt limit. Descending from a known-stable high
+    // voltage means we approach the cliff gently (vs the old clock-ascent that
+    // hard-crashed the PC).
+    const STEP: u32 = 20;
+    let mut v = vmax;
+    while v >= vfloor && !stop.load(Ordering::SeqCst) {
+        if nidavellir_core::nvml_gpu::pin_core_clock_mhz(target).is_err() {
+            prog.log.push("Falha ao fixar o clock (NVML) — abortando.".into());
             break;
         }
         if gpu::lock_core_voltage_mv(v).is_err() {
             warn!("power sweep: lock {v}mV failed; skipping");
+            v = v.saturating_sub(STEP);
             continue;
         }
-        let intent = TuningPoint::from_axes([("gpu_voltage_mv", v as i64), ("gpu_offset_mhz", 0)]);
+        let intent =
+            TuningPoint::from_axes([("gpu_voltage_mv", v as i64), ("gpu_clock_mhz", target as i64)]);
         let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_power_sweep"));
         let m = load_and_measure(&ctx, DWELL_MS);
         let _ = store.clear_boot_flag();
         prog.log.push(format!(
-            "{v} mV → {} MHz · {:.0} W (máx {:.0}, σ{:.0}{}) : {}",
-            m.clock_mhz, m.power_w, m.max_power_w, m.power_std_w,
+            "{v} mV @ {target} MHz → {} MHz · {:.0} W (máx {:.0}{}) : {}",
+            m.clock_mhz, m.power_w, m.max_power_w,
             if m.capped_frac > 0.02 { format!(", cap {:.0}%", m.capped_frac * 100.0) } else { String::new() },
             match m.result {
                 StabilityResult::Stable => "ok",
-                StabilityResult::SilentError => "erro silencioso",
+                StabilityResult::SilentError => "erro silencioso (limite)",
                 StabilityResult::Crash => "instável",
             }
         ));
-        if matches!(m.result, StabilityResult::Stable) && m.clock_mhz > 0 && m.power_w > 0.0 {
-            prog.points.push(PowerSweepPoint {
-                voltage_mv: v,
-                clock_mhz: m.clock_mhz,
-                power_w: m.power_w,
-                max_power_w: m.max_power_w,
-                power_std_w: m.power_std_w,
-                power_capped_frac: m.capped_frac,
-                stable: true,
-                perf_per_watt: m.clock_mhz as f64 / m.power_w as f64,
-            });
-        } else if matches!(m.result, StabilityResult::Crash) {
-            // A stock-clock point shouldn't device-lost, but if it does, recover.
-            let _ = gpu::unlock_core_voltage();
-            if let Some(fresh) = recover_ctx() {
-                ctx = fresh;
-            } else {
-                prog.note = Some("GPU não recuperou — parando".into());
+        match m.result {
+            StabilityResult::Stable if m.clock_mhz > 0 && m.power_w > 0.0 => {
+                prog.points.push(PowerSweepPoint {
+                    voltage_mv: v,
+                    clock_mhz: m.clock_mhz,
+                    power_w: m.power_w,
+                    max_power_w: m.max_power_w,
+                    power_std_w: m.power_std_w,
+                    power_capped_frac: m.capped_frac,
+                    stable: true,
+                    perf_per_watt: m.clock_mhz as f64 / m.power_w as f64,
+                });
+                set(&progress, prog.clone());
+                v = v.saturating_sub(STEP);
+            }
+            StabilityResult::Stable => {
+                v = v.saturating_sub(STEP);
+            }
+            StabilityResult::SilentError => {
+                prog.log.push(format!("Limite de undervolt em ~{v} mV — parando a descida."));
+                break;
+            }
+            StabilityResult::Crash => {
+                let _ = gpu::unlock_core_voltage();
+                let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+                if recover_ctx().map(|c| ctx = c).is_none() {
+                    prog.note = Some("GPU não recuperou — parando".into());
+                }
                 break;
             }
         }
-        set(&progress, prog.clone());
     }
 
     let _ = gpu::unlock_core_voltage();
@@ -336,50 +350,32 @@ fn run_power_sweep(
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
     let _ = store.clear_boot_flag();
 
-    // --- Synthesize the three profiles ------------------------------------
+    // --- Synthesize the three profiles (all hold the stock target clock; they
+    // differ in voltage → power. No core OC here, so performance = stock; the
+    // profiles trade power/stability-margin). -----------------------------
     use std::cmp::Ordering as Ord;
-    let cap = prog.power_limit_w;
-    let stock = prog.stock_clock_mhz;
-
-    // Brokkr's headroom: cap − max(10% cap, 2σ) — variance-aware (spiky loads get
-    // more margin), with the measured power-cap fraction as the hard gate.
     let max_std = prog.points.iter().map(|p| p.power_std_w).fold(0.0f32, f32::max);
     let headroom = (0.10 * cap).max(2.0 * max_std);
     let brokkr_target = if cap > 0.0 { cap - headroom } else { f32::MAX };
     prog.target_w = brokkr_target;
 
-    // Godforge: highest sustained clock, full power allowed; tie → lower power.
-    prog.godforge = prog
-        .points
-        .iter()
-        .filter(|p| p.stable)
-        .copied()
-        .max_by(|a, b| {
-            a.clock_mhz
-                .cmp(&b.clock_mhz)
-                .then_with(|| b.power_w.partial_cmp(&a.power_w).unwrap_or(Ord::Equal))
-        });
-    // Brokkr's Best: highest clock that never power-caps and stays under target.
+    // Godforge: highest voltage held → most power / most stability margin (stock perf).
+    prog.godforge = prog.points.iter().copied().max_by_key(|p| p.voltage_mv);
+    // Brokkr's Best: highest voltage whose sustained power stays under the target
+    // (stock perf, comfortably off the cap). Falls back to the most efficient.
     prog.brokkrs = prog
         .points
         .iter()
-        .filter(|p| p.stable && p.power_capped_frac < 0.03 && p.power_w <= brokkr_target)
+        .filter(|p| p.power_w <= brokkr_target)
         .copied()
-        .max_by_key(|p| p.clock_mhz);
-    // Deep Calm: absolute best perf/watt subject to perf ≥ stock. If the card is
-    // barely power-limited (no locked point matches stock's free-boost clock),
-    // relax to within 5% of stock so we still surface a useful efficiency pick.
-    let best_ppw_above = |min: u32| {
-        prog
-            .points
-            .iter()
-            .filter(|p| p.stable && p.clock_mhz >= min)
-            .copied()
-            .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal))
-    };
-    prog.deep_calm = best_ppw_above(stock)
-        .or_else(|| best_ppw_above((stock as f64 * 0.95) as u32))
-        .or_else(|| prog.points.iter().filter(|p| p.stable).copied().max_by_key(|p| p.clock_mhz));
+        .max_by_key(|p| p.voltage_mv)
+        .or_else(|| prog.points.iter().copied().min_by_key(|p| p.voltage_mv));
+    // Deep Calm: best perf/watt = lowest stable voltage = least power (same perf).
+    prog.deep_calm = prog
+        .points
+        .iter()
+        .copied()
+        .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal));
     prog.recommended = prog.deep_calm;
 
     if prog.godforge.is_some() {
@@ -387,26 +383,18 @@ fn run_power_sweep(
             Some(p) => format!("{} MHz @ {} mV ({:.0} W)", p.clock_mhz, p.voltage_mv, p.power_w),
             None => "—".into(),
         };
-        // Deep Calm efficiency vs stock (% of stock clock, watts saved).
         let dc_eff = match prog.deep_calm {
-            Some(p) if stock > 0 && sm.power_w > 0.0 => format!(
-                " (Deep Calm = {:.0}% do stock, −{:.0} W)",
-                p.clock_mhz as f64 / stock as f64 * 100.0,
-                (sm.power_w - p.power_w).max(0.0)
-            ),
+            Some(p) if sm.power_w > 0.0 => {
+                format!(" (Deep Calm mantém o clock economizando {:.0} W)", (sm.power_w - p.power_w).max(0.0))
+            }
             _ => String::new(),
         };
-        let cap_note = if sm.capped_frac < 0.05 && sm.max_power_w < cap * 0.9 {
-            " · ⚠ placa pouco power-limited (stock mal satura o cap) — ganho é eficiência, não perf"
-        } else {
-            ""
-        };
         prog.note = Some(format!(
-            "Stock {stock} MHz · cap {cap:.0} W (alvo Brokkr's ≤ {brokkr_target:.0} W) · Godforge {} · Brokkr's {} · Deep Calm {}{dc_eff}{cap_note} — confirme em jogo.",
+            "Mantendo {target} MHz · cap {cap:.0} W (alvo Brokkr's ≤ {brokkr_target:.0} W) · Godforge {} · Brokkr's {} · Deep Calm {}{dc_eff} — confirme em jogo.",
             fmt(prog.godforge), fmt(prog.brokkrs), fmt(prog.deep_calm)
         ));
     } else {
-        prog.note = Some("Nenhum ponto estável medido.".into());
+        prog.note = Some("Nenhum ponto de undervolt estável encontrado.".into());
     }
     prog.running = false;
     prog.phase = "done".into();
