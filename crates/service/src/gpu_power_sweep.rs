@@ -145,7 +145,9 @@ fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(80));
+            // Fast sampling to catch short power spikes the cap reacts to (NVML
+            // at ~80ms missed the peaks that still hit the 200W cap in Heaven).
+            std::thread::sleep(std::time::Duration::from_millis(30));
         }
     });
     let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 10_000, ms))) {
@@ -461,12 +463,12 @@ fn run_power_sweep(
 
     // Godforge: highest voltage held → most power / most stability margin (stock perf).
     prog.godforge = prog.points.iter().copied().max_by_key(|p| p.voltage_mv);
-    // Brokkr's Best: highest voltage whose sustained power stays under the target
-    // (stock perf, comfortably off the cap). Falls back to the most efficient.
+    // Brokkr's Best: highest voltage whose PEAK power stays under the target
+    // (peak, not mean — the cap reacts to spikes). Falls back to the most efficient.
     prog.brokkrs = prog
         .points
         .iter()
-        .filter(|p| p.power_w <= brokkr_target)
+        .filter(|p| p.max_power_w <= brokkr_target)
         .copied()
         .max_by_key(|p| p.voltage_mv)
         .or_else(|| prog.points.iter().copied().min_by_key(|p| p.voltage_mv));

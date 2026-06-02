@@ -82,18 +82,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // The float result is written to a sink buffer so the compiler can't eliminate
 // it; it isn't verified (only the integer chains are the known-answer).
 const POWER_SHADER: &str = r#"
-struct P { iters: u32, n: u32, p0: u32, p1: u32 };
+struct P { iters: u32, n: u32, bw_n: u32, pad: u32 };
 @group(0) @binding(0) var<storage, read_write> data: array<vec4<u32>>;
 @group(0) @binding(1) var<storage, read_write> fsink: array<vec4<f32>>;
-@group(0) @binding(2) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read_write> bw: array<u32>;
+@group(0) @binding(3) var<uniform> p: P;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.n) { return; }
     var v = data[i];
     let fi = f32(i);
-    // Two independent FP accumulators → FP ILP (the dependency chains don't stall
-    // each other), driving the FP32 cores harder for a near-cap power draw.
+    // Drive ALL three power domains at once, like a real game (which our pure-
+    // compute load under-measured — a 3060 Ti hit only 155 W here at 967 mV but
+    // ~199 W in Heaven): integer ALU + two FP FMA chains (FP32 cores) + a strided
+    // VRAM read-modify-write (memory controller + DRAM power).
     var f = vec4<f32>(fi * 1e-3 + 1.0, fi * 2e-3 + 1.5, fi * 3e-3 + 2.0, fi * 1.5e-3 + 0.5);
     var g = vec4<f32>(fi * 1.7e-3 + 1.1, fi * 0.9e-3 + 1.3, fi * 2.3e-3 + 1.9, fi * 1.2e-3 + 0.7);
     let m = vec4<f32>(1.0000001);
@@ -104,8 +107,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         g = fma(g, a, m);
         f = fma(f, a, m);
         g = fma(g, m, a);
-        f = fma(f, m, a);
-        g = fma(g, a, m);
+        let idx = (i * 2654435761u + k * 2246822519u) % p.bw_n;
+        bw[idx] = bw[idx] + v.x;
     }
     data[i] = v;
     fsink[i] = f + g;
@@ -525,9 +528,19 @@ impl GpuCtx {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        // Bandwidth buffer: strided RMW adds memory-controller + DRAM power so the
+        // load matches a real game (compute-only under-measured the draw).
+        let bw_bytes = (256u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
+        let bw_n = (bw_bytes / 4) as u32;
+        let bw = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pwr-bw"),
+            size: (bw_n as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pwr-params"),
-            contents: bytemuck::bytes_of(&Params { a: iters, n: elements, _pad: [0; 2] }),
+            contents: bytemuck::bytes_of(&Quad { a: iters, b: elements, c: bw_n, d: 0 }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -543,7 +556,8 @@ impl GpuCtx {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: data.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: fsink.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bw.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
             ],
         });
 
