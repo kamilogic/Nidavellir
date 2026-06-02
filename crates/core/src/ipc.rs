@@ -38,6 +38,39 @@ pub enum IpcRequest {
     StartBenchmark,
     StopBenchmark,
     GetBenchmarkProgress,
+    StartPowerSweep,
+    StopPowerSweep,
+    GetPowerSweepProgress,
+    ApplyPowerRecommended,
+}
+
+/// One measured (voltage → max-stable-clock, power) point of the power sweep.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct PowerSweepPoint {
+    pub voltage_mv: u32,
+    pub clock_mhz: u32,
+    pub power_w: f32,
+    pub stable: bool,
+    /// Efficiency proxy: sustained clock per watt.
+    pub perf_per_watt: f64,
+}
+
+/// Power-target sweep: for a range of locked voltages, the max stable clock and
+/// the sustained power it draws under a heavy load — used to find the perf/watt
+/// knee (best performance just before diminishing returns) under the power cap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PowerSweepProgress {
+    pub running: bool,
+    pub phase: String,
+    pub log: Vec<String>,
+    pub points: Vec<PowerSweepPoint>,
+    /// Enforced power cap (W).
+    pub power_limit_w: f32,
+    /// Target power (W) — defaults to the perf/watt knee's draw; configurable.
+    pub target_w: f32,
+    /// The recommended operating point (the knee, or best under an explicit target).
+    pub recommended: Option<PowerSweepPoint>,
+    pub note: Option<String>,
 }
 
 /// One benchmark run's measured metrics (stock or tuned).
@@ -184,6 +217,7 @@ pub enum ResponseData {
     GpuApply(GpuApplyStatus),
     ForgeAll(ForgeAllProgress),
     Benchmark(BenchmarkProgress),
+    PowerSweep(PowerSweepProgress),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

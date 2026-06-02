@@ -304,6 +304,44 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetBenchmarkProgress => {
             IpcResponse::success(ResponseData::Benchmark(guard.benchmark.progress()))
         }
+        IpcRequest::StartPowerSweep => {
+            let store = guard.safe_store.clone();
+            if guard.power_sweep.start(store) {
+                IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
+            } else {
+                IpcResponse::failure("Power sweep already running")
+            }
+        }
+        IpcRequest::StopPowerSweep => {
+            guard.power_sweep.stop();
+            IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
+        }
+        IpcRequest::GetPowerSweepProgress => {
+            IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
+        }
+        IpcRequest::ApplyPowerRecommended => {
+            let rec = guard.power_sweep.progress().recommended;
+            match rec {
+                None => IpcResponse::failure("Run the power sweep first"),
+                Some(p) => {
+                    let mut ap = crate::gpu_apply::load_applied().unwrap_or_default();
+                    ap.core = Some(nidavellir_core::gpu_sweep::VfPoint {
+                        freq_mhz: p.clock_mhz,
+                        voltage_mv: p.voltage_mv,
+                    });
+                    if ap.label.is_empty() {
+                        ap.label = "Power knee".into();
+                    }
+                    let msg = match crate::gpu_apply::apply_and_persist(
+                        ap.label.clone(), ap.core, ap.mem_offset_mhz, &guard.safe_store,
+                    ) {
+                        Ok(()) => format!("Applied {} MHz @ {} mV", p.clock_mhz, p.voltage_mv),
+                        Err(e) => format!("Apply failed: {e}"),
+                    };
+                    IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+                }
+            }
+        }
     }
 }
 

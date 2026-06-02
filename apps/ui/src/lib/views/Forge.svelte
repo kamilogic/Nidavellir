@@ -17,7 +17,9 @@
   let forge = $state(null);
   let forgePreflight = $state(false);
   let benchmark = $state(null);
+  let powerSweep = $state(null);
   const forgeRunning = $derived(forge?.running);
+  const powerRunning = $derived(powerSweep?.running);
 
   // Keep a terminal pinned to its newest line (tail -f). The `dep` param makes
   // the action re-run on every appended line so the latest is always in view.
@@ -58,6 +60,8 @@
       forge = fa?.data?.type === "ForgeAll" ? fa.data : forge;
       const bm = await serviceCall("GetBenchmarkProgress");
       benchmark = bm?.data?.type === "Benchmark" ? bm.data : benchmark;
+      const ps = await serviceCall("GetPowerSweepProgress");
+      powerSweep = ps?.data?.type === "PowerSweep" ? ps.data : powerSweep;
       error = null;
     } catch (e) {
       error = String(e);
@@ -104,6 +108,10 @@
   const setBench = (r) => (benchmark = r?.data?.type === "Benchmark" ? r.data : benchmark);
   const startBench = () => call("StartBenchmark", setBench);
   const stopBench = () => call("StopBenchmark", setBench);
+  const setPower = (r) => (powerSweep = r?.data?.type === "PowerSweep" ? r.data : powerSweep);
+  const startPower = () => call("StartPowerSweep", setPower);
+  const stopPower = () => call("StopPowerSweep", setPower);
+  const applyPowerRec = () => call("ApplyPowerRecommended", setApplied);
   const pct = (a, b) => (a > 0 ? ((b - a) / a) * 100 : 0);
   const sgn = (x, d = 0) => (x >= 0 ? "+" : "") + x.toFixed(d);
 
@@ -241,6 +249,58 @@
   </div>
 
   <p class="sub apply-hint">{$t("forge.orderHint")}</p>
+
+  <div class="power">
+    <div class="real-head">
+      <h3 class="section-head">⚡ {$t("forge.powerTitle")}</h3>
+      {#if powerRunning}
+        <button class="btn stop" onclick={stopPower}>{$t("forge.benchStop")}</button>
+      {:else}
+        <button class="btn go" onclick={startPower}>{$t("forge.powerRun")}</button>
+      {/if}
+    </div>
+    <p class="sub">{$t("forge.powerDesc")}</p>
+    {#if powerSweep && powerSweep.phase !== "idle"}
+      {#if powerSweep.power_limit_w > 0}
+        <p class="sub">{$t("forge.powerCap", { w: powerSweep.power_limit_w.toFixed(0) })}</p>
+      {/if}
+      {#if powerSweep.log?.length}
+        <div class="terminal">
+          <div class="term-head">
+            <span class="dots"><i></i><i></i><i></i></span>
+            <span class="term-title">nidavellir · power sweep</span>
+            <span class="term-status" class:live={powerRunning}>{powerRunning ? "running" : "done"}</span>
+          </div>
+          <div class="term-body" use:autoscroll={powerSweep.log.length}>
+            {#each powerSweep.log as line, i}
+              <div class="tline"><span class="gutter">{(i + 1).toString().padStart(2, "0")}</span><span class="tlead">{line}</span></div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+      {#if powerSweep.points?.length}
+        <table class="bench-table">
+          <thead>
+            <tr><th>mV</th><th>{$t("forge.benchClock")}</th><th>{$t("forge.benchPower")}</th><th>fps/W·</th></tr>
+          </thead>
+          <tbody>
+            {#each powerSweep.points as p}
+              <tr class:rec={powerSweep.recommended && p.voltage_mv === powerSweep.recommended.voltage_mv}>
+                <td>{p.voltage_mv}</td>
+                <td>{p.clock_mhz} MHz</td>
+                <td>{p.power_w.toFixed(0)} W</td>
+                <td>{p.perf_per_watt.toFixed(1)}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+      {#if powerSweep.note}<p class="point" class:accent={!powerRunning}>{powerSweep.note}</p>{/if}
+      {#if powerSweep.recommended && !powerRunning}
+        <button class="btn go small" onclick={applyPowerRec}>{$t("forge.powerApply")}</button>
+      {/if}
+    {/if}
+  </div>
 
   <div class="section real">
     <div class="real-head">
@@ -843,10 +903,16 @@
     flex-direction: column;
     gap: 0.5rem;
   }
-  .bench {
+  .bench,
+  .power {
     margin-top: 1rem;
     padding-top: 1rem;
     border-top: 1px solid var(--border);
+  }
+  .bench-table tr.rec td {
+    background: rgba(163, 190, 140, 0.12);
+    color: var(--nord-aurora);
+    font-weight: 700;
   }
   .bench-table {
     width: 100%;

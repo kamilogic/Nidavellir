@@ -2,6 +2,7 @@ mod gpu_apply;
 mod gpu_benchmark;
 mod gpu_forge_all;
 mod gpu_mem_sweep;
+mod gpu_power_sweep;
 mod gpu_real;
 mod gpu_sweep_real;
 mod ipc_server;
@@ -17,6 +18,7 @@ use windows_service::define_windows_service;
 use gpu_benchmark::BenchmarkHandle;
 use gpu_forge_all::ForgeAllHandle;
 use gpu_mem_sweep::MemSweepHandle;
+use gpu_power_sweep::PowerSweepHandle;
 use gpu_real::GpuValidationHandle;
 use gpu_sweep_real::RealSweepHandle;
 use nidavellir_core::safe_loop::SafeLoopStore;
@@ -35,6 +37,7 @@ pub struct AppState {
     pub mem_sweep: MemSweepHandle,
     pub forge_all: ForgeAllHandle,
     pub benchmark: BenchmarkHandle,
+    pub power_sweep: PowerSweepHandle,
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -84,6 +87,7 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         mem_sweep: MemSweepHandle::default(),
         forge_all: ForgeAllHandle::default(),
         benchmark: BenchmarkHandle::default(),
+        power_sweep: PowerSweepHandle::default(),
     }));
     ipc_server::run_pipe_server(state)?;
     Ok(())

@@ -104,6 +104,11 @@ const dict = {
     "forge.benchTemp": "Max temp",
     "forge.benchPowerCap": "Power-capped",
     "forge.benchLimit": "Power limit: {w} W (enforced cap the card throttles against).",
+    "forge.powerTitle": "Power sweep — best perf under the power cap",
+    "forge.powerDesc": "For a range of locked voltages, finds the max stable clock and measures the sustained power it draws under heavy load, then recommends the perf/watt knee (near-max performance well under the cap). The real per-chip mV↔W map — no formula.",
+    "forge.powerRun": "Run power sweep",
+    "forge.powerCap": "Detected power cap: {w} W.",
+    "forge.powerApply": "Apply recommended (knee)",
 
     "phase.idle": "Idle",
     "phase.baseline": "Baseline (thermal equilibrium)",
@@ -202,6 +207,11 @@ const dict = {
     "forge.benchTemp": "Temp máx",
     "forge.benchPowerCap": "Em power-cap",
     "forge.benchLimit": "Limite de potência: {w} W (teto que faz a placa throttlar).",
+    "forge.powerTitle": "Power sweep — melhor desempenho sob o teto de potência",
+    "forge.powerDesc": "Para uma faixa de tensões travadas, acha o clock máximo estável e mede a potência sustentada sob carga pesada, depois recomenda o joelho de perf/watt (quase o máximo bem abaixo do teto). O mapa real mV↔W do teu chip — sem fórmula.",
+    "forge.powerRun": "Rodar power sweep",
+    "forge.powerCap": "Teto de potência detectado: {w} W.",
+    "forge.powerApply": "Aplicar recomendado (joelho)",
 
     "phase.idle": "Ocioso",
     "phase.baseline": "Baseline (equilíbrio térmico)",
