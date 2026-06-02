@@ -168,6 +168,7 @@ fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
 /// the line joining its endpoints — the elbow where more power stops buying much
 /// more clock. Falls back to the best raw perf/watt for tiny sets.
 #[cfg(windows)]
+#[allow(dead_code)]
 fn knee(points: &[PowerSweepPoint]) -> Option<PowerSweepPoint> {
     let pts: Vec<&PowerSweepPoint> = points.iter().filter(|p| p.stable && p.power_w > 0.0).collect();
     if pts.is_empty() {
@@ -365,29 +366,45 @@ fn run_power_sweep(
         .filter(|p| p.stable && p.power_capped_frac < 0.03 && p.power_w <= brokkr_target)
         .copied()
         .max_by_key(|p| p.clock_mhz);
-    // Deep Calm: best perf/watt with clock ≥ stock baseline.
-    prog.deep_calm = prog
-        .points
-        .iter()
-        .filter(|p| p.stable && p.clock_mhz >= stock)
-        .copied()
-        .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal));
-    if prog.deep_calm.is_none() {
-        prog.deep_calm = knee(&prog.points);
-    }
+    // Deep Calm: absolute best perf/watt subject to perf ≥ stock. If the card is
+    // barely power-limited (no locked point matches stock's free-boost clock),
+    // relax to within 5% of stock so we still surface a useful efficiency pick.
+    let best_ppw_above = |min: u32| {
+        prog
+            .points
+            .iter()
+            .filter(|p| p.stable && p.clock_mhz >= min)
+            .copied()
+            .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal))
+    };
+    prog.deep_calm = best_ppw_above(stock)
+        .or_else(|| best_ppw_above((stock as f64 * 0.95) as u32))
+        .or_else(|| prog.points.iter().filter(|p| p.stable).copied().max_by_key(|p| p.clock_mhz));
     prog.recommended = prog.deep_calm;
 
     if prog.godforge.is_some() {
-        let g = prog.godforge.unwrap();
         let fmt = |o: Option<PowerSweepPoint>| match o {
             Some(p) => format!("{} MHz @ {} mV ({:.0} W)", p.clock_mhz, p.voltage_mv, p.power_w),
             None => "—".into(),
         };
+        // Deep Calm efficiency vs stock (% of stock clock, watts saved).
+        let dc_eff = match prog.deep_calm {
+            Some(p) if stock > 0 && sm.power_w > 0.0 => format!(
+                " (Deep Calm = {:.0}% do stock, −{:.0} W)",
+                p.clock_mhz as f64 / stock as f64 * 100.0,
+                (sm.power_w - p.power_w).max(0.0)
+            ),
+            _ => String::new(),
+        };
+        let cap_note = if sm.capped_frac < 0.05 && sm.max_power_w < cap * 0.9 {
+            " · ⚠ placa pouco power-limited (stock mal satura o cap) — ganho é eficiência, não perf"
+        } else {
+            ""
+        };
         prog.note = Some(format!(
-            "Stock {stock} MHz · cap {cap:.0} W (alvo Brokkr's ≤ {brokkr_target:.0} W) · Godforge {} · Brokkr's {} · Deep Calm {} — confirme em jogo.",
+            "Stock {stock} MHz · cap {cap:.0} W (alvo Brokkr's ≤ {brokkr_target:.0} W) · Godforge {} · Brokkr's {} · Deep Calm {}{dc_eff}{cap_note} — confirme em jogo.",
             fmt(prog.godforge), fmt(prog.brokkrs), fmt(prog.deep_calm)
         ));
-        let _ = g;
     } else {
         prog.note = Some("Nenhum ponto estável medido.".into());
     }

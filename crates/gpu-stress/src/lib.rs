@@ -92,18 +92,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= p.n) { return; }
     var v = data[i];
     let fi = f32(i);
+    // Two independent FP accumulators → FP ILP (the dependency chains don't stall
+    // each other), driving the FP32 cores harder for a near-cap power draw.
     var f = vec4<f32>(fi * 1e-3 + 1.0, fi * 2e-3 + 1.5, fi * 3e-3 + 2.0, fi * 1.5e-3 + 0.5);
+    var g = vec4<f32>(fi * 1.7e-3 + 1.1, fi * 0.9e-3 + 1.3, fi * 2.3e-3 + 1.9, fi * 1.2e-3 + 0.7);
     let m = vec4<f32>(1.0000001);
     let a = vec4<f32>(0.9999999);
     for (var k: u32 = 0u; k < p.iters; k = k + 1u) {
         v = v * 1664525u + vec4<u32>(1013904223u);
         f = fma(f, m, a);
+        g = fma(g, a, m);
         f = fma(f, a, m);
+        g = fma(g, m, a);
         f = fma(f, m, a);
-        f = fma(f, a, m);
+        g = fma(g, a, m);
     }
     data[i] = v;
-    fsink[i] = f;
+    fsink[i] = f + g;
 }
 "#;
 
