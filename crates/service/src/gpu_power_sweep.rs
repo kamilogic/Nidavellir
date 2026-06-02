@@ -136,7 +136,7 @@ fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
             std::thread::sleep(std::time::Duration::from_millis(80));
         }
     });
-    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 20_000, ms))) {
+    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 10_000, ms))) {
         Ok(r) => r.result,
         Err(_) => StabilityResult::Crash,
     };

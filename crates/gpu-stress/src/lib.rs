@@ -74,25 +74,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-// Max-power ALU virus: each lane runs FOUR independent LCG chains in a vec4
-// (4× instruction-level parallelism → saturates the ALU pipelines for the
-// highest sustained power draw, near a real power-virus, so high-voltage points
-// actually reach the power cap). Each vec4 lane is a pure LCG of its own seed →
-// fully verifiable via jump-ahead. No memory traffic (registers only) so power,
-// not bandwidth, is the limit.
+// Max-power virus: each lane drives BOTH datapaths at once — an integer vec4 LCG
+// (verified via jump-ahead) AND a float vec4 FMA chain (the hottest op on NVIDIA;
+// FP32 cores dominate the power budget). Pure integer ALU only reached ~80% of a
+// 200 W cap on a 3060 Ti; mixing in independent FP FMAs pushes the draw up near
+// the real cap so high-voltage points actually throttle and the V↔W map is real.
+// The float result is written to a sink buffer so the compiler can't eliminate
+// it; it isn't verified (only the integer chains are the known-answer).
 const POWER_SHADER: &str = r#"
 struct P { iters: u32, n: u32, p0: u32, p1: u32 };
 @group(0) @binding(0) var<storage, read_write> data: array<vec4<u32>>;
-@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> fsink: array<vec4<f32>>;
+@group(0) @binding(2) var<uniform> p: P;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.n) { return; }
     var v = data[i];
+    let fi = f32(i);
+    var f = vec4<f32>(fi * 1e-3 + 1.0, fi * 2e-3 + 1.5, fi * 3e-3 + 2.0, fi * 1.5e-3 + 0.5);
+    let m = vec4<f32>(1.0000001);
+    let a = vec4<f32>(0.9999999);
     for (var k: u32 = 0u; k < p.iters; k = k + 1u) {
         v = v * 1664525u + vec4<u32>(1013904223u);
+        f = fma(f, m, a);
+        f = fma(f, a, m);
+        f = fma(f, m, a);
+        f = fma(f, a, m);
     }
     data[i] = v;
+    fsink[i] = f;
 }
 "#;
 
@@ -477,9 +488,10 @@ impl GpuCtx {
         }
     }
 
-    /// Sustained MAX-POWER ALU load (4-way ILP per lane via `vec4`), known-answer
-    /// checked. The densest, most power-hungry load we have — used by the power
-    /// sweep so high-voltage points reach the power cap and the V↔W map is real.
+    /// Sustained MAX-POWER load: int vec4 LCG (known-answer checked) + float vec4
+    /// FMA (load, drives the FP32 cores) per lane — both datapaths at once for the
+    /// hottest draw, so the power sweep's high-voltage points reach the cap. The
+    /// integer chains are the known-answer; the float sink is load-only.
     pub fn run_power_load(&self, elements: u32, iters: u32, target_ms: u64) -> StageReport {
         const S1: u32 = 0x9e3779b9;
         const S2: u32 = 0x85ebca6b;
@@ -501,6 +513,13 @@ impl GpuCtx {
             contents: bytemuck::cast_slice(&input),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
+        // Float sink: forces the FP FMA work to execute (can't be optimized out).
+        let fsink = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pwr-fsink"),
+            size: (elements as u64) * 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pwr-params"),
             contents: bytemuck::bytes_of(&Params { a: iters, n: elements, _pad: [0; 2] }),
@@ -518,7 +537,8 @@ impl GpuCtx {
             label: Some("pwr"), layout: &pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: data.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: fsink.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
             ],
         });
 
