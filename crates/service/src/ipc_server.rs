@@ -319,30 +319,42 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetPowerSweepProgress => {
             IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
         }
-        IpcRequest::ApplyPowerRecommended => {
-            let rec = guard.power_sweep.progress().recommended;
-            match rec {
-                None => IpcResponse::failure("Run the power sweep first"),
-                Some(p) => {
-                    let mut ap = crate::gpu_apply::load_applied().unwrap_or_default();
-                    ap.core = Some(nidavellir_core::gpu_sweep::VfPoint {
-                        freq_mhz: p.clock_mhz,
-                        voltage_mv: p.voltage_mv,
-                    });
-                    if ap.label.is_empty() {
-                        ap.label = "Power knee".into();
-                    }
-                    let msg = match crate::gpu_apply::apply_and_persist(
-                        ap.label.clone(), ap.core, ap.mem_offset_mhz, &guard.safe_store,
-                    ) {
-                        Ok(()) => format!("Applied {} MHz @ {} mV", p.clock_mhz, p.voltage_mv),
-                        Err(e) => format!("Apply failed: {e}"),
-                    };
-                    IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
-                }
-            }
+        IpcRequest::ApplyPowerGodforge => {
+            let pt = guard.power_sweep.progress().godforge;
+            apply_power_profile(&guard.safe_store, pt, "Godforge")
+        }
+        IpcRequest::ApplyPowerBrokkrs => {
+            let pt = guard.power_sweep.progress().brokkrs;
+            apply_power_profile(&guard.safe_store, pt, "Brokkr's Best")
+        }
+        IpcRequest::ApplyPowerDeepCalm => {
+            let pt = guard.power_sweep.progress().deep_calm;
+            apply_power_profile(&guard.safe_store, pt, "Deep Calm")
         }
     }
+}
+
+/// Apply a power-sweep profile point (core voltage + clock, with the hard clock
+/// cap) and persist it, keeping any existing memory offset.
+fn apply_power_profile(
+    store: &nidavellir_core::safe_loop::SafeLoopStore,
+    pt: Option<nidavellir_core::ipc::PowerSweepPoint>,
+    label: &str,
+) -> IpcResponse {
+    let Some(p) = pt else {
+        return IpcResponse::failure("Run the power sweep first (no point for this profile)");
+    };
+    let mut ap = crate::gpu_apply::load_applied().unwrap_or_default();
+    ap.core = Some(nidavellir_core::gpu_sweep::VfPoint {
+        freq_mhz: p.clock_mhz,
+        voltage_mv: p.voltage_mv,
+    });
+    ap.label = label.into();
+    let msg = match crate::gpu_apply::apply_and_persist(ap.label.clone(), ap.core, ap.mem_offset_mhz, store) {
+        Ok(()) => format!("Applied {label}: {} MHz @ {} mV", p.clock_mhz, p.voltage_mv),
+        Err(e) => format!("Apply failed: {e}"),
+    };
+    IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
 }
 
 /// Build the apply-status payload from the persisted profile.

@@ -74,6 +74,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// Max-power ALU virus: each lane runs FOUR independent LCG chains in a vec4
+// (4× instruction-level parallelism → saturates the ALU pipelines for the
+// highest sustained power draw, near a real power-virus, so high-voltage points
+// actually reach the power cap). Each vec4 lane is a pure LCG of its own seed →
+// fully verifiable via jump-ahead. No memory traffic (registers only) so power,
+// not bandwidth, is the limit.
+const POWER_SHADER: &str = r#"
+struct P { iters: u32, n: u32, p0: u32, p1: u32 };
+@group(0) @binding(0) var<storage, read_write> data: array<vec4<u32>>;
+@group(0) @binding(1) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= p.n) { return; }
+    var v = data[i];
+    for (var k: u32 = 0u; k < p.iters; k = k + 1u) {
+        v = v * 1664525u + vec4<u32>(1013904223u);
+    }
+    data[i] = v;
+}
+"#;
+
 // Each lane gathers from a LARGE (VRAM-resident) table, striding across the
 // whole table so accesses miss cache and hit the memory controller / DRAM —
 // the path that shares the core voltage rail.
@@ -449,6 +471,89 @@ impl GpuCtx {
         let (mismatches, mapped_ok) = self.readback_compare(&data, byte_size, &expected);
         StageReport {
             name: name.to_string(),
+            result: self.verdict(mismatches, mapped_ok),
+            mismatches,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// Sustained MAX-POWER ALU load (4-way ILP per lane via `vec4`), known-answer
+    /// checked. The densest, most power-hungry load we have — used by the power
+    /// sweep so high-voltage points reach the power cap and the V↔W map is real.
+    pub fn run_power_load(&self, elements: u32, iters: u32, target_ms: u64) -> StageReport {
+        const S1: u32 = 0x9e3779b9;
+        const S2: u32 = 0x85ebca6b;
+        const S3: u32 = 0xc2b2ae35;
+        let start = std::time::Instant::now();
+
+        // Four independent LCG seeds per lane, packed as vec4.
+        let mut input: Vec<u32> = Vec::with_capacity(elements as usize * 4);
+        for i in 0..elements {
+            input.push(i);
+            input.push(i ^ S1);
+            input.push(i ^ S2);
+            input.push(i ^ S3);
+        }
+        let byte_size = (elements as usize * 16) as u64;
+
+        let data = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pwr-data"),
+            contents: bytemuck::cast_slice(&input),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pwr-params"),
+            contents: bytemuck::bytes_of(&Params { a: iters, n: elements, _pad: [0; 2] }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pwr"),
+            source: wgpu::ShaderSource::Wgsl(POWER_SHADER.into()),
+        });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("pwr"), layout: None, module: &module, entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pwr"), layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
+            ],
+        });
+
+        let groups = elements.div_ceil(64);
+        let mut k: u64 = 0;
+        while (start.elapsed().as_millis() as u64) < target_ms {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipeline);
+                cp.set_bind_group(0, &bind, &[]);
+                cp.dispatch_workgroups(groups, 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            k += 1;
+            if k % 8 == 0 {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+            if self.crashed.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let (a, c) = lcg_pow((iters as u64).wrapping_mul(k));
+        let mut expected: Vec<u32> = Vec::with_capacity(elements as usize * 4);
+        for i in 0..elements {
+            expected.push(a.wrapping_mul(i).wrapping_add(c));
+            expected.push(a.wrapping_mul(i ^ S1).wrapping_add(c));
+            expected.push(a.wrapping_mul(i ^ S2).wrapping_add(c));
+            expected.push(a.wrapping_mul(i ^ S3).wrapping_add(c));
+        }
+        let (mismatches, mapped_ok) = self.readback_compare(&data, byte_size, &expected);
+        StageReport {
+            name: "PowerLoad".into(),
             result: self.verdict(mismatches, mapped_ok),
             mismatches,
             elapsed_ms: start.elapsed().as_millis() as u64,

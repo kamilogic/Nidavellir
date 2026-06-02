@@ -17,7 +17,7 @@
 //!
 //! Windows-only (NVAPI/NVML).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nidavellir_core::gpu_sweep::StabilityResult;
@@ -31,16 +31,7 @@ const VOLTAGES: &[u32] = &[850, 875, 900, 925, 950, 975, 1000];
 const DWELL_MS: u64 = 5000;
 
 fn idle() -> PowerSweepProgress {
-    PowerSweepProgress {
-        running: false,
-        phase: "idle".into(),
-        log: Vec::new(),
-        points: Vec::new(),
-        power_limit_w: 0.0,
-        target_w: 0.0,
-        recommended: None,
-        note: None,
-    }
+    PowerSweepProgress { phase: "idle".into(), ..Default::default() }
 }
 
 #[derive(Clone)]
@@ -107,40 +98,70 @@ fn recover_ctx() -> Option<nidavellir_gpu_stress::GpuCtx> {
     None
 }
 
-/// Run a heavy ALU load for ~`ms` while sampling NVML; returns the stability
-/// verdict, the mean sustained core clock (MHz) and the mean power (W).
+/// Precise per-dwell measurement under the max-power load. Returns the stability
+/// verdict and steady-state stats: (mean_clock, mean_power, max_power, std_power,
+/// power_capped_fraction). The first ~1.5 s of samples are discarded so only the
+/// thermally/clock-settled steady state is measured (precision for the knee +
+/// Brokkr's headroom calc).
 #[cfg(windows)]
-fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> (StabilityResult, u32, f32) {
+struct Measured {
+    result: StabilityResult,
+    clock_mhz: u32,
+    power_w: f32,
+    max_power_w: f32,
+    power_std_w: f32,
+    capped_frac: f32,
+}
+
+#[cfg(windows)]
+fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     let stop = Arc::new(AtomicBool::new(false));
-    let clk = Arc::new(AtomicU64::new(0));
-    let pw = Arc::new(AtomicU64::new(0));
-    let n = Arc::new(AtomicU64::new(0));
-    let (s2, c2, p2, n2) = (stop.clone(), clk.clone(), pw.clone(), n.clone());
+    // Collect raw samples in the sampler thread for precise stats (mean/max/std).
+    let samples: Arc<Mutex<Vec<(u32, f32, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let (s2, smp) = (stop.clone(), samples.clone());
+    let t0 = std::time::Instant::now();
     let sampler = std::thread::spawn(move || {
         while !s2.load(Ordering::SeqCst) {
             if let Some(r) = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml().into_iter().next() {
                 if let (Some(c), Some(p)) = (r.core_clock_mhz, r.power_w) {
-                    c2.fetch_add(c as u64, Ordering::SeqCst);
-                    p2.fetch_add((p * 1000.0) as u64, Ordering::SeqCst);
-                    n2.fetch_add(1, Ordering::SeqCst);
+                    // Discard the first 1.5 s (ramp-up) — steady state only.
+                    if t0.elapsed().as_millis() >= 1500 {
+                        if let Ok(mut v) = smp.lock() {
+                            v.push((c, p, r.power_capped == Some(true)));
+                        }
+                    }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(80));
         }
     });
-    // Dense ALU is the most power-hungry load (no memory stalls) — best proxy for
-    // the real per-voltage power ceiling.
-    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_alu("power", 2_000_000, 200_000, ms))) {
+    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 20_000, ms))) {
         Ok(r) => r.result,
         Err(_) => StabilityResult::Crash,
     };
     stop.store(true, Ordering::SeqCst);
     let _ = sampler.join();
-    let cnt = n.load(Ordering::SeqCst).max(1);
-    let clock = (clk.load(Ordering::SeqCst) / cnt) as u32;
-    let power = (pw.load(Ordering::SeqCst) as f32 / cnt as f32) / 1000.0;
-    (res, clock, power)
+
+    let v = samples.lock().map(|g| g.clone()).unwrap_or_default();
+    if v.is_empty() {
+        return Measured { result: res, clock_mhz: 0, power_w: 0.0, max_power_w: 0.0, power_std_w: 0.0, capped_frac: 0.0 };
+    }
+    let n = v.len() as f32;
+    let clock = (v.iter().map(|s| s.0 as u64).sum::<u64>() / v.len() as u64) as u32;
+    let mean_p = v.iter().map(|s| s.1).sum::<f32>() / n;
+    let max_p = v.iter().map(|s| s.1).fold(0.0f32, f32::max);
+    let var = v.iter().map(|s| (s.1 - mean_p).powi(2)).sum::<f32>() / n;
+    let std_p = var.sqrt();
+    let capped = v.iter().filter(|s| s.2).count() as f32 / n;
+    Measured {
+        result: res,
+        clock_mhz: clock,
+        power_w: mean_p,
+        max_power_w: max_p,
+        power_std_w: std_p,
+        capped_frac: capped,
+    }
 }
 
 /// Find the perf/watt knee: the point of the (power, clock) curve farthest above
@@ -220,10 +241,21 @@ fn run_power_sweep(
         }
     };
 
+    // Stock baseline (no voltage lock) under the same max load — likely power-
+    // capped, so its sustained clock is the bar Deep Calm/undervolt must beat.
+    let _ = gpu::set_core_offset_mhz(0);
+    let sm = load_and_measure(&ctx, DWELL_MS);
+    prog.stock_clock_mhz = sm.clock_mhz;
+    prog.log.push(format!(
+        "Stock → {} MHz · {:.0} W{}",
+        sm.clock_mhz, sm.power_w,
+        if sm.capped_frac > 0.1 { " · power-cap" } else { "" }
+    ));
+    set(&progress, prog.clone());
+
     // Always offset 0 — we measure each card's own stock clock at the locked
     // voltage. No overclocking: stock V/F points are stable, so this can't
     // hard-lock the machine (the +offset OC approach crashed the PC at 937mV).
-    let _ = gpu::set_core_offset_mhz(0);
     for &v in VOLTAGES {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -234,25 +266,30 @@ fn run_power_sweep(
         }
         let intent = TuningPoint::from_axes([("gpu_voltage_mv", v as i64), ("gpu_offset_mhz", 0)]);
         let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_power_sweep"));
-        let (res, clock, power) = load_and_measure(&ctx, DWELL_MS);
+        let m = load_and_measure(&ctx, DWELL_MS);
         let _ = store.clear_boot_flag();
         prog.log.push(format!(
-            "{v} mV → {clock} MHz · {power:.0} W : {}",
-            match res {
+            "{v} mV → {} MHz · {:.0} W (máx {:.0}, σ{:.0}{}) : {}",
+            m.clock_mhz, m.power_w, m.max_power_w, m.power_std_w,
+            if m.capped_frac > 0.02 { format!(", cap {:.0}%", m.capped_frac * 100.0) } else { String::new() },
+            match m.result {
                 StabilityResult::Stable => "ok",
                 StabilityResult::SilentError => "erro silencioso",
                 StabilityResult::Crash => "instável",
             }
         ));
-        if matches!(res, StabilityResult::Stable) && clock > 0 && power > 0.0 {
+        if matches!(m.result, StabilityResult::Stable) && m.clock_mhz > 0 && m.power_w > 0.0 {
             prog.points.push(PowerSweepPoint {
                 voltage_mv: v,
-                clock_mhz: clock,
-                power_w: power,
+                clock_mhz: m.clock_mhz,
+                power_w: m.power_w,
+                max_power_w: m.max_power_w,
+                power_std_w: m.power_std_w,
+                power_capped_frac: m.capped_frac,
                 stable: true,
-                perf_per_watt: clock as f64 / power as f64,
+                perf_per_watt: m.clock_mhz as f64 / m.power_w as f64,
             });
-        } else if matches!(res, StabilityResult::Crash) {
+        } else if matches!(m.result, StabilityResult::Crash) {
             // A stock-clock point shouldn't device-lost, but if it does, recover.
             let _ = gpu::unlock_core_voltage();
             if let Some(fresh) = recover_ctx() {
@@ -270,14 +307,59 @@ fn run_power_sweep(
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
     let _ = store.clear_boot_flag();
 
-    // Recommend the perf/watt knee.
-    if let Some(k) = knee(&prog.points) {
-        prog.recommended = Some(k);
-        prog.target_w = k.power_w;
+    // --- Synthesize the three profiles ------------------------------------
+    use std::cmp::Ordering as Ord;
+    let cap = prog.power_limit_w;
+    let stock = prog.stock_clock_mhz;
+
+    // Brokkr's headroom: cap − max(10% cap, 2σ) — variance-aware (spiky loads get
+    // more margin), with the measured power-cap fraction as the hard gate.
+    let max_std = prog.points.iter().map(|p| p.power_std_w).fold(0.0f32, f32::max);
+    let headroom = (0.10 * cap).max(2.0 * max_std);
+    let brokkr_target = if cap > 0.0 { cap - headroom } else { f32::MAX };
+    prog.target_w = brokkr_target;
+
+    // Godforge: highest sustained clock, full power allowed; tie → lower power.
+    prog.godforge = prog
+        .points
+        .iter()
+        .filter(|p| p.stable)
+        .copied()
+        .max_by(|a, b| {
+            a.clock_mhz
+                .cmp(&b.clock_mhz)
+                .then_with(|| b.power_w.partial_cmp(&a.power_w).unwrap_or(Ord::Equal))
+        });
+    // Brokkr's Best: highest clock that never power-caps and stays under target.
+    prog.brokkrs = prog
+        .points
+        .iter()
+        .filter(|p| p.stable && p.power_capped_frac < 0.03 && p.power_w <= brokkr_target)
+        .copied()
+        .max_by_key(|p| p.clock_mhz);
+    // Deep Calm: best perf/watt with clock ≥ stock baseline.
+    prog.deep_calm = prog
+        .points
+        .iter()
+        .filter(|p| p.stable && p.clock_mhz >= stock)
+        .copied()
+        .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal));
+    if prog.deep_calm.is_none() {
+        prog.deep_calm = knee(&prog.points);
+    }
+    prog.recommended = prog.deep_calm;
+
+    if prog.godforge.is_some() {
+        let g = prog.godforge.unwrap();
+        let fmt = |o: Option<PowerSweepPoint>| match o {
+            Some(p) => format!("{} MHz @ {} mV ({:.0} W)", p.clock_mhz, p.voltage_mv, p.power_w),
+            None => "—".into(),
+        };
         prog.note = Some(format!(
-            "Recomendado (joelho perf/watt): {} MHz @ {} mV · {:.0} W de {:.0} W cap — confirme em jogo.",
-            k.clock_mhz, k.voltage_mv, k.power_w, prog.power_limit_w
+            "Stock {stock} MHz · cap {cap:.0} W (alvo Brokkr's ≤ {brokkr_target:.0} W) · Godforge {} · Brokkr's {} · Deep Calm {} — confirme em jogo.",
+            fmt(prog.godforge), fmt(prog.brokkrs), fmt(prog.deep_calm)
         ));
+        let _ = g;
     } else {
         prog.note = Some("Nenhum ponto estável medido.".into());
     }

@@ -41,15 +41,24 @@ pub enum IpcRequest {
     StartPowerSweep,
     StopPowerSweep,
     GetPowerSweepProgress,
-    ApplyPowerRecommended,
+    ApplyPowerGodforge,
+    ApplyPowerBrokkrs,
+    ApplyPowerDeepCalm,
 }
 
-/// One measured (voltage → max-stable-clock, power) point of the power sweep.
+/// One measured (locked voltage → sustained clock + power) point of the sweep.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PowerSweepPoint {
     pub voltage_mv: u32,
     pub clock_mhz: u32,
+    /// Mean sustained power (W) under the max-power load.
     pub power_w: f32,
+    /// Peak sampled power (W) — the spike headroom indicator.
+    pub max_power_w: f32,
+    /// Std-dev of power (W) — workload spikiness, for the Brokkr's headroom calc.
+    pub power_std_w: f32,
+    /// Fraction of samples (0–1) the card was power-capped (SW_POWER_CAP).
+    pub power_capped_frac: f32,
     pub stable: bool,
     /// Efficiency proxy: sustained clock per watt.
     pub perf_per_watt: f64,
@@ -68,8 +77,16 @@ pub struct PowerSweepProgress {
     pub power_limit_w: f32,
     /// Target power (W) — defaults to the perf/watt knee's draw; configurable.
     pub target_w: f32,
-    /// The recommended operating point (the knee, or best under an explicit target).
+    /// The recommended operating point (Deep Calm — the perf/watt knee).
     pub recommended: Option<PowerSweepPoint>,
+    /// Max performance, up to full power for stability.
+    pub godforge: Option<PowerSweepPoint>,
+    /// Max performance the undervolt holds under the cap (stays off the cap).
+    pub brokkrs: Option<PowerSweepPoint>,
+    /// Best perf/watt with clock ≥ stock baseline.
+    pub deep_calm: Option<PowerSweepPoint>,
+    /// Stock baseline sustained clock (MHz) under the same load, for reference.
+    pub stock_clock_mhz: u32,
     pub note: Option<String>,
 }
 

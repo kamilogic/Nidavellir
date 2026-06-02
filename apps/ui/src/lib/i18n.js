@@ -109,6 +109,10 @@ const dict = {
     "forge.powerRun": "Run power sweep",
     "forge.powerCap": "Detected power cap: {w} W.",
     "forge.powerApply": "Apply recommended (knee)",
+    "forge.powerStock": "Stock baseline (under load): {c} MHz.",
+    "forge.prof_godforge": "Godforge",
+    "forge.prof_brokkrs": "Brokkr's Best",
+    "forge.prof_deep_calm": "Deep Calm",
 
     "phase.idle": "Idle",
     "phase.baseline": "Baseline (thermal equilibrium)",
@@ -212,6 +216,10 @@ const dict = {
     "forge.powerRun": "Rodar power sweep",
     "forge.powerCap": "Teto de potência detectado: {w} W.",
     "forge.powerApply": "Aplicar recomendado (joelho)",
+    "forge.powerStock": "Baseline stock (sob carga): {c} MHz.",
+    "forge.prof_godforge": "Godforge",
+    "forge.prof_brokkrs": "Brokkr's Best",
+    "forge.prof_deep_calm": "Deep Calm",
 
     "phase.idle": "Ocioso",
     "phase.baseline": "Baseline (equilíbrio térmico)",

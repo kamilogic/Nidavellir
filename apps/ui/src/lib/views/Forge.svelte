@@ -111,7 +111,12 @@
   const setPower = (r) => (powerSweep = r?.data?.type === "PowerSweep" ? r.data : powerSweep);
   const startPower = () => call("StartPowerSweep", setPower);
   const stopPower = () => call("StopPowerSweep", setPower);
-  const applyPowerRec = () => call("ApplyPowerRecommended", setApplied);
+  const POWER_APPLY = {
+    godforge: "ApplyPowerGodforge",
+    brokkrs: "ApplyPowerBrokkrs",
+    deep_calm: "ApplyPowerDeepCalm",
+  };
+  const applyPower = (which) => call(POWER_APPLY[which], setApplied);
   const pct = (a, b) => (a > 0 ? ((b - a) / a) * 100 : 0);
   const sgn = (x, d = 0) => (x >= 0 ? "+" : "") + x.toFixed(d);
 
@@ -278,27 +283,44 @@
           </div>
         </div>
       {/if}
+      {#if powerSweep.stock_clock_mhz > 0}
+        <p class="sub">{$t("forge.powerStock", { c: powerSweep.stock_clock_mhz })}</p>
+      {/if}
       {#if powerSweep.points?.length}
         <table class="bench-table">
           <thead>
-            <tr><th>mV</th><th>{$t("forge.benchClock")}</th><th>{$t("forge.benchPower")}</th><th>fps/W·</th></tr>
+            <tr><th>mV</th><th>MHz</th><th>W (máx)</th><th>cap%</th><th>MHz/W</th></tr>
           </thead>
           <tbody>
             {#each powerSweep.points as p}
-              <tr class:rec={powerSweep.recommended && p.voltage_mv === powerSweep.recommended.voltage_mv}>
+              <tr>
                 <td>{p.voltage_mv}</td>
-                <td>{p.clock_mhz} MHz</td>
-                <td>{p.power_w.toFixed(0)} W</td>
+                <td>{p.clock_mhz}</td>
+                <td>{p.power_w.toFixed(0)} ({p.max_power_w.toFixed(0)})</td>
+                <td class:danger={p.power_capped_frac > 0.05}>{(p.power_capped_frac * 100).toFixed(0)}%</td>
                 <td>{p.perf_per_watt.toFixed(1)}</td>
               </tr>
             {/each}
           </tbody>
         </table>
       {/if}
-      {#if powerSweep.note}<p class="point" class:accent={!powerRunning}>{powerSweep.note}</p>{/if}
-      {#if powerSweep.recommended && !powerRunning}
-        <button class="btn go small" onclick={applyPowerRec}>{$t("forge.powerApply")}</button>
+      {#if !powerRunning && (powerSweep.godforge || powerSweep.brokkrs || powerSweep.deep_calm)}
+        <div class="profiles">
+          {#each [["godforge", powerSweep.godforge], ["brokkrs", powerSweep.brokkrs], ["deep_calm", powerSweep.deep_calm]] as [key, p]}
+            <div class="profile">
+              <div class="prof-name">{$t("forge.prof_" + key)}</div>
+              {#if p}
+                <div class="prof-val">{p.clock_mhz} MHz @ {p.voltage_mv} mV</div>
+                <div class="prof-sub">{p.power_w.toFixed(0)} W · {p.perf_per_watt.toFixed(1)} MHz/W</div>
+                <button class="btn go small" onclick={() => applyPower(key)}>{$t("forge.apply")}</button>
+              {:else}
+                <div class="prof-sub">—</div>
+              {/if}
+            </div>
+          {/each}
+        </div>
       {/if}
+      {#if powerSweep.note}<p class="point" class:accent={!powerRunning}>{powerSweep.note}</p>{/if}
     {/if}
   </div>
 
@@ -913,6 +935,36 @@
     background: rgba(163, 190, 140, 0.12);
     color: var(--nord-aurora);
     font-weight: 700;
+  }
+  .profiles {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.6rem;
+    margin-top: 0.7rem;
+  }
+  .profile {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 0.7rem;
+    background: rgba(10, 16, 28, 0.5);
+    text-align: center;
+  }
+  .prof-name {
+    font-weight: 700;
+    color: var(--nord-frost-bright);
+    font-size: 0.85rem;
+    letter-spacing: 0.03em;
+  }
+  .prof-val {
+    margin-top: 0.3rem;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  .prof-sub {
+    color: var(--muted);
+    font-size: 0.78rem;
+    margin: 0.15rem 0 0.5rem;
+    font-variant-numeric: tabular-nums;
   }
   .bench-table {
     width: 100%;
