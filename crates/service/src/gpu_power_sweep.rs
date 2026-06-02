@@ -25,7 +25,11 @@ use nidavellir_core::ipc::{PowerSweepPoint, PowerSweepProgress};
 use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
 use tracing::{info, warn};
 
-const DWELL_MS: u64 = 5000;
+// Long enough for power to RAMP UP and stabilize (real loads like Heaven take
+// seconds to reach their sustained draw — it's a ramp, not a spike). We discard
+// the ramp and take the WORST CASE (max), not the mean.
+const DWELL_MS: u64 = 15000;
+const RAMP_DISCARD_MS: u128 = 6000;
 /// Max clock we'll flatten above a voltage's stock-curve clock (MHz). Bounds how
 /// aggressive the undervolt-OC gets — large offsets at low voltage are what
 /// hard-crashed the PC, so past this we stop descending.
@@ -123,26 +127,38 @@ struct Measured {
     max_power_w: f32,
     power_std_w: f32,
     capped_frac: f32,
+    /// Max core voltage observed under load (mV) — for the descent's safe start.
+    volt_mv: u32,
 }
 
 #[cfg(windows)]
 fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::AtomicU32;
     let stop = Arc::new(AtomicBool::new(false));
     // Collect raw samples in the sampler thread for precise stats (mean/max/std).
     let samples: Arc<Mutex<Vec<(u32, f32, bool)>>> = Arc::new(Mutex::new(Vec::new()));
-    let (s2, smp) = (stop.clone(), samples.clone());
+    let volt = Arc::new(AtomicU32::new(0));
+    let (s2, smp, vlt) = (stop.clone(), samples.clone(), volt.clone());
     let t0 = std::time::Instant::now();
     let sampler = std::thread::spawn(move || {
+        let mut tick: u32 = 0;
         while !s2.load(Ordering::SeqCst) {
             if let Some(r) = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml().into_iter().next() {
                 if let (Some(c), Some(p)) = (r.core_clock_mhz, r.power_w) {
-                    // Discard the first 1.5 s (ramp-up) — steady state only.
-                    if t0.elapsed().as_millis() >= 1500 {
+                    // Discard the ramp-up — steady state only.
+                    if t0.elapsed().as_millis() >= RAMP_DISCARD_MS {
                         if let Ok(mut v) = smp.lock() {
                             v.push((c, p, r.power_capped == Some(true)));
                         }
                     }
+                }
+            }
+            // Voltage via NVAPI is heavier (re-inits), so sample it sparsely.
+            tick += 1;
+            if tick % 16 == 0 {
+                if let Some(mv) = nidavellir_gpu_nvapi::read_core_voltage_mv() {
+                    vlt.fetch_max(mv, Ordering::SeqCst);
                 }
             }
             // Fast sampling to catch short power spikes the cap reacts to (NVML
@@ -150,16 +166,20 @@ fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
     });
-    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 10_000, ms))) {
+    // FurMark-class graphics load (raster+ROP+TMU+FP, the real game path) — draws
+    // ≥ a real game at the same V/clock, so "off-cap under this" guarantees off-cap
+    // in games. Compute-only under-measured (159W vs Heaven's 199W at 967mV).
+    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_render_stress(ms))) {
         Ok(r) => r.result,
         Err(_) => StabilityResult::Crash,
     };
     stop.store(true, Ordering::SeqCst);
     let _ = sampler.join();
 
+    let volt_mv = volt.load(Ordering::SeqCst);
     let v = samples.lock().map(|g| g.clone()).unwrap_or_default();
     if v.is_empty() {
-        return Measured { result: res, clock_mhz: 0, power_w: 0.0, max_power_w: 0.0, power_std_w: 0.0, capped_frac: 0.0 };
+        return Measured { result: res, clock_mhz: 0, power_w: 0.0, max_power_w: 0.0, power_std_w: 0.0, capped_frac: 0.0, volt_mv };
     }
     let n = v.len() as f32;
     let clock = (v.iter().map(|s| s.0 as u64).sum::<u64>() / v.len() as u64) as u32;
@@ -175,6 +195,7 @@ fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
         max_power_w: max_p,
         power_std_w: std_p,
         capped_frac: capped,
+        volt_mv,
     }
 }
 
@@ -224,7 +245,7 @@ fn arduous_validate(
             ]),
             "gpu_power_validate",
         ));
-        let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 10_000, 35_000))) {
+        let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_render_stress(35_000))) {
             Ok(r) => r.result,
             Err(_) => StabilityResult::Crash,
         };
@@ -368,19 +389,26 @@ fn run_power_sweep(
         set(&progress, prog);
         return;
     }
+    // Start the descent AT the stock's own operating voltage under load — NOT at
+    // the curve top. With a game-realistic (≈cap) load, locking a voltage ABOVE
+    // what stock used can't reduce voltage to fit the cap → it slams the power
+    // limit and TDRs. Stock's voltage is the at-cap ceiling; we descend from it
+    // into the off-cap undervolt region.
+    let start_v = if sm.volt_mv >= vfloor && sm.volt_mv <= vmax { sm.volt_mv } else { vmax };
     prog.log.push(format!(
-        "Alvo: manter {target} MHz e baixar a tensão de {vmax} mV ↓ até a mínima estável."
+        "Tensão do stock sob carga: {} mV. Mantendo {target} MHz e baixando de {start_v} mV ↓.",
+        sm.volt_mv
     ));
     set(&progress, prog.clone());
 
-    // REAL undervolt: pin the clock at the stock target and descend the voltage
-    // in small steps from a safe high one, measuring the (now realistic) power at
-    // each voltage. Stop at the first instability — that's the cliff; the last
-    // stable voltage is the undervolt limit. Descending from a known-stable high
-    // voltage means we approach the cliff gently (vs the old clock-ascent that
-    // hard-crashed the PC).
+    // REAL undervolt: hold the stock target clock and descend the voltage in small
+    // steps, measuring the (now realistic) power at each. Stop at the first
+    // instability — the cliff; last stable = the undervolt limit. A crash here is
+    // power (over-cap) or undervolt instability → recover and CONTINUE LOWER
+    // (lower V = less power), bounded, instead of aborting.
     const STEP: u32 = 20;
-    let mut v = vmax;
+    let mut v = start_v;
+    let mut crashes = 0u32;
     while v >= vfloor && !stop.load(Ordering::SeqCst) {
         // Flatten the clock to the target at this voltage: lock V, offset the
         // curve up to the target, and cap the clock there. (NVML min=max pinning
@@ -439,10 +467,19 @@ fn run_power_sweep(
             StabilityResult::Crash => {
                 let _ = gpu::unlock_core_voltage();
                 let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+                let _ = gpu::set_core_offset_mhz(0);
+                crashes += 1;
                 if recover_ctx().map(|c| ctx = c).is_none() {
                     prog.note = Some("GPU não recuperou — parando".into());
+                    break;
                 }
-                break;
+                if crashes > 3 {
+                    prog.log.push("Muitos crashes — parando a descida.".into());
+                    break;
+                }
+                // Likely over-cap at this (still-high) voltage — go lower (less power).
+                prog.log.push(format!("Recuperado; descendo (crash {crashes}/3)."));
+                v = v.saturating_sub(STEP);
             }
         }
     }

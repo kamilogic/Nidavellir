@@ -246,6 +246,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // of pixel position + instance, so a stable GPU renders the SAME frame every
 // time; a diverging frame checksum is a silent error before a hard crash.
 const RENDER_SHADER: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
 struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) seed: f32 };
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
@@ -262,15 +264,30 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut 
 }
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
-    var x = in.uv.x * 64.0 + in.seed;
-    var y = in.uv.y * 64.0 - in.seed;
-    var acc = 0.0;
-    for (var k = 0; k < 320; k = k + 1) {
-        acc = acc + sin(x) * cos(y) + tanh(x * 0.01);
-        x = fma(x, 1.0001, 0.013);
-        y = fma(y, 0.9997, 0.017);
+    // FurMark-class fragment: four independent FP32 FMA chains (ILP → saturates
+    // the FP cores) PLUS heavy DEPENDENT texture sampling (TMU + L2/DRAM — the
+    // game activity a flat-shaded render misses, which kept us at ~160W vs a
+    // game's ~199W at the same V/clock), over heavy overdraw → raster + ROP + TMU
+    // + FP all at once, like a worst-case game.
+    var a = in.uv.x * 64.0 + in.seed;
+    var b = in.uv.y * 64.0 - in.seed;
+    var c = a * 1.3 + b * 0.7 + 1.0;
+    var d = a - b * 1.1 + 2.0;
+    var t = vec4<f32>(0.0);
+    for (var k = 0; k < 256; k = k + 1) {
+        a = fma(a, 1.0001, 0.013);
+        b = fma(b, 0.9997, 0.017);
+        c = fma(c, 1.0003, a);
+        d = fma(d, 0.9994, b);
+        // Dependent texture taps: UVs derived from the FP state so the sampler
+        // can't be hoisted — pulls real TMU + cache/memory traffic per pixel.
+        let uv0 = in.uv + vec2<f32>(fract(a * 0.01), fract(b * 0.01));
+        let uv1 = in.uv * 4.0 + vec2<f32>(fract(c * 0.013), fract(d * 0.017));
+        t = t + textureSampleLevel(tex, samp, uv0, 0.0) + textureSampleLevel(tex, samp, uv1, 0.0);
+        c = c + sin(a) * 0.001 + t.x * 0.0001;
+        d = d + cos(b) * 0.001 + t.y * 0.0001;
     }
-    let v = fract(abs(acc) * 0.00137);
+    let v = fract(abs(a + b + c + d + t.x + t.z) * 0.00037);
     return vec4<f32>(v, fract(v * 7.0), fract(v * 13.0), 1.0);
 }
 "#;
@@ -1138,8 +1155,8 @@ impl GpuCtx {
     pub fn run_render_stress(&self, target_ms: u64) -> RenderResult {
         let start = std::time::Instant::now();
         let mut frames: u64 = 0;
-        const DIM: u32 = 1024; // 1024*4 = 4096 B/row (256-aligned for copy)
-        const INSTANCES: u32 = 64; // full-screen triangles → heavy overdraw
+        const DIM: u32 = 1536; // 1536*4 = 6144 B/row (256-aligned for copy)
+        const INSTANCES: u32 = 128; // full-screen triangles → heavy overdraw
 
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("render-target"),
@@ -1150,6 +1167,42 @@ impl GpuCtx {
             view_formats: &[],
         });
         let view = tex.create_view(&Default::default());
+
+        // Source texture the fragment shader samples heavily (TMU + memory load,
+        // like a game's texturing). Filled with a deterministic pattern.
+        const SRC: u32 = 1024;
+        let src_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("render-src-tex"),
+            size: wgpu::Extent3d { width: SRC, height: SRC, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut src_data = vec![0u8; (SRC as usize) * (SRC as usize) * 4];
+        for (i, px) in src_data.chunks_exact_mut(4).enumerate() {
+            let h = (i as u32).wrapping_mul(2654435761);
+            px[0] = (h >> 24) as u8;
+            px[1] = (h >> 16) as u8;
+            px[2] = (h >> 8) as u8;
+            px[3] = 255;
+        }
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture { texture: &src_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &src_data,
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(SRC * 4), rows_per_image: Some(SRC) },
+            wgpu::Extent3d { width: SRC, height: SRC, depth_or_array_layers: 1 },
+        );
+        let src_view = src_tex.create_view(&Default::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("render-samp"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render"), source: wgpu::ShaderSource::Wgsl(RENDER_SHADER.into()),
         });
@@ -1169,6 +1222,14 @@ impl GpuCtx {
                 compilation_options: Default::default(),
             }),
             multiview: None,
+        });
+        let tex_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("render-tex"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
         });
 
         // Readback: copy the frame to a buffer, reduce to one checksum u32.
@@ -1215,6 +1276,7 @@ impl GpuCtx {
                     depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
                 });
                 rp.set_pipeline(&pipeline);
+                rp.set_bind_group(0, &tex_bind, &[]);
                 rp.draw(0..3, 0..INSTANCES);
             }
             self.queue.submit(Some(enc.finish()));
