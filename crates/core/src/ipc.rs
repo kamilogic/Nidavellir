@@ -51,6 +51,9 @@ pub enum IpcRequest {
 pub struct PowerSweepPoint {
     pub voltage_mv: u32,
     pub clock_mhz: u32,
+    /// Clock offset (MHz) that realizes this point — applied WITHOUT a hard
+    /// voltage lock (curve flatten), so the card keeps its power management.
+    pub offset_mhz: i32,
     /// Mean sustained power (W) under the max-power load.
     pub power_w: f32,
     /// Peak sampled power (W) — the spike headroom indicator.

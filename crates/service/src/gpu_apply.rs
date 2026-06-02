@@ -50,19 +50,18 @@ fn curve_freq_at(voltage_mv: u32) -> Option<u32> {
         .map(|p| p.freq_mhz)
 }
 
-/// Realize a core V/F point: lock the voltage, offset the clock so the GPU runs
-/// `point.freq_mhz` at `point.voltage_mv`, **and hard-cap the max clock at that
-/// frequency** so the curve is flat after the validated limit — the GPU can
-/// never boost to a higher (unvalidated) freq/voltage point. The cap is the
-/// reliable flatten; the voltage lock pins the operating point we validated.
+/// Realize a core V/F point by FLATTENING the curve — offset the clock up so the
+/// GPU reaches `point.freq_mhz` at the lower `point.voltage_mv`, and hard-cap the
+/// max clock there so it never boosts past the validated point. We do NOT hard-
+/// lock the voltage: under a heavy (≈power-cap) game load a hard voltage lock
+/// removes the card's power management and TDRs — the flatten (offset + clock cap)
+/// achieves the undervolt while letting the card stay safe (the Afterburner way).
 #[cfg(windows)]
 pub fn apply_core(point: VfPoint) -> Result<(), String> {
     let base = curve_freq_at(point.voltage_mv).unwrap_or(point.freq_mhz);
     let offset = (point.freq_mhz as i64 - base as i64).clamp(-300, 400) as i32;
-    nidavellir_gpu_nvapi::lock_core_voltage_mv(point.voltage_mv)?;
     nidavellir_gpu_nvapi::set_core_offset_mhz(offset)?;
-    // Flatten the top of the curve at the validated frequency. Best-effort: if
-    // the driver rejects the lock the voltage lock + offset still clamp us.
+    // Flatten the top of the curve at the validated frequency (the undervolt).
     if let Err(e) = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(point.freq_mhz) {
         warn!("core clock cap at {} MHz failed (continuing): {e}", point.freq_mhz);
     }

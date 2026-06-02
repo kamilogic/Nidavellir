@@ -37,6 +37,7 @@ const MAX_OFFSET: i32 = 150;
 
 /// Stock-curve clock (MHz) at or below `v` mV — the card's natural clock there.
 #[cfg(windows)]
+#[allow(dead_code)]
 fn curve_freq_at_v(pts: &[(u32, u32)], v: u32) -> u32 {
     pts.iter()
         .filter(|p| p.0 <= v)
@@ -202,11 +203,11 @@ fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
 /// Find the perf/watt knee: the point of the (power, clock) curve farthest above
 /// the line joining its endpoints — the elbow where more power stops buying much
 /// more clock. Falls back to the best raw perf/watt for tiny sets.
-/// Arduous re-validation of a chosen undervolt point: pin the clock + lock the
-/// voltage and run a LONG max-power soak. The quick descent dwell only finds an
-/// approximate cliff; a marginal undervolt can pass it yet fail in a game. If the
-/// soak fails, step the voltage UP to the next measured point and retry until
-/// stable — so the profile we hand the user is actually solid.
+/// Arduous re-validation of a chosen undervolt point: cap the clock at target +
+/// apply the point's offset (NO voltage lock) and run a LONG max-power soak. The
+/// quick dwell only approximates the cliff; a marginal undervolt can pass it yet
+/// fail in a game. If the soak fails, step to a LOWER offset (less undervolt =
+/// higher voltage = safer) and retry until stable — so the profile is solid.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn arduous_validate(
@@ -214,8 +215,7 @@ fn arduous_validate(
     store: &SafeLoopStore,
     target: u32,
     start: PowerSweepPoint,
-    asc_points: &[PowerSweepPoint],
-    curve_pts: &[(u32, u32)],
+    points: &[PowerSweepPoint],
     stop: &Arc<AtomicBool>,
     label: &str,
     progress: &Arc<Mutex<PowerSweepProgress>>,
@@ -228,19 +228,15 @@ fn arduous_validate(
             return Some(cand);
         }
         prog.log.push(format!(
-            "Validação árdua {label}: {} mV @ {target} MHz (~35s)…",
-            cand.voltage_mv
+            "Validação árdua {label}: +{} MHz (~{} mV @ {target} MHz, ~35s)…",
+            cand.offset_mhz, cand.voltage_mv
         ));
         set(progress, prog.clone());
-        if nidavellir_gpu_nvapi::lock_core_voltage_mv(cand.voltage_mv).is_err() {
-            return Some(cand);
-        }
-        let need = (target as i32 - curve_freq_at_v(curve_pts, cand.voltage_mv) as i32).max(0);
-        let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(need);
         let _ = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(target);
+        let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(cand.offset_mhz);
         let _ = store.arm_boot_flag(&BootFlag::new(
             TuningPoint::from_axes([
-                ("gpu_voltage_mv", cand.voltage_mv as i64),
+                ("gpu_offset_mhz", cand.offset_mhz as i64),
                 ("gpu_clock_mhz", target as i64),
             ]),
             "gpu_power_validate",
@@ -251,25 +247,26 @@ fn arduous_validate(
         };
         let _ = store.clear_boot_flag();
         if matches!(res, StabilityResult::Stable) {
-            prog.log.push(format!("✓ {label} validado: {} mV @ {target} MHz", cand.voltage_mv));
+            prog.log.push(format!("✓ {label} validado: +{} MHz (~{} mV)", cand.offset_mhz, cand.voltage_mv));
             set(progress, prog.clone());
             return Some(cand);
         }
         prog.log.push(format!(
-            "✗ {label} instável em {} mV ({res:?}) — subindo a tensão",
-            cand.voltage_mv
+            "✗ {label} instável em +{} MHz ({res:?}) — reduzindo offset",
+            cand.offset_mhz
         ));
         if matches!(res, StabilityResult::Crash) {
-            let _ = nidavellir_gpu_nvapi::unlock_core_voltage();
+            let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(0);
             let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
             if recover_ctx().map(|c| *ctx = c).is_none() {
                 return None;
             }
         }
-        match asc_points.iter().find(|p| p.voltage_mv > cand.voltage_mv).copied() {
+        // Back off to the next LOWER offset (less undervolt → higher voltage → safer).
+        match points.iter().filter(|p| p.offset_mhz < cand.offset_mhz).max_by_key(|p| p.offset_mhz).copied() {
             Some(n) => cand = n,
             None => {
-                prog.log.push(format!("Sem ponto estável acima para {label}."));
+                prog.log.push(format!("Sem ponto mais conservador para {label}."));
                 return None;
             }
         }
@@ -352,20 +349,6 @@ fn run_power_sweep(
         }
     };
 
-    // Voltage range from the card's REAL V/F curve (adapts to any GPU). We never
-    // undervolt more than ~250 mV below the top, to bound how far past the cliff
-    // a step can go.
-    let curve_pts: Vec<(u32, u32)> = gpu::read_curve()
-        .map(|c| c.points.iter().map(|p| (p.voltage_mv, p.freq_mhz)).collect())
-        .unwrap_or_default();
-    let (vmax, vfloor) = if curve_pts.len() >= 2 {
-        let vx = curve_pts.iter().map(|p| p.0).max().unwrap();
-        let vn = curve_pts.iter().map(|p| p.0).min().unwrap();
-        (vx, vn.max(vx.saturating_sub(250)))
-    } else {
-        (1050u32, 850u32)
-    };
-
     let cap = prog.power_limit_w;
 
     // Stock baseline (unlocked) under the max load → the clock we KEEP (target),
@@ -389,52 +372,29 @@ fn run_power_sweep(
         set(&progress, prog);
         return;
     }
-    // Start the descent AT the stock's own operating voltage under load — NOT at
-    // the curve top. With a game-realistic (≈cap) load, locking a voltage ABOVE
-    // what stock used can't reduce voltage to fit the cap → it slams the power
-    // limit and TDRs. Stock's voltage is the at-cap ceiling; we descend from it
-    // into the off-cap undervolt region.
-    let start_v = if sm.volt_mv >= vfloor && sm.volt_mv <= vmax { sm.volt_mv } else { vmax };
+    // FLATTEN-based undervolt — NO hard voltage lock. Hard-locking the voltage
+    // (set_vfp_locks) under a game-realistic ≈cap load TDRs: the card can't manage
+    // power. Instead we cap the clock at the stock target and RAISE the offset;
+    // more offset makes the card reach the target at a LOWER voltage (it picks the
+    // voltage itself, keeping power management), drawing less power. Voltage is the
+    // measured OUTPUT. Sweep offset up until instability = the undervolt limit.
     prog.log.push(format!(
-        "Tensão do stock sob carga: {} mV. Mantendo {target} MHz e baixando de {start_v} mV ↓.",
-        sm.volt_mv
+        "Mantendo {target} MHz; subindo o offset (flatten, sem travar tensão) até o limite estável."
     ));
     set(&progress, prog.clone());
-
-    // REAL undervolt: hold the stock target clock and descend the voltage in small
-    // steps, measuring the (now realistic) power at each. Stop at the first
-    // instability — the cliff; last stable = the undervolt limit. A crash here is
-    // power (over-cap) or undervolt instability → recover and CONTINUE LOWER
-    // (lower V = less power), bounded, instead of aborting.
-    const STEP: u32 = 20;
-    let mut v = start_v;
-    let mut crashes = 0u32;
-    while v >= vfloor && !stop.load(Ordering::SeqCst) {
-        // Flatten the clock to the target at this voltage: lock V, offset the
-        // curve up to the target, and cap the clock there. (NVML min=max pinning
-        // overrides the voltage lock, so use the offset+cap mechanism instead.)
-        let need = target as i32 - curve_freq_at_v(&curve_pts, v) as i32;
-        if need > MAX_OFFSET {
-            prog.log.push(format!(
-                "Parando em {v} mV: manter {target} MHz exigiria +{need} MHz de flatten (limite {MAX_OFFSET})."
-            ));
-            break;
-        }
-        if gpu::lock_core_voltage_mv(v).is_err() {
-            warn!("power sweep: lock {v}mV failed; skipping");
-            v = v.saturating_sub(STEP);
-            continue;
-        }
-        let _ = gpu::set_core_offset_mhz(need.max(0));
-        let _ = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(target);
+    let _ = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(target);
+    const OSTEP: i32 = 15;
+    let mut offset = 0i32;
+    while offset <= MAX_OFFSET && !stop.load(Ordering::SeqCst) {
+        let _ = gpu::set_core_offset_mhz(offset);
         let intent =
-            TuningPoint::from_axes([("gpu_voltage_mv", v as i64), ("gpu_clock_mhz", target as i64)]);
+            TuningPoint::from_axes([("gpu_offset_mhz", offset as i64), ("gpu_clock_mhz", target as i64)]);
         let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_power_sweep"));
         let m = load_and_measure(&ctx, DWELL_MS);
         let _ = store.clear_boot_flag();
         prog.log.push(format!(
-            "{v} mV @ {target} MHz → {} MHz · {:.0} W (máx {:.0}{}) : {}",
-            m.clock_mhz, m.power_w, m.max_power_w,
+            "+{offset} MHz → {} mV · {} MHz · {:.0} W (máx {:.0}{}) : {}",
+            m.volt_mv, m.clock_mhz, m.power_w, m.max_power_w,
             if m.capped_frac > 0.02 { format!(", cap {:.0}%", m.capped_frac * 100.0) } else { String::new() },
             match m.result {
                 StabilityResult::Stable => "ok",
@@ -443,10 +403,11 @@ fn run_power_sweep(
             }
         ));
         match m.result {
-            StabilityResult::Stable if m.clock_mhz > 0 && m.power_w > 0.0 => {
+            StabilityResult::Stable if m.clock_mhz > 0 && m.power_w > 0.0 && m.volt_mv > 0 => {
                 prog.points.push(PowerSweepPoint {
-                    voltage_mv: v,
+                    voltage_mv: m.volt_mv,
                     clock_mhz: m.clock_mhz,
+                    offset_mhz: offset,
                     power_w: m.power_w,
                     max_power_w: m.max_power_w,
                     power_std_w: m.power_std_w,
@@ -455,36 +416,28 @@ fn run_power_sweep(
                     perf_per_watt: m.clock_mhz as f64 / m.power_w as f64,
                 });
                 set(&progress, prog.clone());
-                v = v.saturating_sub(STEP);
+                offset += OSTEP;
             }
             StabilityResult::Stable => {
-                v = v.saturating_sub(STEP);
+                offset += OSTEP;
             }
             StabilityResult::SilentError => {
-                prog.log.push(format!("Limite de undervolt em ~{v} mV — parando a descida."));
+                prog.log.push("Limite de undervolt (erro silencioso) — parando.".into());
                 break;
             }
             StabilityResult::Crash => {
-                let _ = gpu::unlock_core_voltage();
-                let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+                // Too much undervolt at this offset → instability. Stop; the last
+                // recorded offset is the limit. (No hard lock, so this is rarer.)
                 let _ = gpu::set_core_offset_mhz(0);
-                crashes += 1;
-                if recover_ctx().map(|c| ctx = c).is_none() {
-                    prog.note = Some("GPU não recuperou — parando".into());
-                    break;
-                }
-                if crashes > 3 {
-                    prog.log.push("Muitos crashes — parando a descida.".into());
-                    break;
-                }
-                // Likely over-cap at this (still-high) voltage — go lower (less power).
-                prog.log.push(format!("Recuperado; descendo (crash {crashes}/3)."));
-                v = v.saturating_sub(STEP);
+                let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+                let _ = recover_ctx().map(|c| ctx = c);
+                prog.log.push("Limite de undervolt (instável) — parando.".into());
+                break;
             }
         }
     }
 
-    let _ = gpu::unlock_core_voltage();
+    let _ = gpu::set_core_offset_mhz(0);
     let _ = gpu::reset_all();
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
     let _ = store.clear_boot_flag();
@@ -517,18 +470,17 @@ fn run_power_sweep(
         .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal));
 
     // --- Arduous validation of each pick (long soak + back-off) -----------
-    let mut asc = prog.points.clone();
-    asc.sort_by_key(|p| p.voltage_mv);
+    let pts = prog.points.clone();
     prog.phase = "validate".into();
     set(&progress, prog.clone());
     if let Some(p) = prog.godforge {
-        prog.godforge = arduous_validate(&mut ctx, &store, target, p, &asc, &curve_pts, &stop, "Godforge", &progress, &mut prog);
+        prog.godforge = arduous_validate(&mut ctx, &store, target, p, &pts, &stop, "Godforge", &progress, &mut prog);
     }
     if let Some(p) = prog.brokkrs {
-        prog.brokkrs = arduous_validate(&mut ctx, &store, target, p, &asc, &curve_pts, &stop, "Brokkr's", &progress, &mut prog);
+        prog.brokkrs = arduous_validate(&mut ctx, &store, target, p, &pts, &stop, "Brokkr's", &progress, &mut prog);
     }
     if let Some(p) = prog.deep_calm {
-        prog.deep_calm = arduous_validate(&mut ctx, &store, target, p, &asc, &curve_pts, &stop, "Deep Calm", &progress, &mut prog);
+        prog.deep_calm = arduous_validate(&mut ctx, &store, target, p, &pts, &stop, "Deep Calm", &progress, &mut prog);
     }
     prog.recommended = prog.deep_calm;
 
