@@ -26,6 +26,21 @@ use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
 use tracing::{info, warn};
 
 const DWELL_MS: u64 = 5000;
+/// Max clock we'll flatten above a voltage's stock-curve clock (MHz). Bounds how
+/// aggressive the undervolt-OC gets — large offsets at low voltage are what
+/// hard-crashed the PC, so past this we stop descending.
+const MAX_OFFSET: i32 = 150;
+
+/// Stock-curve clock (MHz) at or below `v` mV — the card's natural clock there.
+#[cfg(windows)]
+fn curve_freq_at_v(pts: &[(u32, u32)], v: u32) -> u32 {
+    pts.iter()
+        .filter(|p| p.0 <= v)
+        .max_by_key(|p| p.0)
+        .or_else(|| pts.iter().min_by_key(|p| p.0))
+        .map(|p| p.1)
+        .unwrap_or(0)
+}
 
 fn idle() -> PowerSweepProgress {
     PowerSweepProgress { phase: "idle".into(), ..Default::default() }
@@ -177,6 +192,7 @@ fn arduous_validate(
     target: u32,
     start: PowerSweepPoint,
     asc_points: &[PowerSweepPoint],
+    curve_pts: &[(u32, u32)],
     stop: &Arc<AtomicBool>,
     label: &str,
     progress: &Arc<Mutex<PowerSweepProgress>>,
@@ -193,10 +209,12 @@ fn arduous_validate(
             cand.voltage_mv
         ));
         set(progress, prog.clone());
-        let _ = nidavellir_core::nvml_gpu::pin_core_clock_mhz(target);
         if nidavellir_gpu_nvapi::lock_core_voltage_mv(cand.voltage_mv).is_err() {
             return Some(cand);
         }
+        let need = (target as i32 - curve_freq_at_v(curve_pts, cand.voltage_mv) as i32).max(0);
+        let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(need);
+        let _ = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(target);
         let _ = store.arm_boot_flag(&BootFlag::new(
             TuningPoint::from_axes([
                 ("gpu_voltage_mv", cand.voltage_mv as i64),
@@ -314,13 +332,15 @@ fn run_power_sweep(
     // Voltage range from the card's REAL V/F curve (adapts to any GPU). We never
     // undervolt more than ~250 mV below the top, to bound how far past the cliff
     // a step can go.
-    let (vmax, vfloor) = match gpu::read_curve() {
-        Ok(c) if c.points.len() >= 2 => {
-            let vx = c.points.iter().map(|p| p.voltage_mv).max().unwrap_or(1050);
-            let vn = c.points.iter().map(|p| p.voltage_mv).min().unwrap_or(800);
-            (vx, vn.max(vx.saturating_sub(250)))
-        }
-        _ => (1050u32, 850u32),
+    let curve_pts: Vec<(u32, u32)> = gpu::read_curve()
+        .map(|c| c.points.iter().map(|p| (p.voltage_mv, p.freq_mhz)).collect())
+        .unwrap_or_default();
+    let (vmax, vfloor) = if curve_pts.len() >= 2 {
+        let vx = curve_pts.iter().map(|p| p.0).max().unwrap();
+        let vn = curve_pts.iter().map(|p| p.0).min().unwrap();
+        (vx, vn.max(vx.saturating_sub(250)))
+    } else {
+        (1050u32, 850u32)
     };
 
     let cap = prog.power_limit_w;
@@ -360,8 +380,14 @@ fn run_power_sweep(
     const STEP: u32 = 20;
     let mut v = vmax;
     while v >= vfloor && !stop.load(Ordering::SeqCst) {
-        if nidavellir_core::nvml_gpu::pin_core_clock_mhz(target).is_err() {
-            prog.log.push("Falha ao fixar o clock (NVML) — abortando.".into());
+        // Flatten the clock to the target at this voltage: lock V, offset the
+        // curve up to the target, and cap the clock there. (NVML min=max pinning
+        // overrides the voltage lock, so use the offset+cap mechanism instead.)
+        let need = target as i32 - curve_freq_at_v(&curve_pts, v) as i32;
+        if need > MAX_OFFSET {
+            prog.log.push(format!(
+                "Parando em {v} mV: manter {target} MHz exigiria +{need} MHz de flatten (limite {MAX_OFFSET})."
+            ));
             break;
         }
         if gpu::lock_core_voltage_mv(v).is_err() {
@@ -369,6 +395,8 @@ fn run_power_sweep(
             v = v.saturating_sub(STEP);
             continue;
         }
+        let _ = gpu::set_core_offset_mhz(need.max(0));
+        let _ = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(target);
         let intent =
             TuningPoint::from_axes([("gpu_voltage_mv", v as i64), ("gpu_clock_mhz", target as i64)]);
         let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_power_sweep"));
@@ -455,13 +483,13 @@ fn run_power_sweep(
     prog.phase = "validate".into();
     set(&progress, prog.clone());
     if let Some(p) = prog.godforge {
-        prog.godforge = arduous_validate(&mut ctx, &store, target, p, &asc, &stop, "Godforge", &progress, &mut prog);
+        prog.godforge = arduous_validate(&mut ctx, &store, target, p, &asc, &curve_pts, &stop, "Godforge", &progress, &mut prog);
     }
     if let Some(p) = prog.brokkrs {
-        prog.brokkrs = arduous_validate(&mut ctx, &store, target, p, &asc, &stop, "Brokkr's", &progress, &mut prog);
+        prog.brokkrs = arduous_validate(&mut ctx, &store, target, p, &asc, &curve_pts, &stop, "Brokkr's", &progress, &mut prog);
     }
     if let Some(p) = prog.deep_calm {
-        prog.deep_calm = arduous_validate(&mut ctx, &store, target, p, &asc, &stop, "Deep Calm", &progress, &mut prog);
+        prog.deep_calm = arduous_validate(&mut ctx, &store, target, p, &asc, &curve_pts, &stop, "Deep Calm", &progress, &mut prog);
     }
     prog.recommended = prog.deep_calm;
 
