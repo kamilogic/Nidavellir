@@ -241,22 +241,50 @@ fn run_power_sweep(
         }
     };
 
+    // Voltages to characterize: derive from the card's REAL V/F curve so this
+    // adapts to any GPU (a 3060 Ti tops ~1075 mV, a bigger card differs). Sample
+    // the top ~200 mV window (where the useful high clocks live) in 7 steps.
+    let volts: Vec<u32> = match gpu::read_curve() {
+        Ok(c) if c.points.len() >= 2 => {
+            let vmax = c.points.iter().map(|p| p.voltage_mv).max().unwrap_or(1000);
+            let vmin_curve = c.points.iter().map(|p| p.voltage_mv).min().unwrap_or(800);
+            let lo = vmax.saturating_sub(200).max(vmin_curve);
+            let n = 7u32;
+            let span = vmax.saturating_sub(lo);
+            (0..n).map(|i| lo + span * i / (n - 1)).collect()
+        }
+        _ => VOLTAGES.to_vec(),
+    };
+    prog.log.push(format!(
+        "Faixa de tensão (da curva): {}–{} mV",
+        volts.first().copied().unwrap_or(0),
+        volts.last().copied().unwrap_or(0)
+    ));
+
     // Stock baseline (no voltage lock) under the same max load — likely power-
     // capped, so its sustained clock is the bar Deep Calm/undervolt must beat.
+    // Also our CALIBRATION: how much of this card's cap does the load saturate?
     let _ = gpu::set_core_offset_mhz(0);
     let sm = load_and_measure(&ctx, DWELL_MS);
     prog.stock_clock_mhz = sm.clock_mhz;
+    let cap = prog.power_limit_w;
+    let sat_pct = if cap > 0.0 { sm.max_power_w / cap * 100.0 } else { 0.0 };
     prog.log.push(format!(
-        "Stock → {} MHz · {:.0} W{}",
-        sm.clock_mhz, sm.power_w,
-        if sm.capped_frac > 0.1 { " · power-cap" } else { "" }
+        "Stock → {} MHz · {:.0} W (pico {:.0}, {:.0}% do cap){}",
+        sm.clock_mhz, sm.power_w, sm.max_power_w, sat_pct,
+        if sm.capped_frac > 0.1 { " · power-cap ✓" } else { "" }
     ));
+    if cap > 0.0 && sm.capped_frac < 0.05 && sat_pct < 85.0 {
+        prog.log.push(format!(
+            "⚠ A carga só atingiu {sat_pct:.0}% do cap ({cap:.0} W) — esta placa precisa de um kernel mais pesado para saturar; o mapa de potência subestima o real."
+        ));
+    }
     set(&progress, prog.clone());
 
     // Always offset 0 — we measure each card's own stock clock at the locked
     // voltage. No overclocking: stock V/F points are stable, so this can't
     // hard-lock the machine (the +offset OC approach crashed the PC at 937mV).
-    for &v in VOLTAGES {
+    for &v in &volts {
         if stop.load(Ordering::SeqCst) {
             break;
         }
