@@ -164,6 +164,78 @@ fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
 /// Find the perf/watt knee: the point of the (power, clock) curve farthest above
 /// the line joining its endpoints — the elbow where more power stops buying much
 /// more clock. Falls back to the best raw perf/watt for tiny sets.
+/// Arduous re-validation of a chosen undervolt point: pin the clock + lock the
+/// voltage and run a LONG max-power soak. The quick descent dwell only finds an
+/// approximate cliff; a marginal undervolt can pass it yet fail in a game. If the
+/// soak fails, step the voltage UP to the next measured point and retry until
+/// stable — so the profile we hand the user is actually solid.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn arduous_validate(
+    ctx: &mut nidavellir_gpu_stress::GpuCtx,
+    store: &SafeLoopStore,
+    target: u32,
+    start: PowerSweepPoint,
+    asc_points: &[PowerSweepPoint],
+    stop: &Arc<AtomicBool>,
+    label: &str,
+    progress: &Arc<Mutex<PowerSweepProgress>>,
+    prog: &mut PowerSweepProgress,
+) -> Option<PowerSweepPoint> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let mut cand = start;
+    for _ in 0..6 {
+        if stop.load(Ordering::SeqCst) {
+            return Some(cand);
+        }
+        prog.log.push(format!(
+            "Validação árdua {label}: {} mV @ {target} MHz (~35s)…",
+            cand.voltage_mv
+        ));
+        set(progress, prog.clone());
+        let _ = nidavellir_core::nvml_gpu::pin_core_clock_mhz(target);
+        if nidavellir_gpu_nvapi::lock_core_voltage_mv(cand.voltage_mv).is_err() {
+            return Some(cand);
+        }
+        let _ = store.arm_boot_flag(&BootFlag::new(
+            TuningPoint::from_axes([
+                ("gpu_voltage_mv", cand.voltage_mv as i64),
+                ("gpu_clock_mhz", target as i64),
+            ]),
+            "gpu_power_validate",
+        ));
+        let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 10_000, 35_000))) {
+            Ok(r) => r.result,
+            Err(_) => StabilityResult::Crash,
+        };
+        let _ = store.clear_boot_flag();
+        if matches!(res, StabilityResult::Stable) {
+            prog.log.push(format!("✓ {label} validado: {} mV @ {target} MHz", cand.voltage_mv));
+            set(progress, prog.clone());
+            return Some(cand);
+        }
+        prog.log.push(format!(
+            "✗ {label} instável em {} mV ({res:?}) — subindo a tensão",
+            cand.voltage_mv
+        ));
+        if matches!(res, StabilityResult::Crash) {
+            let _ = nidavellir_gpu_nvapi::unlock_core_voltage();
+            let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+            if recover_ctx().map(|c| *ctx = c).is_none() {
+                return None;
+            }
+        }
+        match asc_points.iter().find(|p| p.voltage_mv > cand.voltage_mv).copied() {
+            Some(n) => cand = n,
+            None => {
+                prog.log.push(format!("Sem ponto estável acima para {label}."));
+                return None;
+            }
+        }
+    }
+    Some(cand)
+}
+
 #[cfg(windows)]
 #[allow(dead_code)]
 fn knee(points: &[PowerSweepPoint]) -> Option<PowerSweepPoint> {
@@ -376,7 +448,27 @@ fn run_power_sweep(
         .iter()
         .copied()
         .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal));
+
+    // --- Arduous validation of each pick (long soak + back-off) -----------
+    let mut asc = prog.points.clone();
+    asc.sort_by_key(|p| p.voltage_mv);
+    prog.phase = "validate".into();
+    set(&progress, prog.clone());
+    if let Some(p) = prog.godforge {
+        prog.godforge = arduous_validate(&mut ctx, &store, target, p, &asc, &stop, "Godforge", &progress, &mut prog);
+    }
+    if let Some(p) = prog.brokkrs {
+        prog.brokkrs = arduous_validate(&mut ctx, &store, target, p, &asc, &stop, "Brokkr's", &progress, &mut prog);
+    }
+    if let Some(p) = prog.deep_calm {
+        prog.deep_calm = arduous_validate(&mut ctx, &store, target, p, &asc, &stop, "Deep Calm", &progress, &mut prog);
+    }
     prog.recommended = prog.deep_calm;
+
+    let _ = nidavellir_gpu_nvapi::unlock_core_voltage();
+    let _ = gpu::reset_all();
+    let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+    let _ = store.clear_boot_flag();
 
     if prog.godforge.is_some() {
         let fmt = |o: Option<PowerSweepPoint>| match o {
