@@ -167,10 +167,13 @@ fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
     });
-    // FurMark-class graphics load (raster+ROP+TMU+FP, the real game path) — draws
-    // ≥ a real game at the same V/clock, so "off-cap under this" guarantees off-cap
-    // in games. Compute-only under-measured (159W vs Heaven's 199W at 967mV).
-    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_render_stress(ms))) {
+    // Dense int+FP compute load for the dwell. NOTE: the FurMark-class textured
+    // render (run_render_stress) draws true game power (~199W) but, combined with
+    // the V/F constraint (clock cap) needed to test the undervolt, it TDRs (the
+    // card can't manage power) and the driver then can't re-init for ~18s. So the
+    // CONSTRAINED sweep uses the lighter compute load (proven not to TDR);
+    // game-power realism / off-cap is validated separately against a real game.
+    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 10_000, ms))) {
         Ok(r) => r.result,
         Err(_) => StabilityResult::Crash,
     };
@@ -241,7 +244,7 @@ fn arduous_validate(
             ]),
             "gpu_power_validate",
         ));
-        let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_render_stress(35_000))) {
+        let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 10_000, 35_000))) {
             Ok(r) => r.result,
             Err(_) => StabilityResult::Crash,
         };
