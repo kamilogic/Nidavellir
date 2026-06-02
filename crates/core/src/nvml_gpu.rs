@@ -13,6 +13,11 @@ pub struct NvmlGpuReading {
     pub memory_clock_mhz: Option<u32>,
     pub temperature_c: Option<f32>,
     pub power_w: Option<f32>,
+    /// Enforced power limit (W) — the cap the card throttles against.
+    pub power_limit_w: Option<f32>,
+    /// True if the GPU is currently throttling because it hit the power cap
+    /// (SW_POWER_CAP) — the key signal that an undervolt can reclaim headroom.
+    pub power_capped: Option<bool>,
     pub source: SensorSource,
     pub quality: SensorQuality,
 }
@@ -78,6 +83,10 @@ pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
             .ok()
             .map(|t| t as f32);
         let power_w = device.power_usage().ok().map(|mw| mw as f32 / 1000.0);
+        let power_limit_w = device.enforced_power_limit().ok().map(|mw| mw as f32 / 1000.0);
+        let power_capped = device.current_throttle_reasons().ok().map(|r| {
+            r.contains(nvml_wrapper::bitmasks::device::ThrottleReasons::SW_POWER_CAP)
+        });
 
         out.push(NvmlGpuReading {
             index: i,
@@ -89,6 +98,8 @@ pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
             memory_clock_mhz,
             temperature_c,
             power_w,
+            power_limit_w,
+            power_capped,
             source: SensorSource::Nvml,
             quality: SensorQuality::Live,
         });

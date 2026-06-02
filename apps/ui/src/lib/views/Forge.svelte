@@ -16,6 +16,7 @@
   let applied = $state(null);
   let forge = $state(null);
   let forgePreflight = $state(false);
+  let benchmark = $state(null);
   const forgeRunning = $derived(forge?.running);
 
   // Keep a terminal pinned to its newest line (tail -f). The `dep` param makes
@@ -31,6 +32,7 @@
   const SWEEPING = ["baseline", "vram_diagnostic", "voltage_bisection", "synthesis"];
   const realRunning = $derived(realSweep && SWEEPING.includes(realSweep.phase));
   const memRunning = $derived(memSweep?.running);
+  const benchRunning = $derived(benchmark?.running);
 
   // The point the chart should flatten the curve at. When a profile is applied
   // the GPU is hard-capped there (clock lock), so the *effective* curve is flat
@@ -54,6 +56,8 @@
       applied = ap?.data?.type === "GpuApply" ? ap.data : applied;
       const fa = await serviceCall("GetForgeAllProgress");
       forge = fa?.data?.type === "ForgeAll" ? fa.data : forge;
+      const bm = await serviceCall("GetBenchmarkProgress");
+      benchmark = bm?.data?.type === "Benchmark" ? bm.data : benchmark;
       error = null;
     } catch (e) {
       error = String(e);
@@ -97,6 +101,31 @@
     call("StartForgeAll", setForge);
   };
   const stopForge = () => call("StopForgeAll", setForge);
+  const setBench = (r) => (benchmark = r?.data?.type === "Benchmark" ? r.data : benchmark);
+  const startBench = () => call("StartBenchmark", setBench);
+  const stopBench = () => call("StopBenchmark", setBench);
+  const pct = (a, b) => (a > 0 ? ((b - a) / a) * 100 : 0);
+  const sgn = (x, d = 0) => (x >= 0 ? "+" : "") + x.toFixed(d);
+
+  // Before/after rows for the benchmark table (computed here so the markup
+  // stays clean — {@const} can't live directly inside a <tr>).
+  const benchRows = $derived.by(() => {
+    const s = benchmark?.stock,
+      u = benchmark?.tuned;
+    if (!s || !u) return [];
+    const rows = [
+      { key: "forge.benchFps", s: s.fps.toFixed(0), u: u.fps.toFixed(0), d: sgn(pct(s.fps, u.fps)) + "%", good: u.fps >= s.fps },
+      { key: "forge.benchClock", s: String(s.avg_clock_mhz), u: String(u.avg_clock_mhz), d: sgn(u.avg_clock_mhz - s.avg_clock_mhz) + " MHz", good: u.avg_clock_mhz >= s.avg_clock_mhz },
+      { key: "forge.benchPower", s: s.avg_power_w.toFixed(0) + " W", u: u.avg_power_w.toFixed(0) + " W", d: sgn(pct(s.avg_power_w, u.avg_power_w)) + "%", good: u.avg_power_w <= s.avg_power_w },
+      { key: "forge.benchPerfWatt", s: s.perf_per_watt.toFixed(2), u: u.perf_per_watt.toFixed(2), d: sgn(pct(s.perf_per_watt, u.perf_per_watt)) + "%", good: u.perf_per_watt >= s.perf_per_watt },
+      { key: "forge.benchBandwidth", s: s.bandwidth_gbps.toFixed(0), u: u.bandwidth_gbps.toFixed(0), d: sgn(pct(s.bandwidth_gbps, u.bandwidth_gbps)) + "%", good: u.bandwidth_gbps >= s.bandwidth_gbps },
+      { key: "forge.benchTemp", s: s.max_temp_c.toFixed(0) + "°C", u: u.max_temp_c.toFixed(0) + "°C", d: sgn(u.max_temp_c - s.max_temp_c) + "°C", good: u.max_temp_c <= s.max_temp_c },
+    ];
+    if (s.power_capped_frac > 0.05 || u.power_capped_frac > 0.05) {
+      rows.push({ key: "forge.benchPowerCap", s: (s.power_capped_frac * 100).toFixed(0) + "%", u: (u.power_capped_frac * 100).toFixed(0) + "%", d: sgn((u.power_capped_frac - s.power_capped_frac) * 100) + "%", good: u.power_capped_frac <= s.power_capped_frac });
+    }
+    return rows;
+  });
 
   $effect(() => {
     refresh();
@@ -129,6 +158,57 @@
     <button class="btn small" onclick={resetTuning}>{$t("forge.reset")}</button>
   </div>
   <p class="sub apply-hint">{$t("forge.applyHint")}</p>
+
+  <div class="bench">
+    <div class="real-head">
+      <h3 class="section-head">📊 {$t("forge.benchTitle")}</h3>
+      {#if benchRunning}
+        <button class="btn stop" onclick={stopBench}>{$t("forge.benchStop")}</button>
+      {:else}
+        <button class="btn go" onclick={startBench} disabled={!applied?.core && !applied?.mem_offset_mhz}>
+          {$t("forge.benchRun")}
+        </button>
+      {/if}
+    </div>
+    <p class="sub">{$t("forge.benchDesc")}</p>
+    {#if benchmark && benchmark.phase !== "idle"}
+      {#if benchmark.log?.length}
+        <div class="terminal">
+          <div class="term-head">
+            <span class="dots"><i></i><i></i><i></i></span>
+            <span class="term-title">nidavellir · benchmark</span>
+            <span class="term-status" class:live={benchRunning}>{benchRunning ? benchmark.phase : "done"}</span>
+          </div>
+          <div class="term-body" use:autoscroll={benchmark.log.length}>
+            {#each benchmark.log as line, i}
+              <div class="tline"><span class="gutter">{(i + 1).toString().padStart(2, "0")}</span><span class="tlead">{line}</span></div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+      {#if benchRows.length}
+        <table class="bench-table">
+          <thead>
+            <tr><th>{$t("forge.benchMetric")}</th><th>Stock</th><th>Tuned</th><th>Δ</th></tr>
+          </thead>
+          <tbody>
+            {#each benchRows as row}
+              <tr>
+                <td>{$t(row.key)}</td>
+                <td>{row.s}</td>
+                <td>{row.u}</td>
+                <td class:accent={row.good} class:danger={!row.good}>{row.d}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+        {#if benchmark.power_limit_w > 0}
+          <p class="sub">{$t("forge.benchLimit", { w: benchmark.power_limit_w.toFixed(0) })}</p>
+        {/if}
+      {/if}
+      {#if benchmark.note}<p class="point" class:accent={!benchRunning}>{benchmark.note}</p>{/if}
+    {/if}
+  </div>
 
   <div class="forge-all">
     <div class="real-head">
@@ -762,6 +842,43 @@
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
+  }
+  .bench {
+    margin-top: 1rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+  }
+  .bench-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 0.6rem;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .bench-table th,
+  .bench-table td {
+    text-align: right;
+    padding: 0.32rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .bench-table th:first-child,
+  .bench-table td:first-child {
+    text-align: left;
+    color: var(--muted);
+  }
+  .bench-table th {
+    color: var(--nord-mist);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .bench-table td.accent {
+    color: var(--nord-aurora);
+    font-weight: 700;
+  }
+  .bench-table td.danger {
+    color: var(--nord-danger);
+    font-weight: 700;
   }
   .terminal {
     font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;

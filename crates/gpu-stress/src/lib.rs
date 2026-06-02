@@ -49,6 +49,15 @@ pub struct StageReport {
     pub elapsed_ms: u64,
 }
 
+/// Result of a render-pipeline run: the stability verdict plus the rendered
+/// frame count and FPS (the benchmark's performance metric).
+#[derive(Debug, Clone, Copy)]
+pub struct RenderResult {
+    pub result: StabilityResult,
+    pub frames: u64,
+    pub fps: f64,
+}
+
 const ALU_SHADER: &str = r#"
 struct P { iters: u32, n: u32, p0: u32, p1: u32 };
 @group(0) @binding(0) var<storage, read_write> data: array<u32>;
@@ -992,9 +1001,11 @@ impl GpuCtx {
     /// stable GPU yields an identical checksum every time; a divergence is a
     /// SilentError, a device-lost is a Crash. Closer to a game than any compute
     /// test (raster + ROP + fragment units), so it catches instability that
-    /// compute-only validation passes.
-    pub fn run_render_stress(&self, target_ms: u64) -> StageReport {
+    /// compute-only validation passes. Returns the verdict plus the rendered
+    /// frame count / FPS — the benchmark uses the FPS as its performance metric.
+    pub fn run_render_stress(&self, target_ms: u64) -> RenderResult {
         let start = std::time::Instant::now();
+        let mut frames: u64 = 0;
         const DIM: u32 = 1024; // 1024*4 = 4096 B/row (256-aligned for copy)
         const INSTANCES: u32 = 64; // full-screen triangles → heavy overdraw
 
@@ -1075,6 +1086,7 @@ impl GpuCtx {
                 rp.draw(0..3, 0..INSTANCES);
             }
             self.queue.submit(Some(enc.finish()));
+            frames += 1;
 
             if self.crashed.load(Ordering::SeqCst) {
                 break;
@@ -1117,12 +1129,8 @@ impl GpuCtx {
         } else {
             StabilityResult::Stable
         };
-        StageReport {
-            name: "Render".into(),
-            result,
-            mismatches: u32::from(diverged),
-            elapsed_ms: start.elapsed().as_millis() as u64,
-        }
+        let secs = start.elapsed().as_secs_f64().max(0.001);
+        RenderResult { result, frames, fps: frames as f64 / secs }
     }
 
     /// Measure sustained memory bandwidth (GB/s) over ~`target_ms` by streaming

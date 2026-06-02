@@ -289,6 +289,21 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetForgeAllProgress => {
             IpcResponse::success(ResponseData::ForgeAll(guard.forge_all.progress()))
         }
+        IpcRequest::StartBenchmark => {
+            let store = guard.safe_store.clone();
+            if guard.benchmark.start(store) {
+                IpcResponse::success(ResponseData::Benchmark(guard.benchmark.progress()))
+            } else {
+                IpcResponse::failure("Benchmark already running")
+            }
+        }
+        IpcRequest::StopBenchmark => {
+            guard.benchmark.stop();
+            IpcResponse::success(ResponseData::Benchmark(guard.benchmark.progress()))
+        }
+        IpcRequest::GetBenchmarkProgress => {
+            IpcResponse::success(ResponseData::Benchmark(guard.benchmark.progress()))
+        }
     }
 }
 

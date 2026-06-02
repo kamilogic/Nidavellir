@@ -59,6 +59,7 @@ pub fn run_service() -> windows_service::Result<()> {
         real_sweep: crate::gpu_sweep_real::RealSweepHandle::default(),
         mem_sweep: crate::gpu_mem_sweep::MemSweepHandle::default(),
         forge_all: crate::gpu_forge_all::ForgeAllHandle::default(),
+        benchmark: crate::gpu_benchmark::BenchmarkHandle::default(),
     }));
 
     let pipe_state = Arc::clone(&state);

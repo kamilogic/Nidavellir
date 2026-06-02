@@ -35,6 +35,35 @@ pub enum IpcRequest {
     StartForgeAll,
     StopForgeAll,
     GetForgeAllProgress,
+    StartBenchmark,
+    StopBenchmark,
+    GetBenchmarkProgress,
+}
+
+/// One benchmark run's measured metrics (stock or tuned).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BenchSnapshot {
+    pub fps: f64,
+    pub bandwidth_gbps: f64,
+    pub avg_clock_mhz: u32,
+    pub avg_power_w: f32,
+    pub max_temp_c: f32,
+    /// Performance per watt (FPS ÷ average watts).
+    pub perf_per_watt: f64,
+    /// Fraction of samples (0–1) where the card was power-capped (SW_POWER_CAP).
+    pub power_capped_frac: f32,
+}
+
+/// Before/after benchmark progress + report (stock vs applied profile).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BenchmarkProgress {
+    pub running: bool,
+    pub phase: String,
+    pub log: Vec<String>,
+    pub stock: Option<BenchSnapshot>,
+    pub tuned: Option<BenchSnapshot>,
+    pub power_limit_w: f32,
+    pub note: Option<String>,
 }
 
 /// Live status of the full auto pipeline (VRAM gate → core → memory → soak).
@@ -154,6 +183,7 @@ pub enum ResponseData {
     MemSweep(MemSweepProgress),
     GpuApply(GpuApplyStatus),
     ForgeAll(ForgeAllProgress),
+    Benchmark(BenchmarkProgress),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
