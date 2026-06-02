@@ -5,12 +5,15 @@
 //! makes a given clock cost less power (P ≈ C·f·V²), reclaiming that headroom so
 //! the card sustains a higher clock within the budget.
 //!
-//! For a range of locked voltages we raise the clock to its max stable value and
-//! **measure the sustained power it draws** under a heavy ALU load. That maps the
+//! For a range of locked voltages we measure, under a heavy ALU load, the clock
+//! the card naturally runs and the **sustained power it draws** — at each card's
+//! own stock V/F point (offset 0), which are inherently stable. That maps the
 //! real (per-chip) clock↔power↔voltage relationship — far more accurate than any
-//! `mV→W` formula — and lets us pick the **perf/watt knee**: the point just before
-//! diminishing returns (near-max performance at much lower power), which on a
-//! power-limited card is the sweet spot the user otherwise hunts for by hand.
+//! `mV→W` formula — and lets us pick the **perf/watt knee**: the most efficient
+//! operating voltage, which on a power-limited card is the sweet spot the user
+//! otherwise hunts for by hand. The performance win comes from *locking* that
+//! efficient voltage (+ clock cap), NOT from overclocking — so this sweep never
+//! pushes the clock past stock and won't hard-lock the machine.
 //!
 //! Windows-only (NVAPI/NVML).
 
@@ -22,10 +25,9 @@ use nidavellir_core::ipc::{PowerSweepPoint, PowerSweepProgress};
 use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
 use tracing::{info, warn};
 
-/// Voltages (mV) to characterize, low → high.
-const VOLTAGES: &[u32] = &[825, 862, 900, 937, 975, 1012];
-const STEP_MHZ: i32 = 30;
-const CAP_MHZ: i32 = 300;
+/// Voltages (mV) to characterize, low → high. Stock V/F points (offset 0) — all
+/// inherently stable; we never overclock past stock here.
+const VOLTAGES: &[u32] = &[850, 875, 900, 925, 950, 975, 1000];
 const DWELL_MS: u64 = 5000;
 
 fn idle() -> PowerSweepProgress {
@@ -218,9 +220,11 @@ fn run_power_sweep(
         }
     };
 
-    let near_cap = if prog.power_limit_w > 0.0 { prog.power_limit_w * 0.97 } else { f32::MAX };
-
-    'volts: for &v in VOLTAGES {
+    // Always offset 0 — we measure each card's own stock clock at the locked
+    // voltage. No overclocking: stock V/F points are stable, so this can't
+    // hard-lock the machine (the +offset OC approach crashed the PC at 937mV).
+    let _ = gpu::set_core_offset_mhz(0);
+    for &v in VOLTAGES {
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -228,72 +232,37 @@ fn run_power_sweep(
             warn!("power sweep: lock {v}mV failed; skipping");
             continue;
         }
-        let mut best: Option<(u32, f32)> = None;
-        let mut offset = 0i32;
-        loop {
-            if stop.load(Ordering::SeqCst) {
-                break 'volts;
-            }
-            let intent = TuningPoint::from_axes([
-                ("gpu_voltage_mv", v as i64),
-                ("gpu_offset_mhz", offset as i64),
-            ]);
-            let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_power_sweep"));
-            let _ = gpu::set_core_offset_mhz(offset);
-            let (res, clock, power) = load_and_measure(&ctx, DWELL_MS);
-            prog.log.push(format!(
-                "{v} mV +{offset} → {clock} MHz · {power:.0} W : {}",
-                match res {
-                    StabilityResult::Stable => "ok",
-                    StabilityResult::SilentError => "erro silencioso",
-                    StabilityResult::Crash => "device-lost",
-                }
-            ));
-            set(&progress, prog.clone());
-
+        let intent = TuningPoint::from_axes([("gpu_voltage_mv", v as i64), ("gpu_offset_mhz", 0)]);
+        let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_power_sweep"));
+        let (res, clock, power) = load_and_measure(&ctx, DWELL_MS);
+        let _ = store.clear_boot_flag();
+        prog.log.push(format!(
+            "{v} mV → {clock} MHz · {power:.0} W : {}",
             match res {
-                StabilityResult::Stable => {
-                    let _ = store.clear_boot_flag();
-                    best = Some((clock, power));
-                    if power >= near_cap {
-                        prog.log.push(format!("   {v} mV atingiu ~cap ({power:.0} W) — próxima tensão"));
-                        break;
-                    }
-                    offset += STEP_MHZ;
-                    if offset > CAP_MHZ {
-                        break;
-                    }
-                }
-                StabilityResult::SilentError => break,
-                StabilityResult::Crash => {
-                    warn!("power sweep: device lost at {v}mV +{offset} — recovering");
-                    let _ = gpu::set_core_offset_mhz(0);
-                    let _ = gpu::unlock_core_voltage();
-                    match recover_ctx() {
-                        Some(fresh) => {
-                            ctx = fresh;
-                            break;
-                        }
-                        None => {
-                            prog.note = Some("GPU não recuperou — parando".into());
-                            break 'volts;
-                        }
-                    }
-                }
+                StabilityResult::Stable => "ok",
+                StabilityResult::SilentError => "erro silencioso",
+                StabilityResult::Crash => "instável",
             }
-        }
-        if let Some((clock, power)) = best {
-            let p = PowerSweepPoint {
+        ));
+        if matches!(res, StabilityResult::Stable) && clock > 0 && power > 0.0 {
+            prog.points.push(PowerSweepPoint {
                 voltage_mv: v,
                 clock_mhz: clock,
                 power_w: power,
                 stable: true,
-                perf_per_watt: if power > 0.0 { clock as f64 / power as f64 } else { 0.0 },
-            };
-            prog.points.push(p);
-            set(&progress, prog.clone());
+                perf_per_watt: clock as f64 / power as f64,
+            });
+        } else if matches!(res, StabilityResult::Crash) {
+            // A stock-clock point shouldn't device-lost, but if it does, recover.
+            let _ = gpu::unlock_core_voltage();
+            if let Some(fresh) = recover_ctx() {
+                ctx = fresh;
+            } else {
+                prog.note = Some("GPU não recuperou — parando".into());
+                break;
+            }
         }
-        let _ = gpu::set_core_offset_mhz(0);
+        set(&progress, prog.clone());
     }
 
     let _ = gpu::unlock_core_voltage();
