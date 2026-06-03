@@ -341,6 +341,22 @@ fn run_power_sweep(
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
     let _ = gpu::reset_all();
 
+    // [RE] Read-only dump + read-modify-write round-trip of the modern V/F curve
+    // API, at idle/no-load (safe). Tells us the entry layout + whether the new
+    // read-modify-write SET actually stores the offset.
+    {
+        prog.log.push(format!("VF dump: {}", nidavellir_gpu_nvapi::vf_dump_points()));
+        let mut rt = String::from("VF round-trip (+30MHz): ");
+        for idx in [0usize, 50, 100, 150, 200, 254] {
+            let st = nidavellir_gpu_nvapi::vf_set_point_mhz(idx, 30);
+            let after = nidavellir_gpu_nvapi::vf_get_point_khz(idx);
+            let _ = nidavellir_gpu_nvapi::vf_set_point_mhz(idx, 0);
+            rt.push_str(&format!("[{idx}:st{st}→{after:?}] "));
+        }
+        prog.log.push(rt);
+        set(&progress, prog.clone());
+    }
+
     let mut ctx = match GpuCtx::new() {
         Ok(c) => c,
         Err(e) => {

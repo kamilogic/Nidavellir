@@ -226,20 +226,28 @@ mod vfcurve {
     const ID_ENUM: u32 = 0xE5AC_921F; // NvAPI_EnumPhysicalGPUs
     const ID_GET: u32 = 0x23F1_B133; // ClkVfPointsGetControl
     pub const ID_SET: u32 = 0x0733_E009; // ClkVfPointsSetControl
-    const VER: u32 = 0x0001_2420; // (1<<16) | 0x2420
-    const NPTS: usize = 128;
+    const VER: u32 = 0x0001_2420; // size 0x2420 | (1<<16)
+    const NPTS: usize = 255;
 
+    // Per-point CONTROL entry (36 B = 0x24). Exact layout from LACT/NvAPI RE:
+    // type_(+0,4) · rsvd[16](+4) · union data{ prog.freq_offset_khz: i32 }(+20,4) ·
+    // rest of the 16-byte union (+24,12). The frequency offset (kHz) is at +20.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct Entry {
-        freq_delta_khz: i32,
-        _rest: [u8; 0x48 - 4],
+        type_: u32,
+        _rsvd: [u8; 16],
+        freq_offset_khz: i32, // +20
+        _rsvd2: [u8; 12],
     }
+    const _: () = assert!(core::mem::size_of::<Entry>() == 0x24);
+
+    // ClockClientClkVfPointsControlV1: version · mask[8] (256-bit) · rsvd[32] · 255 entries.
     #[repr(C)]
     struct Control {
         version: u32,
-        mask: [u32; 4],
-        _pad: [u32; 3], // 0x14..0x20
+        mask: [u32; 8],
+        _rsvd: [u8; 32],
         points: [Entry; NPTS],
     }
     const _: () = assert!(core::mem::size_of::<Control>() == 0x2420);
@@ -276,6 +284,29 @@ mod vfcurve {
         f(h, &mut c)
     }
 
+    /// Read-only diagnostic: per-point single-bit GET (all-bits mask returns -1).
+    /// Reports the GET status + current freq offset for a few sampled points so we
+    /// can confirm the modern GET reads the right field with the corrected struct.
+    pub fn dump_points() -> String {
+        let _ = nvapi::initialize();
+        let Some(p) = qi(ID_GET) else { return "qi fail".into() };
+        let Some(h) = handle() else { return "handle fail".into() };
+        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Control) -> i32;
+        let f: F = unsafe { core::mem::transmute(p) };
+        let mut out = String::new();
+        for i in [0usize, 50, 100, 150, 200, 254] {
+            let mut c: Control = unsafe { core::mem::zeroed() };
+            c.version = VER;
+            c.mask[i / 32] = 1u32 << (i % 32);
+            let st = f(h, &mut c);
+            out.push_str(&format!(
+                "[{i}:st{st} ty{} off{}] ",
+                c.points[i].type_, c.points[i].freq_offset_khz
+            ));
+        }
+        out
+    }
+
     /// Read back ONE point's current freq offset (kHz) via the modern GET — used
     /// to verify a write round-trips in the new API's own 128-point index space.
     /// Returns `Some(khz)` on success, `None` on API failure.
@@ -294,7 +325,7 @@ mod vfcurve {
         if f(h, &mut c) != 0 {
             return None;
         }
-        Some(c.points[index].freq_delta_khz)
+        Some(c.points[index].freq_offset_khz)
     }
 
     /// Write a per-point graphics-clock frequency offset (kHz) to ONE curve point
@@ -306,15 +337,28 @@ mod vfcurve {
             return -1003;
         }
         let _ = nvapi::initialize();
-        let Some(p) = qi(ID_SET) else { return -1001 };
+        let Some(pset) = qi(ID_SET) else { return -1001 };
+        let Some(pget) = qi(ID_GET) else { return -1001 };
         let Some(h) = handle() else { return -1002 };
         type F = extern "C" fn(NvPhysicalGpuHandle, *mut Control) -> i32;
-        let f: F = unsafe { core::mem::transmute(p) };
+        let fget: F = unsafe { core::mem::transmute(pget) };
+        let fset: F = unsafe { core::mem::transmute(pset) };
+        // Read-modify-write: GET the full control first so every point's hidden
+        // control fields (valid flags, min/max ranges) are populated. Writing a
+        // zeroed struct makes the driver silently ignore the write (status 0,
+        // no-op). Then modify only the target offset and SET with just its bit.
         let mut c: Control = unsafe { core::mem::zeroed() };
         c.version = VER;
-        c.mask[index / 32] = 1u32 << (index % 32);
-        c.points[index].freq_delta_khz = freq_delta_khz;
-        f(h, &mut c)
+        c.mask[index / 32] = 1u32 << (index % 32); // single point (all-bits → err -1)
+        let g = fget(h, &mut c);
+        if g != 0 {
+            return g;
+        }
+        // The target entry's hidden control fields are now populated; set the
+        // offset and write back with the SAME single-bit mask.
+        c.version = VER;
+        c.points[index].freq_offset_khz = freq_delta_khz;
+        fset(h, &mut c)
     }
 }
 
@@ -323,6 +367,12 @@ mod vfcurve {
 #[cfg(windows)]
 pub fn vf_set_point_mhz(index: usize, mhz: i32) -> i32 {
     vfcurve::set_point(index, mhz * 1000)
+}
+
+/// Read-only diagnostic dump of the modern GET control entries (for RE).
+#[cfg(windows)]
+pub fn vf_dump_points() -> String {
+    vfcurve::dump_points()
 }
 
 /// Read back one point's current freq offset (kHz) via the modern GET.
