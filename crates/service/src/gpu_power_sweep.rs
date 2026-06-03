@@ -341,33 +341,6 @@ fn run_power_sweep(
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
     let _ = gpu::reset_all();
 
-    // [RE] Read-only dump + read-modify-write round-trip of the modern V/F curve
-    // API, at idle/no-load (safe). Tells us the entry layout + whether the new
-    // read-modify-write SET actually stores the offset.
-    {
-        // SAFE VF-ceiling proof (idle, lowering-only): flatten every point ≥800 mV
-        // down to 1500 MHz, re-read the curve to confirm the driver reflects it,
-        // then reset. Pure underclock direction → cannot destabilize.
-        let curve = nidavellir_gpu_nvapi::read_vf_curve_modern();
-        let top = curve.iter().max_by_key(|(_, mv, _)| *mv).copied();
-        let before_top = top.map(|(_, _, f)| f).unwrap_or(0);
-        let applied = nidavellir_gpu_nvapi::apply_vf_ceiling(800, 1500);
-        let after_top = top
-            .and_then(|(i, _, _)| nidavellir_gpu_nvapi::vf_point_status(i))
-            .map(|(f, _)| f)
-            .unwrap_or(0);
-        let n_reset = nidavellir_gpu_nvapi::reset_vf_curve();
-        let restored_top = top
-            .and_then(|(i, _, _)| nidavellir_gpu_nvapi::vf_point_status(i))
-            .map(|(f, _)| f)
-            .unwrap_or(0);
-        prog.log.push(format!(
-            "VF ceiling proof: {} pts; topo {before_top}→(teto1500){after_top}→(reset){restored_top} MHz; apply={applied:?}, reset {n_reset} pts",
-            curve.len()
-        ));
-        set(&progress, prog.clone());
-    }
-
     let mut ctx = match GpuCtx::new() {
         Ok(c) => c,
         Err(e) => {
@@ -402,6 +375,25 @@ fn run_power_sweep(
         set(&progress, prog);
         return;
     }
+
+    // SAFE live-clock proof of the VF ceiling UNDER LOAD (lowering-only): flatten
+    // every point ≥800 mV to a clearly-reduced 1500 MHz, measure the live clock
+    // the card actually runs under the heavy load, then reset and re-measure. Pure
+    // underclock → cannot destabilize. If the loaded clock drops to ~1500 and then
+    // returns to stock, the ceiling controls real boost behaviour (not just the
+    // GetStatus report).
+    {
+        let applied = nidavellir_gpu_nvapi::apply_vf_ceiling(800, 1500);
+        let cm = load_and_measure(&ctx, 9000);
+        let n_reset = nidavellir_gpu_nvapi::reset_vf_curve();
+        let rm = load_and_measure(&ctx, 9000);
+        prog.log.push(format!(
+            "VF ceiling sob carga: teto1500 → {} MHz · {:.0} W (apply={applied:?}); reset {n_reset} pts → {} MHz · {:.0} W",
+            cm.clock_mhz, cm.power_w, rm.clock_mhz, rm.power_w
+        ));
+        set(&progress, prog.clone());
+    }
+
     // FLATTEN-based undervolt — NO hard voltage lock. Hard-locking the voltage
     // (set_vfp_locks) under a game-realistic ≈cap load TDRs: the card can't manage
     // power. Instead we cap the clock at the stock target and RAISE the offset;
