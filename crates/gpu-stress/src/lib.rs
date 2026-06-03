@@ -274,7 +274,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     var c = a * 1.3 + b * 0.7 + 1.0;
     var d = a - b * 1.1 + 2.0;
     var t = vec4<f32>(0.0);
-    for (var k = 0; k < 256; k = k + 1) {
+    for (var k = 0; k < 96; k = k + 1) {
         a = fma(a, 1.0001, 0.013);
         b = fma(b, 0.9997, 0.017);
         c = fma(c, 1.0003, a);
@@ -1156,7 +1156,15 @@ impl GpuCtx {
         let start = std::time::Instant::now();
         let mut frames: u64 = 0;
         const DIM: u32 = 1536; // 1536*4 = 6144 B/row (256-aligned for copy)
-        const INSTANCES: u32 = 128; // full-screen triangles → heavy overdraw
+        // Overdraw factor. 8 full-screen triangles at 1536² already swamp the GPU's
+        // parallel fragment capacity (18.9M frags ≫ thousands of ALUs) so it stays
+        // 100% occupied → full game power (~199W). 128 instances did NOT raise power
+        // (already saturated) but made a SINGLE frame's work so large (~1.5-2s) that
+        // it grazed the ~2s TDR watchdog — fine at boost clock, but once the power
+        // cap throttled the clock a frame crossed 2s and the driver reset (device
+        // lost). Keeping per-frame work bounded (many short frames, not one giant
+        // one — like a real game) is what makes the load safely repeatable.
+        const INSTANCES: u32 = 8; // heavy overdraw, but bounded per-frame work
 
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("render-target"),
@@ -1281,6 +1289,17 @@ impl GpuCtx {
             }
             self.queue.submit(Some(enc.finish()));
             frames += 1;
+
+            // Throttle the queue: bound in-flight frames so we don't flood the
+            // submission queue. Without this, a tight submit loop floods the driver
+            // — the first dwell survives but leaves it stressed, and the SECOND call
+            // TDRs (device lost, unrecoverable). The heavy compute load (run_power_
+            // load) polls every 8 submits for the same reason; render frames are far
+            // heavier, so bound tighter (every 3). Keeps the GPU saturated (~199 W,
+            // game power) while staying safely repeatable across a full sweep.
+            if frames % 3 == 0 {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
 
             if self.crashed.load(Ordering::SeqCst) {
                 break;

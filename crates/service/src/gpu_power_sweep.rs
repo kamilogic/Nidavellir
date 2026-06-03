@@ -194,9 +194,24 @@ struct Measured {
 }
 
 #[cfg(windows)]
-fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
+fn load_and_measure(ms: u64) -> Measured {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::AtomicU32;
+    // FRESH wgpu context per measurement. The FurMark-class render reliably runs
+    // ONCE on a fresh device but TDRs (device lost, unrecoverable) if a SECOND
+    // heavy render is issued on the SAME GpuCtx — so we create + drop a context per
+    // dwell. The clock offset is applied via NVAPI on the hardware, independent of
+    // the wgpu device, so a fresh context still measures the applied operating point.
+    let ctx = match nidavellir_gpu_stress::GpuCtx::new() {
+        Ok(c) => c,
+        Err(_) => {
+            return Measured {
+                result: StabilityResult::Crash,
+                clock_mhz: 0, power_w: 0.0, max_power_w: 0.0, power_std_w: 0.0,
+                capped_frac: 0.0, volt_mv: 0,
+            }
+        }
+    };
     let stop = Arc::new(AtomicBool::new(false));
     // Collect raw samples in the sampler thread for precise stats (mean/max/std).
     let samples: Arc<Mutex<Vec<(u32, f32, bool)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -228,13 +243,16 @@ fn load_and_measure(ctx: &nidavellir_gpu_stress::GpuCtx, ms: u64) -> Measured {
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
     });
-    // Dense int+FP compute load for the dwell. NOTE: the FurMark-class textured
-    // render (run_render_stress) draws true game power (~199W) but, combined with
-    // the V/F constraint (clock cap) needed to test the undervolt, it TDRs (the
-    // card can't manage power) and the driver then can't re-init for ~18s. So the
-    // CONSTRAINED sweep uses the lighter compute load (proven not to TDR);
-    // game-power realism / off-cap is validated separately against a real game.
-    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 10_000, ms))) {
+    // FurMark-class TEXTURED RENDER for the dwell — it exercises the full graphics
+    // pipeline (texturing, heavy overdraw, FP fragment) so it draws TRUE GAME POWER
+    // (~199 W on a 3060 Ti, like Overwatch) and SATURATES THE POWER CAP, which a
+    // pure-ALU compute kernel never does (~159 W, never cap-limited → wrong regime).
+    // It still detects silent errors (per-frame reduction checksum) and crashes.
+    // Safe here: the measurement loop applies only a clock OFFSET (no rigid clock
+    // pin / voltage lock), so the card stays power-managed and throttles to fit the
+    // cap instead of TDRing — measuring the real power-limited regime the undervolt
+    // actually helps in.
+    let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_render_stress(ms))) {
         Ok(r) => r.result,
         Err(_) => StabilityResult::Crash,
     };
@@ -419,7 +437,7 @@ fn run_power_sweep(
     // and the calibration of how much of the cap the load saturates.
     let _ = gpu::set_core_offset_mhz(0);
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-    let sm = load_and_measure(&ctx, DWELL_MS);
+    let sm = load_and_measure(DWELL_MS);
     prog.stock_clock_mhz = sm.clock_mhz;
     let target = sm.clock_mhz;
     let sat_pct = if cap > 0.0 { sm.max_power_w / cap * 100.0 } else { 0.0 };
@@ -435,24 +453,6 @@ fn run_power_sweep(
         prog.note = Some("Não foi possível ler o clock do stock.".into());
         set(&progress, prog);
         return;
-    }
-
-    // SAFE live-clock proof of the VF ceiling UNDER LOAD (lowering-only): flatten
-    // every point ≥800 mV to a clearly-reduced 1500 MHz, measure the live clock
-    // the card actually runs under the heavy load, then reset and re-measure. Pure
-    // underclock → cannot destabilize. If the loaded clock drops to ~1500 and then
-    // returns to stock, the ceiling controls real boost behaviour (not just the
-    // GetStatus report).
-    {
-        let applied = nidavellir_gpu_nvapi::apply_vf_ceiling(800, 1500);
-        let cm = load_and_measure(&ctx, 9000);
-        let n_reset = nidavellir_gpu_nvapi::reset_vf_curve();
-        let rm = load_and_measure(&ctx, 9000);
-        prog.log.push(format!(
-            "VF ceiling sob carga: teto1500 → {} MHz · {:.0} W (apply={applied:?}); reset {n_reset} pts → {} MHz · {:.0} W",
-            cm.clock_mhz, cm.power_w, rm.clock_mhz, rm.power_w
-        ));
-        set(&progress, prog.clone());
     }
 
     // FLATTEN-based undervolt — NO hard voltage lock. Hard-locking the voltage
@@ -473,7 +473,7 @@ fn run_power_sweep(
         let intent =
             TuningPoint::from_axes([("gpu_offset_mhz", offset as i64), ("gpu_clock_mhz", target as i64)]);
         let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_power_sweep"));
-        let m = load_and_measure(&ctx, DWELL_MS);
+        let m = load_and_measure(DWELL_MS);
         let _ = store.clear_boot_flag();
         prog.log.push(format!(
             "+{offset} MHz → {} mV · {} MHz · {:.0} W (máx {:.0}{}) : {}",
