@@ -175,6 +175,10 @@ pub struct GpuCurveSnapshot {
     pub plateau: Option<VfPoint>,
     /// True when read from real hardware (vs unavailable/simulated).
     pub real: bool,
+    /// True when the modern per-point V/F curve API (Afterburner-style elastic
+    /// ceiling) is usable on this GPU + driver — drives UI messaging.
+    #[serde(default)]
+    pub vf_curve_supported: bool,
 }
 
 /// One completed stage of the validation battery.

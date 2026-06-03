@@ -353,6 +353,11 @@
           </p>
         {/if}
         <VfChart points={realCurve.points} plateau={chartLimit} height={300} />
+        <p class="sub vf-method" class:ok={realCurve.vf_curve_supported}>
+          {realCurve.vf_curve_supported ? "⚡ " : ""}{$t(
+            realCurve.vf_curve_supported ? "forge.vfElastic" : "forge.vfFallback"
+          )}
+        </p>
         {#if advanced}
           <p class="sub">{$t("forge.curvePoints", { name: realCurve.name, n: realCurve.points.length })}</p>
           <ul class="list">
@@ -749,6 +754,9 @@
     margin: 0.25rem 0;
     font-size: 0.82rem;
     color: var(--muted);
+  }
+  .vf-method.ok {
+    color: var(--nord-success, #a3be8c);
   }
   .err {
     color: var(--nord-danger);

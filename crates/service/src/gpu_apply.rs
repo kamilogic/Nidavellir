@@ -50,18 +50,36 @@ fn curve_freq_at(voltage_mv: u32) -> Option<u32> {
         .map(|p| p.freq_mhz)
 }
 
-/// Realize a core V/F point by FLATTENING the curve — offset the clock up so the
-/// GPU reaches `point.freq_mhz` at the lower `point.voltage_mv`, and hard-cap the
-/// max clock there so it never boosts past the validated point. We do NOT hard-
-/// lock the voltage: under a heavy (≈power-cap) game load a hard voltage lock
-/// removes the card's power management and TDRs — the flatten (offset + clock cap)
-/// achieves the undervolt while letting the card stay safe (the Afterburner way).
+/// Realize a core V/F point by FLATTENING the curve. We do NOT hard-lock the
+/// voltage: under a heavy (≈power-cap) game load a hard voltage lock removes the
+/// card's power management and TDRs.
+///
+/// Preferred path (Pascal+ on a modern driver): the **elastic VF ceiling** — set
+/// per-point frequency offsets so every curve point at or above `point.voltage_mv`
+/// is flattened to `point.freq_mhz`, leaving lower-voltage points free. The GPU
+/// keeps full power-management elasticity (it can still drop clocks/voltage on
+/// light load) yet never boosts past the validated point — the true Afterburner
+/// curve-flatten. Fallback (older driver / no modern curve API): a global clock
+/// offset + an NVML max-clock cap (less elastic, but works everywhere).
 #[cfg(windows)]
 pub fn apply_core(point: VfPoint) -> Result<(), String> {
+    if nidavellir_gpu_nvapi::vf_curve_supported() {
+        match nidavellir_gpu_nvapi::apply_vf_ceiling(point.voltage_mv, point.freq_mhz) {
+            Ok(n) => {
+                info!(
+                    "VF ceiling: {n} pts achatados para {} MHz acima de {} mV (elástico)",
+                    point.freq_mhz, point.voltage_mv
+                );
+                return Ok(());
+            }
+            Err(e) => warn!("VF ceiling falhou ({e}); usando fallback offset+cap"),
+        }
+    }
+    // Fallback: offset the clock up so the GPU reaches freq at the lower voltage,
+    // then hard-cap the max clock so it never boosts past the validated point.
     let base = curve_freq_at(point.voltage_mv).unwrap_or(point.freq_mhz);
     let offset = (point.freq_mhz as i64 - base as i64).clamp(-300, 400) as i32;
     nidavellir_gpu_nvapi::set_core_offset_mhz(offset)?;
-    // Flatten the top of the curve at the validated frequency (the undervolt).
     if let Err(e) = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(point.freq_mhz) {
         warn!("core clock cap at {} MHz failed (continuing): {e}", point.freq_mhz);
     }
@@ -112,6 +130,12 @@ pub fn reset(store: &SafeLoopStore) -> Result<(), String> {
     clear_applied();
     let _ = store.clear_boot_flag();
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+    // Zero the modern V/F curve offsets too (reset_all uses the legacy path and
+    // won't clear ceiling offsets written via ClkVfPoints).
+    if nidavellir_gpu_nvapi::vf_curve_supported() {
+        let n = nidavellir_gpu_nvapi::reset_vf_curve();
+        info!("VF curve reset: {n} pts zerados");
+    }
     nidavellir_gpu_nvapi::reset_all()
 }
 

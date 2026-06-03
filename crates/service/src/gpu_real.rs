@@ -22,18 +22,24 @@ pub fn read_curve_snapshot() -> GpuCurveSnapshot {
             let plateau = c
                 .plateau()
                 .map(|p| VfPoint { freq_mhz: p.freq_mhz, voltage_mv: p.voltage_mv });
-            GpuCurveSnapshot { name: c.name, points, plateau, real: true }
+            GpuCurveSnapshot {
+                name: c.name,
+                points,
+                plateau,
+                real: true,
+                vf_curve_supported: nidavellir_gpu_nvapi::vf_curve_supported(),
+            }
         }
         Err(e) => {
             warn!("NVAPI read_curve failed: {e}");
-            GpuCurveSnapshot { name: format!("unavailable: {e}"), points: vec![], plateau: None, real: false }
+            GpuCurveSnapshot { name: format!("unavailable: {e}"), points: vec![], plateau: None, real: false, vf_curve_supported: false }
         }
     }
 }
 
 #[cfg(not(windows))]
 pub fn read_curve_snapshot() -> GpuCurveSnapshot {
-    GpuCurveSnapshot { name: "NVAPI é só Windows".into(), points: vec![], plateau: None, real: false }
+    GpuCurveSnapshot { name: "NVAPI é só Windows".into(), points: vec![], plateau: None, real: false, vf_curve_supported: false }
 }
 
 fn idle_validation() -> GpuValidationStatus {
