@@ -8,3 +8,4 @@ authors.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 nvapi = "0.1"
+nvapi-sys = "0.1"

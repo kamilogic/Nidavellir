@@ -2280,6 +2280,7 @@ name = "nidavellir-gpu-nvapi"
 version = "0.1.0"
 dependencies = [
  "nvapi",
+ "nvapi-sys",
 ]
 
 [[package]]

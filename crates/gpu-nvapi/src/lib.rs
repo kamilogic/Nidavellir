@@ -213,6 +213,150 @@ pub fn reset_all() -> Result<(), String> {
     a.and(b).and(c)
 }
 
+/// Modern per-point V/F curve control via the undocumented NvAPI `ClkVfPoints`
+/// family — what MSI Afterburner / NVIDIA App / Green Curve / NV-UV use on
+/// Pascal+ with current drivers (550+/590+). The `nvapi` crate only wraps the
+/// OLD `SetClockBoostTable`, which driver 595.97 rejects; these are called by
+/// function id via `NvAPI_QueryInterface`. READ side is harmless; writes are
+/// gated behind a working read probe.
+#[cfg(windows)]
+mod vfcurve {
+    use nvapi_sys::handles::NvPhysicalGpuHandle;
+
+    const ID_ENUM: u32 = 0xE5AC_921F; // NvAPI_EnumPhysicalGPUs
+    const ID_GET: u32 = 0x23F1_B133; // ClkVfPointsGetControl
+    pub const ID_SET: u32 = 0x0733_E009; // ClkVfPointsSetControl
+    const VER: u32 = 0x0001_2420; // (1<<16) | 0x2420
+    const NPTS: usize = 128;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Entry {
+        freq_delta_khz: i32,
+        _rest: [u8; 0x48 - 4],
+    }
+    #[repr(C)]
+    struct Control {
+        version: u32,
+        mask: [u32; 4],
+        _pad: [u32; 3], // 0x14..0x20
+        points: [Entry; NPTS],
+    }
+    const _: () = assert!(core::mem::size_of::<Control>() == 0x2420);
+
+    fn qi(id: u32) -> Option<usize> {
+        nvapi_sys::nvapi::nvapi_QueryInterface(id).ok()
+    }
+
+    fn handle() -> Option<NvPhysicalGpuHandle> {
+        let p = qi(ID_ENUM)?;
+        type F = extern "C" fn(*mut [NvPhysicalGpuHandle; 64], *mut u32) -> i32;
+        let f: F = unsafe { core::mem::transmute(p) };
+        let mut h: [NvPhysicalGpuHandle; 64] = unsafe { core::mem::zeroed() };
+        let mut n: u32 = 0;
+        if f(&mut h, &mut n) == 0 && n > 0 {
+            Some(h[0])
+        } else {
+            None
+        }
+    }
+
+    /// Read-only probe of `ClkVfPointsGetControl` for point 0. Returns the NvAPI
+    /// status — 0 means the modern API + struct version work on this driver.
+    /// Status `-1001`/`-1002` are our own markers (QueryInterface / enum failed).
+    pub fn probe_get() -> i32 {
+        let _ = nvapi::initialize();
+        let Some(p) = qi(ID_GET) else { return -1001 };
+        let Some(h) = handle() else { return -1002 };
+        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Control) -> i32;
+        let f: F = unsafe { core::mem::transmute(p) };
+        let mut c: Control = unsafe { core::mem::zeroed() };
+        c.version = VER;
+        c.mask[0] = 1; // point 0 only
+        f(h, &mut c)
+    }
+
+    /// Read back ONE point's current freq offset (kHz) via the modern GET — used
+    /// to verify a write round-trips in the new API's own 128-point index space.
+    /// Returns `Some(khz)` on success, `None` on API failure.
+    pub fn get_point(index: usize) -> Option<i32> {
+        if index >= NPTS {
+            return None;
+        }
+        let _ = nvapi::initialize();
+        let p = qi(ID_GET)?;
+        let h = handle()?;
+        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Control) -> i32;
+        let f: F = unsafe { core::mem::transmute(p) };
+        let mut c: Control = unsafe { core::mem::zeroed() };
+        c.version = VER;
+        c.mask[index / 32] = 1u32 << (index % 32);
+        if f(h, &mut c) != 0 {
+            return None;
+        }
+        Some(c.points[index].freq_delta_khz)
+    }
+
+    /// Write a per-point graphics-clock frequency offset (kHz) to ONE curve point
+    /// (`index` = the 128-bit mask bit; the API rejects multiple bits per call).
+    /// Returns the NvAPI status (0 = OK). This is the modern Afterburner-style
+    /// curve write — it does NOT hard-lock voltage, so the GPU keeps elasticity.
+    pub fn set_point(index: usize, freq_delta_khz: i32) -> i32 {
+        if index >= NPTS {
+            return -1003;
+        }
+        let _ = nvapi::initialize();
+        let Some(p) = qi(ID_SET) else { return -1001 };
+        let Some(h) = handle() else { return -1002 };
+        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Control) -> i32;
+        let f: F = unsafe { core::mem::transmute(p) };
+        let mut c: Control = unsafe { core::mem::zeroed() };
+        c.version = VER;
+        c.mask[index / 32] = 1u32 << (index % 32);
+        c.points[index].freq_delta_khz = freq_delta_khz;
+        f(h, &mut c)
+    }
+}
+
+/// Write a per-point V/F frequency offset (MHz) to one curve point via the modern
+/// API. `index` is the curve point index (from [`read_curve_indexed`]).
+#[cfg(windows)]
+pub fn vf_set_point_mhz(index: usize, mhz: i32) -> i32 {
+    vfcurve::set_point(index, mhz * 1000)
+}
+
+/// Read back one point's current freq offset (kHz) via the modern GET.
+#[cfg(windows)]
+pub fn vf_get_point_khz(index: usize) -> Option<i32> {
+    vfcurve::get_point(index)
+}
+
+/// Read the graphics V/F curve as `(point_index, voltage_mv, freq_mhz)` — the
+/// index is what [`vf_set_point_mhz`] addresses.
+#[cfg(windows)]
+pub fn read_curve_indexed() -> Result<Vec<(usize, u32, u32)>, String> {
+    let gpu = first_gpu()?;
+    let mask = gpu.vfp_mask().map_err(|e| format!("vfp_mask: {e:?}"))?;
+    let curve = gpu.vfp_curve(mask.mask).map_err(|e| format!("vfp_curve: {e:?}"))?;
+    Ok(curve
+        .graphics
+        .iter()
+        .map(|(i, e)| (*i, e.voltage.0 / 1000, e.frequency.0 / 1000))
+        .collect())
+}
+
+/// True if the modern per-point V/F curve API works on this GPU + driver.
+#[cfg(windows)]
+pub fn vf_curve_supported() -> bool {
+    vfcurve::probe_get() == 0
+}
+
+/// Raw NvAPI status from the modern ClkVf read probe (for diagnostics).
+#[cfg(windows)]
+pub fn vf_curve_probe_status() -> i32 {
+    vfcurve::probe_get()
+}
+
 #[cfg(windows)]
 fn first_gpu() -> Result<nvapi::PhysicalGpu, String> {
     nvapi::initialize().map_err(|e| format!("NvAPI_Initialize failed: {e:?}"))?;
