@@ -252,6 +252,84 @@ mod vfcurve {
     }
     const _: () = assert!(core::mem::size_of::<Control>() == 0x2420);
 
+    // ---- GetStatus: per-point ACTUAL freq + voltage (read-only) ---------------
+    const ID_STATUS: u32 = 0x2153_7AD4; // ClkVfPointsGetStatus
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Tuple {
+        freq_khz: u32,
+        voltage_uv: u32,
+        _rsvd: [u8; 32],
+    }
+    // ClockClientClkVfPointStatusV3 (348 B): type_ · freq_khz · voltage_uv ·
+    // vf_tuple_base · vf_tuple_offset · rsvd[256].
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct StatusEntry {
+        type_: u32,
+        freq_khz: u32,
+        voltage_uv: u32,
+        base: Tuple,
+        offset: Tuple,
+        _rsvd: [u8; 256],
+    }
+    const _: () = assert!(core::mem::size_of::<StatusEntry>() == 348);
+    #[repr(C)]
+    struct Status {
+        version: u32,
+        mask: [u32; 8],
+        b_base_supported: u8,
+        _rsvd: [u8; 64],
+        points: [StatusEntry; NPTS],
+    }
+    // NVAPI MAKE_VERSION(struct, 3) = sizeof | (3<<16); derive from our struct so
+    // it always matches our layout (driver returns -190 if the size is wrong).
+    const VER_STATUS: u32 = (core::mem::size_of::<Status>() as u32) | (3 << 16);
+
+    /// Read one point's ACTUAL (freq_khz, voltage_µV) via GetStatus. Single-bit
+    /// mask. Returns `None` if the point is invalid / API fails.
+    pub fn get_status(index: usize) -> Option<(u32, u32)> {
+        if index >= NPTS {
+            return None;
+        }
+        let _ = nvapi::initialize();
+        let p = qi(ID_STATUS)?;
+        let h = handle()?;
+        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Status) -> i32;
+        let f: F = unsafe { core::mem::transmute(p) };
+        let mut s: Box<Status> = Box::new(unsafe { core::mem::zeroed() });
+        s.version = VER_STATUS;
+        s.mask[index / 32] = 1u32 << (index % 32);
+        if f(h, s.as_mut()) != 0 {
+            return None;
+        }
+        Some((s.points[index].freq_khz, s.points[index].voltage_uv))
+    }
+
+    /// Diagnostic: GetStatus for sampled points — confirms the struct version and
+    /// shows real freq/voltage data (proves the curve is read, not zeroed).
+    pub fn dump_status() -> String {
+        let _ = nvapi::initialize();
+        let Some(p) = qi(ID_STATUS) else { return "qi(status) fail".into() };
+        let Some(h) = handle() else { return "handle fail".into() };
+        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Status) -> i32;
+        let f: F = unsafe { core::mem::transmute(p) };
+        let mut out = format!("VER_STATUS {VER_STATUS:#x} ");
+        for i in [0usize, 40, 80, 120, 160] {
+            let mut s: Box<Status> = Box::new(unsafe { core::mem::zeroed() });
+            s.version = VER_STATUS;
+            s.mask[i / 32] = 1u32 << (i % 32);
+            let st = f(h, s.as_mut());
+            out.push_str(&format!(
+                "[{i}:st{st} {}MHz {}mV] ",
+                s.points[i].freq_khz / 1000,
+                s.points[i].voltage_uv / 1000
+            ));
+        }
+        out
+    }
+
     fn qi(id: u32) -> Option<usize> {
         nvapi_sys::nvapi::nvapi_QueryInterface(id).ok()
     }
@@ -373,6 +451,18 @@ pub fn vf_set_point_mhz(index: usize, mhz: i32) -> i32 {
 #[cfg(windows)]
 pub fn vf_dump_points() -> String {
     vfcurve::dump_points()
+}
+
+/// Read-only diagnostic dump of GetStatus (per-point real freq + voltage).
+#[cfg(windows)]
+pub fn vf_dump_status() -> String {
+    vfcurve::dump_status()
+}
+
+/// One V/F point's actual (freq_mhz, voltage_mv) via the modern GetStatus.
+#[cfg(windows)]
+pub fn vf_point_status(index: usize) -> Option<(u32, u32)> {
+    vfcurve::get_status(index).map(|(f, v)| (f / 1000, v / 1000))
 }
 
 /// Read back one point's current freq offset (kHz) via the modern GET.

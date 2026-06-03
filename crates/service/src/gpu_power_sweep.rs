@@ -345,7 +345,8 @@ fn run_power_sweep(
     // API, at idle/no-load (safe). Tells us the entry layout + whether the new
     // read-modify-write SET actually stores the offset.
     {
-        prog.log.push(format!("VF dump: {}", nidavellir_gpu_nvapi::vf_dump_points()));
+        prog.log.push(format!("VF status: {}", nidavellir_gpu_nvapi::vf_dump_status()));
+        prog.log.push(format!("VF ctrl: {}", nidavellir_gpu_nvapi::vf_dump_points()));
         let mut rt = String::from("VF round-trip (+30MHz): ");
         for idx in [0usize, 50, 100, 150, 200, 254] {
             let st = nidavellir_gpu_nvapi::vf_set_point_mhz(idx, 30);
