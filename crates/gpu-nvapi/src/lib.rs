@@ -101,6 +101,82 @@ pub fn set_mem_offset_mhz(mhz: i32) -> Result<(), String> {
     .map_err(|e| format!("set_pstates(memory) failed: {e:?}"))
 }
 
+/// Apply an Afterburner-style **VF CEILING**: flatten every graphics curve point
+/// at or above `ceiling_mv` to `target_mhz` (cap the top of the curve), leaving
+/// lower-voltage points untouched so the GPU keeps its V/F elasticity (it can
+/// still downclock/downvolt). Unlike a hard voltage lock or NVML clock cap, this
+/// doesn't remove the card's power management — which is what TDR'd under heavy
+/// load. `khz_per_mhz` is the table delta unit (use [`calibrate_vf_unit`]).
+/// Reversible via [`reset_vf_table`].
+#[cfg(windows)]
+pub fn set_vf_ceiling(target_mhz: u32, ceiling_mv: u32, khz_per_mhz: i32) -> Result<(), String> {
+    let gpu = first_gpu()?;
+    let mask = gpu.vfp_mask().map_err(|e| format!("vfp_mask: {e:?}"))?;
+    let curve = gpu.vfp_curve(mask.mask).map_err(|e| format!("vfp_curve: {e:?}"))?;
+    let deltas: Vec<(usize, nvapi::Kilohertz2Delta)> = curve
+        .graphics
+        .iter()
+        .filter_map(|(i, e)| {
+            let v = e.voltage.0 / 1000;
+            let f = (e.frequency.0 / 1000) as i32;
+            if v >= ceiling_mv {
+                Some((*i, nvapi::Kilohertz2Delta((target_mhz as i32 - f) * khz_per_mhz)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if deltas.is_empty() {
+        return Err("no curve points at/above the ceiling voltage".into());
+    }
+    gpu.set_vfp_table(mask.mask, deltas.into_iter(), std::iter::empty())
+        .map_err(|e| format!("set_vfp_table: {e:?}"))
+}
+
+/// Clear all graphics VFP curve deltas (curve back to stock).
+#[cfg(windows)]
+pub fn reset_vf_table() -> Result<(), String> {
+    let gpu = first_gpu()?;
+    let mask = gpu.vfp_mask().map_err(|e| format!("vfp_mask: {e:?}"))?;
+    let curve = gpu.vfp_curve(mask.mask).map_err(|e| format!("vfp_curve: {e:?}"))?;
+    let deltas: Vec<(usize, nvapi::Kilohertz2Delta)> =
+        curve.graphics.iter().map(|(i, _)| (*i, nvapi::Kilohertz2Delta(0))).collect();
+    gpu.set_vfp_table(mask.mask, deltas.into_iter(), std::iter::empty())
+        .map_err(|e| format!("reset vfp_table: {e:?}"))
+}
+
+/// Calibrate the VFP table's delta unit (the Kilohertz/Kilohertz2 ×2 quirk):
+/// write a small **lowering** delta to the top-voltage graphics point (safe — no
+/// load, and lowering can't destabilize), read the curve back, and return
+/// `(probe_units, mhz_moved, base_mhz)`. The caller derives kHz-units-per-MHz =
+/// probe_units / mhz_moved. Resets the probe after. If `mhz_moved == 0` the read
+/// doesn't reflect deltas → don't trust a guessed unit.
+#[cfg(windows)]
+pub fn calibrate_vf_unit() -> Result<(i32, i32, i32), String> {
+    let gpu = first_gpu()?;
+    let mask = gpu.vfp_mask().map_err(|e| format!("vfp_mask: {e:?}"))?;
+    let curve = gpu.vfp_curve(mask.mask).map_err(|e| format!("vfp_curve: {e:?}"))?;
+    let (idx, base) = curve
+        .graphics
+        .iter()
+        .max_by_key(|(_, e)| e.voltage.0)
+        .map(|(i, e)| (*i, (e.frequency.0 / 1000) as i32))
+        .ok_or_else(|| "no graphics points".to_string())?;
+    const PROBE: i32 = -30000; // lowering delta in table units
+    gpu.set_vfp_table(mask.mask, std::iter::once((idx, nvapi::Kilohertz2Delta(PROBE))), std::iter::empty())
+        .map_err(|e| format!("probe set: {e:?}"))?;
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let c2 = gpu.vfp_curve(mask.mask).map_err(|e| format!("re-read: {e:?}"))?;
+    let after = c2
+        .graphics
+        .iter()
+        .find(|(i, _)| *i == idx)
+        .map(|(_, e)| (e.frequency.0 / 1000) as i32)
+        .unwrap_or(base);
+    let _ = gpu.set_vfp_table(mask.mask, std::iter::once((idx, nvapi::Kilohertz2Delta(0))), std::iter::empty());
+    Ok((PROBE, after - base, base))
+}
+
 /// Lock the core voltage to `mv` (the GPU runs at the curve frequency for that
 /// voltage). Reversible via [`unlock_core_voltage`].
 #[cfg(windows)]

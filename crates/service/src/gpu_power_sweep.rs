@@ -454,23 +454,17 @@ fn run_power_sweep(
     let brokkr_target = if cap > 0.0 { cap - headroom } else { f32::MAX };
     prog.target_w = brokkr_target;
 
-    // Godforge: highest voltage held → most power / most stability margin (stock perf).
+    // Two profiles only (Deep Calm removed — it converged with Brokkr's):
+    // Godforge = max stable performance (least undervolt = most stability margin,
+    // the +0 / highest-voltage point); Brokkr's Best = best perf/watt (the
+    // deepest stable undervolt, lowest power at the same clock).
     prog.godforge = prog.points.iter().copied().max_by_key(|p| p.voltage_mv);
-    // Brokkr's Best: highest voltage whose PEAK power stays under the target
-    // (peak, not mean — the cap reacts to spikes). Falls back to the most efficient.
     prog.brokkrs = prog
-        .points
-        .iter()
-        .filter(|p| p.max_power_w <= brokkr_target)
-        .copied()
-        .max_by_key(|p| p.voltage_mv)
-        .or_else(|| prog.points.iter().copied().min_by_key(|p| p.voltage_mv));
-    // Deep Calm: best perf/watt = lowest stable voltage = least power (same perf).
-    prog.deep_calm = prog
         .points
         .iter()
         .copied()
         .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal));
+    prog.deep_calm = None;
 
     // --- Arduous validation of each pick (long soak + back-off) -----------
     let pts = prog.points.clone();
@@ -482,10 +476,7 @@ fn run_power_sweep(
     if let Some(p) = prog.brokkrs {
         prog.brokkrs = arduous_validate(&mut ctx, &store, target, p, &pts, &stop, "Brokkr's", &progress, &mut prog);
     }
-    if let Some(p) = prog.deep_calm {
-        prog.deep_calm = arduous_validate(&mut ctx, &store, target, p, &pts, &stop, "Deep Calm", &progress, &mut prog);
-    }
-    prog.recommended = prog.deep_calm;
+    prog.recommended = prog.brokkrs;
 
     let _ = nidavellir_gpu_nvapi::unlock_core_voltage();
     let _ = gpu::reset_all();
@@ -497,15 +488,15 @@ fn run_power_sweep(
             Some(p) => format!("{} MHz @ {} mV ({:.0} W)", p.clock_mhz, p.voltage_mv, p.power_w),
             None => "—".into(),
         };
-        let dc_eff = match prog.deep_calm {
+        let bk_eff = match prog.brokkrs {
             Some(p) if sm.power_w > 0.0 => {
-                format!(" (Deep Calm mantém o clock economizando {:.0} W)", (sm.power_w - p.power_w).max(0.0))
+                format!(" (Brokkr's economiza {:.0} W no mesmo clock)", (sm.power_w - p.power_w).max(0.0))
             }
             _ => String::new(),
         };
         prog.note = Some(format!(
-            "Mantendo {target} MHz · cap {cap:.0} W (alvo Brokkr's ≤ {brokkr_target:.0} W) · Godforge {} · Brokkr's {} · Deep Calm {}{dc_eff} — confirme em jogo.",
-            fmt(prog.godforge), fmt(prog.brokkrs), fmt(prog.deep_calm)
+            "Mantendo {target} MHz · cap {cap:.0} W · Godforge {} · Brokkr's {}{bk_eff} — confirme em jogo.",
+            fmt(prog.godforge), fmt(prog.brokkrs)
         ));
     } else {
         prog.note = Some("Nenhum ponto de undervolt estável encontrado.".into());

@@ -304,9 +304,9 @@
           </tbody>
         </table>
       {/if}
-      {#if !powerRunning && (powerSweep.godforge || powerSweep.brokkrs || powerSweep.deep_calm)}
+      {#if !powerRunning && (powerSweep.godforge || powerSweep.brokkrs)}
         <div class="profiles">
-          {#each [["godforge", powerSweep.godforge], ["brokkrs", powerSweep.brokkrs], ["deep_calm", powerSweep.deep_calm]] as [key, p]}
+          {#each [["godforge", powerSweep.godforge], ["brokkrs", powerSweep.brokkrs]] as [key, p]}
             <div class="profile">
               <div class="prof-name">{$t("forge.prof_" + key)}</div>
               {#if p}
@@ -938,7 +938,7 @@
   }
   .profiles {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
     gap: 0.6rem;
     margin-top: 0.7rem;
   }
