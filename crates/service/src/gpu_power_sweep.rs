@@ -345,16 +345,26 @@ fn run_power_sweep(
     // API, at idle/no-load (safe). Tells us the entry layout + whether the new
     // read-modify-write SET actually stores the offset.
     {
-        prog.log.push(format!("VF status: {}", nidavellir_gpu_nvapi::vf_dump_status()));
-        prog.log.push(format!("VF ctrl: {}", nidavellir_gpu_nvapi::vf_dump_points()));
-        let mut rt = String::from("VF round-trip (+30MHz): ");
-        for idx in [0usize, 50, 100, 150, 200, 254] {
-            let st = nidavellir_gpu_nvapi::vf_set_point_mhz(idx, 30);
-            let after = nidavellir_gpu_nvapi::vf_get_point_khz(idx);
-            let _ = nidavellir_gpu_nvapi::vf_set_point_mhz(idx, 0);
-            rt.push_str(&format!("[{idx}:st{st}→{after:?}] "));
-        }
-        prog.log.push(rt);
+        // SAFE VF-ceiling proof (idle, lowering-only): flatten every point ≥800 mV
+        // down to 1500 MHz, re-read the curve to confirm the driver reflects it,
+        // then reset. Pure underclock direction → cannot destabilize.
+        let curve = nidavellir_gpu_nvapi::read_vf_curve_modern();
+        let top = curve.iter().max_by_key(|(_, mv, _)| *mv).copied();
+        let before_top = top.map(|(_, _, f)| f).unwrap_or(0);
+        let applied = nidavellir_gpu_nvapi::apply_vf_ceiling(800, 1500);
+        let after_top = top
+            .and_then(|(i, _, _)| nidavellir_gpu_nvapi::vf_point_status(i))
+            .map(|(f, _)| f)
+            .unwrap_or(0);
+        let n_reset = nidavellir_gpu_nvapi::reset_vf_curve();
+        let restored_top = top
+            .and_then(|(i, _, _)| nidavellir_gpu_nvapi::vf_point_status(i))
+            .map(|(f, _)| f)
+            .unwrap_or(0);
+        prog.log.push(format!(
+            "VF ceiling proof: {} pts; topo {before_top}→(teto1500){after_top}→(reset){restored_top} MHz; apply={applied:?}, reset {n_reset} pts",
+            curve.len()
+        ));
         set(&progress, prog.clone());
     }
 

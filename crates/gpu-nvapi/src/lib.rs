@@ -465,6 +465,66 @@ pub fn vf_point_status(index: usize) -> Option<(u32, u32)> {
     vfcurve::get_status(index).map(|(f, v)| (f / 1000, v / 1000))
 }
 
+/// Read the full live V/F curve via the modern GetStatus as `(index, voltage_mv,
+/// freq_mhz)` for every valid point (voltage > 0). This is the index→voltage→freq
+/// map the VF ceiling needs.
+#[cfg(windows)]
+pub fn read_vf_curve_modern() -> Vec<(usize, u32, u32)> {
+    let mut out = Vec::new();
+    for i in 0..255 {
+        if let Some((f_khz, uv)) = vfcurve::get_status(i) {
+            if uv > 0 {
+                out.push((i, uv / 1000, f_khz / 1000));
+            }
+        }
+    }
+    out
+}
+
+/// Apply an Afterburner-style **VF ceiling**: flatten every curve point whose
+/// voltage is ≥ `ceiling_mv` to `target_mhz` (via per-point freq offsets), leaving
+/// lower-voltage points untouched (elastic). This caps the top of the curve at
+/// `target_mhz` without hard-locking voltage, so the GPU keeps its power-management
+/// elasticity (the thing a rigid clock-cap / voltage-lock removed → TDR).
+/// Returns the number of points flattened.
+#[cfg(windows)]
+pub fn apply_vf_ceiling(ceiling_mv: u32, target_mhz: u32) -> Result<usize, String> {
+    let curve = read_vf_curve_modern();
+    if curve.is_empty() {
+        return Err("curva V/F vazia (GetStatus não retornou pontos)".into());
+    }
+    let mut flattened = 0;
+    for (idx, mv, base_mhz) in curve {
+        let off_mhz = if mv >= ceiling_mv {
+            target_mhz as i32 - base_mhz as i32
+        } else {
+            0
+        };
+        let st = vfcurve::set_point(idx, off_mhz * 1000);
+        if st != 0 {
+            return Err(format!("set_point({idx}) status {st}"));
+        }
+        if off_mhz != 0 {
+            flattened += 1;
+        }
+    }
+    Ok(flattened)
+}
+
+/// Reset the modern V/F curve: zero every valid point's frequency offset.
+#[cfg(windows)]
+pub fn reset_vf_curve() -> usize {
+    let mut n = 0;
+    for i in 0..255 {
+        if vfcurve::get_status(i).map_or(false, |(_, uv)| uv > 0)
+            && vfcurve::set_point(i, 0) == 0
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Read back one point's current freq offset (kHz) via the modern GET.
 #[cfg(windows)]
 pub fn vf_get_point_khz(index: usize) -> Option<i32> {
