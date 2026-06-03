@@ -115,6 +115,67 @@ fn recover_ctx() -> Option<nidavellir_gpu_stress::GpuCtx> {
     None
 }
 
+/// 3-tier failure classification (user's spec) — distinguishes "the GPU computed
+/// the wrong answer but the driver is fine" from "the workload context was lost but
+/// recoverable" from "the driver could not re-initialize the device (hard TDR)".
+/// Each tier recedes a different number of sweep steps.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailTier {
+    /// L1: instability detected, driver healthy (silent error / wrong result).
+    L1Instability,
+    /// L2: workload/context lost, but the device was recreated successfully.
+    L2WorkloadReset,
+    /// L3: hard TDR — the driver could not re-initialize the device.
+    L3HardTdr,
+}
+
+#[cfg(windows)]
+impl FailTier {
+    fn label(self) -> &'static str {
+        match self {
+            FailTier::L1Instability => "L1 FAIL · instabilidade (driver ok)",
+            FailTier::L2WorkloadReset => "L2 FAIL · Workload-Reset (device recriado)",
+            FailTier::L3HardTdr => "L3 FAIL · HARD TDR (driver não reinicializou)",
+        }
+    }
+    /// How many sweep steps to recede (toward higher voltage / safety) for this tier.
+    fn backoff_steps(self) -> u32 {
+        match self {
+            FailTier::L1Instability => 1,
+            FailTier::L2WorkloadReset => 2,
+            FailTier::L3HardTdr => 4,
+        }
+    }
+}
+
+/// Classify a non-stable result into the 3-tier model, recovering the device on a
+/// context loss. On a Crash the offset/clock are first reset to stock, then the
+/// GpuCtx is recreated; if recreation fails it's a hard TDR (L3) and `*ctx` is left
+/// as-is (the caller must abort — there is no working device to run more loads on).
+#[cfg(windows)]
+fn classify_failure(
+    res: StabilityResult,
+    ctx: &mut nidavellir_gpu_stress::GpuCtx,
+) -> FailTier {
+    match res {
+        StabilityResult::SilentError => FailTier::L1Instability,
+        StabilityResult::Stable => FailTier::L1Instability, // not expected; treat as mild
+        StabilityResult::Crash => {
+            let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(0);
+            let _ = nidavellir_gpu_nvapi::reset_vf_curve();
+            let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+            match recover_ctx() {
+                Some(c) => {
+                    *ctx = c;
+                    FailTier::L2WorkloadReset
+                }
+                None => FailTier::L3HardTdr,
+            }
+        }
+    }
+}
+
 /// Precise per-dwell measurement under the max-power load. Returns the stability
 /// verdict and steady-state stats: (mean_clock, mean_power, max_power, std_power,
 /// power_capped_fraction). The first ~1.5 s of samples are discarded so only the
@@ -254,23 +315,23 @@ fn arduous_validate(
             set(progress, prog.clone());
             return Some(cand);
         }
-        prog.log.push(format!(
-            "✗ {label} instável em +{} MHz ({res:?}) — reduzindo offset",
-            cand.offset_mhz
-        ));
-        if matches!(res, StabilityResult::Crash) {
-            let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(0);
-            let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-            if recover_ctx().map(|c| *ctx = c).is_none() {
-                return None;
-            }
+        let tier = classify_failure(res, ctx);
+        prog.log.push(format!("✗ {label}: {} em +{} MHz", tier.label(), cand.offset_mhz));
+        set(progress, prog.clone());
+        if tier == FailTier::L3HardTdr {
+            prog.log.push(format!("Abortando {label}: device não recuperou (hard TDR)."));
+            set(progress, prog.clone());
+            return None;
         }
-        // Back off to the next LOWER offset (less undervolt → higher voltage → safer).
-        match points.iter().filter(|p| p.offset_mhz < cand.offset_mhz).max_by_key(|p| p.offset_mhz).copied() {
-            Some(n) => cand = n,
-            None => {
-                prog.log.push(format!("Sem ponto mais conservador para {label}."));
-                return None;
+        // Recede this tier's number of steps toward a LOWER offset (less undervolt
+        // → higher voltage → safer): L1 backs off 1, L2 backs off 2.
+        for _ in 0..tier.backoff_steps() {
+            match points.iter().filter(|p| p.offset_mhz < cand.offset_mhz).max_by_key(|p| p.offset_mhz).copied() {
+                Some(n) => cand = n,
+                None => {
+                    prog.log.push(format!("Sem ponto mais conservador para {label}."));
+                    return None;
+                }
             }
         }
     }
@@ -444,16 +505,18 @@ fn run_power_sweep(
                 offset += OSTEP;
             }
             StabilityResult::SilentError => {
-                prog.log.push("Limite de undervolt (erro silencioso) — parando.".into());
+                prog.log.push(format!(
+                    "Limite de undervolt — {} — parando.",
+                    FailTier::L1Instability.label()
+                ));
                 break;
             }
             StabilityResult::Crash => {
-                // Too much undervolt at this offset → instability. Stop; the last
-                // recorded offset is the limit. (No hard lock, so this is rarer.)
+                // Too much undervolt at this offset → instability. Classify + reset
+                // + recover; the last recorded offset is the limit. Stop here.
                 let _ = gpu::set_core_offset_mhz(0);
-                let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-                let _ = recover_ctx().map(|c| ctx = c);
-                prog.log.push("Limite de undervolt (instável) — parando.".into());
+                let tier = classify_failure(StabilityResult::Crash, &mut ctx);
+                prog.log.push(format!("Limite de undervolt — {} — parando.", tier.label()));
                 break;
             }
         }

@@ -93,6 +93,49 @@ is load-only.
   correction = *less* real bandwidth. We find the effective-bandwidth peak/knee,
   not the max clock — better than Afterburner's "crank until artifacts".
 
+## The elastic V/F ceiling (how the undervolt is applied)
+
+A hard voltage lock or a rigid clock pin makes the GPU run a fixed clock at a fixed
+voltage. Under a heavy, near-power-cap game load that removes the card's ability to
+manage its own power, and it **TDRs** (driver reset / black screen). MSI Afterburner
+avoids this by editing the **V/F curve** instead: it keeps the curve free below a
+chosen point and **flattens it to the right** of that point. The card still drops
+clocks/voltage on light load (elasticity preserved), but never boosts past the
+validated point.
+
+Nidavellir does the same via the modern NVAPI **`ClkVfPoints`** family (per-point
+curve offsets), which is what Afterburner/the NVIDIA app use on current drivers:
+
+- **Read** the live curve — `(index → voltage → frequency)` per point via
+  `ClkVfPointsGetStatus`.
+- **Apply a ceiling** at the validated `(voltage Vp, clock Fp)`: every point whose
+  voltage ≥ Vp gets a per-point frequency offset that flattens it to Fp; lower-
+  voltage points are left untouched (elastic). No voltage lock, no clock pin.
+- **Reset** zeroes every point's offset.
+
+Verified on an RTX 3060 Ti (driver 595.97): applying a ceiling drops the clock the
+card sustains under load to the ceiling value (and its power with it), and reset
+restores stock boost — all while the card keeps managing its own power.
+
+If the modern API is **not** available (older driver, or a GPU that doesn't expose
+it), apply falls back to a global clock offset + an NVML max-clock cap — less
+elastic, but it works everywhere. The Forge view shows which mode is active.
+
+### Supported GPUs for the V/F-curve method
+
+The elastic ceiling needs NVIDIA's per-point curve API, present on **desktop
+Pascal and newer**:
+
+- **Supported:** GTX 10-series (Pascal), GTX 16-series (Turing), RTX 20 (Turing),
+  RTX 30 (Ampere), RTX 40 (Ada), RTX 50 (Blackwell) — desktop cards on a current
+  driver (R550+; verified on 595.97).
+- **Fallback (offset + clock cap):** Maxwell and older; cards/drivers that don't
+  expose `ClkVfPoints`; most **laptop** GPUs (vendor-locked curves).
+- **Not supported:** non-NVIDIA GPUs (NVAPI is NVIDIA-only) — AMD is on the roadmap.
+
+The program **detects this at runtime** (`vf_curve_supported()`), so the UI always
+reflects what your exact GPU + driver actually allow rather than a static list.
+
 ## Apply & persist
 
 GPU offsets are **volatile** (lost on reboot/driver reload). "Apply" writes the
