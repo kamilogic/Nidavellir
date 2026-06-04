@@ -30,9 +30,16 @@ use tracing::info;
 // the ramp and take the WORST CASE (max), not the mean.
 const DWELL_MS: u64 = 15000;
 const RAMP_DISCARD_MS: u128 = 6000;
-/// Max clock we'll flatten above a voltage's stock-curve clock (MHz). Bounds how
-/// aggressive the undervolt-OC gets — large offsets at low voltage are what
-/// hard-crashed the PC, so past this we stop descending.
+/// Upper bound on the curve-flatten offset (MHz). The offset-flatten HOLDS the
+/// clock near stock (~1826 MHz here) and drops the voltage as the offset grows —
+/// so a big offset means running a high clock at a very low voltage, which is MORE
+/// aggressive than a hand undervolt that also lowers the clock (e.g. 1800@875mV).
+/// LESSON (2026-06-03): MAX_OFFSET=270 let the validate soak reach +255 (~855 mV
+/// @ ~1826 MHz) and HARD-CRASHED the PC (reboot, not a recoverable TDR — deep
+/// undervolt bugchecks, the heavy soak surfaces it). +150 (~900 mV) validated
+/// stable. So this stays conservative; going deeper than ~900 mV (toward a hand-
+/// tuned ~875 mV) must be done via the controlled VF ceiling at a chosen (clock,
+/// voltage) point — not by holding a high clock and starving the voltage.
 const MAX_OFFSET: i32 = 150;
 
 /// Stock-curve clock (MHz) at or below `v` mV — the card's natural clock there.
