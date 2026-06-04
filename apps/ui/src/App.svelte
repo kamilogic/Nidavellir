@@ -8,11 +8,11 @@
 
   let onboarded = $state(false);
   let onboardingStep = $state(1);
-  let activeTab = $state("capability");
+  let activeTab = $state("forge");
 
   function finishOnboarding(_goal) {
     onboarded = true;
-    activeTab = "capability";
+    activeTab = "forge";
   }
 </script>
 
@@ -25,11 +25,11 @@
     <div class="top-right">
       {#if onboarded}
         <nav>
-          <button class:active={activeTab === "capability"} onclick={() => (activeTab = "capability")}>
-            {$t("nav.capabilities")}
-          </button>
           <button class:active={activeTab === "forge"} onclick={() => (activeTab = "forge")}>
             {$t("nav.forge")}
+          </button>
+          <button class:active={activeTab === "capability"} onclick={() => (activeTab = "capability")}>
+            {$t("nav.capabilities")}
           </button>
           <button class:active={activeTab === "dashboard"} onclick={() => (activeTab = "dashboard")}>
             {$t("nav.sensors")}
@@ -62,26 +62,48 @@
 
 <style>
   :global(:root) {
-    --nord-void: #060910;
-    --nord-night: #0a101c;
-    --nord-deep: #0e1726;
-    --nord-surface: #131f2e;
-    --nord-surface-2: #1a2839;
-    --nord-raised: #223044;
-    --nord-border: rgba(136, 192, 208, 0.14);
-    --nord-border-card: rgba(136, 192, 208, 0.22);
-    --nord-frost: #8fbcbb;
-    --nord-frost-bright: #88c0d0;
-    --nord-frost-dim: #5e8094;
-    --nord-silver: #d8dee9;
-    --nord-mist: #92a4bd;
-    --nord-dim: #5c6b7e;
-    --nord-aurora: #a3be8c;
-    --nord-aurora-glow: rgba(163, 190, 140, 0.35);
-    --nord-ember: #d08770;
-    --nord-ember-bright: #ebcb8b;
-    --nord-twilight: rgba(180, 142, 173, 0.12);
-    --nord-danger: #bf616a;
+    --forge-void: #05070b;
+    --forge-night: #090d13;
+    --forge-iron: #10161e;
+    --forge-panel: rgba(18, 24, 32, 0.94);
+    --forge-panel-raised: rgba(26, 34, 45, 0.94);
+    --forge-graphite: #222c38;
+    --forge-line: rgba(189, 166, 126, 0.18);
+    --forge-line-strong: rgba(214, 168, 93, 0.34);
+    --forge-text: #e8edf4;
+    --forge-muted: #9aa7b7;
+    --forge-dim: #657386;
+    --forge-steel: #9caabd;
+    --forge-blue: #7eadbe;
+    --forge-green: #9dbf91;
+    --forge-gold: #d6a85d;
+    --forge-copper: #b9754b;
+    --forge-red: #c56f73;
+    --forge-panel-bg: linear-gradient(180deg, rgba(24, 31, 40, 0.96), rgba(13, 18, 25, 0.94));
+    --forge-panel-edge: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+    --forge-shadow-panel: 0 18px 45px rgba(0, 0, 0, 0.34), var(--forge-panel-edge);
+    --forge-shadow-active: 0 18px 42px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(214, 168, 93, 0.12);
+
+    --nord-void: var(--forge-void);
+    --nord-night: var(--forge-night);
+    --nord-deep: var(--forge-iron);
+    --nord-surface: var(--forge-panel);
+    --nord-surface-2: var(--forge-panel-raised);
+    --nord-raised: var(--forge-graphite);
+    --nord-border: var(--forge-line);
+    --nord-border-card: var(--forge-line);
+    --nord-frost: var(--forge-blue);
+    --nord-frost-bright: var(--forge-blue);
+    --nord-frost-dim: var(--forge-dim);
+    --nord-silver: var(--forge-text);
+    --nord-mist: var(--forge-muted);
+    --nord-dim: var(--forge-dim);
+    --nord-aurora: var(--forge-green);
+    --nord-aurora-glow: rgba(157, 191, 145, 0.28);
+    --nord-ember: var(--forge-copper);
+    --nord-ember-bright: var(--forge-gold);
+    --nord-twilight: rgba(185, 117, 75, 0.08);
+    --nord-danger: var(--forge-red);
   }
 
   :global(body) {
@@ -91,17 +113,16 @@
     color: var(--nord-silver);
     background-color: var(--nord-void);
     background-image:
-      radial-gradient(ellipse 110% 65% at 50% -28%, rgba(94, 129, 172, 0.28) 0%, transparent 52%),
-      radial-gradient(ellipse 55% 45% at 105% 5%, var(--nord-twilight) 0%, transparent 48%),
-      radial-gradient(ellipse 40% 35% at -5% 25%, rgba(143, 188, 187, 0.06) 0%, transparent 45%),
-      linear-gradient(168deg, var(--nord-void) 0%, var(--nord-night) 38%, #070a10 100%);
+      radial-gradient(ellipse 120% 70% at 50% -30%, rgba(214, 168, 93, 0.09) 0%, rgba(214, 168, 93, 0.035) 34%, transparent 68%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.018) 0, transparent 14rem),
+      linear-gradient(145deg, var(--forge-void) 0%, var(--forge-night) 48%, #07090d 100%);
     background-attachment: fixed;
   }
 
   main {
-    max-width: 1120px;
+    width: min(calc(100vw - 3rem), 1200px);
     margin: 0 auto;
-    padding: 2rem 1.5rem 3rem;
+    padding: 1.4rem 0 2.25rem;
   }
 
   .top {
@@ -109,22 +130,19 @@
     justify-content: space-between;
     align-items: flex-start;
     gap: 1rem;
-    margin-bottom: 1.75rem;
+    margin-bottom: 1.1rem;
     border-bottom: 1px solid var(--nord-border);
-    padding-bottom: 1.25rem;
+    padding-bottom: 0.9rem;
   }
 
   h1 {
     margin: 0;
-    font-family: Cinzel, "Palatino Linotype", serif;
-    font-size: 1.85rem;
-    font-weight: 600;
-    letter-spacing: 0.18em;
+    font-size: 1.7rem;
+    font-weight: 800;
+    letter-spacing: 0.14em;
     text-transform: uppercase;
     color: var(--nord-silver);
-    text-shadow:
-      0 0 42px rgba(136, 192, 208, 0.18),
-      0 1px 0 rgba(0, 0, 0, 0.5);
+    text-shadow: 0 1px 0 rgba(0, 0, 0, 0.65);
   }
 
   .tagline {
@@ -132,7 +150,7 @@
     color: var(--nord-frost-dim);
     font-size: 0.92rem;
     font-style: italic;
-    letter-spacing: 0.02em;
+    letter-spacing: 0.01em;
   }
 
   .top-right {
@@ -146,7 +164,7 @@
     background: rgba(10, 16, 28, 0.75);
     color: var(--nord-mist);
     border: 1px solid var(--nord-border);
-    border-radius: 9px;
+    border-radius: 8px;
     padding: 0.45rem 0.6rem;
     font-size: 0.8rem;
     font-weight: 600;
@@ -156,8 +174,8 @@
     display: flex;
     gap: 0.35rem;
     padding: 0.3rem;
-    border-radius: 12px;
-    background: rgba(10, 16, 28, 0.75);
+    border-radius: 10px;
+    background: rgba(8, 11, 16, 0.76);
     border: 1px solid var(--nord-border);
     backdrop-filter: blur(10px);
   }
@@ -166,24 +184,36 @@
     background: transparent;
     color: var(--nord-mist);
     border: none;
-    border-radius: 9px;
+    border-radius: 8px;
     padding: 0.5rem 1rem;
     cursor: pointer;
     font-weight: 600;
     font-size: 0.85rem;
-    letter-spacing: 0.03em;
+    letter-spacing: 0.02em;
   }
 
   nav button:hover {
     color: var(--nord-silver);
-    background: rgba(136, 192, 208, 0.06);
+    background: rgba(214, 168, 93, 0.07);
   }
 
   nav button.active {
-    color: var(--nord-frost-bright);
-    background: rgba(136, 192, 208, 0.1);
+    color: var(--forge-gold);
+    background: rgba(214, 168, 93, 0.1);
     box-shadow:
-      inset 0 0 0 1px rgba(136, 192, 208, 0.28),
-      0 0 24px rgba(136, 192, 208, 0.08);
+      inset 0 0 0 1px rgba(214, 168, 93, 0.22),
+      0 0 24px rgba(214, 168, 93, 0.08);
+  }
+  @media (max-width: 760px) {
+    main {
+      width: min(calc(100vw - 1.5rem), 1200px);
+      padding-top: 1rem;
+    }
+    .top {
+      flex-direction: column;
+    }
+    .top-right {
+      justify-content: flex-start;
+    }
   }
 </style>

@@ -14,6 +14,21 @@ This file is the continuity index. See also: `architecture.md`, `decisions.md`,
   committed, and validated on hardware (no crash).** Service + UI run; GPU at stock.
 
 ## Completed work (this arc)
+- **GPU-first UI Phase 1 cleanup**: Forge is now the default post-onboarding
+  screen, and the large `Forge.svelte` view was split into focused UI components
+  under `apps/ui/src/lib/components/forge`. No tuning, IPC, or service logic changed.
+- **GPU-first UI Phase 2 IA pass**: the Forge view is now organized as GPU Hero
+  Status -> Recommended Action -> Profile Comparison -> Forge Knowledge -> Forge
+  Progress -> Advanced Diagnostics. Safe Loop status is surfaced with existing IPC.
+- **Profile-state UX pass**: active profile cards now show `Applied ✓`, disable
+  repeat apply clicks, and emphasize outcome-first expected results.
+- **GPU-first UI Phase 3 visual system pass**: Forge Home now uses shared forged
+  silicon tokens, reusable status badges, stronger Forge State hierarchy, profile
+  identity variants, and a clearer Advanced Diagnostics disclosure. Frontend only;
+  no tuning logic, IPC names, or backend contracts changed.
+- **Phase 3 visual cleanup**: reduced background texture noise, compacted the GPU
+  Hero into a focused control-panel summary, made the forge progression rail
+  subtle, and set the desktop window to 1180x820 with a 1100x720 minimum.
 - **Modern NvAPI V/F curve (ClkVfPoints) read + write + apply + reset** work on
   driver 595.97 (the old `nvapi` crate's `SetClockBoostTable` is rejected). Elastic
   "VF ceiling" (Afterburner-style flatten) verified to control the live clock under

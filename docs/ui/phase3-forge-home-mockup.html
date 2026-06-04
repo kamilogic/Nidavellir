@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nidavellir Phase 3 Forge Home Mockup</title>
+    <style>
+      :root {
+        --forge-void: #05070b;
+        --forge-iron: #0b1018;
+        --forge-graphite: #111a24;
+        --forge-panel: #141f2b;
+        --forge-raised: #1a2735;
+        --forge-steel: #253344;
+        --forge-line: rgba(170, 188, 205, 0.16);
+        --forge-line-strong: rgba(215, 180, 106, 0.42);
+        --forge-bronze: #b8874c;
+        --forge-gold: #d7b46a;
+        --forge-ember: #c97945;
+        --forge-blue: #79a9c7;
+        --forge-green: #8fbf8f;
+        --forge-red: #c26b72;
+        --text-primary: #e7ecf2;
+        --text-secondary: #a8b3c1;
+        --text-muted: #687789;
+        --shadow-panel: 0 20px 48px rgba(0, 0, 0, 0.28);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        color: var(--text-primary);
+        background:
+          radial-gradient(ellipse 120% 70% at 50% -30%, rgba(215, 180, 106, 0.09) 0%, rgba(215, 180, 106, 0.035) 34%, transparent 68%),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 14rem),
+          linear-gradient(180deg, #080c12 0%, var(--forge-void) 100%);
+      }
+
+      main {
+        width: min(1200px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 32px 0 48px;
+      }
+
+      .mockup-note {
+        margin: 0 0 16px;
+        color: var(--text-muted);
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .app-header {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+
+      .brand {
+        margin: 0;
+        font-size: 24px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .tagline {
+        margin: 6px 0 0;
+        color: var(--text-muted);
+        font-size: 13px;
+      }
+
+      .nav {
+        display: flex;
+        gap: 6px;
+        padding: 4px;
+        border: 1px solid var(--forge-line);
+        border-radius: 10px;
+        background: rgba(11, 16, 24, 0.72);
+      }
+
+      .nav span {
+        padding: 8px 12px;
+        border-radius: 7px;
+        color: var(--text-muted);
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .nav .active {
+        color: var(--forge-gold);
+        background: rgba(215, 180, 106, 0.1);
+        box-shadow: inset 0 0 0 1px rgba(215, 180, 106, 0.2);
+      }
+
+      .panel {
+        position: relative;
+        border: 1px solid var(--forge-line);
+        border-radius: 12px;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 44%),
+          var(--forge-panel);
+        box-shadow: var(--shadow-panel);
+      }
+
+      .panel::after {
+        content: "NIDAVELLIR / SILICON FORGE";
+        position: absolute;
+        right: 16px;
+        bottom: 12px;
+        color: rgba(170, 188, 205, 0.12);
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 0.18em;
+        pointer-events: none;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(220px, 280px) auto;
+        align-items: center;
+        gap: 14px;
+        padding: 16px;
+        overflow: hidden;
+      }
+
+      .kicker {
+        display: block;
+        margin-bottom: 8px;
+        color: var(--text-muted);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      .gpu-name {
+        font-size: 22px;
+        line-height: 1.08;
+      }
+
+      .hero-copy {
+        margin-top: 7px;
+        color: var(--text-secondary);
+        max-width: 58ch;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .hero-title-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .state-rail {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 5px;
+        margin-top: 10px;
+        padding-top: 9px;
+        border-top: 1px solid rgba(170, 188, 205, 0.11);
+      }
+
+      .compact-rail {
+        grid-column: 1 / -1;
+      }
+
+      .rail-step {
+        border-top: 2px solid rgba(255, 255, 255, 0.07);
+        padding-top: 5px;
+        color: var(--text-muted);
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+
+      .rail-step.done {
+        border-color: var(--forge-bronze);
+        color: var(--forge-bronze);
+      }
+
+      .rail-step.current {
+        border-color: var(--forge-gold);
+        color: var(--forge-gold);
+      }
+
+      .metric {
+        border: 1px solid var(--forge-line);
+        border-radius: 9px;
+        padding: 12px;
+        background: rgba(5, 7, 11, 0.28);
+      }
+
+      .metric span {
+        display: block;
+        color: var(--text-muted);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .metric strong {
+        display: block;
+        margin-top: 6px;
+        font-size: 18px;
+      }
+
+      .metric small {
+        display: block;
+        margin-top: 4px;
+        color: var(--text-muted);
+        font-size: 12px;
+      }
+
+      .hero-reset {
+        margin-top: 0;
+        white-space: nowrap;
+      }
+
+      .section {
+        margin-top: 16px;
+        padding: 18px;
+      }
+
+      .section-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 14px;
+      }
+
+      .section h3 {
+        font-size: 18px;
+      }
+
+      .section p {
+        color: var(--text-secondary);
+        font-size: 14px;
+        line-height: 1.5;
+      }
+
+      .status-badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 28px;
+        padding: 5px 10px;
+        border: 1px solid var(--forge-line);
+        border-radius: 999px;
+        color: var(--text-secondary);
+        font-size: 12px;
+        font-weight: 800;
+      }
+
+      .status-badge.protected {
+        border-color: rgba(143, 191, 143, 0.46);
+        color: var(--forge-green);
+        background: rgba(143, 191, 143, 0.08);
+      }
+
+      .status-badge.recommended {
+        border-color: rgba(215, 180, 106, 0.5);
+        color: var(--forge-gold);
+        background: rgba(215, 180, 106, 0.1);
+      }
+
+      .action {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .button {
+        border: 1px solid rgba(215, 180, 106, 0.46);
+        border-radius: 8px;
+        padding: 10px 14px;
+        color: var(--forge-gold);
+        background: rgba(215, 180, 106, 0.1);
+        font-weight: 800;
+      }
+
+      .profiles {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      .profile {
+        display: flex;
+        min-height: 380px;
+        flex-direction: column;
+        gap: 14px;
+        padding: 16px;
+        border: 1px solid var(--forge-line);
+        border-radius: 12px;
+        background: rgba(5, 7, 11, 0.24);
+      }
+
+      .profile.godforge {
+        border-top-color: rgba(201, 121, 69, 0.76);
+      }
+
+      .profile.brokkrs {
+        border-color: rgba(215, 180, 106, 0.6);
+        background:
+          linear-gradient(180deg, rgba(215, 180, 106, 0.09), rgba(5, 7, 11, 0.22) 52%),
+          rgba(5, 7, 11, 0.24);
+        transform: translateY(-4px);
+      }
+
+      .profile.deep-calm {
+        border-top-color: rgba(121, 169, 199, 0.74);
+      }
+
+      .profile-title {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .profile h4 {
+        margin: 0;
+        font-size: 18px;
+      }
+
+      .profile .philosophy {
+        margin-top: 4px;
+        color: var(--text-muted);
+        font-size: 12px;
+        font-weight: 800;
+      }
+
+      .expected {
+        border-top: 1px solid var(--forge-line);
+        padding-top: 12px;
+      }
+
+      .expected span,
+      .technical span {
+        display: block;
+        color: var(--text-muted);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      ul {
+        margin: 8px 0 0;
+        padding-left: 18px;
+        color: var(--text-primary);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      .technical {
+        margin-top: auto;
+        border-top: 1px solid var(--forge-line);
+        padding-top: 12px;
+      }
+
+      .technical strong {
+        display: block;
+        margin-top: 7px;
+        font-size: 14px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .technical small {
+        display: block;
+        margin-top: 4px;
+        color: var(--text-muted);
+        font-size: 12px;
+      }
+
+      .profile-button {
+        border: 1px solid var(--forge-line);
+        border-radius: 8px;
+        padding: 10px;
+        text-align: center;
+        color: var(--text-secondary);
+        font-weight: 800;
+      }
+
+      .profile-button.applied {
+        border-color: rgba(143, 191, 143, 0.5);
+        color: var(--forge-green);
+        background: rgba(143, 191, 143, 0.08);
+      }
+
+      .knowledge-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 10px;
+      }
+
+      details {
+        margin-top: 16px;
+      }
+
+      summary {
+        cursor: pointer;
+        list-style-position: outside;
+      }
+
+      .diagnostics-list {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 8px;
+        margin-top: 14px;
+      }
+
+      .diagnostics-list div {
+        border: 1px solid var(--forge-line);
+        border-radius: 8px;
+        padding: 10px;
+        color: var(--text-muted);
+        font-size: 12px;
+        background: rgba(5, 7, 11, 0.22);
+      }
+
+      @media (max-width: 900px) {
+        .hero,
+        .action,
+        .profiles,
+        .knowledge-grid,
+        .diagnostics-list {
+          grid-template-columns: 1fr;
+        }
+
+        .profile.brokkrs {
+          transform: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="mockup-note">Phase 3 visual mockup / data placeholders / not production styling</p>
+
+      <header class="app-header">
+        <div>
+          <h1 class="brand">Nidavellir</h1>
+          <p class="tagline">Where silicon is forged to its prime.</p>
+        </div>
+        <nav class="nav" aria-label="Mock navigation">
+          <span class="active">Forge</span>
+          <span>Profiles</span>
+          <span>Knowledge</span>
+          <span>Diagnostics</span>
+          <span>Settings</span>
+        </nav>
+      </header>
+
+      <section class="panel hero">
+        <div>
+          <span class="kicker">GPU Forge Home</span>
+          <div class="hero-title-row">
+            <h2 class="gpu-name">GeForce RTX 3060 Ti</h2>
+            <span class="status-badge recommended">Forged</span>
+            <span class="status-badge protected">Protected</span>
+          </div>
+          <p class="hero-copy">
+            Nidavellir has forged this GPU and selected a daily profile.
+          </p>
+        </div>
+
+        <div class="metric">
+          <span>Current Profile</span>
+          <strong>Brokkr's Best</strong>
+          <small>From applied profile data</small>
+        </div>
+
+        <div class="profile-button hero-reset">Reset to stock</div>
+
+        <div class="state-rail compact-rail">
+          <div class="rail-step done">Raw</div>
+          <div class="rail-step done">Forging</div>
+          <div class="rail-step done">Tempered</div>
+          <div class="rail-step done">Refined</div>
+          <div class="rail-step current">Forged</div>
+        </div>
+      </section>
+
+      <section class="panel section action">
+        <div>
+          <span class="kicker">Recommended next step</span>
+          <h3>Ready for Daily Use</h3>
+          <p>The applied profile will be re-applied on boot with Safe Loop protection.</p>
+        </div>
+        <span class="status-badge protected">Protected</span>
+      </section>
+
+      <section class="panel section">
+        <div class="section-head">
+          <div>
+            <span class="kicker">Profile Comparison</span>
+            <h3>Choose how this GPU should behave</h3>
+          </div>
+          <span class="status-badge recommended">Brokkr's Best recommended</span>
+        </div>
+
+        <div class="profiles">
+          <article class="profile godforge">
+            <div class="profile-title">
+              <div>
+                <h4>Godforge</h4>
+                <div class="philosophy">Performance first</div>
+              </div>
+            </div>
+            <p>Maximum sustainable performance with a higher power and thermal trade-off.</p>
+            <div class="expected">
+              <span>Expected Result</span>
+              <ul>
+                <li>Highest sustainable performance</li>
+                <li>Higher power consumption</li>
+                <li>Higher thermal output</li>
+              </ul>
+            </div>
+            <div class="technical">
+              <span>Technical</span>
+              <strong>From profile payload</strong>
+              <small>Values shown only when measured</small>
+            </div>
+            <div class="profile-button">Apply</div>
+          </article>
+
+          <article class="profile brokkrs">
+            <div class="profile-title">
+              <div>
+                <h4>Brokkr's Best</h4>
+                <div class="philosophy">Balance first</div>
+              </div>
+              <span class="status-badge recommended">Recommended</span>
+            </div>
+            <p>Signature Nidavellir profile for daily gaming: performance, power and stability in balance.</p>
+            <div class="expected">
+              <span>Expected Result</span>
+              <ul>
+                <li>Strong gaming performance</li>
+                <li>Lower power draw</li>
+                <li>Lower temperatures</li>
+                <li>Lower fan noise</li>
+              </ul>
+            </div>
+            <div class="technical">
+              <span>Technical</span>
+              <strong>Applied profile payload</strong>
+              <small>Technical values from existing UI data</small>
+            </div>
+            <div class="profile-button applied">Applied ✓</div>
+          </article>
+
+          <article class="profile deep-calm">
+            <div class="profile-title">
+              <div>
+                <h4>Deep Calm</h4>
+                <div class="philosophy">Efficiency first</div>
+              </div>
+            </div>
+            <p>Maximum efficiency for cooler, quieter operation with a measured performance trade-off.</p>
+            <div class="expected">
+              <span>Expected Result</span>
+              <ul>
+                <li>Maximum efficiency</li>
+                <li>Lowest power consumption</li>
+                <li>Cooler and quieter operation</li>
+              </ul>
+            </div>
+            <div class="technical">
+              <span>Technical</span>
+              <strong>From profile payload</strong>
+              <small>Shows honest empty state if missing</small>
+            </div>
+            <div class="profile-button">Apply</div>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel section">
+        <div class="section-head">
+          <div>
+            <span class="kicker">Forge Knowledge</span>
+            <h3>What Nidavellir has learned</h3>
+          </div>
+        </div>
+        <div class="knowledge-grid">
+          <div class="metric">
+            <span>Stable Knowledge</span>
+            <strong>From completed runs</strong>
+            <small>count from UI data</small>
+          </div>
+          <div class="metric">
+            <span>Known Stable Edge</span>
+            <strong>From tradeoff data</strong>
+            <small>latest stable edge</small>
+          </div>
+          <div class="metric">
+            <span>Validation</span>
+            <strong>Latest result</strong>
+            <small>from validation payload</small>
+          </div>
+          <div class="metric">
+            <span>Recovery</span>
+            <strong>Safe Loop state</strong>
+            <small>existing backend status</small>
+          </div>
+        </div>
+      </section>
+
+      <details class="panel section">
+        <summary>
+          <span class="kicker">Advanced Diagnostics</span>
+          <h3>Engineer detail drawer</h3>
+          <p>Raw data stays available without dominating the Forge Home.</p>
+        </summary>
+        <div class="diagnostics-list">
+          <div>Benchmark internals</div>
+          <div>Power sweep logs</div>
+          <div>V/F curve</div>
+          <div>Validation traces</div>
+          <div>Raw sweep tables</div>
+        </div>
+      </details>
+    </main>
+  </body>
+</html>
