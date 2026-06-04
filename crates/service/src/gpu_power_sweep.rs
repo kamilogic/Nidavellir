@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use nidavellir_core::gpu_sweep::StabilityResult;
 use nidavellir_core::ipc::{PowerSweepPoint, PowerSweepProgress};
 use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
-use tracing::{info, warn};
+use tracing::info;
 
 // Long enough for power to RAMP UP and stabilize (real loads like Heaven take
 // seconds to reach their sustained draw — it's a ramp, not a spike). We discard
@@ -303,18 +303,20 @@ fn arduous_validate(
     progress: &Arc<Mutex<PowerSweepProgress>>,
     prog: &mut PowerSweepProgress,
 ) -> Option<PowerSweepPoint> {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
     let mut cand = start;
     for _ in 0..6 {
         if stop.load(Ordering::SeqCst) {
             return Some(cand);
         }
         prog.log.push(format!(
-            "Validação árdua {label}: +{} MHz (~{} mV @ {target} MHz, ~35s)…",
+            "Validação árdua {label}: +{} MHz (~{} mV @ {target} MHz, ~35s, carga de jogo)…",
             cand.offset_mhz, cand.voltage_mv
         ));
         set(progress, prog.clone());
-        let _ = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(target);
+        // Soak under the SAME game-power render the sweep measured with (no rigid
+        // NVML clock pin — the cap + curve limit the clock naturally, exactly like
+        // the measurement). A marginal undervolt that passed the short dwell can
+        // still fail this long soak; if so, back off to a higher voltage.
         let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(cand.offset_mhz);
         let _ = store.arm_boot_flag(&BootFlag::new(
             TuningPoint::from_axes([
@@ -323,10 +325,7 @@ fn arduous_validate(
             ]),
             "gpu_power_validate",
         ));
-        let res = match catch_unwind(AssertUnwindSafe(|| ctx.run_power_load(1_000_000, 10_000, 35_000))) {
-            Ok(r) => r.result,
-            Err(_) => StabilityResult::Crash,
-        };
+        let res = load_and_measure(35_000).result;
         let _ = store.clear_boot_flag();
         if matches!(res, StabilityResult::Stable) {
             prog.log.push(format!("✓ {label} validado: +{} MHz (~{} mV)", cand.offset_mhz, cand.voltage_mv));
@@ -541,11 +540,27 @@ fn run_power_sweep(
     // the +0 / highest-voltage point); Brokkr's Best = best perf/watt (the
     // deepest stable undervolt, lowest power at the same clock).
     prog.godforge = prog.points.iter().copied().max_by_key(|p| p.voltage_mv);
-    prog.brokkrs = prog
+    // Brokkr's Best MUST stay OFF the power cap — a capped profile dips its clock
+    // in-game (the inconsistency we're eliminating). So pick the best perf/watt
+    // among points that ran essentially un-capped (cap < 5%); only if none are
+    // off-cap fall back to the least-capped point.
+    let off_cap: Vec<PowerSweepPoint> = prog
         .points
         .iter()
         .copied()
-        .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal));
+        .filter(|p| p.power_capped_frac < 0.05)
+        .collect();
+    prog.brokkrs = if off_cap.is_empty() {
+        prog.points
+            .iter()
+            .copied()
+            .min_by(|a, b| a.power_capped_frac.partial_cmp(&b.power_capped_frac).unwrap_or(Ord::Equal))
+    } else {
+        off_cap
+            .iter()
+            .copied()
+            .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal))
+    };
     prog.deep_calm = None;
 
     // --- Arduous validation of each pick (long soak + back-off) -----------
