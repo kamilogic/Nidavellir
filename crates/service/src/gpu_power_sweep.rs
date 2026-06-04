@@ -46,6 +46,35 @@ const PROBE_STEPS: i32 = 2;
 /// this with a Wilson-lower-bound confidence gate; the per-point stats below feed it.)
 const CONSERVATIVE_MARGIN_FRAC: f64 = 0.30;
 
+/// Brokkr's V2 selection profiles. The threshold is the minimum stability
+/// confidence (Wilson lower bound over a point's accumulated trials) a candidate
+/// must clear to be eligible. Higher = more evidence required = safer.
+#[cfg(windows)]
+#[allow(dead_code)] // Conservative/Aggressive are selectable; only Balanced is wired for now
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SweepProfile {
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+#[cfg(windows)]
+impl SweepProfile {
+    /// Minimum Wilson lower-bound stability confidence to accept a candidate.
+    fn threshold(self) -> f64 {
+        match self {
+            SweepProfile::Conservative => 0.95,
+            SweepProfile::Balanced => 0.85,
+            SweepProfile::Aggressive => 0.70,
+        }
+    }
+}
+
+/// Active selection profile. Hard-coded for now (the sweep IPC is param-free);
+/// exposing it per-request via IPC/UI is a follow-up.
+#[cfg(windows)]
+const ACTIVE_PROFILE: SweepProfile = SweepProfile::Balanced;
+
 /// Instability severity, ordered (mirrors the L1/L2/L3 fail tiers). Stored per point
 /// and per frontier so the algorithm can weigh a cheap SilentError differently from
 /// an expensive HardReboot.
@@ -72,7 +101,7 @@ struct PointStat {
     voltage_mv_sum: u64,
 }
 
-#[allow(dead_code)] // score()/mean_voltage_mv() feed V2 (confidence-based selection)
+#[allow(dead_code)] // mean_voltage_mv() reserved for V3; score()/confidence() drive V2 selection
 impl PointStat {
     /// Mean efficiency (MHz/W) over the stable trials, or 0 if never stable.
     fn score(&self) -> f64 {
@@ -82,9 +111,32 @@ impl PointStat {
             self.clock_mhz_sum as f64 / self.power_w_sum
         }
     }
+    /// Stability confidence: Wilson lower bound (z=1.96, 95%) of the stable rate
+    /// over accumulated trials. Few trials ⇒ low confidence even at a 100% rate
+    /// (1/1 ≈ 0.21, 50/50 ≈ 0.93), so a barely-tested point can't win on luck.
+    fn confidence(&self) -> f64 {
+        wilson_lower_bound(self.stable_trials, self.trials, 1.96)
+    }
     fn mean_voltage_mv(&self) -> u32 {
         if self.stable_trials == 0 { 0 } else { (self.voltage_mv_sum / self.stable_trials as u64) as u32 }
     }
+}
+
+/// Wilson score-interval lower bound for a binomial success rate — a sample-size-
+/// aware confidence floor: `successes`/`trials` stable observations, `z` the normal
+/// quantile (1.96 ≈ 95%). Returns 0 when there are no trials.
+#[allow(dead_code)] // live on Windows (drives selection); kept for non-Windows builds
+fn wilson_lower_bound(successes: u32, trials: u32, z: f64) -> f64 {
+    if trials == 0 {
+        return 0.0;
+    }
+    let n = trials as f64;
+    let phat = successes as f64 / n;
+    let z2 = z * z;
+    let center = phat + z2 / (2.0 * n);
+    let margin = z * ((phat * (1.0 - phat) / n) + z2 / (4.0 * n * n)).sqrt();
+    let denom = 1.0 + z2 / n;
+    ((center - margin) / denom).max(0.0)
 }
 
 /// Severity-differentiated stability frontier (user's design): keep the shallowest
@@ -556,6 +608,68 @@ fn knee(points: &[PowerSweepPoint]) -> Option<PowerSweepPoint> {
     Some(best)
 }
 
+/// Brokkr's V2 selection: among the off-cap candidates, choose the highest
+/// accumulated efficiency (`score`, MHz/W) whose stability confidence (Wilson
+/// lower bound over accumulated trials) clears the active profile's threshold.
+/// When none qualifies — the usual case until a point is re-tested across runs —
+/// fall back to the V1 strategy (best off-cap perf/watt, else least-capped), so
+/// selection never returns "no solution". Joins each candidate to `know.points`
+/// by offset for its accumulated confidence; data collection is untouched.
+#[cfg(windows)]
+fn select_brokkrs_v2(
+    all_points: &[PowerSweepPoint],
+    off_cap: &[PowerSweepPoint],
+    know: &GpuKnowledge,
+    profile: SweepProfile,
+) -> (Option<PowerSweepPoint>, Vec<String>) {
+    use std::cmp::Ordering as Ord;
+    let threshold = profile.threshold();
+    let mut log = Vec::new();
+
+    // Off-cap candidates whose accumulated confidence (Wilson-LB) clears the gate.
+    let mut gated: Vec<(PowerSweepPoint, f64, f64)> = off_cap
+        .iter()
+        .filter_map(|p| {
+            let ps = know.points.get(&p.offset_mhz)?;
+            Some((*p, ps.confidence(), ps.score()))
+        })
+        .filter(|(_, conf, _)| *conf >= threshold)
+        .collect();
+
+    if !gated.is_empty() {
+        // Among the trusted points, take the best accumulated efficiency (MHz/W).
+        gated.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ord::Equal));
+        let (best, conf, score) = gated[0];
+        log.push(format!(
+            "BROKKRS V2: candidate=+{} score={:.2} confidence={:.2} threshold={:.2} decision=accepted",
+            best.offset_mhz, score, conf, threshold
+        ));
+        return (Some(best), log);
+    }
+
+    // Confidence not yet mature → fall back to the V1 selection.
+    let best_conf = off_cap
+        .iter()
+        .filter_map(|p| know.points.get(&p.offset_mhz).map(|ps| ps.confidence()))
+        .fold(0.0_f64, f64::max);
+    log.push(format!(
+        "BROKKRS V2: no candidate met threshold best_confidence={:.2} threshold={:.2} fallback=V1",
+        best_conf, threshold
+    ));
+    let v1 = if off_cap.is_empty() {
+        all_points
+            .iter()
+            .copied()
+            .min_by(|a, b| a.power_capped_frac.partial_cmp(&b.power_capped_frac).unwrap_or(Ord::Equal))
+    } else {
+        off_cap
+            .iter()
+            .copied()
+            .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal))
+    };
+    (v1, log)
+}
+
 #[cfg(windows)]
 fn run_power_sweep(
     progress: Arc<Mutex<PowerSweepProgress>>,
@@ -731,7 +845,6 @@ fn run_power_sweep(
     // cliff (a +255 offset / ~855 mV hard-crashed the PC); the best efficiency sits
     // well before it. We return the BEST EFFICIENCY OBSERVED among stable points,
     // and the offset sweep is bounded (MAX_OFFSET) to stay out of the cliff region.
-    use std::cmp::Ordering as Ord;
     let max_std = prog.points.iter().map(|p| p.power_std_w).fold(0.0f32, f32::max);
     let headroom = (0.10 * cap).max(2.0 * max_std);
     let brokkr_target = if cap > 0.0 { cap - headroom } else { f32::MAX };
@@ -750,17 +863,9 @@ fn run_power_sweep(
         .copied()
         .filter(|p| p.power_capped_frac < 0.05)
         .collect();
-    prog.brokkrs = if off_cap.is_empty() {
-        prog.points
-            .iter()
-            .copied()
-            .min_by(|a, b| a.power_capped_frac.partial_cmp(&b.power_capped_frac).unwrap_or(Ord::Equal))
-    } else {
-        off_cap
-            .iter()
-            .copied()
-            .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal))
-    };
+    let (brokkrs, v2_log) = select_brokkrs_v2(&prog.points, &off_cap, &know, ACTIVE_PROFILE);
+    prog.log.extend(v2_log);
+    prog.brokkrs = brokkrs;
     prog.deep_calm = None;
     if let Some(b) = prog.brokkrs {
         prog.log.push(format!(
@@ -811,4 +916,77 @@ fn run_power_sweep(
     prog.phase = "done".into();
     set(&progress, prog);
     info!("Power sweep finished");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wilson_lower_bound_matches_spec_values() {
+        // No trials → no confidence (the gate can never pass on an unseen point).
+        assert_eq!(wilson_lower_bound(0, 0, 1.96), 0.0);
+        // The V2 premise: a single clean trial is weak; many clean trials are strong.
+        let one = wilson_lower_bound(1, 1, 1.96);
+        let fifty = wilson_lower_bound(50, 50, 1.96);
+        assert!((one - 0.21).abs() < 0.01, "1/1 ≈ 0.21, got {one}");
+        assert!((fifty - 0.93).abs() < 0.01, "50/50 ≈ 0.93, got {fifty}");
+        // A failure must drag confidence below a perfect record of the same size.
+        assert!(wilson_lower_bound(9, 10, 1.96) < wilson_lower_bound(10, 10, 1.96));
+    }
+
+    #[cfg(windows)]
+    fn pt(offset_mhz: i32, perf_per_watt: f64, capped: f32) -> PowerSweepPoint {
+        PowerSweepPoint {
+            voltage_mv: 900,
+            clock_mhz: 1830,
+            offset_mhz,
+            power_w: 180.0,
+            max_power_w: 185.0,
+            power_std_w: 1.0,
+            power_capped_frac: capped,
+            stable: true,
+            perf_per_watt,
+        }
+    }
+
+    /// Build a knowledge base where each entry has an exact (trials, stable, score).
+    #[cfg(windows)]
+    fn knowledge_with(entries: &[(i32, u32, u32, f64)]) -> GpuKnowledge {
+        let mut k = GpuKnowledge::default();
+        for &(offset, trials, stable, score) in entries {
+            let e = k.points.entry(offset).or_default();
+            e.trials = trials;
+            e.stable_trials = stable;
+            e.failures = trials - stable;
+            // score() = clock_mhz_sum / power_w_sum → choose sums that yield `score`.
+            e.power_w_sum = 100.0 * stable as f64;
+            e.clock_mhz_sum = (score * e.power_w_sum) as u64;
+        }
+        k
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gate_picks_best_score_among_confident_points() {
+        // +195 is the most efficient point that is ALSO well-tested; +210 is more
+        // efficient on paper but tested once → its low confidence must keep it out.
+        let off_cap = vec![pt(180, 10.24, 0.0), pt(195, 11.0, 0.0), pt(210, 12.0, 0.0)];
+        let know = knowledge_with(&[(180, 50, 50, 10.24), (195, 60, 60, 11.0), (210, 1, 1, 12.0)]);
+        let (pick, log) = select_brokkrs_v2(&off_cap, &off_cap, &know, SweepProfile::Balanced);
+        assert_eq!(pick.unwrap().offset_mhz, 195);
+        assert!(log.iter().any(|l| l.contains("decision=accepted")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gate_falls_back_to_v1_when_confidence_is_immature() {
+        // Every point has a single trial (today's real state) → nothing clears .85
+        // → V1 fallback chooses the best off-cap perf/watt and logs that it did.
+        let off_cap = vec![pt(150, 9.0, 0.0), pt(180, 10.24, 0.0)];
+        let know = knowledge_with(&[(150, 1, 1, 9.0), (180, 1, 1, 10.24)]);
+        let (pick, log) = select_brokkrs_v2(&off_cap, &off_cap, &know, SweepProfile::Balanced);
+        assert_eq!(pick.unwrap().offset_mhz, 180);
+        assert!(log.iter().any(|l| l.contains("fallback=V1")));
+    }
 }

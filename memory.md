@@ -8,10 +8,12 @@ This file is the continuity index. See also: `architecture.md`, `decisions.md`,
 `roadmap.md`, `handoff.md`, and the methodology doc `docs/gpu-forge.md`.
 
 ## Current status (2026-06-04)
-- `master`, clean tree, 97 commits, latest tag **v0.3.1**.
+- `master`, latest tag **v0.3.1**. V2 work on a worktree branch (uncommitted).
 - Active work: **Brokkr's Best** profile refinement — the perf/watt undervolt.
-- **V1 of the continuous per-GPU stability-knowledge algorithm is implemented,
-  committed, and validated on hardware (no crash).** Service + UI run; GPU at stock.
+- **V1** of the continuous per-GPU stability-knowledge algorithm is implemented,
+  committed, and validated on hardware (no crash). Service + UI run; GPU at stock.
+- **V2 (confidence-gated selection) is implemented + unit-tested** (compiles clean;
+  3 tests pass). Not yet committed. See `decisions.md`.
 
 ## Completed work (this arc)
 - **Modern NvAPI V/F curve (ClkVfPoints) read + write + apply + reset** work on
@@ -26,6 +28,11 @@ This file is the continuity index. See also: `architecture.md`, `decisions.md`,
 - **Continuous per-GPU knowledge (V1)**: severity-separated frontier + per-point
   stats persisted, data-driven margin (no fixed MHz). See `decisions.md`.
 - 3-tier failure classification; Safe Loop reboot protection confirmed working.
+- **V2 selection (this session)**: Wilson lower-bound confidence gate over
+  accumulated trials; picks best `score()` (MHz/W) clearing the profile threshold
+  (Balanced .85 active), else falls back to V1. Selection now reads the persisted
+  knowledge (V1 only wrote it); off-cap invariant kept via an offset join. Code-only,
+  no data-model/schema change. `cargo check` clean; 3 unit tests pass.
 
 ## Known issues / open questions
 - A deep undervolt (+255 offset / ~855 mV) **hard-rebooted** the PC once — deep
@@ -39,8 +46,11 @@ This file is the continuity index. See also: `architecture.md`, `decisions.md`,
 - 2 `.exe` binaries committed inflate the repo — confirm intent vs `.gitignore`/LFS.
 
 ## Next recommended actions
-1. **V2**: Wilson lower-bound confidence + score×confidence selection + profiles
-   (Conservative/Balanced/Aggressive). Code-only, no GPU run.
-2. Optionally one more supervised sweep → converges at +240 (~870 mV ≈ user's
+1. **Commit V2** (worktree branch) once reviewed; then consider exposing the
+   profile via IPC/UI (currently a const).
+2. **V3**: dedicated short confidence trials on the safe side so the gate matures —
+   today every point has 1 trial → Wilson-LB ≈ 0.21 → V2 falls back to V1.
+   `arduous_validate`'s 35 s soak discards its result: the natural hook to record it.
+3. Optionally one more supervised sweep → converges at +240 (~870 mV ≈ user's
    hand-tuned 1800 MHz @ 875 mV), then stops by design.
-3. In-game apply test of Brokkr's via the VF ceiling (user present).
+4. In-game apply test of Brokkr's via the VF ceiling (user present).

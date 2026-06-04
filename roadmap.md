@@ -14,11 +14,15 @@
     stats, data-driven margin — no fixed MHz).
 
 ## Now — Brokkr's refinement
-- **V2 (next, code-only):** Wilson lower-bound confidence; selection = max score
-  s.t. confidence ≥ profile threshold; profiles **Conservative .95 / Balanced .85 /
-  Aggressive .70**. Per-point stats from V1 already feed this.
-- **V3:** dedicated short confidence trials on the safe side; reinforce promising
-  points without re-exploring danger; tune `target_clock_mhz` selection.
+- **V2 (DONE this session, uncommitted):** Wilson lower-bound confidence gate;
+  selection = max `score()` s.t. confidence ≥ profile threshold; profiles
+  **Conservative .95 / Balanced .85 (active) / Aggressive .70**; V1 fallback when
+  none clears the gate. Implemented + unit-tested in `gpu_power_sweep.rs`. Profile
+  is a const (IPC/UI plumbing is a follow-up).
+- **V3 (next):** dedicated short confidence trials on the safe side so the gate
+  matures (today 1 trial/point → always falls back to V1); `arduous_validate`'s soak
+  is the natural place to record confidence; reinforce promising points; tune
+  `target_clock_mhz` selection.
 
 ## Near-term
 - **Godforge** as a real OC profile (currently the max-voltage stock point).

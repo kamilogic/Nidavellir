@@ -2,6 +2,26 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## V2 selection = Wilson-confidence gate (not score×confidence), with V1 fallback
+- **Decision**: among off-cap points, pick the highest accumulated `score()` (MHz/W)
+  whose stability confidence — Wilson lower bound (z=1.96) over accumulated
+  trials/stable_trials — clears the active profile threshold (**Conservative .95 /
+  Balanced .85 / Aggressive .70**; Balanced active, a const). If none clears it, fall
+  back to the V1 strategy (best off-cap perf/watt) and log it. Never returns "no
+  solution".
+- **Why a gate, not score×confidence**: safety-first. "Trust ≥ X, then best
+  efficiency" is predictable; a product silently trades confidence for efficiency and
+  could ride a barely-tested point. Ranking among the trusted still uses `score()`.
+- **Why a join, not selecting from knowledge directly**: the off-cap invariant lives
+  on the per-run `PowerSweepPoint` (`power_capped_frac`); `PointStat` has no cap
+  field. V2 gates the off-cap subset and joins to `know.points` by offset for
+  confidence — so data collection and the `gpu_knowledge.json` schema stay untouched.
+- **Reality today**: 1 trial/point → Wilson-LB ≈ 0.21 everywhere → V2 always falls
+  back to V1 (the chosen point is unchanged, but the decision is now logged). The gate
+  "wakes up" only as trials accumulate across runs → motivates V3.
+- **Scope**: code-only inside `gpu_power_sweep.rs`; unit-tested (Wilson values +
+  gate-accept + gate-fallback). Supersedes the earlier "score×confidence" phrasing.
+
 ## Brokkr's objective = max efficiency (MHz/W), not min voltage
 - **Decision**: the undervolt profile maximizes performance-per-watt (the efficiency
   knee), using the stability frontier only to bound the search.

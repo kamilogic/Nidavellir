@@ -5,6 +5,11 @@ How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 
 ## Where things stand
 - **Brokkr's V1 (continuous per-GPU knowledge) is implemented + validated on HW.**
+- **V2 (confidence-gated selection) is implemented + unit-tested (uncommitted, on
+  worktree branch `claude/vigilant-gagarin-213d23`).** `cargo check` clean;
+  `cargo test -p nidavellir-service` = 3/3. Active profile = Balanced (.85), a const.
+  With today's 1-trial data the gate falls back to V1, so the chosen point is
+  unchanged — but the decision is now logged.
 - Last supervised sweep explored to **+210 offset (~881 mV)** with NO crash and
   found Brokkr's = **1830 MHz @ 881 mV · 179 W · 10.24 MHz/W (off-cap)** — essentially
   the user's hand-tuned 1800 MHz @ 875 mV. Godforge = stock max-voltage point.
@@ -28,11 +33,12 @@ How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
   ABS_MAX_OFFSET=240; never re-touches the 255 reboot).
 
 ## Pending / next actions
-1. **V2** (code-only, no GPU): Wilson lower-bound confidence + score×confidence
-   selection + Conservative/Balanced/Aggressive profiles. PointStat already has
-   trials/failures.
-2. Optional: one more supervised sweep → +240, closes the exploration.
-3. In-game apply test of Brokkr's (`ApplyPowerBrokkrs`) — confirm consistency in
+1. **Commit V2** (worktree branch `claude/vigilant-gagarin-213d23`) once reviewed;
+   then consider exposing the profile via IPC/UI (currently a const).
+2. **V3**: confidence trials so the gate matures (today 1 trial/point → falls back to
+   V1). `arduous_validate`'s 35 s soak discards its result — the natural hook.
+3. Optional: one more supervised sweep → +240, closes the exploration.
+4. In-game apply test of Brokkr's (`ApplyPowerBrokkrs`) — confirm consistency in
    Overwatch. Small TDR risk; user present.
 
 ## Gotchas / safety
@@ -49,7 +55,8 @@ How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 
 ## Files to know
 - `crates/service/src/gpu_power_sweep.rs` — the sweep + knowledge model (V1) + the
-  3-tier `FailTier` + `GpuKnowledge`/`BoundaryKnowledge`/`PointStat`.
+  3-tier `FailTier` + `GpuKnowledge`/`BoundaryKnowledge`/`PointStat` + **V2**
+  (`wilson_lower_bound`, `SweepProfile`, `select_brokkrs_v2`, unit tests).
 - `crates/gpu-nvapi/src/lib.rs` — `vfcurve` mod (ClkVfPoints FFI), `apply_vf_ceiling`,
   `read_vf_curve_modern`, `vf_curve_supported`.
 - `crates/service/src/gpu_apply.rs` — apply via VF ceiling (NVML cap = fallback).
