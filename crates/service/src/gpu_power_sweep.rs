@@ -533,24 +533,26 @@ fn run_power_sweep(
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
     let _ = store.clear_boot_flag();
 
-    // --- Synthesize the three profiles (all hold the stock target clock; they
-    // differ in voltage → power. No core OC here, so performance = stock; the
-    // profiles trade power/stability-margin). -----------------------------
+    // --- Synthesize the profiles --------------------------------------------
+    // Brokkr's objective (user's redefinition, 2026-06-03): MAXIMIZE efficiency
+    // (MHz per Watt) — the perf/watt KNEE — NOT minimize voltage / chase the
+    // deepest undervolt. The deepest-undervolt question walks toward the stability
+    // cliff (a +255 offset / ~855 mV hard-crashed the PC); the best efficiency sits
+    // well before it. We return the BEST EFFICIENCY OBSERVED among stable points,
+    // and the offset sweep is bounded (MAX_OFFSET) to stay out of the cliff region.
     use std::cmp::Ordering as Ord;
     let max_std = prog.points.iter().map(|p| p.power_std_w).fold(0.0f32, f32::max);
     let headroom = (0.10 * cap).max(2.0 * max_std);
     let brokkr_target = if cap > 0.0 { cap - headroom } else { f32::MAX };
     prog.target_w = brokkr_target;
 
-    // Two profiles only (Deep Calm removed — it converged with Brokkr's):
-    // Godforge = max stable performance (least undervolt = most stability margin,
-    // the +0 / highest-voltage point); Brokkr's Best = best perf/watt (the
-    // deepest stable undervolt, lowest power at the same clock).
+    // Godforge = max stable performance (least undervolt / highest voltage; OC-
+    // oriented, refined later). Deep Calm removed (converged with Brokkr's).
     prog.godforge = prog.points.iter().copied().max_by_key(|p| p.voltage_mv);
-    // Brokkr's Best MUST stay OFF the power cap — a capped profile dips its clock
-    // in-game (the inconsistency we're eliminating). So pick the best perf/watt
-    // among points that ran essentially un-capped (cap < 5%); only if none are
-    // off-cap fall back to the least-capped point.
+    // Brokkr's Best = best efficiency (MHz/W) among points that ran OFF the cap
+    // (power_capped_frac < 5%) — a capped profile dips its clock in-game, the
+    // inconsistency we eliminate. Among the off-cap points this is the efficiency
+    // knee; fall back to the least-capped point only if none ran off-cap.
     let off_cap: Vec<PowerSweepPoint> = prog
         .points
         .iter()
@@ -569,6 +571,13 @@ fn run_power_sweep(
             .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal))
     };
     prog.deep_calm = None;
+    if let Some(b) = prog.brokkrs {
+        prog.log.push(format!(
+            "Melhor eficiência (MHz/W): {:.2} @ {} mV · {} MHz · {:.0} W (off-cap) — não o menor mV, o melhor perf/watt.",
+            b.perf_per_watt, b.voltage_mv, b.clock_mhz, b.power_w
+        ));
+        set(&progress, prog.clone());
+    }
 
     // --- Arduous validation of each pick (long soak + back-off) -----------
     let pts = prog.points.clone();
@@ -593,13 +602,15 @@ fn run_power_sweep(
             None => "—".into(),
         };
         let bk_eff = match prog.brokkrs {
-            Some(p) if sm.power_w > 0.0 => {
-                format!(" (Brokkr's economiza {:.0} W no mesmo clock)", (sm.power_w - p.power_w).max(0.0))
-            }
+            Some(p) if sm.power_w > 0.0 => format!(
+                " ({:.2} MHz/W, −{:.0} W vs stock, off-cap)",
+                p.perf_per_watt,
+                (sm.power_w - p.power_w).max(0.0)
+            ),
             _ => String::new(),
         };
         prog.note = Some(format!(
-            "Mantendo {target} MHz · cap {cap:.0} W · Godforge {} · Brokkr's {}{bk_eff} — confirme em jogo.",
+            "Mantendo {target} MHz · cap {cap:.0} W · Godforge {} · Brokkr's (melhor eficiência) {}{bk_eff} — confirme em jogo.",
             fmt(prog.godforge), fmt(prog.brokkrs)
         ));
     } else {
