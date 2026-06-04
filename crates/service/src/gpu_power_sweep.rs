@@ -32,68 +32,171 @@ const DWELL_MS: u64 = 15000;
 const RAMP_DISCARD_MS: u128 = 6000;
 /// One exploration step (MHz of curve-flatten offset). ~9 mV/step here.
 const EXPLORE_STEP: i32 = 15;
-/// Stay this far (MHz offset) BELOW a learned hard-crash offset when exploring, so
-/// we never re-probe the cliff. The +255 reboot taught us the crash region; with
-/// this buffer the descent stops near a hand-tuned ~875 mV, well above it.
-const CRASH_BUFFER: i32 = 60;
-/// Exploration ceiling when no crash has ever been learned (first run, no memory).
-/// Conservative: ~900 mV, the last value validated stable before the reboot.
+/// Exploration ceiling when nothing has been learned yet (fresh per-GPU knowledge).
+/// Conservative: ~900 mV, the value validated stable before the +255 reboot.
 const DEFAULT_CEILING: i32 = 150;
-/// Hard cap regardless of memory — we never flatten the clock more than this.
+/// Hard cap regardless of knowledge — we never flatten the clock more than this.
 const ABS_MAX_OFFSET: i32 = 240;
+/// How many steps PAST the deepest known-clean offset a single run may probe, so we
+/// creep toward the optimum across runs instead of leaping at the cliff.
+const PROBE_STEPS: i32 = 2;
+/// V1 "Conservative" search margin as a FRACTION of the discovered zone width
+/// (highest_clean → lowest_failure) — NOT a fixed MHz. A wide zone ⇒ wider margin;
+/// a narrow (refined) zone ⇒ tight margin. Adapts to each GPU's curve. (V2 replaces
+/// this with a Wilson-lower-bound confidence gate; the per-point stats below feed it.)
+const CONSERVATIVE_MARGIN_FRAC: f64 = 0.30;
 
-/// Persistent "stability frontier" memory (user's design): turn instability into
-/// DATA. We remember the deepest offset that ran stable and the first offset that
-/// crashed, so each run knows roughly where the cliff is and explores BELOW it
-/// instead of rediscovering it with another reboot.
+/// Instability severity, ordered (mirrors the L1/L2/L3 fail tiers). Stored per point
+/// and per frontier so the algorithm can weigh a cheap SilentError differently from
+/// an expensive HardReboot.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
+enum FailSeverity {
+    #[default]
+    None,
+    SilentError,
+    Tdr,
+    Reboot,
+}
+
+/// Accumulated statistics for ONE offset, summed across ALL runs (continuous
+/// learning). The stable aggregates give a mean score; trials/failures feed the
+/// (future) Wilson confidence — a point with 50 clean trials must outrank one with 1.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
-struct BoundaryMemory {
-    /// Deepest curve-flatten offset (MHz) observed STABLE.
-    last_stable_offset: i32,
-    /// Shallowest offset (MHz) that produced a crash/TDR/reboot, if any.
-    first_crash_offset: Option<i32>,
+struct PointStat {
+    trials: u32,
+    failures: u32,
+    worst_severity: FailSeverity,
+    stable_trials: u32,
+    clock_mhz_sum: u64,
+    power_w_sum: f64,
+    voltage_mv_sum: u64,
 }
 
-#[cfg(windows)]
-fn boundary_path() -> std::path::PathBuf {
-    nidavellir_core::safe_loop::default_data_dir().join("gpu_boundary.json")
-}
-
-#[cfg(windows)]
-fn load_boundary() -> BoundaryMemory {
-    std::fs::read_to_string(boundary_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
-        .unwrap_or_default()
-}
-
-#[cfg(windows)]
-fn save_boundary(b: &BoundaryMemory) {
-    let _ = std::fs::create_dir_all(nidavellir_core::safe_loop::default_data_dir());
-    if let Ok(j) = serde_json::to_string_pretty(b) {
-        let _ = std::fs::write(boundary_path(), j);
+#[allow(dead_code)] // score()/mean_voltage_mv() feed V2 (confidence-based selection)
+impl PointStat {
+    /// Mean efficiency (MHz/W) over the stable trials, or 0 if never stable.
+    fn score(&self) -> f64 {
+        if self.stable_trials == 0 || self.power_w_sum <= 0.0 {
+            0.0
+        } else {
+            self.clock_mhz_sum as f64 / self.power_w_sum
+        }
+    }
+    fn mean_voltage_mv(&self) -> u32 {
+        if self.stable_trials == 0 { 0 } else { (self.voltage_mv_sum / self.stable_trials as u64) as u32 }
     }
 }
 
-/// How many steps PAST the deepest known-stable offset a single run may probe.
-/// Incremental: each run extends the frontier only a little, so we creep toward the
-/// efficiency optimum across runs instead of leaping at the cliff.
-const PROBE_STEPS: i32 = 2;
+/// Severity-differentiated stability frontier (user's design): keep the shallowest
+/// offset of each failure class separately, never collapsing them to one number.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct BoundaryKnowledge {
+    /// Deepest offset (MHz) observed fully stable.
+    highest_clean: i32,
+    lowest_silent_error: Option<i32>,
+    lowest_tdr: Option<i32>,
+    lowest_reboot: Option<i32>,
+}
 
-/// Exploration ceiling (MHz offset). Probe only a couple of steps past the deepest
-/// known-stable offset, NEVER within `CRASH_BUFFER` of a known crash, never past
-/// `ABS_MAX_OFFSET`, and at least `DEFAULT_CEILING` (so a fresh memory still maps
-/// the safe region). This is the user's "progressive exploration + permanent
-/// learning": instability seen in a run lowers `first_crash` and pulls the ceiling
-/// back next time.
+impl BoundaryKnowledge {
+    /// Shallowest offset that ever failed, of ANY severity — the search bound.
+    fn lowest_failure(&self) -> Option<i32> {
+        [self.lowest_silent_error, self.lowest_tdr, self.lowest_reboot]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+}
+
+/// Per-GPU continuous knowledge base: the stability curve this specific GPU is
+/// learning about itself, accumulated across runs. Keyed by GPU identity so a
+/// hardware change starts fresh.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct GpuKnowledge {
+    gpu_key: String,
+    target_clock_mhz: u32,
+    boundary: BoundaryKnowledge,
+    /// offset (MHz) → accumulated stats.
+    points: std::collections::BTreeMap<i32, PointStat>,
+    schema_version: u32,
+}
+
+impl GpuKnowledge {
+    fn record_stable(&mut self, offset: i32, clock_mhz: u32, power_w: f32, voltage_mv: u32) {
+        let e = self.points.entry(offset).or_default();
+        e.trials += 1;
+        e.stable_trials += 1;
+        e.clock_mhz_sum += clock_mhz as u64;
+        e.power_w_sum += power_w as f64;
+        e.voltage_mv_sum += voltage_mv as u64;
+        if offset > self.boundary.highest_clean {
+            self.boundary.highest_clean = offset;
+        }
+    }
+    fn record_failure(&mut self, offset: i32, sev: FailSeverity) {
+        let e = self.points.entry(offset).or_default();
+        e.trials += 1;
+        e.failures += 1;
+        if sev > e.worst_severity {
+            e.worst_severity = sev;
+        }
+        let slot = match sev {
+            FailSeverity::SilentError => &mut self.boundary.lowest_silent_error,
+            FailSeverity::Tdr => &mut self.boundary.lowest_tdr,
+            FailSeverity::Reboot => &mut self.boundary.lowest_reboot,
+            FailSeverity::None => return,
+        };
+        *slot = Some(slot.map_or(offset, |x| x.min(offset)));
+    }
+}
+
 #[cfg(windows)]
-fn explore_ceiling(b: &BoundaryMemory) -> i32 {
-    let probe = b.last_stable_offset + PROBE_STEPS * EXPLORE_STEP;
-    let crash_cap = b
-        .first_crash_offset
-        .map(|c| c - CRASH_BUFFER)
-        .unwrap_or(ABS_MAX_OFFSET);
-    probe.min(crash_cap).min(ABS_MAX_OFFSET).max(DEFAULT_CEILING)
+fn knowledge_path() -> std::path::PathBuf {
+    nidavellir_core::safe_loop::default_data_dir().join("gpu_knowledge.json")
+}
+
+/// Load the per-GPU knowledge; if the stored key doesn't match this GPU, start fresh
+/// (but keep the identity so the first save stamps it).
+#[cfg(windows)]
+fn load_knowledge(gpu_key: &str) -> GpuKnowledge {
+    let mut k: GpuKnowledge = std::fs::read_to_string(knowledge_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
+        .unwrap_or_default();
+    if k.gpu_key != gpu_key {
+        k = GpuKnowledge::default();
+        k.gpu_key = gpu_key.to_string();
+    }
+    k
+}
+
+#[cfg(windows)]
+fn save_knowledge(k: &GpuKnowledge) {
+    let _ = std::fs::create_dir_all(nidavellir_core::safe_loop::default_data_dir());
+    if let Ok(j) = serde_json::to_string_pretty(k) {
+        let _ = std::fs::write(knowledge_path(), j);
+    }
+}
+
+/// Exploration ceiling (MHz offset), DATA-DRIVEN (no fixed margin):
+/// - probe only `PROBE_STEPS` past the deepest known-clean offset (incremental), and
+/// - never reach a known failure — back off a margin RELATIVE to the zone width
+///   (`highest_clean → lowest_failure`), keeping at least one step of gap.
+/// As runs refine the zone, the relative margin tightens around the true frontier.
+#[cfg(windows)]
+fn explore_ceiling(k: &GpuKnowledge) -> i32 {
+    let hc = k.boundary.highest_clean;
+    let incremental = hc + PROBE_STEPS * EXPLORE_STEP;
+    let by_failure = match k.boundary.lowest_failure() {
+        Some(f) => {
+            let width = (f - hc).max(EXPLORE_STEP);
+            let margin = ((width as f64) * CONSERVATIVE_MARGIN_FRAC).round() as i32;
+            (f - margin.max(EXPLORE_STEP)).min(f - EXPLORE_STEP)
+        }
+        None => ABS_MAX_OFFSET,
+    };
+    let raw = incremental.min(by_failure).min(ABS_MAX_OFFSET);
+    raw.max(DEFAULT_CEILING.min(by_failure.max(EXPLORE_STEP)))
 }
 
 /// Stock-curve clock (MHz) at or below `v` mV — the card's natural clock there.
@@ -531,13 +634,20 @@ fn run_power_sweep(
     // BELOW the known crash — turn instability into DATA instead of rediscovering
     // the cliff with another reboot. The frontier delimits the SEARCH; the result
     // is the best-efficiency point, chosen later with a safety margin.
-    let mut boundary = load_boundary();
-    let ceiling = explore_ceiling(&boundary);
+    let gpu_key = nidavellir_gpu_nvapi::read_curve()
+        .map(|c| c.name)
+        .unwrap_or_else(|_| "unknown-gpu".into());
+    let mut know = load_knowledge(&gpu_key);
+    know.target_clock_mhz = target;
+    let ceiling = explore_ceiling(&know);
+    let fmt_opt = |o: Option<i32>| o.map(|v| format!("+{v}")).unwrap_or_else(|| "—".into());
     prog.log.push(format!(
-        "Fronteira aprendida: estável ≤ +{} MHz · crash @ {} · explorando até +{} MHz (margem {} do penhasco).",
-        boundary.last_stable_offset,
-        boundary.first_crash_offset.map(|c| format!("+{c}")).unwrap_or_else(|| "?".into()),
-        ceiling, CRASH_BUFFER
+        "Conhecimento [{}]: limpo ≤ +{} · SilentError {} · TDR {} · Reboot {} → explorando até +{} (margem {:.0}% da zona).",
+        know.gpu_key, know.boundary.highest_clean,
+        fmt_opt(know.boundary.lowest_silent_error),
+        fmt_opt(know.boundary.lowest_tdr),
+        fmt_opt(know.boundary.lowest_reboot),
+        ceiling, CONSERVATIVE_MARGIN_FRAC * 100.0
     ));
     set(&progress, prog.clone());
 
@@ -572,11 +682,10 @@ fn run_power_sweep(
                     stable: true,
                     perf_per_watt: m.clock_mhz as f64 / m.power_w as f64,
                 });
-                // Learn: this offset ran stable — remember it for future runs.
-                if offset > boundary.last_stable_offset {
-                    boundary.last_stable_offset = offset;
-                    save_boundary(&boundary);
-                }
+                // Continuous learning: accumulate this offset's stats + raise the
+                // clean frontier. Persisted, so confidence grows across runs.
+                know.record_stable(offset, m.clock_mhz, m.power_w, m.volt_mv);
+                save_knowledge(&know);
                 set(&progress, prog.clone());
                 offset += EXPLORE_STEP;
             }
@@ -584,13 +693,12 @@ fn run_power_sweep(
                 offset += EXPLORE_STEP;
             }
             StabilityResult::SilentError => {
-                // First instability = the frontier. Record it as data; the best
-                // EFFICIENCY (not this edge) is the result, chosen below with margin.
-                boundary.first_crash_offset =
-                    Some(boundary.first_crash_offset.map_or(offset, |c| c.min(offset)));
-                save_boundary(&boundary);
+                // First instability = a frontier observation, recorded by SEVERITY.
+                // The best EFFICIENCY (not this edge) is the result, chosen below.
+                know.record_failure(offset, FailSeverity::SilentError);
+                save_knowledge(&know);
                 prog.log.push(format!(
-                    "Fronteira de instabilidade em +{offset} MHz — {} — registrado, parando.",
+                    "Fronteira em +{offset} MHz — {} — registrado (SilentError), parando.",
                     FailTier::L1Instability.label()
                 ));
                 break;
@@ -598,11 +706,12 @@ fn run_power_sweep(
             StabilityResult::Crash => {
                 let _ = gpu::set_core_offset_mhz(0);
                 let tier = classify_failure(StabilityResult::Crash, &mut ctx);
-                boundary.first_crash_offset =
-                    Some(boundary.first_crash_offset.map_or(offset, |c| c.min(offset)));
-                save_boundary(&boundary);
+                // In-sweep we can only observe up to a (recovered/unrecovered) TDR;
+                // a true reboot is learned post-boot via the Safe Loop boot-flag.
+                know.record_failure(offset, FailSeverity::Tdr);
+                save_knowledge(&know);
                 prog.log.push(format!(
-                    "Fronteira (crash) em +{offset} MHz — {} — registrado, parando.",
+                    "Fronteira em +{offset} MHz — {} — registrado (TDR), parando.",
                     tier.label()
                 ));
                 break;
