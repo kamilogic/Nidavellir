@@ -1,5 +1,8 @@
 # Nidavellir — Product Vision
 
+> Canonical product/agent governance: **`AGENTS.md`**. This doc is the deeper
+> backend/product-model detail and must not contradict it.
+
 > *Where silicon is forged to its prime.*
 
 Nidavellir is **not** an overclock or undervolt tool. It is a system that **learns

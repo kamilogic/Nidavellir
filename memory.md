@@ -4,8 +4,9 @@ Honest, safety-first GPU/CPU/RAM auto-tuner for Windows. Tauri v2 + Svelte 5 UI,
 Rust core service, NVIDIA-focused undervolting. ~14 K LOC source across 5 Rust
 crates + a Svelte UI. Tested on RTX 3060 Ti (driver 595.97), i7-13700K, DDR4-4000.
 
-This file is the continuity index. See also: `architecture.md`, `decisions.md`,
-`roadmap.md`, `handoff.md`, and the methodology doc `docs/gpu-forge.md`.
+This file is the continuity index. See also: `AGENTS.md` (canonical product/agent
+governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
+`product.md`, and the methodology doc `docs/gpu-forge.md`.
 
 ## Current status (2026-06-04)
 - `master`, tag **v0.3.1**. Work on worktree branch `claude/vigilant-gagarin-213d23`.
@@ -13,9 +14,11 @@ This file is the continuity index. See also: `architecture.md`, `decisions.md`,
   (Godforge/Brokkr's/Deep Calm). See `product.md`.
 - **V1** continuous per-GPU stability knowledge: implemented, committed, HW-validated.
 - **V2** confidence-gated selection: implemented + unit-tested, **committed** (5d72342).
-- **F1a (this session)**: pure 3-profile synthesis (`synthesize_forge_profiles`) +
-  tests — Godforge=clock / Brokkr's=R / Deep Calm=MHz/W; not yet wired (F1b).
-  6 tests pass; uncommitted. See `decisions.md`.
+- **F1a**: pure 3-profile synthesis (`synthesize_forge_profiles`) + tests —
+  Godforge=clock / Brokkr's=R / Deep Calm=MHz/W; not yet wired (F1b). 6 tests pass.
+  **committed** (95753de). See `decisions.md`.
+- Branch **reconciled with master governance** (AGENTS.md / CLAUDE.md /
+  docs/contracts/ui-backend.md + Codex UI Phases 1–3). UI owned by Codex.
 
 ## Completed work (this arc)
 - **GPU-first UI Phase 1 cleanup**: Forge is now the default post-onboarding
@@ -63,9 +66,8 @@ This file is the continuity index. See also: `architecture.md`, `decisions.md`,
 - 2 `.exe` binaries committed inflate the repo — confirm intent vs `.gitignore`/LFS.
 
 ## Next recommended actions
-1. **Commit F1a** (synthesis + tests + vision docs) once reviewed.
-2. **F1b**: extend the safe flatten sweep to multiple target clocks → real game-power
-   clock×power frontier; decide knowledge keying by (clock, offset); wire
-   `synthesize_forge_profiles` into the live sweep (replaces the single-clock picks).
-3. Then F2–F7 (see `product.md` / `roadmap.md`).
-4. In-game apply test (user present); optional one more supervised sweep → +240.
+1. **F1b** (pending user approval): extend the safe flatten sweep to multiple target
+   clocks → real game-power clock×power frontier; knowledge keying by (clock, offset);
+   wire `synthesize_forge_profiles` into the live sweep. Needs a supervised HW run.
+2. Then F2–F7 (see `product.md` / `roadmap.md`).
+3. In-game apply test (user present); optional one more supervised sweep → +240.
