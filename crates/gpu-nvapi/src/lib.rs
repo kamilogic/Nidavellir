@@ -221,7 +221,14 @@ pub fn reset_all() -> Result<(), String> {
 /// gated behind a working read probe.
 #[cfg(windows)]
 mod vfcurve {
-    use nvapi_sys::handles::NvPhysicalGpuHandle;
+    /// NVAPI handles are opaque pointer-sized values. `nvapi_sys`'s
+    /// `NvPhysicalGpuHandle` is a `repr(Rust)` newtype around `*const c_void` (via
+    /// `nv_declare_handle!`), so passing it BY VALUE in an `extern "C" fn` signature
+    /// trips `improper_ctypes_definitions` — the compiler can't guarantee a
+    /// `repr(Rust)` type's layout matches the C ABI. NVAPI passes the handle as one
+    /// opaque pointer and the enum call *fills* the handle array, so we carry it as a
+    /// raw `*mut c_void` here: ABI-identical, FFI-safe, and never dereferenced.
+    type RawGpuHandle = *mut core::ffi::c_void;
 
     const ID_ENUM: u32 = 0xE5AC_921F; // NvAPI_EnumPhysicalGPUs
     const ID_GET: u32 = 0x23F1_B133; // ClkVfPointsGetControl
@@ -296,7 +303,7 @@ mod vfcurve {
         let _ = nvapi::initialize();
         let p = qi(ID_STATUS)?;
         let h = handle()?;
-        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Status) -> i32;
+        type F = extern "C" fn(RawGpuHandle, *mut Status) -> i32;
         let f: F = unsafe { core::mem::transmute(p) };
         let mut s: Box<Status> = Box::new(unsafe { core::mem::zeroed() });
         s.version = VER_STATUS;
@@ -313,7 +320,7 @@ mod vfcurve {
         let _ = nvapi::initialize();
         let Some(p) = qi(ID_STATUS) else { return "qi(status) fail".into() };
         let Some(h) = handle() else { return "handle fail".into() };
-        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Status) -> i32;
+        type F = extern "C" fn(RawGpuHandle, *mut Status) -> i32;
         let f: F = unsafe { core::mem::transmute(p) };
         let mut out = format!("VER_STATUS {VER_STATUS:#x} ");
         for i in [0usize, 40, 80, 120, 160] {
@@ -334,11 +341,11 @@ mod vfcurve {
         nvapi_sys::nvapi::nvapi_QueryInterface(id).ok()
     }
 
-    fn handle() -> Option<NvPhysicalGpuHandle> {
+    fn handle() -> Option<RawGpuHandle> {
         let p = qi(ID_ENUM)?;
-        type F = extern "C" fn(*mut [NvPhysicalGpuHandle; 64], *mut u32) -> i32;
+        type F = extern "C" fn(*mut [RawGpuHandle; 64], *mut u32) -> i32;
         let f: F = unsafe { core::mem::transmute(p) };
-        let mut h: [NvPhysicalGpuHandle; 64] = unsafe { core::mem::zeroed() };
+        let mut h: [RawGpuHandle; 64] = unsafe { core::mem::zeroed() };
         let mut n: u32 = 0;
         if f(&mut h, &mut n) == 0 && n > 0 {
             Some(h[0])
@@ -354,7 +361,7 @@ mod vfcurve {
         let _ = nvapi::initialize();
         let Some(p) = qi(ID_GET) else { return -1001 };
         let Some(h) = handle() else { return -1002 };
-        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Control) -> i32;
+        type F = extern "C" fn(RawGpuHandle, *mut Control) -> i32;
         let f: F = unsafe { core::mem::transmute(p) };
         let mut c: Control = unsafe { core::mem::zeroed() };
         c.version = VER;
@@ -369,7 +376,7 @@ mod vfcurve {
         let _ = nvapi::initialize();
         let Some(p) = qi(ID_GET) else { return "qi fail".into() };
         let Some(h) = handle() else { return "handle fail".into() };
-        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Control) -> i32;
+        type F = extern "C" fn(RawGpuHandle, *mut Control) -> i32;
         let f: F = unsafe { core::mem::transmute(p) };
         let mut out = String::new();
         for i in [0usize, 50, 100, 150, 200, 254] {
@@ -395,7 +402,7 @@ mod vfcurve {
         let _ = nvapi::initialize();
         let p = qi(ID_GET)?;
         let h = handle()?;
-        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Control) -> i32;
+        type F = extern "C" fn(RawGpuHandle, *mut Control) -> i32;
         let f: F = unsafe { core::mem::transmute(p) };
         let mut c: Control = unsafe { core::mem::zeroed() };
         c.version = VER;
@@ -418,7 +425,7 @@ mod vfcurve {
         let Some(pset) = qi(ID_SET) else { return -1001 };
         let Some(pget) = qi(ID_GET) else { return -1001 };
         let Some(h) = handle() else { return -1002 };
-        type F = extern "C" fn(NvPhysicalGpuHandle, *mut Control) -> i32;
+        type F = extern "C" fn(RawGpuHandle, *mut Control) -> i32;
         let fget: F = unsafe { core::mem::transmute(pget) };
         let fset: F = unsafe { core::mem::transmute(pset) };
         // Read-modify-write: GET the full control first so every point's hidden
