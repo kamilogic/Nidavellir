@@ -2,123 +2,326 @@
 
 Where silicon is forged to its prime.
 
-**The realm of the dwarf smiths in Norse mythology.** Where Mjolnir, Gungnir, and Draupnir were forged — legendary weapons and artifacts that surpassed the limits of raw material.
+**Nidavellir** is a safety-first GPU tuning system for Windows.
 
-Nidavellir applies the same idea to silicon: an honest, safety-first auto-tuner for CPU, GPU, and RAM on Windows. It forges validated profiles — **Godforge**, **Brokkr's Best**, and **Deep Calm** — instead of blind offsets, and never promises what your hardware cannot deliver.
+It learns how your specific GPU behaves under real load, builds GPU-specific knowledge over time, and forges transparent performance profiles instead of applying generic undervolt or overclock presets.
+
+Nidavellir is named after the legendary realm of the dwarf smiths in Norse mythology — where impossible artifacts were forged beyond the limits of raw material.
+
+The same idea applies here:
+
+> Every GPU is different. Nidavellir does not assume what your silicon can do. It measures, validates, learns, and forges.
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0f766e)
-![Status](https://img.shields.io/badge/status-v0.1%20%E2%80%94%20foundations-1d4ed8)
+![Status](https://img.shields.io/badge/status-v0.3%20%E2%80%94%20GPU%20forge%20in%20development-1d4ed8)
 
 ---
 
-## Installing (end users)
+## Current Scope
 
-1. Download **`Nidavellir_*_x64-setup.exe`** from [GitHub Releases](https://github.com/kamilogic/nidavellir/releases) (or your distribution channel).
-2. Run the installer — **UAC once** (admin required for Core Service + optional kernel driver).
-3. Accept the optional **PawnIO driver** step when prompted (recommended for CPU MSR access).
-4. Launch **Nidavellir** from the Start Menu.
+Nidavellir is currently focused on:
 
-The installer includes:
+```text
+NVIDIA GPU tuning on Windows
+````
 
-- UI (Tauri + WebView2 bootstrapper)
-- **Nidavellir Core Service** (auto-starts at boot)
-- Optional bundled **PawnIO** setup (if shipped in that release build)
+Current development priorities:
 
-You do **not** need Rust, Node, or a separate PawnIO download for normal use.
+* GPU V/F curve tuning
+* automatic power/efficiency profiling
+* Safe Loop crash recovery
+* persistent GPU knowledge
+* transparent profile generation
 
-**Requirements:** Windows 10/11 x64
+Out of scope for the current development phase:
+
+* CPU tuning
+* RAM tuning
+* AMD GPU support
+* Linux support
+
+These may return later, but the project is currently GPU-first.
 
 ---
 
-## Building from source (developers)
+## Why Nidavellir Exists
+
+Most GPUs ship with aggressive boost behavior:
+
+* high voltage headroom;
+* clocks that may not sustain under real power limits;
+* unnecessary heat and fan noise;
+* performance limited by power or thermals;
+* no clear explanation of what the best tuning point actually is.
+
+Manual undervolting can fix this, but it requires experience.
+
+Nidavellir aims to make this process accessible:
+
+```text
+Detect GPU
+→ Forge GPU
+→ Learn safe operating regions
+→ Build transparent profiles
+→ Apply the profile you prefer
+→ Recover safely if something fails
+```
+
+---
+
+## Profiles
+
+Nidavellir forges three profile types.
+
+### Godforge
+
+Maximum sustainable performance.
+
+Godforge is for users who want the highest stable performance their GPU can sustain under load.
+
+It is not based on advertised boost clocks or short-lived peaks.
+
+It is based on measured, validated, sustainable behavior.
+
+---
+
+### Brokkr's Best
+
+Recommended for most users.
+
+Brokkr's Best aims to preserve nearly all gaming performance while significantly reducing power draw, heat, and fan noise.
+
+It is the balanced profile:
+
+```text
+strong performance
++
+lower power
++
+stability-first validation
+```
+
+---
+
+### Deep Calm
+
+Maximum efficiency.
+
+Deep Calm prioritizes the best performance-per-watt result, even if some performance is sacrificed.
+
+It is intended for users who want:
+
+* lower power draw;
+* lower temperatures;
+* quieter operation;
+* efficient daily use.
+
+---
+
+## Forge Knowledge
+
+Nidavellir does not apply a fixed formula.
+
+It builds GPU-specific knowledge over time.
+
+Example:
+
+```text
++180 MHz → stable
++210 MHz → stable
++225 MHz → silent error
++255 MHz → hard reboot
+```
+
+That knowledge is preserved and used to avoid repeating unsafe regions.
+
+The long-term goal is for each GPU to become better understood over time.
+
+---
+
+## Safe Loop
+
+Nidavellir is designed around the assumption that tuning can fail.
+
+The Safe Loop system protects the user by tracking risky steps and recovering after interrupted or failed tuning attempts.
+
+Planned/active recovery behavior includes:
+
+* boot flags before risky operations;
+* detection of interrupted tuning;
+* crash/reboot classification;
+* automatic return to a safe state;
+* blacklist of known unsafe regions;
+* no persistence of known-bad profiles.
+
+Safety is part of the product, not an afterthought.
+
+---
+
+## Installing
+
+Nidavellir is not ready for general end-user installation yet.
+
+Installer builds may exist for testing, but the current project state is still active development.
+
+When end-user releases are available, they will be published through:
+
+[GitHub Releases](https://github.com/kamilogic/nidavellir/releases)
+
+Expected release package:
+
+```text
+Nidavellir_*_x64-setup.exe
+```
+
+Requirements:
+
+* Windows 10/11 x64
+* NVIDIA GPU
+* Administrator permission for the core service
+
+---
+
+## Building from Source
 
 ### Prerequisites
 
-- Windows 10/11 x64
-- [Rust](https://rustup.rs/) with **MSVC** toolchain (`rustup default stable-x86_64-pc-windows-msvc`)
-- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) — *Desktop development with C++*
-- [Node.js](https://nodejs.org/) 20+
-
-### Dev workflow
+* Windows 10/11 x64
+* [Rust](https://rustup.rs/) with MSVC toolchain
 
 ```powershell
-# Terminal 1 — Core Service (admin required for Super I/O / PawnIO LPC)
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-service-admin.ps1
-# Or: open PowerShell as Administrator, then:
-# cargo run -p nidavellir-service -- console
+rustup default stable-x86_64-pc-windows-msvc
+```
 
-# Terminal 2 — UI hot reload (normal user is fine)
+* [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+
+  * Desktop development with C++
+* [Node.js](https://nodejs.org/) 20+
+
+---
+
+## Development Workflow
+
+### Core Service
+
+The service requires administrator privileges for hardware-level operations.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-service-admin.ps1
+```
+
+Alternative:
+
+```powershell
+cargo run -p nidavellir-service -- console
+```
+
+### UI
+
+```powershell
 cd apps/ui
 npm install
 npm run tauri:dev
 ```
 
-### Release installer (local)
+---
+
+## Release Installer
 
 ```powershell
-# From repo root — builds sidecar + NSIS installer
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-full-release.ps1
 ```
 
-Output: `target/release/bundle/nsis/Nidavellir_*_x64-setup.exe`
+Expected output:
 
-### Optional: bundle PawnIO in the installer
-
-See [apps/ui/src-tauri/resources/third_party/pawnio/README.md](apps/ui/src-tauri/resources/third_party/pawnio/README.md).
+```text
+target/release/bundle/nsis/Nidavellir_*_x64-setup.exe
+```
 
 ---
 
-## Features
-
-- **Capability-first tuning** – detects what is actually adjustable on your machine.
-- **Privileged Core Service** – UI runs without admin; only the service touches MSR/PCI.
-- **PawnIO driver path** – replaces blocklisted WinRing0 (see [nidavellir-v2-plano.md](nidavellir-v2-plano.md)).
-- **Installer único para o usuário final** – UI Tauri + Core Service + (opcional) driver PawnIO em um só `.exe`.
-- **Safe Loop (v0.2+)** – crash-surviving recovery before aggressive tuning ships.
-
 ## Architecture
 
+```text
+Tauri + Svelte UI
+        |
+        | named pipe IPC
+        v
+Nidavellir Core Service
+        |
+        | NVAPI / hardware interfaces
+        v
+GPU
 ```
-UI (Tauri + Svelte 5, no admin)
-        |  named pipe IPC
-Core Service (Windows Service)
-        |  PawnIO / future GPU APIs
-   Hardware
-```
 
-## Status
+The UI runs without administrator privileges.
 
-**v0.1 — Foundations**
+The Core Service owns privileged hardware interactions.
 
-| Version | Focus |
-|---|---|
-| v0.1 | Detection, capability probe, unified installer, Core Service, UI shell |
-| v0.2 | Safe Loop — boot-flag, watchdog, crash recovery |
-| v0.3 | GPU undervolt sweep (NVAPI/ADLX) |
+---
 
-Full roadmap: [nidavellir-v2-plano.md](nidavellir-v2-plano.md)
+## Project Layout
 
-## Project layout
-
-```
+```text
 nidavellir/
-├── apps/ui/                 Tauri UI + NSIS installer config
+├── apps/
+│   └── ui/                 Tauri + Svelte frontend
 ├── crates/
-│   ├── core/                Detection, capability, IPC, sensors
-│   ├── driver-pawnio/       PawnIO backend
-│   └── service/             Windows Service
-├── scripts/
-│   ├── build-release.ps1    Build sidecar for bundle
-│   └── build-full-release.ps1  Full NSIS release
-└── nidavellir-v2-plano.md
+│   ├── core/               Shared core logic
+│   ├── gpu-nvapi/          NVIDIA GPU control and V/F curve access
+│   ├── driver-pawnio/      PawnIO backend for future CPU/MSR work
+│   └── service/            Windows service and tuning orchestration
+├── docs/
+│   ├── contracts/          UI ↔ backend contracts
+│   └── ui/                 UI/UX direction and design docs
+├── scripts/                Development and release scripts
+├── handoff.md              Continuity document for future sessions
+├── AGENTS.md               Project-wide agent instructions
+└── CLAUDE.md               Claude Code backend instructions
 ```
+
+---
+
+## Current Development Status
+
+Nidavellir is currently in active GPU-focused development.
+
+Implemented or in progress:
+
+* NVIDIA V/F curve read/write through modern NVAPI path;
+* VF ceiling concept;
+* power-aware GPU sweep;
+* Safe Loop recovery model;
+* Forge Knowledge persistence model;
+* profile synthesis model for:
+
+  * Godforge;
+  * Brokkr's Best;
+  * Deep Calm;
+* GPU-first UI redesign.
+
+Near-term focus:
+
+* multi-clock frontier sweep;
+* robust maximum sustainable clock discovery;
+* improved Brokkr's Best selection;
+* Deep Calm restoration;
+* persistent applied profile state;
+* Forge Knowledge reconstruction on service startup;
+* UI polish and design system.
+
+---
 
 ## Tests
 
 ```powershell
 cargo test -p nidavellir-core -p nidavellir-driver-pawnio -p nidavellir-service
 ```
+
+Additional GPU-specific tests may require compatible NVIDIA hardware and should be treated carefully.
+
+---
 
 ## License
 
