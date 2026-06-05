@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use nidavellir_core::gpu_sweep::StabilityResult;
 use nidavellir_core::ipc::{PowerSweepPoint, PowerSweepProgress};
 use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
-use tracing::info;
+use tracing::{info, warn};
 
 // Long enough for power to RAMP UP and stabilize (real loads like Heaven take
 // seconds to reach their sustained draw — it's a ramp, not a spike). We discard
@@ -310,6 +310,165 @@ impl PowerSweepHandle {
         });
         true
     }
+}
+
+// ---------------------------------------------------------------------------
+// Forge-state persistence — restore the completed sweep result across restarts.
+//
+// The runtime `PowerSweepProgress` (profiles, points, knowledge summary) is the
+// only place the forged state lives; on restart the handle is rebuilt empty, so
+// the UI sees an unforged GPU even though `gpu_knowledge.json` persisted. We
+// snapshot the *completed* progress to `forge_state.json` and seed the handle
+// from it on startup. This does NOT recompute anything from knowledge and does
+// not alter the IPC `PowerSweepProgress` type (the wrapper is service-internal).
+// ---------------------------------------------------------------------------
+
+/// Bump when the persisted shape changes incompatibly; older files are ignored.
+const FORGE_STATE_SCHEMA: u32 = 1;
+/// Keep only the last N log lines in the snapshot (the live log can be long).
+const FORGE_STATE_LOG_TAIL: usize = 40;
+
+/// On-disk wrapper around a completed `PowerSweepProgress`, tagged with the GPU
+/// it was forged on and a schema version for forward-compatible rejection.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ForgeStateFile {
+    schema_version: u32,
+    gpu_key: String,
+    progress: PowerSweepProgress,
+}
+
+/// Outcome of decoding a `forge_state.json` payload — kept separate from the FS
+/// layer so the validation rules are unit-testable without touching ProgramData.
+#[derive(Debug)]
+enum ForgeStateLoad {
+    Loaded(Box<PowerSweepProgress>),
+    GpuMismatch { stored: String },
+    SchemaMismatch { found: u32 },
+    Corrupt,
+}
+
+/// Serialize a completed progress for persistence: force `running=false` and trim
+/// the log to its tail so the file stays small. Returns `None` if serialization
+/// fails (caller simply skips the write).
+fn encode_forge_state(gpu_key: &str, prog: &PowerSweepProgress) -> Option<String> {
+    let mut snapshot = prog.clone();
+    snapshot.running = false;
+    if snapshot.log.len() > FORGE_STATE_LOG_TAIL {
+        let drop = snapshot.log.len() - FORGE_STATE_LOG_TAIL;
+        snapshot.log.drain(0..drop);
+    }
+    let file = ForgeStateFile {
+        schema_version: FORGE_STATE_SCHEMA,
+        gpu_key: gpu_key.to_string(),
+        progress: snapshot,
+    };
+    serde_json::to_string_pretty(&file).ok()
+}
+
+/// Validate and decode a persisted payload against the detected GPU. Restored
+/// progress always has `running=false` (we never resurrect a "running" sweep).
+fn decode_forge_state(json: &str, gpu_key: &str) -> ForgeStateLoad {
+    let file: ForgeStateFile = match serde_json::from_str(json.trim_start_matches('\u{feff}')) {
+        Ok(f) => f,
+        Err(_) => return ForgeStateLoad::Corrupt,
+    };
+    if file.schema_version != FORGE_STATE_SCHEMA {
+        return ForgeStateLoad::SchemaMismatch { found: file.schema_version };
+    }
+    if file.gpu_key != gpu_key {
+        return ForgeStateLoad::GpuMismatch { stored: file.gpu_key };
+    }
+    let mut prog = file.progress;
+    prog.running = false;
+    ForgeStateLoad::Loaded(Box::new(prog))
+}
+
+#[cfg(windows)]
+fn forge_state_path() -> std::path::PathBuf {
+    nidavellir_core::safe_loop::default_data_dir().join("forge_state.json")
+}
+
+/// Persist the completed sweep result. Best-effort: any failure is logged and
+/// ignored so it can never interfere with the sweep finishing.
+#[cfg(windows)]
+fn save_forge_state(gpu_key: &str, prog: &PowerSweepProgress) {
+    let _ = std::fs::create_dir_all(nidavellir_core::safe_loop::default_data_dir());
+    match encode_forge_state(gpu_key, prog) {
+        Some(j) => match std::fs::write(forge_state_path(), j) {
+            Ok(()) => info!(
+                "forge_state saved (gpu='{}', {} points)",
+                gpu_key,
+                prog.points.len()
+            ),
+            Err(e) => warn!("forge_state save failed: {e}"),
+        },
+        None => warn!("forge_state serialize failed — not saved"),
+    }
+}
+
+/// Load the persisted forge result for `gpu_key`, or `None` to start idle.
+/// Logs each outcome (loaded / missing / GPU mismatch / failure) per spec.
+#[cfg(windows)]
+fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
+    let json = match std::fs::read_to_string(forge_state_path()) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("forge_state missing — starting with idle forge state");
+            return None;
+        }
+        Err(e) => {
+            warn!("forge_state read failed ({e}) — starting idle");
+            return None;
+        }
+    };
+    match decode_forge_state(&json, gpu_key) {
+        ForgeStateLoad::Loaded(prog) => {
+            info!(
+                "forge_state loaded (gpu='{}', {} points)",
+                gpu_key,
+                prog.points.len()
+            );
+            Some(*prog)
+        }
+        ForgeStateLoad::GpuMismatch { stored } => {
+            info!(
+                "forge_state ignored — GPU mismatch (stored '{stored}', detected '{gpu_key}')"
+            );
+            None
+        }
+        ForgeStateLoad::SchemaMismatch { found } => {
+            warn!(
+                "forge_state ignored — schema {found} != expected {FORGE_STATE_SCHEMA}"
+            );
+            None
+        }
+        ForgeStateLoad::Corrupt => {
+            warn!("forge_state load failure — payload unreadable, starting idle");
+            None
+        }
+    }
+}
+
+/// Build the power-sweep handle, seeded from the persisted forge result when one
+/// matches this GPU. The GPU key is derived the same way the sweep keys its
+/// knowledge (`read_curve().name`), so keys match reliably.
+#[cfg(windows)]
+pub fn restore_handle() -> PowerSweepHandle {
+    let handle = PowerSweepHandle::default();
+    let gpu_key = nidavellir_gpu_nvapi::read_curve()
+        .map(|c| c.name)
+        .unwrap_or_else(|_| "unknown-gpu".into());
+    if let Some(prog) = load_forge_state(&gpu_key) {
+        if let Ok(mut g) = handle.progress.lock() {
+            *g = prog;
+        }
+    }
+    handle
+}
+
+#[cfg(not(windows))]
+pub fn restore_handle() -> PowerSweepHandle {
+    PowerSweepHandle::default()
 }
 
 #[cfg(windows)]
@@ -1006,6 +1165,12 @@ fn run_power_sweep(
     }
     prog.running = false;
     prog.phase = "done".into();
+    // Persist the completed result so the service can reconstruct forged
+    // profiles/points after a restart. Only when there is a usable profile, so a
+    // failed/empty sweep never overwrites a previously good snapshot.
+    if prog.godforge.is_some() {
+        save_forge_state(&gpu_key, &prog);
+    }
     set(&progress, prog);
     info!("Power sweep finished");
 }
@@ -1134,5 +1299,85 @@ mod tests {
         let p = synthesize_forge_profiles(&frontier, 0.85);
         assert!(p.godforge.is_some());
         assert!(p.log.iter().any(|l| l.contains("best-effort")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forge_state_roundtrips_and_forces_not_running() {
+        let mut prog = idle();
+        prog.phase = "done".into();
+        prog.running = true; // a running snapshot must restore as NOT running
+        prog.stock_clock_mhz = 1786;
+        prog.points = vec![fp(1830, 200.0), fp(1815, 181.0)];
+        prog.godforge = Some(fp(1830, 200.0));
+        prog.brokkrs = Some(fp(1815, 181.0));
+
+        let json = encode_forge_state("RTX-TEST", &prog).expect("encode");
+        match decode_forge_state(&json, "RTX-TEST") {
+            ForgeStateLoad::Loaded(p) => {
+                assert!(!p.running, "restored progress must never be running");
+                assert_eq!(p.phase, "done");
+                assert_eq!(p.points.len(), 2);
+                assert_eq!(p.godforge.unwrap().clock_mhz, 1830);
+                assert_eq!(p.brokkrs.unwrap().clock_mhz, 1815);
+                assert_eq!(p.stock_clock_mhz, 1786);
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forge_state_rejects_gpu_mismatch() {
+        let json = encode_forge_state("RTX-3060Ti", &idle()).unwrap();
+        match decode_forge_state(&json, "RTX-4090") {
+            ForgeStateLoad::GpuMismatch { stored } => assert_eq!(stored, "RTX-3060Ti"),
+            other => panic!("expected GpuMismatch, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forge_state_rejects_schema_mismatch() {
+        let file = ForgeStateFile {
+            schema_version: FORGE_STATE_SCHEMA + 1,
+            gpu_key: "RTX-TEST".into(),
+            progress: idle(),
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        match decode_forge_state(&json, "RTX-TEST") {
+            ForgeStateLoad::SchemaMismatch { found } => assert_eq!(found, FORGE_STATE_SCHEMA + 1),
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forge_state_rejects_corrupt_payload() {
+        assert!(matches!(
+            decode_forge_state("{ not valid json", "RTX-TEST"),
+            ForgeStateLoad::Corrupt
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forge_state_log_trimmed_to_tail() {
+        let mut prog = idle();
+        prog.log = (0..FORGE_STATE_LOG_TAIL + 25)
+            .map(|i| format!("line {i}"))
+            .collect();
+        let json = encode_forge_state("RTX-TEST", &prog).unwrap();
+        match decode_forge_state(&json, "RTX-TEST") {
+            ForgeStateLoad::Loaded(p) => {
+                assert_eq!(p.log.len(), FORGE_STATE_LOG_TAIL);
+                // The tail is kept (oldest lines dropped).
+                assert_eq!(
+                    p.log.last().unwrap(),
+                    &format!("line {}", FORGE_STATE_LOG_TAIL + 24)
+                );
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
     }
 }

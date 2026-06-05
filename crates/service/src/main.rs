@@ -87,7 +87,9 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         mem_sweep: MemSweepHandle::default(),
         forge_all: ForgeAllHandle::default(),
         benchmark: BenchmarkHandle::default(),
-        power_sweep: PowerSweepHandle::default(),
+        // Seed from the persisted forge result so a restart restores forged
+        // profiles/points instead of showing an unforged GPU.
+        power_sweep: gpu_power_sweep::restore_handle(),
     }));
     ipc_server::run_pipe_server(state)?;
     Ok(())

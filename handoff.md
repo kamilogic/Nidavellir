@@ -3,6 +3,25 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Latest backend checkpoint (2026-06-05) — forge-state persistence
+- **F1b is on hold** pending two foundation reviews; cheap lower-clock probe plan is
+  NOT approved. Review 1 (persistence/startup reconstruction) is done.
+- **Shipped**: `forge_state.json` (under `%ProgramData%\Nidavellir`) persists the final
+  `PowerSweepProgress` on successful sweep completion (only when a profile exists, so a
+  failed sweep can't wipe a good snapshot). Startup seeds `PowerSweepHandle` from it when
+  the GPU key (`read_curve().name`) matches; else idle. Fixes a service restart losing
+  forged profiles/points/apply buttons. Files: `crates/service/src/gpu_power_sweep.rs`
+  (+ `main.rs`, `service_impl.rs` seed both startup paths). Backend-only — no UI, IPC,
+  Safe Loop, synthesis, or `gpu_knowledge.json` change.
+- **Validation**: `cargo test -p nidavellir-service` → 11/11 pass;
+  `cargo check -p nidavellir-service` → no warnings. No GPU stress run.
+- **Remaining foundation work (in order)**:
+  a) manual restart verification (apply a profile → restart service → UI still shows it);
+  b) applied curve / live VF verification (curve-ownership reconciliation: detect
+     Nidavellir-applied vs unknown/Afterburner/manual — design only so far);
+  c) sensor quality / telemetry reliability audit (Review 2, not started);
+  d) F1b redesign — only after a–c land and the direction is confirmed.
+
 ## Where things stand
 - **Brokkr's V1 (continuous per-GPU knowledge): implemented + HW-validated.**
 - **V2 (confidence-gated selection): committed (5d72342).** `cargo test` 3/3. The

@@ -8,9 +8,17 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Current status (2026-06-04)
-- `master`, tag **v0.3.1**. Work on worktree branch `claude/vigilant-gagarin-213d23`.
-- Active work: **product model** — 3 profiles forged from a clock×power frontier
+## Current status (2026-06-05)
+- `master`, tag **v0.3.1**. Work on worktree branch `claude/vibrant-almeida-dfb6c7`.
+- Active work: **foundation reviews before F1b** (F1b on hold, direction not final).
+  Review 1 (persistence/startup) done → forge-state persistence fix shipped (below).
+- **Forge-state persistence (this session)**: new `forge_state.json` persists the
+  final `PowerSweepProgress` (profiles, points, stock baseline) on successful sweep
+  completion; startup restores the `PowerSweepHandle` from it when the GPU key
+  matches (else idle). Fixes a service restart losing forged profiles/points/apply
+  buttons. Backend-only; no UI, IPC, Safe Loop, synthesis or knowledge-schema change.
+  **Does not** solve live VF-curve ownership/mismatch — deferred.
+- Product model: 3 profiles forged from a clock×power frontier
   (Godforge/Brokkr's/Deep Calm). See `product.md`.
 - **V1** continuous per-GPU stability knowledge: implemented, committed, HW-validated.
 - **V2** confidence-gated selection: implemented + unit-tested, **committed** (5d72342).

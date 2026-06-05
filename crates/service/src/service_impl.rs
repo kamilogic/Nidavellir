@@ -60,7 +60,9 @@ pub fn run_service() -> windows_service::Result<()> {
         mem_sweep: crate::gpu_mem_sweep::MemSweepHandle::default(),
         forge_all: crate::gpu_forge_all::ForgeAllHandle::default(),
         benchmark: crate::gpu_benchmark::BenchmarkHandle::default(),
-        power_sweep: crate::gpu_power_sweep::PowerSweepHandle::default(),
+        // Seed from the persisted forge result so a restart restores forged
+        // profiles/points instead of showing an unforged GPU.
+        power_sweep: crate::gpu_power_sweep::restore_handle(),
     }));
 
     let pipe_state = Arc::clone(&state);
