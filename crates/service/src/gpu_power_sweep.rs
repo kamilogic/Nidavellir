@@ -670,6 +670,98 @@ fn select_brokkrs_v2(
     (v1, log)
 }
 
+/// The three forge profiles synthesized from a power frontier (F1 product model).
+#[cfg(windows)]
+#[allow(dead_code)] // wired into the live sweep by F1b (multi-clock measurement)
+struct ForgeProfiles {
+    godforge: Option<PowerSweepPoint>,
+    brokkrs: Option<PowerSweepPoint>,
+    deep_calm: Option<PowerSweepPoint>,
+    log: Vec<String>,
+}
+
+/// Synthesize the three forge profiles from a power frontier — each entry a measured
+/// operating point plus its accumulated stability confidence (Wilson LB):
+/// - **Godforge**  = highest sustained clock (performance).
+/// - **Brokkr's**  = best benefit/cost `R = %power_saved ÷ %clock_lost` vs Godforge
+///   (balance) — deliberately NOT simply the best MHz/W.
+/// - **Deep Calm** = best MHz/W (efficiency).
+/// Only points with confidence ≥ `threshold` are eligible; if none qualify the gate
+/// is dropped (best-effort) and logged, so synthesis never returns nothing. Pure +
+/// unit-tested; the multi-clock frontier that feeds it is produced by F1b.
+#[cfg(windows)]
+#[allow(dead_code)] // wired into the live sweep by F1b (multi-clock measurement)
+fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], threshold: f64) -> ForgeProfiles {
+    use std::cmp::Ordering as Ord;
+    let mut log = Vec::new();
+
+    // Confidence gate (reuses V2): trust only well-tested points; else best-effort.
+    let pool: Vec<(PowerSweepPoint, f64)> = {
+        let trusted: Vec<(PowerSweepPoint, f64)> =
+            frontier.iter().copied().filter(|(_, c)| *c >= threshold).collect();
+        if trusted.is_empty() {
+            let best = frontier.iter().map(|(_, c)| *c).fold(0.0_f64, f64::max);
+            log.push(format!(
+                "FORGE: no point met confidence ≥ {threshold:.2} (best {best:.2}) — best-effort synthesis"
+            ));
+            frontier.to_vec()
+        } else {
+            trusted
+        }
+    };
+    if pool.is_empty() {
+        return ForgeProfiles { godforge: None, brokkrs: None, deep_calm: None, log };
+    }
+
+    // Godforge = highest sustained clock (ties → the lowest power that holds it).
+    let godforge = pool
+        .iter()
+        .copied()
+        .max_by(|a, b| {
+            a.0.clock_mhz
+                .cmp(&b.0.clock_mhz)
+                .then(b.0.power_w.partial_cmp(&a.0.power_w).unwrap_or(Ord::Equal))
+        })
+        .unwrap();
+
+    // Deep Calm = best efficiency (MHz/W).
+    let deep_calm = pool
+        .iter()
+        .copied()
+        .max_by(|a, b| a.0.perf_per_watt.partial_cmp(&b.0.perf_per_watt).unwrap_or(Ord::Equal))
+        .unwrap();
+
+    // Brokkr's = best R = %power_saved ÷ %clock_lost vs Godforge, among points that
+    // trade some clock for a power win; falls back to Godforge if no such trade exists.
+    let gc = godforge.0.clock_mhz as f64;
+    let gp = godforge.0.power_w as f64;
+    let r_of = |p: &PowerSweepPoint| -> f64 {
+        let clk_lost = (gc - p.clock_mhz as f64) / gc;
+        let pwr_saved = (gp - p.power_w as f64) / gp;
+        if clk_lost > 0.0 { pwr_saved / clk_lost } else { 0.0 }
+    };
+    let brokkrs = pool
+        .iter()
+        .copied()
+        .filter(|(p, _)| (p.clock_mhz as f64) < gc && (p.power_w as f64) < gp)
+        .max_by(|a, b| r_of(&a.0).partial_cmp(&r_of(&b.0)).unwrap_or(Ord::Equal))
+        .unwrap_or(godforge);
+
+    log.push(format!(
+        "FORGE: Godforge {}MHz/{:.0}W · Brokkr's {}MHz/{:.0}W (R={:.2}) · Deep Calm {}MHz/{:.0}W ({:.2} MHz/W)",
+        godforge.0.clock_mhz, godforge.0.power_w,
+        brokkrs.0.clock_mhz, brokkrs.0.power_w, r_of(&brokkrs.0),
+        deep_calm.0.clock_mhz, deep_calm.0.power_w, deep_calm.0.perf_per_watt
+    ));
+
+    ForgeProfiles {
+        godforge: Some(godforge.0),
+        brokkrs: Some(brokkrs.0),
+        deep_calm: Some(deep_calm.0),
+        log,
+    }
+}
+
 #[cfg(windows)]
 fn run_power_sweep(
     progress: Arc<Mutex<PowerSweepProgress>>,
@@ -988,5 +1080,59 @@ mod tests {
         let (pick, log) = select_brokkrs_v2(&off_cap, &off_cap, &know, SweepProfile::Balanced);
         assert_eq!(pick.unwrap().offset_mhz, 180);
         assert!(log.iter().any(|l| l.contains("fallback=V1")));
+    }
+
+    #[cfg(windows)]
+    fn fp(clock_mhz: u32, power_w: f32) -> PowerSweepPoint {
+        PowerSweepPoint {
+            voltage_mv: 900,
+            clock_mhz,
+            offset_mhz: 0,
+            power_w,
+            max_power_w: power_w + 5.0,
+            power_std_w: 1.0,
+            power_capped_frac: 0.0,
+            stable: true,
+            perf_per_watt: clock_mhz as f64 / power_w as f64,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forge_synthesis_separates_the_three_profiles() {
+        // Multi-clock frontier: clock falls, power falls; all well-tested.
+        let frontier = vec![
+            (fp(1830, 200.0), 0.95),
+            (fp(1815, 181.0), 0.95), // small clock loss, big power win → best R
+            (fp(1770, 164.0), 0.95),
+            (fp(1740, 158.0), 0.95), // best MHz/W
+        ];
+        let p = synthesize_forge_profiles(&frontier, 0.85);
+        assert_eq!(p.godforge.unwrap().clock_mhz, 1830, "Godforge = highest clock");
+        assert_eq!(p.brokkrs.unwrap().clock_mhz, 1815, "Brokkr's = best benefit/cost R");
+        assert_eq!(p.deep_calm.unwrap().clock_mhz, 1740, "Deep Calm = best MHz/W");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forge_godforge_respects_confidence_gate() {
+        // Top clock barely tested → Godforge drops to the highest TRUSTED clock.
+        let frontier = vec![
+            (fp(1830, 200.0), 0.20),
+            (fp(1815, 181.0), 0.95),
+            (fp(1770, 164.0), 0.95),
+        ];
+        let p = synthesize_forge_profiles(&frontier, 0.85);
+        assert_eq!(p.godforge.unwrap().clock_mhz, 1815);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forge_falls_back_when_nothing_is_trusted() {
+        // Immature data → nothing clears the gate → best-effort, still returns profiles.
+        let frontier = vec![(fp(1830, 200.0), 0.21), (fp(1770, 164.0), 0.21)];
+        let p = synthesize_forge_profiles(&frontier, 0.85);
+        assert!(p.godforge.is_some());
+        assert!(p.log.iter().any(|l| l.contains("best-effort")));
     }
 }

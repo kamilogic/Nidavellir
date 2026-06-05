@@ -8,12 +8,14 @@ This file is the continuity index. See also: `architecture.md`, `decisions.md`,
 `roadmap.md`, `handoff.md`, and the methodology doc `docs/gpu-forge.md`.
 
 ## Current status (2026-06-04)
-- `master`, latest tag **v0.3.1**. V2 work on a worktree branch (uncommitted).
-- Active work: **Brokkr's Best** profile refinement — the perf/watt undervolt.
-- **V1** of the continuous per-GPU stability-knowledge algorithm is implemented,
-  committed, and validated on hardware (no crash). Service + UI run; GPU at stock.
-- **V2 (confidence-gated selection) is implemented + unit-tested** (compiles clean;
-  3 tests pass). Not yet committed. See `decisions.md`.
+- `master`, tag **v0.3.1**. Work on worktree branch `claude/vigilant-gagarin-213d23`.
+- Active work: **product model** — 3 profiles forged from a clock×power frontier
+  (Godforge/Brokkr's/Deep Calm). See `product.md`.
+- **V1** continuous per-GPU stability knowledge: implemented, committed, HW-validated.
+- **V2** confidence-gated selection: implemented + unit-tested, **committed** (5d72342).
+- **F1a (this session)**: pure 3-profile synthesis (`synthesize_forge_profiles`) +
+  tests — Godforge=clock / Brokkr's=R / Deep Calm=MHz/W; not yet wired (F1b).
+  6 tests pass; uncommitted. See `decisions.md`.
 
 ## Completed work (this arc)
 - **Modern NvAPI V/F curve (ClkVfPoints) read + write + apply + reset** work on
@@ -46,11 +48,9 @@ This file is the continuity index. See also: `architecture.md`, `decisions.md`,
 - 2 `.exe` binaries committed inflate the repo — confirm intent vs `.gitignore`/LFS.
 
 ## Next recommended actions
-1. **Commit V2** (worktree branch) once reviewed; then consider exposing the
-   profile via IPC/UI (currently a const).
-2. **V3**: dedicated short confidence trials on the safe side so the gate matures —
-   today every point has 1 trial → Wilson-LB ≈ 0.21 → V2 falls back to V1.
-   `arduous_validate`'s 35 s soak discards its result: the natural hook to record it.
-3. Optionally one more supervised sweep → converges at +240 (~870 mV ≈ user's
-   hand-tuned 1800 MHz @ 875 mV), then stops by design.
-4. In-game apply test of Brokkr's via the VF ceiling (user present).
+1. **Commit F1a** (synthesis + tests + vision docs) once reviewed.
+2. **F1b**: extend the safe flatten sweep to multiple target clocks → real game-power
+   clock×power frontier; decide knowledge keying by (clock, offset); wire
+   `synthesize_forge_profiles` into the live sweep (replaces the single-clock picks).
+3. Then F2–F7 (see `product.md` / `roadmap.md`).
+4. In-game apply test (user present); optional one more supervised sweep → +240.

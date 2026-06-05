@@ -4,12 +4,14 @@ How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
 ## Where things stand
-- **Brokkr's V1 (continuous per-GPU knowledge) is implemented + validated on HW.**
-- **V2 (confidence-gated selection) is implemented + unit-tested (uncommitted, on
-  worktree branch `claude/vigilant-gagarin-213d23`).** `cargo check` clean;
-  `cargo test -p nidavellir-service` = 3/3. Active profile = Balanced (.85), a const.
-  With today's 1-trial data the gate falls back to V1, so the chosen point is
-  unchanged — but the decision is now logged.
+- **Brokkr's V1 (continuous per-GPU knowledge): implemented + HW-validated.**
+- **V2 (confidence-gated selection): committed (5d72342).** `cargo test` 3/3. The
+  gate is now reused as the confidence axis for all 3 product profiles.
+- **Product reframe (this session, see `product.md`)**: 3 profiles forged from a
+  clock×power frontier. **F1a done** — pure `synthesize_forge_profiles` + tests
+  (6/6), not yet wired. **F1b** = produce the real multi-clock frontier.
+- Architecture finding: two overlapping sweep engines (safe flatten vs unsafe
+  lock-voltage frontier); F1b builds on the flatten one — tech debt to consolidate.
 - Last supervised sweep explored to **+210 offset (~881 mV)** with NO crash and
   found Brokkr's = **1830 MHz @ 881 mV · 179 W · 10.24 MHz/W (off-cap)** — essentially
   the user's hand-tuned 1800 MHz @ 875 mV. Godforge = stock max-voltage point.
@@ -33,13 +35,12 @@ How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
   ABS_MAX_OFFSET=240; never re-touches the 255 reboot).
 
 ## Pending / next actions
-1. **Commit V2** (worktree branch `claude/vigilant-gagarin-213d23`) once reviewed;
-   then consider exposing the profile via IPC/UI (currently a const).
-2. **V3**: confidence trials so the gate matures (today 1 trial/point → falls back to
-   V1). `arduous_validate`'s 35 s soak discards its result — the natural hook.
-3. Optional: one more supervised sweep → +240, closes the exploration.
-4. In-game apply test of Brokkr's (`ApplyPowerBrokkrs`) — confirm consistency in
-   Overwatch. Small TDR risk; user present.
+1. **Commit F1a** (synthesis + tests + `product.md`/decisions/roadmap) once reviewed.
+2. **F1b**: extend the safe flatten sweep to several target clocks → real game-power
+   clock×power frontier; knowledge keying by (clock, offset); wire
+   `synthesize_forge_profiles` in (replaces the single-clock godforge/brokkrs picks).
+3. Then F2–F7 (see `product.md`).
+4. In-game apply test (`ApplyPowerBrokkrs`) — consistency in Overwatch; user present.
 
 ## Gotchas / safety
 - **Deep undervolt can HARD-REBOOT** (not just TDR). +255/~855 mV did. Never

@@ -13,16 +13,19 @@
   - **V1 continuous per-GPU stability knowledge** (severity frontier, per-point
     stats, data-driven margin — no fixed MHz).
 
-## Now — Brokkr's refinement
-- **V2 (DONE this session, uncommitted):** Wilson lower-bound confidence gate;
-  selection = max `score()` s.t. confidence ≥ profile threshold; profiles
-  **Conservative .95 / Balanced .85 (active) / Aggressive .70**; V1 fallback when
-  none clears the gate. Implemented + unit-tested in `gpu_power_sweep.rs`. Profile
-  is a const (IPC/UI plumbing is a follow-up).
-- **V3 (next):** dedicated short confidence trials on the safe side so the gate
-  matures (today 1 trial/point → always falls back to V1); `arduous_validate`'s soak
-  is the natural place to record confidence; reinforce promising points; tune
-  `target_clock_mhz` selection.
+## Now — Product model (see product.md)
+Reframed around 3 profiles forged from a clock×power frontier. Phases:
+- **F1 — Profile model**: 3-profile synthesis (Godforge=clock / Brokkr's=R / Deep
+  Calm=MHz/W) + V2 confidence gate.
+  - **F1a (DONE)** — pure `synthesize_forge_profiles` + unit tests. Not yet wired.
+  - **F1b (next)** — extend the safe flatten sweep to multiple target clocks (real
+    game-power frontier); knowledge keying by (clock, offset); wire synthesis in.
+- **F2** transparency (clock/power deltas) · **F3** Forge modes (Quick/Deep/
+  Continuous; breadth = #clock levels) · **F4** reboot→knowledge + limits 1/2/3 ·
+  **F5** lifecycle (Forged→Legendary) · **F6** passive monitoring · **F7** UI
+  (Forge GPU / Refine / Forge Progress).
+- **V2** (Wilson gate) shipped — reused as the confidence axis for all 3 profiles.
+  **V3** (confidence-maturing trials) folds into F1b/F4.
 
 ## Near-term
 - **Godforge** as a real OC profile (currently the max-voltage stock point).
@@ -42,3 +45,5 @@
 ## Housekeeping
 - Confirm the 2 committed `.exe` binaries are intentional (PawnIO runtime) vs
   candidates for `.gitignore` / git-lfs (~17 K "LOC" of binary in the repo).
+- Consolidate the two sweep engines (flatten vs lock-voltage) + redundant
+  `synthesize_profiles` onto the safe flatten engine (see `product.md`).

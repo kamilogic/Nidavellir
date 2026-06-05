@@ -2,6 +2,24 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Product model: 3 profiles over a clock×power frontier (reverses "two profiles")
+- **Decision**: ship **Godforge / Brokkr's Best / Deep Calm**, synthesized from a
+  multi-clock power frontier:
+  - Godforge = highest sustainable clock under the cap (not the advertised boost).
+  - Brokkr's = max `R = %power_saved ÷ %clock_lost` vs Godforge (**NOT** max MHz/W).
+  - Deep Calm = max MHz/W.
+  Two orthogonal axes: the **product profile** (objective) and the **confidence
+  profile** (Conservative/Balanced/Aggressive — the V2 Wilson gate, applied to all 3).
+- **Reverses**: the earlier "Two profiles, not three / removed Deep Calm" and
+  "Brokkr's = max MHz/W". Under the product vision (`product.md`), Brokkr's is a
+  benefit/cost trade and the old Brokkr's metric (MHz/W) becomes Deep Calm.
+- **Requires** a multi-clock frontier measured in real power. The validated *flatten*
+  sweep is single-clock; the *lock-voltage* frontier sweep is unsafe under game load
+  and uses a voltage proxy. Chosen path (A): **extend the safe flatten sweep to
+  multiple target clocks** (F1b) — keeps safety + game-power + continuous knowledge.
+- **Status**: F1a (pure `synthesize_forge_profiles`) implemented + unit-tested
+  (reproduces Godforge 1830 / Brokkr's 1815 / Deep Calm 1740); not yet wired (F1b).
+
 ## V2 selection = Wilson-confidence gate (not score×confidence), with V1 fallback
 - **Decision**: among off-cap points, pick the highest accumulated `score()` (MHz/W)
   whose stability confidence — Wilson lower bound (z=1.96) over accumulated
