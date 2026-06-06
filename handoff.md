@@ -3,9 +3,49 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-05) — forge-state persistence
+## Latest backend checkpoint (2026-06-05) — Sensor Quality Audit (Review 2, investigation-only)
+- **No code/IPC/UI change.** GPU telemetry sources are right (NVML clock/power/cap/temp/
+  util; NVAPI curve). Three structural gaps found:
+  1. **Two disconnected telemetry worlds**: "sensor world" (`SensorEngine`/`GpuSensors`,
+     **30 s cache, `voltage_mv` hardcoded `None`** → UI never gets GPU voltage) vs
+     "sweep world" (`load_and_measure`, NVML 30 ms + NVAPI voltage ~480 ms, stored as
+     `fetch_max`). Nothing reconciles them.
+  2. **Voltage is the weakest signal**: NVAPI `core_voltage()` **string-parsed**, sparse,
+     **max-only**, ramp-unfiltered — then **reused as the deterministic `apply_vf_ceiling`
+     threshold** (`PowerSweepPoint.voltage_mv` → `AppliedProfile.core.voltage_mv` →
+     `ceiling_mv`). This is the root of 837-vs-869 and makes apply fidelity unprovable.
+  3. **One name, three meanings**: `voltage_mv` on `PowerSweepPoint` (measured max),
+     `VfCurvePoint`/GetStatus (VF-table), `AppliedProfile.core` (measured, consumed as
+     curve threshold).
+- **KEY DECISION (see `decisions.md`)**: split voltage into **`vf_table_voltage_mv`**
+  (deterministic, the **apply/frontier key**) · **`measured_voltage_mv`** avg/min/max
+  (telemetry + HWiNFO cross-check only, never an apply key) · **`effective_rail_voltage_mv`**
+  (future). **F1b must NOT key on measured dwell voltage.**
+- **Verdicts NOT finalized**: 837-vs-869 ≈ undersampling + bin quantization (expected,
+  not apply failure); constant ~1062 mV unfocused/desktop ≈ workload-scoped (P0/3D)
+  ceiling leaving other states on stock curve + frequency-only flatten leaving voltage
+  uncapped. To be confirmed by the verification work.
+- **Other gaps**: perf-limiter only reads `SW_POWER_CAP` (NVML exposes the full
+  `ThrottleReasons` set — thermal/voltage/util discarded); no timestamps/p5-clock-dip
+  stats; no workload-context tag; no cross-validation (0 mV / 0 W dropouts stored as real).
+- **Post-audit sequencing** (F1b stays on hold until 1–3 land): (1) split voltage fields +
+  stop keying apply on measured voltage [must-fix]; (2) richer dwell stats + full limiter +
+  context tag; (3) finalize Applied Curve Verification (table-to-table GetStatus plateau,
+  not vs measured voltage) + verify IPC + `GpuApplyStatus.verification`; (4) F1b on the
+  cleaned axis.
+
+## Backend checkpoint (2026-06-05) — Applied Curve Verification review (investigation-only)
+- **No code change.** Apply is **write-and-forget** (`apply_core` logs flattened count,
+  no readback). `GetAppliedProfile` is **metadata-only** (`gpu_applied.json`, no live
+  driver check) — "Applied ✓" = file exists, not curve verified. Verification must use
+  the **modern ClkVfPoints GetStatus** path (`read_vf_curve_modern`), not legacy
+  `read_curve`/`GetGpuCurve`. The flatten caps **frequency, not voltage** — a high VF bin
+  can still be selected. Primitive for verification already exists (`read_vf_curve_modern`),
+  just unwired. Feeds directly into the sensor-audit sequencing above.
+
+## Backend checkpoint (2026-06-05) — forge-state persistence
 - **F1b is on hold** pending two foundation reviews; cheap lower-clock probe plan is
-  NOT approved. Review 1 (persistence/startup reconstruction) is done.
+  NOT approved. Both reviews (persistence/startup + sensor quality) are now done.
 - **Shipped**: `forge_state.json` (under `%ProgramData%\Nidavellir`) persists the final
   `PowerSweepProgress` on successful sweep completion (only when a profile exists, so a
   failed sweep can't wipe a good snapshot). Startup seeds `PowerSweepHandle` from it when
@@ -17,10 +57,14 @@ How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
   `cargo check -p nidavellir-service` → no warnings. No GPU stress run.
 - **Remaining foundation work (in order)**:
   a) manual restart verification (apply a profile → restart service → UI still shows it);
-  b) applied curve / live VF verification (curve-ownership reconciliation: detect
-     Nidavellir-applied vs unknown/Afterburner/manual — design only so far);
-  c) sensor quality / telemetry reliability audit (Review 2, not started);
-  d) F1b redesign — only after a–c land and the direction is confirmed.
+  b) **must-fix**: split voltage fields (`vf_table_voltage_mv` / `measured_voltage_mv` /
+     `effective_rail_voltage_mv`) + stop keying `apply_vf_ceiling` on measured voltage;
+  c) richer dwell stats (min/p5 clock, voltage avg/min/max, full `ThrottleReasons`,
+     sample_count, timestamps, workload-context tag);
+  d) finalize Applied Curve Verification (post-apply GetStatus plateau readback,
+     table-to-table; verify IPC + `GpuApplyStatus.verification`);
+  e) F1b redesign — only after b–d land and the direction is confirmed; key the frontier
+     by (clock + VF-table point), NOT measured voltage.
 
 ## Where things stand
 - **Brokkr's V1 (continuous per-GPU knowledge): implemented + HW-validated.**

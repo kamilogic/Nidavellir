@@ -9,9 +9,22 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
 ## Current status (2026-06-05)
-- `master`, tag **v0.3.1**. Work on worktree branch `claude/vibrant-almeida-dfb6c7`.
+- `master`, tag **v0.3.1** (forge-state persistence pushed). Worktree branch
+  `claude/vibrant-almeida-dfb6c7`.
 - Active work: **foundation reviews before F1b** (F1b on hold, direction not final).
-  Review 1 (persistence/startup) done → forge-state persistence fix shipped (below).
+  Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
+  Applied-Curve-Verification review **done** (investigation; see handoff).
+  Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **Sensor Quality Audit (this session, investigation-only — no code)**: GPU telemetry
+  sources are right (NVML clock/power/cap/temp/util; NVAPI curve), but three structural
+  gaps found: (1) two disconnected telemetry worlds — "sensor world" (`SensorEngine`/
+  `GpuSensors`, **30 s cache, `voltage_mv` always `None`** → UI never gets GPU voltage)
+  vs "sweep world" (`load_and_measure`, NVML 30 ms + NVAPI voltage ~480 ms **max**);
+  (2) voltage is the weakest signal — string-parsed, sparse, max-only, then **reused as
+  the deterministic apply ceiling key**; (3) one type name `voltage_mv` carries three
+  incompatible meanings. **Key decision** (see `decisions.md`): split voltage into
+  `vf_table_voltage_mv` (apply/frontier key) · `measured_voltage_mv` (telemetry only) ·
+  `effective_rail_voltage_mv` (future). **F1b must NOT key on measured dwell voltage.**
 - **Forge-state persistence (this session)**: new `forge_state.json` persists the
   final `PowerSweepProgress` (profiles, points, stock baseline) on successful sweep
   completion; startup restores the `PowerSweepHandle` from it when the GPU key
@@ -74,8 +87,21 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 - 2 `.exe` binaries committed inflate the repo — confirm intent vs `.gitignore`/LFS.
 
 ## Next recommended actions
-1. **F1b** (pending user approval): extend the safe flatten sweep to multiple target
-   clocks → real game-power clock×power frontier; knowledge keying by (clock, offset);
-   wire `synthesize_forge_profiles` into the live sweep. Needs a supervised HW run.
-2. Then F2–F7 (see `product.md` / `roadmap.md`).
-3. In-game apply test (user present); optional one more supervised sweep → +240.
+Post-audit sequencing (both foundation reviews now done; F1b stays on hold until 1–3):
+1. **Split voltage fields + stop keying apply on measured voltage** (must-fix):
+   `vf_table_voltage_mv` (apply/frontier key) vs `measured_voltage_mv` (telemetry) vs
+   `effective_rail_voltage_mv` (future). Fix voltage acquisition (dense, validated,
+   mean/min/max not just max).
+2. **Richer dwell stats**: min/p5 clock, voltage avg/min/max, full NVML `ThrottleReasons`
+   limiter, sample_count, timestamps, workload-context tag.
+3. **Finalize Applied Curve Verification**: post-apply readback comparing the VF-table
+   plateau via modern GetStatus (table-to-table, NOT against measured voltage); add the
+   read-only verify IPC + `GpuApplyStatus.verification`.
+4. **F1b** (only after 1–3): extend the safe flatten sweep to multiple target clocks →
+   real game-power clock×power frontier; key by (clock + VF-table point), NOT measured
+   voltage; wire `synthesize_forge_profiles` into the live sweep. Needs a supervised HW run.
+5. Then F2–F7 (see `product.md` / `roadmap.md`).
+6. In-game apply test (user present); optional one more supervised sweep → +240.
+- Contract additions to draft on approval (`docs/contracts/ui-backend.md`, no `apps/ui`
+  edits): populate `GpuSensors.voltage_mv`, add `dwell_quality`, `GpuApplyStatus.verification`,
+  `workload_context`.

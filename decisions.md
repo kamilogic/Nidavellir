@@ -2,6 +2,39 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Voltage is three concepts, not one number; F1b keys on VF-table, not measured dwell voltage
+- **Decision** (Sensor Quality Audit, 2026-06-05): GPU voltage must be split into
+  explicitly-named, never-conflated fields:
+  - `vf_table_voltage_mv` — deterministic VF-curve point voltage (NVAPI GetStatus).
+    **This is the apply/ceiling key and the F1b frontier axis.**
+  - `measured_voltage_mv` (avg/min/max) — what the rail actually did under dwell
+    (NVAPI `core_voltage`, to be made dense + validated). **Descriptive telemetry and
+    cross-check only — never an apply key.**
+  - `effective_rail_voltage_mv` (future) — physical rail incl. droop, if separable;
+    the only value meaningfully comparable to HWiNFO's "GPU Core Voltage".
+- **F1b must NOT use measured dwell voltage as the deterministic apply/frontier key.**
+  Key the frontier by **(target clock + VF-table point/index)**; attach measured dwell
+  telemetry as a separate descriptive field.
+- **Why**: the current sweep stores voltage as a sparsely-sampled (~480 ms) NVAPI
+  string-parsed **max**, then reuses that exact number as the `apply_vf_ceiling`
+  threshold (`PowerSweepPoint.voltage_mv` → `AppliedProfile.core.voltage_mv` →
+  `ceiling_mv`). A noisy measured max steering a deterministic curve op is the root of
+  the 837-vs-869 confusion and makes apply fidelity unprovable. Three structs already
+  carry a field literally named `voltage_mv` with three incompatible meanings.
+- **Corollary**: 837-vs-869 mV is consistent with undersampling + bin quantization
+  (+ possible sensor-source difference) — expected semantics, NOT proof of apply
+  failure. The constant ~1062 mV unfocused/desktop state is most likely a
+  workload-scoped (P0/3D) ceiling leaving other states on the stock curve, compounded
+  by the frequency-only flatten leaving voltage uncapped. Neither verdict is finalized.
+- **Sequencing**: (1) split voltage fields + stop keying apply on measured voltage
+  (must-fix); (2) richer dwell stats (min/p5 clock, voltage avg/min/max, full
+  `ThrottleReasons` limiter, sample_count, timestamps, workload-context tag);
+  (3) finalize Applied Curve Verification (compare VF-table plateau via GetStatus,
+  table-to-table — not against measured voltage); (4) resume F1b on the cleaned axis.
+- **Status**: audit recorded; no code/IPC/UI change yet. Contract additions
+  (populate `GpuSensors.voltage_mv`, `dwell_quality`, `GpuApplyStatus.verification`)
+  to be drafted in `docs/contracts/ui-backend.md` on approval.
+
 ## Product model: 3 profiles over a clock×power frontier (reverses "two profiles")
 - **Decision**: ship **Godforge / Brokkr's Best / Deep Calm**, synthesized from a
   multi-clock power frontier:
