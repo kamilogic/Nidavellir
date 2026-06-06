@@ -475,6 +475,24 @@ pub fn restore_handle() -> PowerSweepHandle {
     PowerSweepHandle::default()
 }
 
+/// Read-only: load the persisted forge result for THIS GPU (the completed
+/// `PowerSweepProgress` from `forge_state.json`), or `None` if absent/mismatched.
+/// Path-independent (no `PowerSweepHandle` / `AppState` needed), so both the IPC
+/// verifier and the `verify-applied` console subcommand can locate the applied
+/// point's dwell stats. Never mutates anything.
+#[cfg(windows)]
+pub fn load_restored_progress() -> Option<PowerSweepProgress> {
+    let gpu_key = nidavellir_gpu_nvapi::read_curve()
+        .map(|c| c.name)
+        .unwrap_or_else(|_| "unknown-gpu".into());
+    load_forge_state(&gpu_key)
+}
+
+#[cfg(not(windows))]
+pub fn load_restored_progress() -> Option<PowerSweepProgress> {
+    None
+}
+
 #[cfg(windows)]
 fn set(progress: &Arc<Mutex<PowerSweepProgress>>, p: PowerSweepProgress) {
     if let Ok(mut g) = progress.lock() {

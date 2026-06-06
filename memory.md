@@ -27,6 +27,19 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   (+7 verifier). **Read-only runtime path**: `nidavellir-service.exe verify-applied` console
   subcommand runs the verifier with NO startup-recovery/heartbeat/`reapply_on_boot`/pipe server
   → no apply, no VF write (proven: `gpu_applied.json` mtime unchanged).
+- **Patch B — load-state classification (2026-06-06) — DONE, not pushed**: adds a second
+  orthogonal LOAD axis to `ApplyVerificationStatus` (`load_state: LoadVerification` =
+  NotEvaluated / VerifiedUnderLoad / TelemetryInsufficient / LoadMismatch /
+  WorkloadStateMismatch(reserved) / LoadVerificationFailed) + diagnostic dwell fields. Derived
+  from the applied point's EXISTING synthetic-dwell stats (read-only `load_restored_progress()`
+  reads `forge_state.json`; matches the point by label→named slot, fallback unique points entry).
+  Rules: load only evaluated when curve verified; `p5_clock ≥ target−30 MHz` + `telemetry_quality
+  ≥ Medium` → VerifiedUnderLoad; voltage is telemetry-only; `stable=false`→LoadMismatch; bad power
+  →LoadVerificationFailed. Derivation: load upgrades VerifiedCurve→VerifiedUnderLoad, never
+  downgrades. `status` stays the curve axis; additive serde-default fields. **Runtime QA**
+  (`verify-applied`, read-only, no writes): curve=VerifiedCurve(63/65), load=TelemetryInsufficient
+  ("legacy point without dwell quality" — persisted point predates the dwell-stats patch),
+  status=verified_curve. Tests: check clean · service 35/35 (+10). Next: Forge Action Consolidation.
 - **Patch A.1 — offset-based curve verification (2026-06-06) — DONE, not pushed**: runtime QA
   proved GetStatus actual-freq is unreliable at idle (it under-reported the plateau 31/65 even
   though the flatten offsets were resident 63/65). `classify_curve` now gates on the **GET-control

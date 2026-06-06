@@ -222,10 +222,33 @@ pub enum CurveVerification {
     VerificationFailed,
 }
 
-/// Structured result of a read-only applied-curve verification. Telemetry/load and
-/// workload-context fields are intentionally absent (later patches B/C).
+/// Load-state axis (Patch B): whether the applied profile's EXISTING synthetic-dwell
+/// stats support a load-level verification claim. Orthogonal to `CurveVerification`.
+/// Derived from stored dwell stats — does NOT run a new stress test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadVerification {
+    /// No load classification attempted (curve not verified, or no dwell stats).
+    NotEvaluated,
+    /// Curve verified AND the applied point's dwell stats support it under synthetic load.
+    VerifiedUnderLoad,
+    /// Dwell stats exist but are too weak to claim VerifiedUnderLoad (low quality / no p5).
+    TelemetryInsufficient,
+    /// Dwell stats exist but contradict the profile (clock dipped, or not a stable point).
+    LoadMismatch,
+    /// Reserved for live real-workload context (e.g. unfocused/desktop 1062 mV). NOT
+    /// produced by Patch B (which uses only synthetic-dwell stats).
+    WorkloadStateMismatch,
+    /// Load classification hit invalid/implausible data.
+    LoadVerificationFailed,
+}
+
+/// Structured result of a read-only applied-profile verification. `status` is the
+/// CURVE axis (curve-state); `load_state` is the LOAD axis (Patch B). Live real-game
+/// workload-context classification is still future work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyVerificationStatus {
+    /// Curve-state axis (unchanged from Patch A).
     pub status: CurveVerification,
     pub label: Option<String>,
     pub target_mhz: Option<u32>,
@@ -241,6 +264,33 @@ pub struct ApplyVerificationStatus {
     /// True only when `status == VerifiedCurve` (structured; UI must not parse message).
     pub live_curve_match: bool,
     pub message: String,
+
+    // ── Load axis (Patch B; additive). `load_state == VerifiedUnderLoad` upgrades a
+    //    VerifiedCurve to "verified under load". Absent load data never downgrades. ──
+    #[serde(default)]
+    pub load_state: Option<LoadVerification>,
+    #[serde(default)]
+    pub load_reason: Option<String>,
+    /// `Some(true)` when load_state == VerifiedUnderLoad; structured for the UI.
+    #[serde(default)]
+    pub telemetry_match: Option<bool>,
+    /// Dwell stats of the matched applied point (diagnostic context).
+    #[serde(default)]
+    pub p5_clock_mhz: Option<u32>,
+    #[serde(default)]
+    pub min_clock_mhz: Option<u32>,
+    #[serde(default)]
+    pub avg_measured_voltage_mv: Option<u32>,
+    #[serde(default)]
+    pub min_measured_voltage_mv: Option<u32>,
+    #[serde(default)]
+    pub max_measured_voltage_mv: Option<u32>,
+    #[serde(default)]
+    pub voltage_sample_count: Option<u32>,
+    #[serde(default)]
+    pub voltage_quality: Option<DwellQuality>,
+    #[serde(default)]
+    pub telemetry_quality: Option<DwellQuality>,
 }
 
 /// One step of the memory sweep: a clock offset with its measured effective

@@ -3,7 +3,34 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-06) — Applied curve verifier, Patch A (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-06) — Patch B load-state classification (IMPLEMENTED, not pushed)
+- Adds an orthogonal **LOAD axis** to `ApplyVerificationStatus`: `load_state: LoadVerification`
+  (`NotEvaluated/VerifiedUnderLoad/TelemetryInsufficient/LoadMismatch/WorkloadStateMismatch
+  (reserved)/LoadVerificationFailed`) + `load_reason`, `telemetry_match`, and diagnostic dwell
+  fields (`p5_clock_mhz`, `min_clock_mhz`, `avg/min/max_measured_voltage_mv`,
+  `voltage_sample_count`, `voltage_quality`, `telemetry_quality`). `status` stays the curve axis.
+- **Source**: existing synthetic-dwell stats only — NO new stress run. `gpu_power_sweep::
+  load_restored_progress()` (read-only, reads `forge_state.json`) → `find_applied_point` matches
+  by label→named slot (Godforge/Brokkr's Best/Deep Calm) with a clock check, fallback = unique
+  `points` entry; ambiguous→None. `classify_load`: curve must be VerifiedCurve; `p5_clock ≥
+  target−30 MHz` (two bins) AND `telemetry_quality ≥ Medium` → VerifiedUnderLoad; voltage is
+  telemetry-only (implausible→TelemetryInsufficient); `stable=false`→LoadMismatch; bad power→
+  LoadVerificationFailed; missing p5/quality→TelemetryInsufficient. `effective_status` derivation:
+  load upgrades VerifiedCurve→VerifiedUnderLoad, never downgrades; LiveMismatch stays LiveMismatch.
+- **Files**: `crates/core/src/ipc.rs` (LoadVerification + fields), `crates/service/src/gpu_verify.rs`
+  (find_applied_point, classify_load, effective_status, fill_load_axis, tests),
+  `crates/service/src/gpu_power_sweep.rs` (load_restored_progress), `docs/contracts/ui-backend.md`.
+  Additive only; `verify-applied` stays read-only.
+- **Tests**: check clean · service 35/35 (+10 load tests).
+- **Runtime QA** (`verify-applied`, read-only): curve=VerifiedCurve(63/65), forge_state loaded
+  (17 pts), matched Brokkr's slot, **load_state=TelemetryInsufficient** ("legacy point without
+  dwell quality" — the persisted point predates the richer-dwell-stats patch), status=verified_curve.
+  No writes (`gpu_applied.json` + `forge_state.json` mtimes unchanged). To get VerifiedUnderLoad a
+  fresh sweep (HW, supervised) must produce a point carrying the new dwell stats.
+- **Limitations**: WorkloadStateMismatch reserved (live real-game context = future); load axis only
+  as good as the persisted dwell stats. **Next: Forge Action Consolidation.**
+
+## Backend checkpoint (2026-06-06) — Applied curve verifier, Patch A (IMPLEMENTED, pushed)
 - **Read-only `VerifyAppliedProfile` IPC** + new `crates/service/src/gpu_verify.rs`. Answers
   "does the live modern VF curve match the applied profile?" → `CurveVerification` =
   `NotApplicable | MetadataOnly | VerifiedCurve | LiveMismatch | VerificationFailed`.

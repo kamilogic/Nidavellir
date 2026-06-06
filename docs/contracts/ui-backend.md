@@ -148,13 +148,49 @@ Response: `ResponseData::ApplyVerification(ApplyVerificationStatus)`:
 
 Comparison is table-to-table against the deterministic VF-table bin (re-derived like
 
-apply), NOT measured voltage. Telemetry/load classification (`verified_under_load`,
+apply), NOT measured voltage. `stock_detected`/`external_unknown` and live real-game
 
-`workload_state_mismatch`), `stock_detected`/`external_unknown`, and workload context
-
-are NOT included yet (later patches). No UI change required. Rationale: `decisions.md`
+workload context are NOT included yet (later patches). Rationale: `decisions.md`
 
 Applied Curve Verification.
+
+
+
+\### Additive (2026-06-06): load axis (Patch B)
+
+
+
+`ApplyVerificationStatus` gains a second, orthogonal LOAD axis derived from the applied
+
+point's EXISTING synthetic-dwell stats (no new stress run). All additive optional fields:
+
+
+
+\- `load_state`: enum `LoadVerification` → `"not_evaluated"` / `"verified_under_load"` /
+
+&#x20; `"telemetry_insufficient"` / `"load_mismatch"` / `"workload_state_mismatch"` (reserved,
+
+&#x20; not produced yet) / `"load_verification_failed"`.
+
+\- `load_reason: Option<String>`, `telemetry_match: Option<bool>`.
+
+\- Diagnostic dwell stats of the matched point: `p5_clock_mhz`, `min_clock_mhz`,
+
+&#x20; `avg/min/max_measured_voltage_mv`, `voltage_sample_count`, `voltage_quality`,
+
+&#x20; `telemetry_quality`.
+
+
+
+`status` remains the CURVE axis. Effective headline derivation: `verified_under_load`
+
+only when curve is `verified_curve` AND `load_state == verified_under_load`; absent/weak
+
+load data NEVER downgrades a verified curve. `verified_under_load` here means verified
+
+from stored synthetic-dwell stats, NOT live real-game telemetry. UI must use the
+
+structured `status` + `load_state` fields, not parse `message`. No UI change required.
 
 
 
