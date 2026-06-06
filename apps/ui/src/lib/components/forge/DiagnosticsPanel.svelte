@@ -1,4 +1,5 @@
 <script>
+  import { Activity, Play, Square } from "@lucide/svelte";
   import { t } from "../../i18n.js";
   import LogTerminal from "./LogTerminal.svelte";
 
@@ -28,12 +29,19 @@
 
 <div class="bench">
   <div class="real-head">
-    <h3 class="section-head">{$t("forge.benchTitle")}</h3>
+    <h3 class="section-head">
+      <Activity size={14} strokeWidth={1.85} />
+      <span>{$t("forge.benchTitle")}</span>
+    </h3>
     {#if benchRunning}
-      <button class="btn stop" onclick={onStopBench}>{$t("forge.benchStop")}</button>
+      <button class="btn stop" onclick={onStopBench}>
+        <Square size={14} strokeWidth={1.9} />
+        <span>{$t("forge.benchStop")}</span>
+      </button>
     {:else}
       <button class="btn go" onclick={onStartBench} disabled={!applied?.core && !applied?.mem_offset_mhz}>
-        {$t("forge.benchRun")}
+        <Play size={15} strokeWidth={1.9} />
+        <span>{$t("forge.benchRun")}</span>
       </button>
     {/if}
   </div>
@@ -86,6 +94,9 @@
     gap: 1rem;
   }
   .section-head {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
     margin: 0 0 0.5rem;
     font-size: 0.72rem;
     font-weight: 700;
@@ -108,6 +119,10 @@
     color: var(--accent);
   }
   .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.42rem;
     border: 1px solid var(--border);
     border-radius: 9px;
     padding: 0.55rem 1.1rem;

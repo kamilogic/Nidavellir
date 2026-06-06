@@ -1,4 +1,5 @@
 <script>
+  import { CircleCheck, RotateCcw, ShieldCheck, TriangleAlert } from "@lucide/svelte";
   import StatusBadge from "./StatusBadge.svelte";
 
   let {
@@ -32,6 +33,11 @@
   const forgeStateClass = $derived(`state-${forgeState.toLowerCase()}`);
   const forgeStateVariant = $derived(forgeState.toLowerCase());
   const forgeStateIndex = $derived(stateOrder.findIndex((state) => state.label === forgeState));
+  const forgeStateSymbol = $derived.by(() => {
+    if (forgeState === "Forging") return "activity";
+    if (forgeState === "Forged" || forgeState === "Refined") return "check";
+    return null;
+  });
   const safetyState = $derived.by(() => {
     if (!safeLoop) return "Protected";
     if (safeLoop.safe_mode || safeLoop.state === "unstable") return "Needs Attention";
@@ -45,6 +51,7 @@
     if (safetyState === "Recovered Successfully") return "recovered";
     return "protected";
   });
+  const safetySymbol = $derived(safetyVariant === "attention" ? "attention" : "shield");
   const currentProfile = $derived(applied?.label ?? "Stock");
   const verificationText = $derived.by(() => {
     if (!verification) return "Curve verification: Not checked";
@@ -84,8 +91,8 @@
       <div class="title-row">
         <h2>{gpuName}</h2>
         <div class="hero-states">
-          <StatusBadge label={forgeState} variant={forgeStateVariant} compact />
-          <StatusBadge label={safetyState} variant={safetyVariant} compact />
+          <StatusBadge label={forgeState} variant={forgeStateVariant} symbol={forgeStateSymbol} compact />
+          <StatusBadge label={safetyState} variant={safetyVariant} symbol={safetySymbol} compact />
         </div>
       </div>
       <p class="lead">{heroSummary}</p>
@@ -95,13 +102,25 @@
       <span class="lab">Current Profile</span>
       <strong>{currentProfile}</strong>
       <small>{technicalSummary}</small>
-      <small class={`verification ${verificationClass}`}>{verificationText}</small>
+      <small class={`verification ${verificationClass}`}>
+        {#if verificationClass === "verified"}
+          <CircleCheck size={13} strokeWidth={1.9} />
+        {:else if verificationClass === "mismatch"}
+          <TriangleAlert size={13} strokeWidth={1.9} />
+        {:else}
+          <ShieldCheck size={13} strokeWidth={1.9} />
+        {/if}
+        <span>{verificationText}</span>
+      </small>
       {#if applied?.message}
         <small class="applied-msg">{applied.message}</small>
       {/if}
     </div>
 
-    <button class="btn reset" onclick={onReset}>Reset to stock</button>
+    <button class="btn reset" onclick={onReset}>
+      <RotateCcw size={15} strokeWidth={1.85} />
+      <span>Reset to stock</span>
+    </button>
   </div>
 
   <div class="state-rail" aria-label="Forge state progression">
@@ -216,6 +235,9 @@
     color: var(--nord-dim);
   }
   .profile-summary .verification {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.32rem;
     color: var(--nord-dim);
   }
   .profile-summary .verification.verified {
@@ -228,6 +250,10 @@
     color: var(--forge-copper);
   }
   .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.42rem;
     border: 1px solid var(--forge-line);
     border-radius: 8px;
     padding: 0.5rem 0.78rem;

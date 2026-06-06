@@ -13,6 +13,7 @@
     "tauri:dev": "npm run tauri dev"
   },
   "dependencies": {
+    "@lucide/svelte": "^1.17.0",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-shell": "^2.0.0"
   },

@@ -1,8 +1,26 @@
 <script>
-  let { label, variant = "neutral", compact = false } = $props();
+  import { Activity, CircleCheck, Database, ShieldCheck, TriangleAlert } from "@lucide/svelte";
+
+  let { label, variant = "neutral", compact = false, symbol = null } = $props();
+  const iconSize = $derived(compact ? 12 : 14);
 </script>
 
-<span class={`status-badge ${variant}`} class:compact>{label}</span>
+<span class={`status-badge ${variant}`} class:compact>
+  {#if symbol === "shield"}
+    <ShieldCheck size={iconSize} strokeWidth={1.9} />
+  {:else if symbol === "check"}
+    <CircleCheck size={iconSize} strokeWidth={1.9} />
+  {:else if symbol === "attention"}
+    <TriangleAlert size={iconSize} strokeWidth={1.9} />
+  {:else if symbol === "activity"}
+    <Activity size={iconSize} strokeWidth={1.9} />
+  {:else if symbol === "knowledge"}
+    <Database size={iconSize} strokeWidth={1.9} />
+  {:else}
+    <span class="badge-dot" aria-hidden="true"></span>
+  {/if}
+  <span>{label}</span>
+</span>
 
 <style>
   .status-badge {
@@ -25,13 +43,13 @@
     text-transform: uppercase;
     white-space: nowrap;
   }
-  .status-badge::before {
-    content: "";
+  .badge-dot {
     width: 0.4rem;
     height: 0.4rem;
     border-radius: 999px;
     background: currentColor;
     box-shadow: 0 0 12px var(--badge-glow, rgba(255, 255, 255, 0.08));
+    flex-shrink: 0;
   }
   .compact {
     padding: 0.28rem 0.55rem;

@@ -1,4 +1,5 @@
 <script>
+  import { Gauge, Maximize2, ShieldCheck } from "@lucide/svelte";
   import { t } from "../../i18n.js";
   import VfChart from "../VfChart.svelte";
 
@@ -16,18 +17,28 @@
 
 <div class="vf-panel">
   <div class="real-head">
-    <h3 class="section-head">{$t("forge.realTitle")}</h3>
+    <h3 class="section-head">
+      <Gauge size={14} strokeWidth={1.85} />
+      <span>{$t("forge.realTitle")}</span>
+    </h3>
     <label class="adv-toggle">
       <input type="checkbox" bind:checked={advanced} /> {$t("forge.advanced")}
     </label>
   </div>
   <div class="real-actions">
-    <button class="btn" onclick={onReadRealCurve}>{$t("forge.readCurve")}</button>
+    <button class="btn" onclick={onReadRealCurve}>
+      <Gauge size={15} strokeWidth={1.9} />
+      <span>{$t("forge.readCurve")}</span>
+    </button>
     <button class="btn go" onclick={onStartValidation} disabled={validation?.running}>
-      {validation?.running ? $t("forge.validating") : $t("forge.validate")}
+      <ShieldCheck size={15} strokeWidth={1.9} />
+      <span>{validation?.running ? $t("forge.validating") : $t("forge.validate")}</span>
     </button>
     {#if realCurve?.real}
-      <button class="btn ghost" onclick={() => (expanded = true)}>{$t("forge.expand")}</button>
+      <button class="btn ghost" onclick={() => (expanded = true)}>
+        <Maximize2 size={15} strokeWidth={1.9} />
+        <span>{$t("forge.expand")}</span>
+      </button>
     {/if}
   </div>
 
@@ -110,6 +121,9 @@
     gap: 1rem;
   }
   .section-head {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
     margin: 0 0 0.5rem;
     font-size: 0.72rem;
     font-weight: 700;
@@ -133,6 +147,10 @@
     flex-wrap: wrap;
   }
   .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.42rem;
     border: 1px solid var(--border);
     border-radius: 9px;
     padding: 0.55rem 1.1rem;

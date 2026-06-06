@@ -165,15 +165,15 @@
           </div>
           <div class="profile-badges">
             {#if item.recommended}
-              <StatusBadge label="Recommended" variant="recommended" compact />
+              <StatusBadge label="Recommended" variant="recommended" symbol="check" compact />
             {/if}
             {#if state.active}
-              <StatusBadge label="Active" variant="active" compact />
+              <StatusBadge label="Active" variant="active" symbol="check" compact />
             {:else if state.updated}
-              <StatusBadge label="Updated" variant="tempered" compact />
+              <StatusBadge label="Updated" variant="tempered" symbol="activity" compact />
             {/if}
             {#if state.curveMismatch}
-              <StatusBadge label="Curve mismatch" variant="attention" compact />
+              <StatusBadge label="Curve mismatch" variant="attention" symbol="attention" compact />
             {/if}
           </div>
         </div>

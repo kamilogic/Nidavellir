@@ -1,4 +1,5 @@
 <script>
+  import { Activity, CircleCheck, Gauge, Square, Terminal, Zap } from "@lucide/svelte";
   import LogTerminal from "./LogTerminal.svelte";
   import StatusBadge from "./StatusBadge.svelte";
 
@@ -76,21 +77,30 @@
   <div class="progress-head">
     <div>
       <span class="eyebrow">Current action</span>
-      <h3>{title}</h3>
+      <h3>
+        <Activity size={18} strokeWidth={1.85} />
+        <span>{title}</span>
+      </h3>
       <p class="sub">{intro}</p>
     </div>
     <div class="head-actions">
-      <StatusBadge label={safetyState} variant={safetyVariant} compact />
+      <StatusBadge label={safetyState} variant={safetyVariant} symbol={safetyVariant === "attention" ? "attention" : "shield"} compact />
       <span class="run-state" class:live={powerRunning}>{powerRunning ? "Running" : hasRun ? "Stopped" : "Idle"}</span>
       {#if powerRunning}
-        <button class="btn stop" onclick={onStopPower}>Stop forging</button>
+        <button class="btn stop" onclick={onStopPower}>
+          <Square size={14} strokeWidth={1.9} />
+          <span>Stop forging</span>
+        </button>
       {/if}
     </div>
   </div>
 
   <div class="progress-summary">
     <div>
-      <span>Current phase</span>
+      <span class="label-with-icon">
+        <Activity size={13} strokeWidth={1.85} />
+        Current phase
+      </span>
       <strong>{phase}</strong>
     </div>
     <p>{latestMessage}</p>
@@ -98,12 +108,18 @@
 
   <div class="progress-grid">
     <article>
-      <span>Tested points</span>
+      <span class="label-with-icon">
+        <CircleCheck size={13} strokeWidth={1.85} />
+        Tested points
+      </span>
       <strong>{points.length}</strong>
       <small>{points.length ? "Measured during the canonical Power Sweep." : "No tested points yet."}</small>
     </article>
     <article>
-      <span>Latest tested point</span>
+      <span class="label-with-icon">
+        <Gauge size={13} strokeWidth={1.85} />
+        Latest tested point
+      </span>
       <strong>{voltageLabel(latestPoint)}</strong>
       {#if latestPoint}
         <small>{fixed(latestPoint.power_w)} W / {fixed(latestPoint.perf_per_watt, 1)} MHz/W / {latestPoint.stable ? "stable" : "failed"}</small>
@@ -112,7 +128,10 @@
       {/if}
     </article>
     <article>
-      <span>Power target</span>
+      <span class="label-with-icon">
+        <Zap size={13} strokeWidth={1.85} />
+        Power target
+      </span>
       <strong>{powerSweep?.target_w ? `${fixed(powerSweep.target_w)} W` : "Not set"}</strong>
       <small>{powerSweep?.power_limit_w ? `Power limit ${fixed(powerSweep.power_limit_w)} W` : "Available after forge data loads."}</small>
     </article>
@@ -148,7 +167,10 @@
 
   {#if powerSweep?.log?.length}
     <details class="progress-log" open={showLog}>
-      <summary>Technical Power Sweep log</summary>
+      <summary>
+        <Terminal size={14} strokeWidth={1.85} />
+        <span>Technical Power Sweep log</span>
+      </summary>
       <LogTerminal
         title="nidavellir / core vf forge"
         status={powerSweep.running ? powerSweep.phase : "done"}
@@ -191,6 +213,9 @@
     margin-bottom: 0.3rem;
   }
   h3 {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
     margin: 0;
     color: var(--text);
     font-size: 1.05rem;
@@ -209,6 +234,10 @@
     flex-wrap: wrap;
   }
   .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
     border: 1px solid var(--border);
     border-radius: 9px;
     padding: 0.46rem 0.8rem;
@@ -254,6 +283,11 @@
     grid-template-columns: minmax(150px, 0.28fr) minmax(0, 1fr);
     gap: 0.75rem;
     padding: 0.7rem 0.8rem;
+  }
+  .label-with-icon {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.32rem;
   }
   .progress-summary strong,
   .progress-grid strong,
@@ -346,6 +380,9 @@
     padding-top: 0.65rem;
   }
   .progress-log summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
     cursor: pointer;
     color: var(--muted);
     font-size: 0.75rem;

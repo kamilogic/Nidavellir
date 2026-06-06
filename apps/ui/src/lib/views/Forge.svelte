@@ -1,4 +1,5 @@
 <script>
+  import { Activity, CircleCheck, Play, ShieldCheck, Square, Terminal, TriangleAlert } from "@lucide/svelte";
   import { serviceCall } from "../service.js";
   import { t } from "../i18n.js";
   import VfChart from "../components/VfChart.svelte";
@@ -222,7 +223,10 @@
 
   <details class="advanced-diagnostics">
     <summary>
-      <span>Advanced Diagnostics</span>
+      <span class="summary-title">
+        <Terminal size={17} strokeWidth={1.85} />
+        <span>Advanced Diagnostics</span>
+      </span>
       <small>Curve checks, validation, benchmark, applied-profile verification and experimental memory diagnostics</small>
     </summary>
 
@@ -230,7 +234,10 @@
       <section class="diagnostic-group">
         <div class="diagnostic-group-head">
           <span class="section-kicker">Current safe diagnostics</span>
-          <h4>Inspect and verify the current GPU state</h4>
+          <h4>
+            <Activity size={16} strokeWidth={1.85} />
+            <span>Inspect and verify the current GPU state</span>
+          </h4>
           <p>These actions are explicit diagnostics. They do not replace the primary Forge GPU path.</p>
         </div>
 
@@ -255,18 +262,29 @@
 
         <section class="diagnostic-card">
           <div>
-            <h4 class="section-head">Verify applied profile</h4>
+            <h4 class="section-head">
+              <ShieldCheck size={14} strokeWidth={1.85} />
+              <span>Verify applied profile</span>
+            </h4>
             <p class="sub">Read-only check: compares the live modern VF curve against the applied profile. It does not apply or re-apply tuning.</p>
           </div>
           <button class="btn go" onclick={verifyAppliedProfile} disabled={verifying || !applied?.core}>
-            {verifying ? "Verifying..." : "Verify applied profile"}
+            <ShieldCheck size={15} strokeWidth={1.9} />
+            <span>{verifying ? "Verifying..." : "Verify applied profile"}</span>
           </button>
           <p
             class="point"
             class:accent={verification?.status === "verified_curve"}
             class:danger={verification?.status === "live_mismatch"}
           >
-            {verificationLabel}
+            {#if verification?.status === "verified_curve"}
+              <CircleCheck size={14} strokeWidth={1.9} />
+            {:else if verification?.status === "live_mismatch"}
+              <TriangleAlert size={14} strokeWidth={1.9} />
+            {:else}
+              <ShieldCheck size={14} strokeWidth={1.9} />
+            {/if}
+            <span>{verificationLabel}</span>
           </p>
           {#if verification?.message}
             <p class="sub">{verification.message}</p>
@@ -280,7 +298,10 @@
       <section class="diagnostic-group future">
         <div class="diagnostic-group-head">
           <span class="section-kicker">Future / experimental pipeline steps</span>
-          <h4>VRAM optimization is not part of the current Forge GPU pipeline yet</h4>
+          <h4>
+            <Activity size={16} strokeWidth={1.85} />
+            <span>VRAM optimization is not part of the current Forge GPU pipeline yet</span>
+          </h4>
           <p>Memory tuning must come after the core VF curve is forged and validated. This tool is experimental diagnostics only.</p>
         </div>
 
@@ -291,9 +312,15 @@
               <p class="sub">Future pipeline-related diagnostic. It is not a primary product action and does not define the current Forge GPU path.</p>
             </div>
             {#if memRunning}
-              <button class="btn stop" onclick={stopMem}>Stop memory sweep</button>
+              <button class="btn stop" onclick={stopMem}>
+                <Square size={14} strokeWidth={1.9} />
+                <span>Stop memory sweep</span>
+              </button>
             {:else}
-              <button class="btn" onclick={() => (memPreflight = true)}>Run memory sweep (experimental)</button>
+              <button class="btn" onclick={() => (memPreflight = true)}>
+                <Play size={15} strokeWidth={1.9} />
+                <span>Run memory sweep (experimental)</span>
+              </button>
             {/if}
           </div>
 
@@ -349,7 +376,10 @@
       <p class="pre-body">This experimental diagnostic writes memory clocks and is not part of the current Forge GPU pipeline. VRAM optimization is planned for a later pipeline step after the core VF curve is forged and validated.</p>
       <div class="pre-actions">
         <button class="btn ghost" onclick={() => (memPreflight = false)}>{$t("forge.preCancel")}</button>
-        <button class="btn go" onclick={startMem}>Run memory sweep (experimental)</button>
+        <button class="btn go" onclick={startMem}>
+          <Play size={15} strokeWidth={1.9} />
+          <span>Run memory sweep (experimental)</span>
+        </button>
       </div>
     </div>
   </div>
@@ -456,6 +486,14 @@
   .advanced-diagnostics > summary small {
     display: block;
   }
+  .advanced-diagnostics > summary .summary-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
+  }
+  .advanced-diagnostics > summary .summary-title span {
+    display: inline;
+  }
   .advanced-diagnostics > summary small {
     margin-top: 0.25rem;
     color: var(--muted);
@@ -492,6 +530,9 @@
     margin-bottom: 0.85rem;
   }
   .diagnostic-group-head h4 {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
     margin: 0;
     color: var(--text);
     font-size: 0.95rem;
@@ -521,6 +562,10 @@
     line-height: 1.5;
   }
   .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.42rem;
     border: 1px solid var(--border);
     border-radius: 9px;
     padding: 0.55rem 1.1rem;
@@ -563,6 +608,9 @@
     gap: 1rem;
   }
   .section-head {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
     margin: 0 0 0.5rem;
     font-size: 0.72rem;
     font-weight: 700;
@@ -571,6 +619,9 @@
     color: var(--muted);
   }
   .point {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.38rem;
     margin: 0.45rem 0 0;
     font-weight: 600;
     font-variant-numeric: tabular-nums;

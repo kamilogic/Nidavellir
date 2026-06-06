@@ -1,4 +1,5 @@
 <script>
+  import { Play, Square } from "@lucide/svelte";
   import StatusBadge from "./StatusBadge.svelte";
 
   let {
@@ -45,11 +46,17 @@
   </div>
 
   {#if powerRunning}
-    <button class="btn stop" onclick={onStopPower}>Stop forging</button>
+    <button class="btn stop" onclick={onStopPower}>
+      <Square size={14} strokeWidth={1.9} />
+      <span>Stop forging</span>
+    </button>
   {:else if needsAttention}
-    <StatusBadge label="Review Safety" variant="attention" />
+    <StatusBadge label="Review Safety" variant="attention" symbol="attention" />
   {:else}
-    <button class="btn go" onclick={onStartPower}>{primaryLabel}</button>
+    <button class="btn go" onclick={onStartPower}>
+      <Play size={15} strokeWidth={1.9} />
+      <span>{primaryLabel}</span>
+    </button>
   {/if}
 
   {#if !hasProfiles && !applied?.core && !powerRunning}
@@ -100,6 +107,10 @@
     line-height: 1.5;
   }
   .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.42rem;
     border: 1px solid var(--border);
     border-radius: 9px;
     padding: 0.55rem 1.1rem;

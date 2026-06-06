@@ -1,4 +1,5 @@
 <script>
+  import { Database } from "@lucide/svelte";
   import { t } from "../../i18n.js";
 
   let { realSweep = null, powerSweep = null, validation = null, summary = false, compact = false } = $props();
@@ -27,7 +28,10 @@
   <section class="knowledge" class:compact>
     <div>
       <span class="eyebrow">Forge Knowledge</span>
-      <h3>What Nidavellir has learned</h3>
+      <h3>
+        <Database size={17} strokeWidth={1.85} />
+        <span>What Nidavellir has learned</span>
+      </h3>
       {#if hasKnowledge}
         <p>{compact ? "Live summary from this GPU's forge data." : "Knowledge is based only on completed validation and sweep results from this GPU."}</p>
       {:else}
@@ -102,6 +106,9 @@
     margin-bottom: 0.35rem;
   }
   h3 {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
     margin: 0;
     color: var(--text);
     font-size: 1rem;
