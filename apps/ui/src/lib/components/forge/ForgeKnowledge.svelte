@@ -1,21 +1,35 @@
 <script>
   import { t } from "../../i18n.js";
 
-  let { realSweep = null, powerSweep = null, validation = null, summary = false } = $props();
+  let { realSweep = null, powerSweep = null, validation = null, summary = false, compact = false } = $props();
 
   const stableCount = $derived(realSweep?.tradeoffs?.length ?? 0);
   const measuredPowerPoints = $derived(powerSweep?.points?.length ?? 0);
   const hasKnowledge = $derived(Boolean(stableCount || measuredPowerPoints || realSweep?.validation_note || validation?.result));
   const latestBoundary = $derived(realSweep?.tradeoffs?.[realSweep.tradeoffs.length - 1] ?? null);
+  const stablePowerPoints = $derived((powerSweep?.points ?? []).filter((point) => point.stable).length);
+  const stableRegionCount = $derived(stableCount || stablePowerPoints);
+  const latestPowerStable = $derived.by(() => {
+    const points = powerSweep?.points ?? [];
+    return [...points].reverse().find((point) => point.stable) ?? null;
+  });
+  const knownSafeEdge = $derived.by(() => {
+    if (latestBoundary) return `${latestBoundary.freq_mhz} MHz @ ${latestBoundary.vmin_mv} mV`;
+    if (latestPowerStable) {
+      const voltage = latestPowerStable.vf_table_voltage_mv ?? latestPowerStable.voltage_mv;
+      return `${latestPowerStable.clock_mhz} MHz @ ${voltage} mV`;
+    }
+    return "Not learned yet";
+  });
 </script>
 
 {#if summary}
-  <section class="knowledge">
+  <section class="knowledge" class:compact>
     <div>
       <span class="eyebrow">Forge Knowledge</span>
       <h3>What Nidavellir has learned</h3>
       {#if hasKnowledge}
-        <p>Knowledge is based only on completed validation and sweep results from this GPU.</p>
+        <p>{compact ? "Live summary from this GPU's forge data." : "Knowledge is based only on completed validation and sweep results from this GPU."}</p>
       {:else}
         <p>Forge Knowledge is being built from completed forge runs.</p>
       {/if}
@@ -23,12 +37,12 @@
 
     <div class="knowledge-grid">
       <article>
-        <span>Stable knowledge</span>
-        <strong>{stableCount ? `${stableCount} learned point${stableCount === 1 ? "" : "s"}` : "Unknown"}</strong>
+        <span>Stable regions</span>
+        <strong>{stableRegionCount ? `${stableRegionCount} learned point${stableRegionCount === 1 ? "" : "s"}` : "Unknown"}</strong>
       </article>
       <article>
-        <span>Known Stable Edge</span>
-        <strong>{latestBoundary ? `${latestBoundary.freq_mhz} MHz @ ${latestBoundary.vmin_mv} mV` : "Not learned yet"}</strong>
+        <span>Known safe edge</span>
+        <strong>{knownSafeEdge}</strong>
       </article>
       <article>
         <span>Latest validation</span>
@@ -70,6 +84,13 @@
     gap: 0.8rem;
     box-shadow: var(--forge-panel-edge);
   }
+  .knowledge.compact {
+    background: rgba(14, 18, 24, 0.58);
+    border-color: rgba(255, 255, 255, 0.045);
+    padding: 0.78rem 0.9rem;
+    gap: 0.62rem;
+    box-shadow: none;
+  }
   .eyebrow,
   .knowledge-grid span {
     display: block;
@@ -85,11 +106,18 @@
     color: var(--text);
     font-size: 1rem;
   }
+  .compact h3 {
+    color: var(--nord-mist);
+    font-size: 0.92rem;
+  }
   p {
     margin: 0.35rem 0 0;
     color: var(--muted);
     font-size: 0.86rem;
     line-height: 1.5;
+  }
+  .compact p {
+    font-size: 0.8rem;
   }
   .knowledge-grid {
     display: grid;
@@ -101,6 +129,10 @@
     border: 1px solid rgba(255, 255, 255, 0.055);
     border-radius: 8px;
     padding: 0.7rem 0.8rem;
+  }
+  .compact .knowledge-grid article {
+    background: rgba(5, 7, 11, 0.18);
+    padding: 0.56rem 0.65rem;
   }
   .knowledge-grid strong {
     color: var(--text);

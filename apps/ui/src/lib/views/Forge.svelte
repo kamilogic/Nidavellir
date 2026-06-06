@@ -168,36 +168,57 @@
     onReset={resetTuning}
   />
 
-  <RecommendedAction
-    {applied}
-    {powerSweep}
-    {powerRunning}
-    {safeLoop}
-    onStartPower={startPower}
-    onStopPower={stopPower}
-  />
-
-  <section class="home-section">
-    <div>
-      <span class="section-kicker">Profile Comparison</span>
-      <h3>Choose how this GPU should behave</h3>
-      <p>Brokkr's Best is recommended for most users unless your own forge data points elsewhere.</p>
-    </div>
-    <ProfileCards
+  {#if powerRunning}
+    <ForgeProgress
       {powerSweep}
-      {applied}
-      {verification}
-      showPlaceholders
-      onApplyPower={applyPower}
+      {powerRunning}
+      {safeLoop}
+      onStopPower={stopPower}
     />
-  </section>
 
-  <ForgeKnowledge summary {powerSweep} {validation} />
+    <ForgeKnowledge summary compact {powerSweep} {validation} />
 
-  <ForgeProgress
-    {powerSweep}
-    {powerRunning}
-  />
+    <section class="home-section profile-section active-forging">
+      <div>
+        <span class="section-kicker">Profile Comparison</span>
+        <h3>Profiles being produced</h3>
+        <p>Profiles update as forging completes. Existing profiles remain available for reference.</p>
+      </div>
+      <ProfileCards
+        {powerSweep}
+        {applied}
+        {verification}
+        showPlaceholders
+        onApplyPower={applyPower}
+      />
+    </section>
+  {:else}
+    <RecommendedAction
+      {applied}
+      {powerSweep}
+      {powerRunning}
+      {safeLoop}
+      onStartPower={startPower}
+      onStopPower={stopPower}
+    />
+
+    <section class="home-section profile-section">
+      <div>
+        <span class="section-kicker">Profile Comparison</span>
+        <h3>Choose how this GPU should behave</h3>
+        <p>Brokkr's Best is recommended for most users unless your own forge data points elsewhere.</p>
+      </div>
+      <ProfileCards
+        {powerSweep}
+        {applied}
+        {verification}
+        showPlaceholders
+        onApplyPower={applyPower}
+      />
+    </section>
+
+    <ForgeKnowledge summary {powerSweep} {validation} />
+  {/if}
 
   <details class="advanced-diagnostics">
     <summary>
@@ -389,6 +410,17 @@
     color: var(--muted);
     font-size: 0.86rem;
     line-height: 1.5;
+  }
+  .profile-section.active-forging {
+    background: rgba(14, 18, 24, 0.58);
+    border-color: rgba(255, 255, 255, 0.045);
+    box-shadow: none;
+  }
+  .profile-section.active-forging h3 {
+    color: var(--nord-mist);
+  }
+  .profile-section.active-forging :global(.profiles) {
+    opacity: 0.88;
   }
   .advanced-diagnostics > summary {
     display: grid;
