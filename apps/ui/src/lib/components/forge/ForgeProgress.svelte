@@ -1,44 +1,47 @@
 <script>
-  import { t } from "../../i18n.js";
   import LogTerminal from "./LogTerminal.svelte";
 
-  let { forge = null, forgeRunning = false, showLog = false, onRequestStart, onStop } = $props();
+  let { powerSweep = null, powerRunning = false, showLog = false } = $props();
 
-  const phase = $derived(forge?.phase && forge.phase !== "idle" ? forge.phase : "Not running");
-  const hasRun = $derived(Boolean(forge && forge.phase !== "idle"));
+  const phase = $derived(powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : "Not running");
+  const hasRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
+  const profileCount = $derived(
+    [powerSweep?.godforge, powerSweep?.brokkrs, powerSweep?.deep_calm].filter(Boolean).length,
+  );
 </script>
 
 <div class="forge-all">
   <div class="real-head">
-    <h3 class="section-head">{$t("forge.forgeAll")}</h3>
-    {#if forgeRunning}
-      <button class="btn stop" onclick={onStop}>{$t("forge.stopForge")}</button>
-    {:else}
-      <button class="btn go" onclick={onRequestStart}>{$t("forge.runForge")}</button>
-    {/if}
+    <h3 class="section-head">Forge Progress</h3>
   </div>
-  <p class="sub">{$t("forge.forgeAllDesc")}</p>
+  <p class="sub">Current implementation: core VF forge and profile generation. VRAM optimization is planned for a later pipeline step.</p>
   <div class="progress-summary">
     <span>Current phase</span>
     <strong>{phase}</strong>
-    {#if forge?.note}
-      <p>{forge.note}</p>
+    {#if powerSweep?.note}
+      <p>{powerSweep.note}</p>
+    {:else if profileCount}
+      <p>{profileCount} profile{profileCount === 1 ? "" : "s"} generated from the canonical core VF forge path.</p>
     {:else if !hasRun}
-      <p>No forge run is active yet. Start Forge GPU when you are ready to let Nidavellir learn this card.</p>
+      <p>No core VF forge run is active yet. Start Forge GPU when you are ready to let Nidavellir learn this card.</p>
     {/if}
   </div>
-  {#if showLog && forge && forge.phase !== "idle" && (forge.log?.length || forge.running)}
+  <div class="pipeline-steps" aria-label="Forge pipeline status">
+    <span class:active={powerRunning} class:done={hasRun}>Core VF forge</span>
+    <span class:done={profileCount > 0}>Profile generation</span>
+    <span class="planned">VRAM optimization planned</span>
+    <span class="planned">Final validation planned</span>
+  </div>
+  {#if showLog && powerSweep && powerSweep.phase !== "idle" && (powerSweep.log?.length || powerSweep.running)}
     <LogTerminal
-      title="nidavellir / forge"
-      status={forge.running ? forge.phase : "done"}
-      live={forge.running}
-      lines={forge.log ?? []}
-      runningText={forge.running ? `${forge.phase}...` : null}
+      title="nidavellir / core vf forge"
+      status={powerSweep.running ? powerSweep.phase : "done"}
+      live={powerSweep.running}
+      lines={powerSweep.log ?? []}
+      runningText={powerSweep.running ? `${powerSweep.phase}...` : null}
     />
   {/if}
 </div>
-
-<p class="sub apply-hint">{$t("forge.orderHint")}</p>
 
 <style>
   .forge-all {
@@ -95,29 +98,38 @@
     font-size: 0.84rem;
     line-height: 1.45;
   }
-  .apply-hint {
-    margin: 0.1rem 0 0.4rem;
-    font-size: 0.75rem;
+  .pipeline-steps {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.45rem;
+  }
+  .pipeline-steps span {
+    border: 1px solid var(--forge-line);
+    border-radius: 8px;
+    background: rgba(5, 7, 11, 0.22);
     color: var(--nord-dim);
+    font-size: 0.68rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    line-height: 1.25;
+    padding: 0.48rem 0.58rem;
+    text-transform: uppercase;
   }
-  .btn {
-    border: 1px solid var(--border);
-    border-radius: 9px;
-    padding: 0.55rem 1.1rem;
-    font-weight: 600;
-    font-size: 0.85rem;
-    cursor: pointer;
-    background: rgba(8, 11, 16, 0.66);
-    color: var(--text);
-  }
-  .btn.go {
-    background: rgba(214, 168, 93, 0.13);
-    color: var(--forge-gold);
+  .pipeline-steps span.active {
     border-color: rgba(214, 168, 93, 0.42);
+    color: var(--forge-gold);
   }
-  .btn.stop {
-    background: rgba(191, 97, 106, 0.16);
-    color: #f3b9bd;
-    border-color: rgba(191, 97, 106, 0.45);
+  .pipeline-steps span.done {
+    border-color: rgba(157, 191, 145, 0.36);
+    color: var(--forge-green);
+  }
+  .pipeline-steps span.planned {
+    border-style: dashed;
+    opacity: 0.62;
+  }
+  @media (max-width: 760px) {
+    .pipeline-steps {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

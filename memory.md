@@ -126,6 +126,12 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 - **Phase 3 visual cleanup**: reduced background texture noise, compacted the GPU
   Hero into a focused control-panel summary, made the forge progression rail
   subtle, and set the desktop window to 1180x820 with a 1100x720 minimum.
+- **Forge action cleanup (Codex UI pass, 2026-06-06)**: Forge Home now exposes a
+  single primary Forge GPU / Refine Profiles action on the canonical Power Sweep
+  path, applies only `ApplyPower*` profiles, moves curve/validation/benchmark/
+  applied-profile verification/memory diagnostics into Advanced Diagnostics, and
+  labels memory sweep as experimental/future pipeline work. Frontend only; no
+  backend, IPC, tuning, or Safe Loop logic changed.
 - **Modern NvAPI V/F curve (ClkVfPoints) read + write + apply + reset** work on
   driver 595.97 (the old `nvapi` crate's `SetClockBoostTable` is rejected). Elastic
   "VF ceiling" (Afterburner-style flatten) verified to control the live clock under

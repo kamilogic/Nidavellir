@@ -3,37 +3,38 @@
 
   let {
     applied = null,
-    forge = null,
-    forgeRunning = false,
-    realProfiles = null,
     powerSweep = null,
+    powerRunning = false,
     safeLoop = null,
-    onStartForge,
-    onStopForge,
-    onApplyRecommended,
+    onStartPower,
+    onStopPower,
   } = $props();
 
-  const hasProfiles = $derived(Boolean(realProfiles || powerSweep?.brokkrs));
+  const hasProfiles = $derived(Boolean(powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm));
   const needsAttention = $derived(Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable"));
-  const currentPhase = $derived(forge?.phase && forge.phase !== "idle" ? forge.phase : null);
+  const currentPhase = $derived(powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : null);
   const title = $derived.by(() => {
     if (needsAttention) return "Needs Attention";
-    if (forgeRunning) return "Forging in progress";
+    if (powerRunning) return "Core VF forge in progress";
     if (!hasProfiles && !applied?.core) return "Raw GPU Detected";
     if (hasProfiles && !applied?.core) return "Profiles are ready";
-    return "Profile applied";
+    if (hasProfiles) return "Profile applied";
+    return "Ready to forge";
   });
   const body = $derived.by(() => {
     if (needsAttention) return "Nidavellir detected a safety condition that should be reviewed before more tuning.";
-    if (forgeRunning) return `Nidavellir is currently testing your GPU${currentPhase ? `: ${currentPhase}` : ""}.`;
+    if (powerRunning) {
+      return `Nidavellir is running the implemented core VF forge and profile generation path${currentPhase ? `: ${currentPhase}` : ""}.`;
+    }
     if (!hasProfiles && !applied?.core) {
-      return "Nidavellir has detected your NVIDIA GPU, but has not forged it yet.";
+      return "Nidavellir has detected your NVIDIA GPU. The current Forge GPU action runs the implemented core VF forge and profile generation path.";
     }
     if (hasProfiles && !applied?.core) {
-      return "Nidavellir has enough profile data to recommend a daily-use profile.";
+      return "Nidavellir has generated profiles. Choose one below, or refine the core VF profiles by running the forge again.";
     }
-    return "Your applied profile will be re-applied automatically on boot with Safe Loop protection.";
+    return "Your applied profile will be re-applied automatically on boot with Safe Loop protection. You can refine core VF profiles at any time.";
   });
+  const primaryLabel = $derived(hasProfiles ? "Refine Profiles" : "Forge GPU");
 </script>
 
 <section class="next-action">
@@ -43,28 +44,24 @@
     <p>{body}</p>
   </div>
 
-  {#if forgeRunning}
-    <button class="btn stop" onclick={onStopForge}>Stop forging</button>
+  {#if powerRunning}
+    <button class="btn stop" onclick={onStopPower}>Stop forging</button>
   {:else if needsAttention}
     <StatusBadge label="Review Safety" variant="attention" />
-  {:else if hasProfiles && !applied?.core}
-    <button class="btn go" onclick={onApplyRecommended}>Apply Brokkr's Best</button>
-  {:else if !applied?.core}
-    <button class="btn go" onclick={onStartForge}>Forge GPU</button>
   {:else}
-    <StatusBadge label="Ready for Daily Use" variant="protected" />
+    <button class="btn go" onclick={onStartPower}>{primaryLabel}</button>
   {/if}
 
-  {#if !hasProfiles && !applied?.core && !forgeRunning}
+  {#if !hasProfiles && !applied?.core && !powerRunning}
     <div class="first-run">
-      <span>What will happen</span>
+      <span>Current implemented path</span>
       <ol>
-        <li>Check stability</li>
-        <li>Learn safe operating regions</li>
+        <li>Check Safe Loop readiness before risky steps</li>
+        <li>Learn core VF behavior under load</li>
         <li>Create three transparent profiles</li>
         <li>Recommend one for daily use</li>
       </ol>
-      <p>Safety: Safe Loop protection will be active before risky steps.</p>
+      <p>Planned later: VRAM optimization, VRAM validation and final whole-package validation.</p>
     </div>
   {/if}
 </section>

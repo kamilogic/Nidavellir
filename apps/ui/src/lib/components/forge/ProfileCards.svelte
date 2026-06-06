@@ -4,11 +4,9 @@
 
   let {
     mode = "real",
-    realProfiles = null,
     powerSweep = null,
     applied = null,
     showPlaceholders = false,
-    onApplyCore,
     onApplyPower,
   } = $props();
   let applyingKey = $state(null);
@@ -16,8 +14,6 @@
   const meta = [
     {
       key: "godforge",
-      realKey: "godforge",
-      applyIndex: 0,
       name: "Godforge",
       stance: "Performance first",
       summary: "Pushes the silicon toward its strongest sustainable profile.",
@@ -25,8 +21,6 @@
     },
     {
       key: "brokkrs",
-      realKey: "brokkrs_best",
-      applyIndex: 1,
       name: "Brokkr's Best",
       stance: "Balance first",
       summary: "Recommended for most users: strong performance with lower power and heat.",
@@ -35,8 +29,6 @@
     },
     {
       key: "deep_calm",
-      realKey: "deep_calm",
-      applyIndex: 2,
       name: "Deep Calm",
       stance: "Efficiency first",
       summary: "Prioritizes lower power, heat and noise over peak numbers.",
@@ -44,17 +36,11 @@
     },
   ];
 
-  function realProfile(m) {
-    return realProfiles?.[m.realKey] ?? null;
-  }
-
   function powerProfile(m) {
     return powerSweep?.[m.key] ?? null;
   }
 
   function technical(m) {
-    const rp = realProfile(m);
-    if (rp?.point) return `${rp.point.freq_mhz} MHz @ ${rp.point.voltage_mv} mV`;
     const pp = powerProfile(m);
     if (pp) return `${pp.clock_mhz} MHz @ ${pp.voltage_mv} mV`;
     return "Not forged yet";
@@ -67,7 +53,7 @@
   }
 
   function hasData(m) {
-    return Boolean(realProfile(m) || powerProfile(m));
+    return Boolean(powerProfile(m));
   }
 
   function normalize(s) {
@@ -76,10 +62,9 @@
 
   function pointMatches(m) {
     if (!applied?.core) return false;
-    const rp = realProfile(m)?.point;
     const pp = powerProfile(m);
-    const freq = rp?.freq_mhz ?? pp?.clock_mhz;
-    const voltage = rp?.voltage_mv ?? pp?.voltage_mv;
+    const freq = pp?.clock_mhz;
+    const voltage = pp?.voltage_mv;
     return Boolean(freq && voltage && applied.core.freq_mhz === freq && applied.core.voltage_mv === voltage);
   }
 
@@ -114,8 +99,7 @@
     if (!hasData(m) || isApplied(m) || applyingKey) return;
     applyingKey = m.key;
     try {
-      const result = realProfile(m) ? onApplyCore?.(m.applyIndex) : onApplyPower?.(m.key);
-      await result;
+      await onApplyPower?.(m.key);
     } finally {
       applyingKey = null;
     }
@@ -153,7 +137,7 @@
       {/each}
     </div>
   {/if}
-{:else if realProfiles || powerSweep || showPlaceholders}
+{:else if powerSweep || showPlaceholders}
   <div class="profiles">
     {#each meta as item}
       {@const active = isApplied(item)}
@@ -172,7 +156,7 @@
               {/if}
             </div>
           </div>
-        <p class="desc">{realProfile(item)?.description ?? item.summary}</p>
+        <p class="desc">{item.summary}</p>
         <div class="expected">
           <span>Expected Result</span>
           <ul>
@@ -184,9 +168,7 @@
         <div class="technical">
           <span>Technical</span>
           <strong>{technical(item)}</strong>
-          {#if !realProfile(item)}
-            <small>{secondary(item)}</small>
-          {/if}
+          <small>{secondary(item)}</small>
         </div>
         {#if hasData(item)}
           <button

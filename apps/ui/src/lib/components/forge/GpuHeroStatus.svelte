@@ -6,12 +6,10 @@
     applied = null,
     hardware = null,
     safeLoop = null,
-    forgeRunning = false,
-    realRunning = false,
-    memRunning = false,
     powerRunning = false,
     hasProfiles = false,
     hasKnowledge = false,
+    verification = null,
     onReset,
   } = $props();
 
@@ -25,7 +23,7 @@
     { label: "Forged", variant: "forged" },
   ];
   const forgeState = $derived.by(() => {
-    if (forgeRunning || realRunning || memRunning || powerRunning) return "Forging";
+    if (powerRunning) return "Forging";
     if (applied?.core && hasProfiles) return "Forged";
     if (hasProfiles) return "Refined";
     if (hasKnowledge) return "Tempered";
@@ -48,6 +46,18 @@
     return "protected";
   });
   const currentProfile = $derived(applied?.label ?? "Stock");
+  const verificationText = $derived.by(() => {
+    if (!verification) return "Curve verification: Not checked";
+    if (verification.status === "verified_curve") return "Curve verification: Verified";
+    if (verification.status === "live_mismatch") return "Curve verification: Mismatch";
+    return "Curve verification: Unavailable";
+  });
+  const verificationClass = $derived.by(() => {
+    if (!verification) return "unchecked";
+    if (verification.status === "verified_curve") return "verified";
+    if (verification.status === "live_mismatch") return "mismatch";
+    return "unavailable";
+  });
   const technicalSummary = $derived.by(() => {
     const parts = [];
     if (applied?.core) parts.push(`${applied.core.freq_mhz} MHz @ ${applied.core.voltage_mv} mV`);
@@ -85,6 +95,7 @@
       <span class="lab">Current Profile</span>
       <strong>{currentProfile}</strong>
       <small>{technicalSummary}</small>
+      <small class={`verification ${verificationClass}`}>{verificationText}</small>
       {#if applied?.message}
         <small class="applied-msg">{applied.message}</small>
       {/if}
@@ -203,6 +214,18 @@
   }
   .profile-summary .applied-msg {
     color: var(--nord-dim);
+  }
+  .profile-summary .verification {
+    color: var(--nord-dim);
+  }
+  .profile-summary .verification.verified {
+    color: var(--forge-green);
+  }
+  .profile-summary .verification.mismatch {
+    color: var(--forge-red);
+  }
+  .profile-summary .verification.unavailable {
+    color: var(--forge-copper);
   }
   .btn {
     border: 1px solid var(--forge-line);
