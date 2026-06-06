@@ -24,9 +24,17 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   expected = points ≥ ceiling read target ±15 MHz, ≥90% match → VerifiedCurve. **Read-only**:
   no apply/reapply/write/stress. No telemetry/load/context/stock-fingerprint yet (Patches B/C).
   Additive IPC (`ApplyVerificationStatus`), contract noted. Tests: check clean · service 26/26
-  (+7 verifier). **Runtime QA BLOCKED**: `gpu_applied.json` exists → console startup would
-  reapply (VF write, prohibited) → live IPC test deferred. Patch B (load classification from
-  existing dwell stats) is now unblocked.
+  (+7 verifier). **Read-only runtime path**: `nidavellir-service.exe verify-applied` console
+  subcommand runs the verifier with NO startup-recovery/heartbeat/`reapply_on_boot`/pipe server
+  → no apply, no VF write (proven: `gpu_applied.json` mtime unchanged).
+- **⚠ Runtime QA finding (2026-06-06)**: `verify-applied` on the idle test rig returned
+  `LiveMismatch` (matched 31/65 plateau points at 1770 MHz) **but** `offsets_nonzero=63/65` —
+  i.e. the flatten offsets ARE resident (curve applied), yet `read_vf_curve_modern` (GetStatus
+  actual freq) does NOT uniformly report the flattened target at idle. **Confirms the open
+  question: GetStatus actual-freq is unreliable for plateau verification; the GET-control offset
+  readback (`vf_get_point_khz`) is the reliable signal.** → Recommend Patch A.1: classify on the
+  offset readback (offsets present on points ≥ ceiling) rather than GetStatus actual freq. Not
+  changed yet (needs approval). Patch B (load classification) also unblocked.
 - **Richer dwell stats (this session) — IMPLEMENTED, not pushed**: second patch off the
   Sensor Audit. `PowerSweepPoint` gains optional `min_clock_mhz`/`p5_clock_mhz`,
   measured-voltage `avg/min/max` + `voltage_sample_count`, `dwell_sample_count`/

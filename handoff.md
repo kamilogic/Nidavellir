@@ -18,11 +18,18 @@ How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
   `VerifyAppliedProfile` request, `ApplyVerification` response), `crates/service/src/gpu_verify.rs`,
   `main.rs` (mod), `ipc_server.rs` (handler), `docs/contracts/ui-backend.md`. Additive only.
 - **Tests**: `cargo check -p nidavellir-service` clean · service 26/26 (+7 verifier pure tests).
-- **⚠ Runtime QA BLOCKED (safety)**: `gpu_applied.json` exists (Brokkr's 1770@837), so
-  console startup runs `reapply_on_boot` → `apply_vf_ceiling` = a VF WRITE (prohibited for this
-  QA). Service was NOT started. To live-test read-only verify without a write, either (a) approve
-  the normal reapply-on-boot then call `scripts/ipc.ps1 -Method VerifyAppliedProfile`, or
-  (b) add a no-reapply read path. **Manual live IPC test still required.**
+- **Read-only runtime path (2026-06-06)**: added console subcommand
+  `nidavellir-service.exe verify-applied` (`run_verify_only` in `main.rs`) — runs the verifier
+  with NO `run_startup_recovery`/`spawn_heartbeat`/`reapply_on_boot`/pipe server, so **no apply,
+  no VF write**. Prints `ApplyVerificationStatus` JSON + the `apply_verify:` log. Proven
+  non-mutating (`gpu_applied.json` mtime unchanged across a run).
+- **⚠ KEY runtime finding**: on the idle rig `verify-applied` returned **LiveMismatch (31/65
+  plateau points at 1770)** while **offsets_nonzero=63/65**. The flatten offsets are resident
+  (curve IS applied), but `read_vf_curve_modern` (GetStatus actual freq) does not uniformly
+  report the target at idle. **GetStatus actual-freq is NOT a reliable plateau-verification
+  source; the GET-control offset readback (`vf_get_point_khz`) is.** → **Patch A.1 (recommended,
+  not done)**: switch `classify_curve` to gate on offset presence on points ≥ ceiling, keep
+  GetStatus as corroboration. Needs approval (changes verdicts + tests).
 - **Unblocks**: Patch B (load classification) can reuse the applied `PowerSweepPoint` dwell stats.
 
 ## Backend checkpoint (2026-06-05) — Richer dwell stats (IMPLEMENTED, pushed)

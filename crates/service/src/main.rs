@@ -58,11 +58,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() > 1 {
         match args[1].to_string_lossy().as_ref() {
             "run" | "console" => return run_standalone(),
+            "verify-applied" => return run_verify_only(),
             _ => {}
         }
     }
 
     windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main)?;
+    Ok(())
+}
+
+/// Read-only diagnostic: classify the live VF curve against the applied profile and
+/// print the result. Deliberately does NOT run startup recovery, the heartbeat,
+/// `reapply_on_boot`, or the pipe server — so it performs **no apply, no reapply, and
+/// no VF-curve write**. Safe to run while the GPU is at any state.
+fn run_verify_only() -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("verify-applied: read-only curve verification (no reapply, no VF write)");
+    let status = gpu_verify::verify_applied_curve();
+    // Structured result to stdout for headless QA (in addition to the apply_verify log).
+    println!("{}", serde_json::to_string_pretty(&status)?);
     Ok(())
 }
 
