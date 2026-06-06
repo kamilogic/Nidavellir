@@ -76,6 +76,44 @@ change is required (missing optional fields tolerated). Rationale: `decisions.md
 
 
 
+\## Additive (2026-06-05): PowerSweepPoint richer dwell stats
+
+
+
+`PowerSweepPoint` gains further OPTIONAL `#[serde(default)]` fields (backend-only,
+
+backward-compatible; `None` on points measured before this change):
+
+
+
+\- Clock sustainability: `min_clock_mhz`, `p5_clock_mhz` (Option<u32>).
+
+\- Measured-voltage distribution (telemetry only, ramp-filtered + sanity-checked):
+
+&#x20; `avg_measured_voltage_mv`, `min_measured_voltage_mv`, `max_measured_voltage_mv`,
+
+&#x20; `voltage_sample_count` (Option<u32>).
+
+\- Dwell meta: `dwell_sample_count` (Option<u32>), `dwell_duration_ms` (Option<u64>).
+
+\- Temperature: `start_temp_c`, `end_temp_c`, `avg_temp_c` (Option<f32>).
+
+\- Confidence: `voltage_quality`, `telemetry_quality` — new enum `DwellQuality`
+
+&#x20; serializing as `"high"`/`"medium"`/`"low"`/`"unavailable"`.
+
+
+
+These are descriptive telemetry for UI explanation/confidence. `voltage_quality`
+
+is typically `medium` (voltage is sampled sparsely). The legacy `voltage_mv` /
+
+`measured_voltage_mv` (max) and the deterministic `vf_table_voltage_mv` apply key
+
+are UNCHANGED. No UI change required. Rationale: `decisions.md` Sensor Quality Audit.
+
+
+
 (No other active requests)
 
 

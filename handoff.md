@@ -3,7 +3,26 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-05) — Voltage field separation (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-05) — Richer dwell stats (IMPLEMENTED, not pushed)
+- Second patch off the Sensor Audit. **`PowerSweepPoint` gains optional dwell-quality
+  fields**: `min_clock_mhz`/`p5_clock_mhz`, measured-voltage `avg/min/max` +
+  `voltage_sample_count`, `dwell_sample_count`/`dwell_duration_ms`, `start/end/avg_temp_c`,
+  and `voltage_quality`/`telemetry_quality` (new `DwellQuality` enum in `core/ipc.rs`:
+  high/medium/low/unavailable).
+- **Voltage stats are ramp-filtered + sanity-checked (500–1250 mV)**; the legacy unfiltered
+  voltage max (`volt_mv` → `voltage_mv`/`measured_voltage_mv` + the apply-key snap) is
+  **UNCHANGED** (restriction: don't touch the apply-key decision). min/p5 clock from the
+  retained post-ramp clock samples; temp from NVML per-sample reads. Per-point
+  `dwell_stats:` log line (not per-sample).
+- **Files**: `crates/core/src/ipc.rs`, `crates/service/src/gpu_power_sweep.rs`,
+  `docs/contracts/ui-backend.md`. No `apps/ui`, Safe Loop, synthesis, or F1b change.
+  Additive serde-default fields; `PowerSweepPoint` stays `Copy`; old `forge_state.json` loads.
+- **Tests**: `cargo check -p nidavellir-service` clean · core 44/44 · service 19/19.
+- **Limitations (next work)**: full NVML limiter reasons deferred (needs `NvmlGpuReading`
+  in core); voltage cadence still ~480 ms (≈Medium quality, now surfaced); no per-sample
+  timestamps; no hotspot/fan; `arduous_validate` soak path doesn't yet use the richer stats.
+
+## Backend checkpoint (2026-06-05) — Voltage field separation (IMPLEMENTED, pushed)
 - First patch off the Sensor Audit decision. **`PowerSweepPoint` now separates
   `measured_voltage_mv` (telemetry) from `vf_table_voltage_mv` (deterministic apply/
   frontier key)**; legacy `voltage_mv` retained for compat/display.

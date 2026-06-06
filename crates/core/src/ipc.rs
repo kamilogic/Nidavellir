@@ -46,6 +46,19 @@ pub enum IpcRequest {
     ApplyPowerDeepCalm,
 }
 
+/// Telemetry confidence for a dwell metric, from how many valid samples backed it.
+/// Serializes as "high"/"medium"/"low"/"unavailable". Descriptive only — used to
+/// explain measurement strength in the UI/logs, never to fail a tuning decision
+/// unless that decision actually depends on the metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DwellQuality {
+    High,
+    Medium,
+    Low,
+    Unavailable,
+}
+
 /// One measured (locked voltage → sustained clock + power) point of the sweep.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PowerSweepPoint {
@@ -79,6 +92,43 @@ pub struct PowerSweepPoint {
     /// key. `None` for legacy points produced before the split. (Added: voltage split.)
     #[serde(default)]
     pub vf_table_voltage_mv: Option<u32>,
+
+    // ── Richer dwell stats (all additive/optional; `None` on legacy points) ──
+    /// Lowest sustained clock (MHz) over the dwell — a clock that dips well below
+    /// the mean is not truly sustained (matters for Godforge / F1b).
+    #[serde(default)]
+    pub min_clock_mhz: Option<u32>,
+    /// 5th-percentile sustained clock (MHz) — the "bad-case" clock.
+    #[serde(default)]
+    pub p5_clock_mhz: Option<u32>,
+    /// Ramp-filtered + sanity-checked measured-voltage distribution (telemetry only).
+    #[serde(default)]
+    pub avg_measured_voltage_mv: Option<u32>,
+    #[serde(default)]
+    pub min_measured_voltage_mv: Option<u32>,
+    #[serde(default)]
+    pub max_measured_voltage_mv: Option<u32>,
+    /// How many valid (post-ramp, in-range) voltage samples backed the stats above.
+    #[serde(default)]
+    pub voltage_sample_count: Option<u32>,
+    /// Confidence in the measured-voltage stats (sparse voltage sampling → Medium/Low).
+    #[serde(default)]
+    pub voltage_quality: Option<DwellQuality>,
+    /// Post-ramp clock/power sample count and the dwell duration (ms).
+    #[serde(default)]
+    pub dwell_sample_count: Option<u32>,
+    #[serde(default)]
+    pub dwell_duration_ms: Option<u64>,
+    /// GPU temperature at the start/end of the steady-state window and its mean (°C).
+    #[serde(default)]
+    pub start_temp_c: Option<f32>,
+    #[serde(default)]
+    pub end_temp_c: Option<f32>,
+    #[serde(default)]
+    pub avg_temp_c: Option<f32>,
+    /// Overall dwell telemetry confidence (worst of clock/power/voltage quality).
+    #[serde(default)]
+    pub telemetry_quality: Option<DwellQuality>,
 }
 
 /// Power-target sweep: for a range of locked voltages, the max stable clock and

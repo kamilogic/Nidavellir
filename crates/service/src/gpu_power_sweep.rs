@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nidavellir_core::gpu_sweep::StabilityResult;
-use nidavellir_core::ipc::{PowerSweepPoint, PowerSweepProgress};
+use nidavellir_core::ipc::{DwellQuality, PowerSweepPoint, PowerSweepProgress};
 use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
 use tracing::{info, warn};
 
@@ -30,6 +30,10 @@ use tracing::{info, warn};
 // the ramp and take the WORST CASE (max), not the mean.
 const DWELL_MS: u64 = 15000;
 const RAMP_DISCARD_MS: u128 = 6000;
+/// Plausible GPU core-voltage range (mV). Samples outside are dropped from the
+/// measured-voltage stats as sensor glitches (a 0 mV / out-of-range read is noise).
+const VOLT_SANE_MIN_MV: u32 = 500;
+const VOLT_SANE_MAX_MV: u32 = 1250;
 /// One exploration step (MHz of curve-flatten offset). ~9 mV/step here.
 const EXPLORE_STEP: i32 = 15;
 /// Exploration ceiling when nothing has been learned yet (fresh per-GPU knowledge).
@@ -565,7 +569,113 @@ struct Measured {
     power_std_w: f32,
     capped_frac: f32,
     /// Max core voltage observed under load (mV) — for the descent's safe start.
+    /// LEGACY: unfiltered AtomicU32 fetch_max; unchanged so the apply key is stable.
     volt_mv: u32,
+    // ── Richer dwell stats (additive; computed from the retained raw samples) ──
+    /// Post-ramp clock/power sample count and the steady-state window duration.
+    sample_count: u32,
+    duration_ms: u64,
+    /// Sustained-clock distribution (post-ramp): lowest and 5th percentile.
+    min_clock_mhz: u32,
+    p5_clock_mhz: u32,
+    /// Ramp-filtered + sanity-checked measured-voltage stats (telemetry only).
+    volt_min_mv: Option<u32>,
+    volt_avg_mv: Option<u32>,
+    volt_max_mv: Option<u32>,
+    volt_sample_count: u32,
+    /// Steady-state temperature start/end/mean (°C), if NVML reported it.
+    start_temp_c: Option<f32>,
+    end_temp_c: Option<f32>,
+    avg_temp_c: Option<f32>,
+}
+
+impl Measured {
+    /// A no-data result (device init failed / no samples) carrying only the legacy
+    /// voltage max. All richer stats are absent.
+    fn degenerate(result: StabilityResult, volt_mv: u32) -> Self {
+        Measured {
+            result,
+            clock_mhz: 0,
+            power_w: 0.0,
+            max_power_w: 0.0,
+            power_std_w: 0.0,
+            capped_frac: 0.0,
+            volt_mv,
+            sample_count: 0,
+            duration_ms: 0,
+            min_clock_mhz: 0,
+            p5_clock_mhz: 0,
+            volt_min_mv: None,
+            volt_avg_mv: None,
+            volt_max_mv: None,
+            volt_sample_count: 0,
+            start_temp_c: None,
+            end_temp_c: None,
+            avg_temp_c: None,
+        }
+    }
+}
+
+/// 5th-percentile (lower) clock of a sample set — the "bad-case" sustained clock.
+/// `None` if empty. Pure + testable.
+fn p5_clock_mhz(clocks: &[u32]) -> Option<u32> {
+    if clocks.is_empty() {
+        return None;
+    }
+    let mut s = clocks.to_vec();
+    s.sort_unstable();
+    let idx = (((s.len() - 1) as f64) * 0.05).floor() as usize;
+    Some(s[idx])
+}
+
+/// Aggregate already-validated voltage samples → `(min, avg, max, count)`.
+/// Empty → `None`. Pure + testable.
+fn voltage_stats(samples: &[u32]) -> Option<(u32, u32, u32, u32)> {
+    if samples.is_empty() {
+        return None;
+    }
+    let count = samples.len() as u32;
+    let min = *samples.iter().min().unwrap();
+    let max = *samples.iter().max().unwrap();
+    let avg = (samples.iter().map(|&v| v as u64).sum::<u64>() / count as u64) as u32;
+    Some((min, avg, max, count))
+}
+
+/// Telemetry confidence from valid clock/power sample count.
+fn clock_power_quality(sample_count: u32) -> DwellQuality {
+    match sample_count {
+        0 => DwellQuality::Unavailable,
+        1..=29 => DwellQuality::Low,
+        30..=99 => DwellQuality::Medium,
+        _ => DwellQuality::High,
+    }
+}
+
+/// Telemetry confidence from valid voltage sample count (sparser cadence → lower bars).
+fn voltage_quality(sample_count: u32) -> DwellQuality {
+    match sample_count {
+        0 => DwellQuality::Unavailable,
+        1..=9 => DwellQuality::Low,
+        10..=49 => DwellQuality::Medium,
+        _ => DwellQuality::High,
+    }
+}
+
+/// The worst (most conservative) of two qualities.
+fn worst_quality(a: DwellQuality, b: DwellQuality) -> DwellQuality {
+    fn rank(q: DwellQuality) -> u8 {
+        match q {
+            DwellQuality::Unavailable => 0,
+            DwellQuality::Low => 1,
+            DwellQuality::Medium => 2,
+            DwellQuality::High => 3,
+        }
+    }
+    if rank(a) <= rank(b) {
+        a
+    } else {
+        b
+    }
 }
 
 #[cfg(windows)]
@@ -579,19 +689,18 @@ fn load_and_measure(ms: u64) -> Measured {
     // the wgpu device, so a fresh context still measures the applied operating point.
     let ctx = match nidavellir_gpu_stress::GpuCtx::new() {
         Ok(c) => c,
-        Err(_) => {
-            return Measured {
-                result: StabilityResult::Crash,
-                clock_mhz: 0, power_w: 0.0, max_power_w: 0.0, power_std_w: 0.0,
-                capped_frac: 0.0, volt_mv: 0,
-            }
-        }
+        Err(_) => return Measured::degenerate(StabilityResult::Crash, 0),
     };
     let stop = Arc::new(AtomicBool::new(false));
-    // Collect raw samples in the sampler thread for precise stats (mean/max/std).
-    let samples: Arc<Mutex<Vec<(u32, f32, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    // Collect raw samples in the sampler thread for precise stats (mean/max/std + the
+    // richer min/p5/temperature stats). Tuple: (clock_mhz, power_w, capped, temp_c).
+    let samples: Arc<Mutex<Vec<(u32, f32, bool, Option<f32>)>>> = Arc::new(Mutex::new(Vec::new()));
     let volt = Arc::new(AtomicU32::new(0));
-    let (s2, smp, vlt) = (stop.clone(), samples.clone(), volt.clone());
+    // Ramp-filtered + sanity-checked voltage samples → measured-voltage telemetry
+    // (avg/min/max/count). The legacy `volt` AtomicU32 max is kept UNCHANGED so the
+    // apply key (which snaps `volt_mv`) is unaffected.
+    let volts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let (s2, smp, vlt, vsmp) = (stop.clone(), samples.clone(), volt.clone(), volts.clone());
     let t0 = std::time::Instant::now();
     let sampler = std::thread::spawn(move || {
         let mut tick: u32 = 0;
@@ -601,7 +710,7 @@ fn load_and_measure(ms: u64) -> Measured {
                     // Discard the ramp-up — steady state only.
                     if t0.elapsed().as_millis() >= RAMP_DISCARD_MS {
                         if let Ok(mut v) = smp.lock() {
-                            v.push((c, p, r.power_capped == Some(true)));
+                            v.push((c, p, r.power_capped == Some(true), r.temperature_c));
                         }
                     }
                 }
@@ -610,7 +719,15 @@ fn load_and_measure(ms: u64) -> Measured {
             tick += 1;
             if tick % 16 == 0 {
                 if let Some(mv) = nidavellir_gpu_nvapi::read_core_voltage_mv() {
-                    vlt.fetch_max(mv, Ordering::SeqCst);
+                    vlt.fetch_max(mv, Ordering::SeqCst); // legacy max — unchanged
+                    // Additive telemetry: ramp-filter + sanity-check, like clock/power.
+                    if t0.elapsed().as_millis() >= RAMP_DISCARD_MS
+                        && (VOLT_SANE_MIN_MV..=VOLT_SANE_MAX_MV).contains(&mv)
+                    {
+                        if let Ok(mut g) = vsmp.lock() {
+                            g.push(mv);
+                        }
+                    }
                 }
             }
             // Fast sampling to catch short power spikes the cap reacts to (NVML
@@ -635,9 +752,23 @@ fn load_and_measure(ms: u64) -> Measured {
     let _ = sampler.join();
 
     let volt_mv = volt.load(Ordering::SeqCst);
+    let duration_ms = t0.elapsed().as_millis() as u64;
     let v = samples.lock().map(|g| g.clone()).unwrap_or_default();
+    let volt_samples = volts.lock().map(|g| g.clone()).unwrap_or_default();
+    let (volt_min_mv, volt_avg_mv, volt_max_mv, volt_sample_count) = match voltage_stats(&volt_samples)
+    {
+        Some((mn, avg, mx, c)) => (Some(mn), Some(avg), Some(mx), c),
+        None => (None, None, None, 0),
+    };
     if v.is_empty() {
-        return Measured { result: res, clock_mhz: 0, power_w: 0.0, max_power_w: 0.0, power_std_w: 0.0, capped_frac: 0.0, volt_mv };
+        return Measured {
+            volt_min_mv,
+            volt_avg_mv,
+            volt_max_mv,
+            volt_sample_count,
+            duration_ms,
+            ..Measured::degenerate(res, volt_mv)
+        };
     }
     let n = v.len() as f32;
     let clock = (v.iter().map(|s| s.0 as u64).sum::<u64>() / v.len() as u64) as u32;
@@ -646,6 +777,16 @@ fn load_and_measure(ms: u64) -> Measured {
     let var = v.iter().map(|s| (s.1 - mean_p).powi(2)).sum::<f32>() / n;
     let std_p = var.sqrt();
     let capped = v.iter().filter(|s| s.2).count() as f32 / n;
+    let clocks: Vec<u32> = v.iter().map(|s| s.0).collect();
+    let min_clock = clocks.iter().copied().min().unwrap_or(0);
+    let p5_clock = p5_clock_mhz(&clocks).unwrap_or(0);
+    let temps: Vec<f32> = v.iter().filter_map(|s| s.3).collect();
+    let (start_temp_c, end_temp_c, avg_temp_c) = if temps.is_empty() {
+        (None, None, None)
+    } else {
+        let avg = temps.iter().sum::<f32>() / temps.len() as f32;
+        (Some(temps[0]), Some(temps[temps.len() - 1]), Some(avg))
+    };
     Measured {
         result: res,
         clock_mhz: clock,
@@ -654,6 +795,17 @@ fn load_and_measure(ms: u64) -> Measured {
         power_std_w: std_p,
         capped_frac: capped,
         volt_mv,
+        sample_count: v.len() as u32,
+        duration_ms,
+        min_clock_mhz: min_clock,
+        p5_clock_mhz: p5_clock,
+        volt_min_mv,
+        volt_avg_mv,
+        volt_max_mv,
+        volt_sample_count,
+        start_temp_c,
+        end_temp_c,
+        avg_temp_c,
     }
 }
 
@@ -1044,6 +1196,19 @@ fn run_power_sweep(
                 let vf_table_voltage_mv =
                     nidavellir_gpu_nvapi::nearest_vf_bin_at_or_above(&vf_curve, m.volt_mv)
                         .map(|(_, mv)| mv);
+                // Classify telemetry confidence; voltage is the weak link (sparse).
+                let cp_q = clock_power_quality(m.sample_count);
+                let voltage_q = voltage_quality(m.volt_sample_count);
+                let telemetry_q = worst_quality(cp_q, voltage_q);
+                info!(
+                    "dwell_stats: target={target} offset=+{offset} avg_clock={} min_clock={} \
+                     p5_clock={} avg_power={:.0}W peak_power={:.0}W cap={:.0}% avg_mv={:?} \
+                     min_mv={:?} max_mv={:?} voltage_samples={} voltage_quality={:?} \
+                     samples={} dur={}ms telemetry={:?}",
+                    m.clock_mhz, m.min_clock_mhz, m.p5_clock_mhz, m.power_w, m.max_power_w,
+                    m.capped_frac * 100.0, m.volt_avg_mv, m.volt_min_mv, m.volt_max_mv,
+                    m.volt_sample_count, voltage_q, m.sample_count, m.duration_ms, telemetry_q
+                );
                 prog.points.push(PowerSweepPoint {
                     voltage_mv: m.volt_mv,
                     clock_mhz: m.clock_mhz,
@@ -1056,6 +1221,19 @@ fn run_power_sweep(
                     perf_per_watt: m.clock_mhz as f64 / m.power_w as f64,
                     measured_voltage_mv: Some(m.volt_mv),
                     vf_table_voltage_mv,
+                    min_clock_mhz: Some(m.min_clock_mhz),
+                    p5_clock_mhz: Some(m.p5_clock_mhz),
+                    avg_measured_voltage_mv: m.volt_avg_mv,
+                    min_measured_voltage_mv: m.volt_min_mv,
+                    max_measured_voltage_mv: m.volt_max_mv,
+                    voltage_sample_count: Some(m.volt_sample_count),
+                    voltage_quality: Some(voltage_q),
+                    dwell_sample_count: Some(m.sample_count),
+                    dwell_duration_ms: Some(m.duration_ms),
+                    start_temp_c: m.start_temp_c,
+                    end_temp_c: m.end_temp_c,
+                    avg_temp_c: m.avg_temp_c,
+                    telemetry_quality: Some(telemetry_q),
                 });
                 // Continuous learning: accumulate this offset's stats + raise the
                 // clean frontier. Persisted, so confidence grows across runs.
@@ -1216,6 +1394,7 @@ mod tests {
             perf_per_watt,
             measured_voltage_mv: Some(900),
             vf_table_voltage_mv: None,
+            ..Default::default()
         }
     }
 
@@ -1273,6 +1452,7 @@ mod tests {
             perf_per_watt: clock_mhz as f64 / power_w as f64,
             measured_voltage_mv: Some(900),
             vf_table_voltage_mv: None,
+            ..Default::default()
         }
     }
 
@@ -1327,6 +1507,64 @@ mod tests {
         assert_eq!(p.voltage_mv, 843);
         assert_eq!(p.measured_voltage_mv, None);
         assert_eq!(p.vf_table_voltage_mv, None);
+        // The richer dwell-stat fields also default cleanly on legacy points.
+        assert_eq!(p.p5_clock_mhz, None);
+        assert_eq!(p.voltage_sample_count, None);
+        assert_eq!(p.telemetry_quality, None);
+    }
+
+    #[test]
+    fn p5_clock_normal_small_and_empty() {
+        // 20 samples (1700..=1719) → p5 index = floor(19*0.05)=0 → the lowest, 1700.
+        let cs: Vec<u32> = (1700..1720).collect();
+        assert_eq!(p5_clock_mhz(&cs), Some(1700));
+        assert_eq!(p5_clock_mhz(&[1830]), Some(1830)); // single sample
+        assert_eq!(p5_clock_mhz(&[]), None); // empty
+    }
+
+    #[test]
+    fn voltage_stats_aggregates_and_handles_empty() {
+        let (mn, avg, mx, c) = voltage_stats(&[837, 850, 869]).unwrap();
+        assert_eq!((mn, mx, c), (837, 869, 3));
+        assert_eq!(avg, (837 + 850 + 869) / 3);
+        assert_eq!(voltage_stats(&[]), None);
+    }
+
+    #[test]
+    fn quality_classification_thresholds() {
+        assert_eq!(clock_power_quality(0), DwellQuality::Unavailable);
+        assert_eq!(clock_power_quality(10), DwellQuality::Low);
+        assert_eq!(clock_power_quality(50), DwellQuality::Medium);
+        assert_eq!(clock_power_quality(200), DwellQuality::High);
+        assert_eq!(voltage_quality(0), DwellQuality::Unavailable);
+        assert_eq!(voltage_quality(5), DwellQuality::Low);
+        assert_eq!(voltage_quality(20), DwellQuality::Medium);
+        assert_eq!(voltage_quality(60), DwellQuality::High);
+        // Overall takes the worst metric (voltage is the weak link here).
+        assert_eq!(
+            worst_quality(DwellQuality::High, DwellQuality::Medium),
+            DwellQuality::Medium
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn power_point_roundtrips_dwell_stats() {
+        let mut p = fp(1770, 166.0);
+        p.p5_clock_mhz = Some(1765);
+        p.min_clock_mhz = Some(1755);
+        p.avg_measured_voltage_mv = Some(862);
+        p.voltage_sample_count = Some(24);
+        p.voltage_quality = Some(DwellQuality::Medium);
+        p.telemetry_quality = Some(DwellQuality::Medium);
+        p.avg_temp_c = Some(64.0);
+        let json = serde_json::to_string(&p).expect("encode");
+        let back: PowerSweepPoint = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.p5_clock_mhz, Some(1765));
+        assert_eq!(back.avg_measured_voltage_mv, Some(862));
+        assert_eq!(back.voltage_quality, Some(DwellQuality::Medium));
+        assert_eq!(back.telemetry_quality, Some(DwellQuality::Medium));
+        assert_eq!(back.avg_temp_c, Some(64.0));
     }
 
     #[cfg(windows)]

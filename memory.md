@@ -15,6 +15,18 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **Richer dwell stats (this session) — IMPLEMENTED, not pushed**: second patch off the
+  Sensor Audit. `PowerSweepPoint` gains optional `min_clock_mhz`/`p5_clock_mhz`,
+  measured-voltage `avg/min/max` + `voltage_sample_count`, `dwell_sample_count`/
+  `dwell_duration_ms`, `start/end/avg_temp_c`, and `voltage_quality`/`telemetry_quality`
+  (new `DwellQuality` enum: high/medium/low/unavailable). Voltage stats are now
+  **ramp-filtered + sanity-checked (500–1250 mV)**; the legacy unfiltered voltage max is
+  **unchanged** so the apply-key behavior is untouched. Per-point `dwell_stats:` log line.
+  No UI / Safe Loop / synthesis / F1b change; additive serde-default fields (old
+  `forge_state.json` loads; `PowerSweepPoint` stays `Copy`). Tests: `cargo check -p
+  nidavellir-service` clean · core 44/44 · service 19/19. **Limitations**: full NVML
+  limiter reasons deferred; voltage cadence still ~480 ms; no per-sample timestamps; no
+  hotspot/fan; `arduous_validate` soak path doesn't yet use the richer stats.
 - **Voltage field separation (this session) — IMPLEMENTED, not pushed**: first patch
   off the Sensor Audit decision. `PowerSweepPoint` now separates `measured_voltage_mv`
   (telemetry) from `vf_table_voltage_mv` (deterministic apply/frontier key); legacy
