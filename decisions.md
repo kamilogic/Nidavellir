@@ -2,6 +2,30 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 2A: simulated multi-clock outer-loop scaffolding (no hardware)
+- **Decision** (2026-06-06): prove the multi-clock loop in isolation BEFORE touching hardware.
+  `build_frontier(candidate_clocks, &FrontierDescent, &ForgePolicy, probe: impl Fn(u32,u32) ->
+  ProbeSample)` (in `gpu_power_sweep.rs`) drives the outer loop over candidate clocks and a
+  per-target voltage-bin **descent** through an **injected probe closure** — the closure is the
+  only seam to (future) hardware.
+- **Loop rules**: inner descent starts at `safe_start_mv`, steps down by `voltage_step_mv`,
+  **never below `lowest_safe_mv`** (the known-crash floor as a config input); keeps the deepest
+  stable point; stops on first `Unstable`; stops/drops on simulated `curve_verified == false`
+  (the Phase-2B Patch-A gate); drops a clock with no stable point. Outer loop allows a partial
+  frontier; empty frontier → synthesis returns all-`None` (safe failure, no panic).
+- **Frontier points** record `vf_table_voltage_mv` as the deterministic bin; measured voltage
+  stays telemetry only. Synthesis = `synthesize_forge_profiles(&frontier, policy)`.
+- **No hardware path wired**: no `load_and_measure`, no `apply_vf_ceiling`, no VF write, no GPU
+  stress, no Safe Loop interaction, no real power sweep. All types `#[cfg(windows)]
+  #[allow(dead_code)]` (wired in Phase 2B).
+- **Validation**: `cargo check` clean; service **52/52** (8 sim tests; 3060 Ti → 1830/1815/1740
+  and 4090 → 2880/2860/2700 proven *through the loop*; inner-stop, boundary, verify-fail,
+  partial, collapse, no-valid all covered).
+- **Phase 2B (future)**: real probe closure (apply ceiling at bin → Safe-Loop-armed dwell →
+  offset-readback `VerifiedCurve` gate) behind a supervised/approval-gated entry point.
+  **Phase 3** (knowledge re-keying by `(target_clock, vf_table_voltage_bin)` + global voltage-floor
+  boundary) remains future work.
+
 ## F1b Phase 1: policy-driven multi-clock synthesis (pure, service-internal)
 - **Decision** (2026-06-06): the three profiles are synthesized from ONE multi-clock frontier
   via centralized policy, not three independent sweeps. `ForgePolicy` (in `gpu_power_sweep.rs`)

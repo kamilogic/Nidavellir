@@ -27,6 +27,19 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   (+7 verifier). **Read-only runtime path**: `nidavellir-service.exe verify-applied` console
   subcommand runs the verifier with NO startup-recovery/heartbeat/`reapply_on_boot`/pipe server
   → no apply, no VF write (proven: `gpu_applied.json` mtime unchanged).
+- **F1b Phase 2A — simulated multi-clock outer-loop scaffolding (2026-06-06) — DONE, not pushed**:
+  `build_frontier(candidate_clocks, &FrontierDescent, &ForgePolicy, probe: impl Fn(u32,u32)->
+  ProbeSample)` in `gpu_power_sweep.rs` proves the outer loop, per-target voltage-bin descent,
+  stopping rules, known-unsafe boundary, frontier assembly, and synthesis wiring **with NO
+  hardware** — the probe closure is the only seam to (future) hardware. No `load_and_measure`,
+  no `apply_vf_ceiling`, no VF write, no GPU stress, no Safe Loop interaction, no real power sweep.
+  Frontier points use `vf_table_voltage_mv` (deterministic bin); measured voltage stays telemetry.
+  Inner loop keeps deepest stable, stops on first instability or simulated `curve_verified=false`,
+  never probes below `lowest_safe_mv`. 3060 Ti (1830/1815/1740) and 4090 (2880/2860/2700) proven
+  through the loop. No IPC/persistence field added. `cargo check` clean · service **52/52** (+8 sim).
+  **Phase 2B (future)**: real probe closure (apply ceiling → Safe-Loop-armed dwell → offset-readback
+  VerifiedCurve gate) behind a supervised/approval-gated run. **Phase 3** (knowledge re-keying)
+  remains future. See `decisions.md`.
 - **F1b Phase 1 — policy-driven multi-clock synthesis (2026-06-06) — DONE, not pushed**: pure
   service-internal logic in `gpu_power_sweep.rs`. `ForgePolicy` (Balanced 0.98/0.90/0.85 +
   Conservative/Aggressive presets); `synthesize_forge_profiles` now takes `&ForgePolicy` and

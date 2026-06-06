@@ -1220,6 +1220,146 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
     }
 }
 
+// ── F1b Phase 2A: simulated multi-clock outer-loop scaffolding ──────────────────
+// A generic frontier builder that drives the multi-clock loop through an INJECTED
+// probe closure. In Phase 2A the closure is always simulated (tests); Phase 2B will
+// pass a real closure that applies the ceiling + runs `load_and_measure` under
+// supervised approval. The loop itself never touches hardware — no VF write, no
+// `apply_vf_ceiling`, no `load_and_measure`, no Safe Loop interaction.
+
+/// Outcome of a single probe (one target clock at one candidate voltage bin).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // richer severities arrive with Phase 2B/3
+enum ProbeOutcome {
+    Stable,
+    Unstable,
+}
+
+/// What a probe returns — models exactly what a real dwell would yield, so the loop
+/// logic is identical whether the closure is simulated (2A) or real (2B).
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired to the real measurement path in Phase 2B
+struct ProbeSample {
+    outcome: ProbeOutcome,
+    /// Simulated Patch-A curve verification (Phase 2B: real offset-readback). When
+    /// false, the ceiling did not take → stop descending this clock.
+    curve_verified: bool,
+    avg_clock_mhz: u32,
+    p5_clock_mhz: Option<u32>,
+    power_w: f32,
+    max_power_w: f32,
+    power_capped_frac: f32,
+    measured_voltage_mv: Option<u32>,
+    telemetry_quality: DwellQuality,
+    voltage_quality: DwellQuality,
+    /// Accumulated stability confidence (Wilson LB) for this point — feeds the gate.
+    confidence: f64,
+}
+
+/// Voltage-bin descent config for a target clock. The descent never probes below
+/// `lowest_safe_mv` (the known-crash floor from Forge Knowledge — a config input here).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct FrontierDescent {
+    safe_start_mv: u32,
+    voltage_step_mv: u32,
+    lowest_safe_mv: u32,
+}
+
+/// Result of building a (simulated) multi-clock frontier + its synthesized profiles.
+#[cfg(windows)]
+#[allow(dead_code)]
+struct FrontierBuildResult {
+    frontier: Vec<PowerSweepPoint>,
+    profiles: ForgeProfiles,
+    log: Vec<String>,
+}
+
+/// Convert a stable probe at `vbin` into a frontier `PowerSweepPoint`. The deterministic
+/// VF-table bin is recorded as the apply axis; measured voltage stays telemetry.
+#[cfg(windows)]
+#[allow(dead_code)]
+fn probe_to_point(vbin: u32, s: &ProbeSample) -> PowerSweepPoint {
+    PowerSweepPoint {
+        clock_mhz: s.avg_clock_mhz,
+        power_w: s.power_w,
+        max_power_w: s.max_power_w,
+        power_capped_frac: s.power_capped_frac,
+        stable: true,
+        perf_per_watt: if s.power_w > 0.0 { s.avg_clock_mhz as f64 / s.power_w as f64 } else { 0.0 },
+        vf_table_voltage_mv: Some(vbin),
+        measured_voltage_mv: s.measured_voltage_mv,
+        avg_measured_voltage_mv: s.measured_voltage_mv,
+        max_measured_voltage_mv: s.measured_voltage_mv,
+        p5_clock_mhz: s.p5_clock_mhz,
+        voltage_quality: Some(s.voltage_quality),
+        telemetry_quality: Some(s.telemetry_quality),
+        ..Default::default()
+    }
+}
+
+/// Build a multi-clock frontier by descending each candidate clock's voltage bins via
+/// the injected `probe` closure, then synthesize the three profiles with `policy`.
+///
+/// Inner loop (per target): start at `safe_start_mv`, descend by `voltage_step_mv`,
+/// never below `lowest_safe_mv`; stop on the first `Unstable` (keep the deepest stable);
+/// stop if `curve_verified` is false (the ceiling did not apply — can't trust deeper);
+/// drop the clock if no stable point was found. Outer loop: process candidate clocks in
+/// order, allow a partial frontier, then synthesize. Pure — the closure is the only
+/// seam to (future) hardware. Never runs stress / writes the VF curve.
+#[cfg(windows)]
+#[allow(dead_code)] // wired to the real measurement closure in Phase 2B
+fn build_frontier(
+    candidate_clocks: &[u32],
+    descent: &FrontierDescent,
+    policy: &ForgePolicy,
+    probe: impl Fn(u32, u32) -> ProbeSample,
+) -> FrontierBuildResult {
+    let mut paired: Vec<(PowerSweepPoint, f64)> = Vec::new();
+    let mut log = Vec::new();
+
+    for &target in candidate_clocks {
+        let mut deepest: Option<(PowerSweepPoint, f64)> = None;
+        let mut v = descent.safe_start_mv;
+        while v >= descent.lowest_safe_mv {
+            let s = probe(target, v);
+            if !s.curve_verified {
+                log.push(format!(
+                    "{target} MHz @ {v} mV: curve not verified (simulated) — stop descent"
+                ));
+                break;
+            }
+            match s.outcome {
+                ProbeOutcome::Stable => {
+                    deepest = Some((probe_to_point(v, &s), s.confidence));
+                    if v < descent.voltage_step_mv {
+                        break;
+                    }
+                    v -= descent.voltage_step_mv;
+                }
+                ProbeOutcome::Unstable => {
+                    log.push(format!("{target} MHz @ {v} mV: unstable — keep deepest stable"));
+                    break;
+                }
+            }
+        }
+        match deepest {
+            Some(p) => paired.push(p),
+            None => log.push(format!("{target} MHz: no stable point in safe range — dropped")),
+        }
+    }
+
+    let profiles = synthesize_forge_profiles(&paired, policy);
+    FrontierBuildResult {
+        frontier: paired.into_iter().map(|(p, _)| p).collect(),
+        profiles,
+        log,
+    }
+}
+
 #[cfg(windows)]
 fn run_power_sweep(
     progress: Arc<Mutex<PowerSweepProgress>>,
@@ -1776,6 +1916,210 @@ mod tests {
         // Unconstrained: explore a few steps ABOVE the stock boost ceiling (real OC).
         let oc = candidate_clocks(2800, 2880, Regime::Unconstrained, 20, 0.90);
         assert!(oc.iter().any(|&c| c > 2800), "unconstrained explores above stock");
+    }
+
+    // ── F1b Phase 2A: simulated multi-clock outer-loop scaffolding ──────────────
+    #[cfg(windows)]
+    fn stable_sample(clock: u32, power: f32, conf: f64) -> ProbeSample {
+        ProbeSample {
+            outcome: ProbeOutcome::Stable,
+            curve_verified: true,
+            avg_clock_mhz: clock,
+            p5_clock_mhz: Some(clock.saturating_sub(5)),
+            power_w: power,
+            max_power_w: power + 5.0,
+            power_capped_frac: 0.0,
+            measured_voltage_mv: None,
+            telemetry_quality: DwellQuality::Medium,
+            voltage_quality: DwellQuality::Medium,
+            confidence: conf,
+        }
+    }
+
+    #[cfg(windows)]
+    fn unstable_sample() -> ProbeSample {
+        ProbeSample {
+            outcome: ProbeOutcome::Unstable,
+            curve_verified: true,
+            avg_clock_mhz: 0,
+            p5_clock_mhz: None,
+            power_w: 0.0,
+            max_power_w: 0.0,
+            power_capped_frac: 0.0,
+            measured_voltage_mv: None,
+            telemetry_quality: DwellQuality::Unavailable,
+            voltage_quality: DwellQuality::Unavailable,
+            confidence: 0.0,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sim_frontier_3060ti_power_capped_picks_expected_profiles() {
+        let targets = [1830u32, 1815, 1800, 1770, 1740];
+        let probe = |target: u32, vbin: u32| -> ProbeSample {
+            // (lowest-stable bin, power at that bin) per target — the descent bottoms here.
+            let (min_mv, base) = match target {
+                1830 => (925u32, 190.0f32),
+                1815 => (900, 177.0),
+                1800 => (875, 170.0),
+                1770 => (850, 156.0),
+                1740 => (825, 150.0),
+                _ => (2000, 999.0),
+            };
+            if vbin >= min_mv {
+                stable_sample(target, base + (vbin - min_mv) as f32 * 0.2, 0.95)
+            } else {
+                unstable_sample()
+            }
+        };
+        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), probe);
+        assert_eq!(r.frontier.len(), 5);
+        assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
+        assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 1815);
+        assert_eq!(r.profiles.deep_calm.unwrap().clock_mhz, 1740);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sim_frontier_4090_headroom_picks_expected_profiles() {
+        let targets = [2880u32, 2860, 2840, 2800, 2760, 2700];
+        let probe = |target: u32, vbin: u32| -> ProbeSample {
+            let (min_mv, base) = match target {
+                2880 => (1075u32, 405.0f32),
+                2860 => (1050, 365.0),
+                2840 => (1025, 335.0),
+                2800 => (975, 285.0),
+                2760 => (950, 260.0),
+                2700 => (925, 245.0),
+                _ => (2000, 999.0),
+            };
+            if vbin >= min_mv {
+                stable_sample(target, base + (vbin - min_mv) as f32 * 0.2, 0.95)
+            } else {
+                unstable_sample()
+            }
+        };
+        let d = FrontierDescent { safe_start_mv: 1100, voltage_step_mv: 25, lowest_safe_mv: 800 };
+        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), probe);
+        assert_eq!(r.frontier.len(), 6);
+        assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 2880, "Godforge = highest clock");
+        assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 2860, "Brokkr's = max R within 98% floor");
+        assert_eq!(r.profiles.deep_calm.unwrap().clock_mhz, 2700, "Deep Calm = max MHz/W within 90% floor");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sim_inner_loop_stops_at_first_instability() {
+        // Stable for vbin >= 900, unstable below → deepest stable is the 900 bin.
+        let probe = |target: u32, vbin: u32| {
+            if vbin >= 900 {
+                stable_sample(target, 200.0 + (vbin - 900) as f32 * 0.1, 0.95)
+            } else {
+                unstable_sample()
+            }
+        };
+        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), probe);
+        assert_eq!(r.frontier.len(), 1);
+        assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(900), "deepest stable bin kept");
+        assert!(r.frontier[0].stable);
+        assert_eq!(r.frontier[0].clock_mhz, 2000);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sim_respects_known_unsafe_boundary() {
+        use std::cell::Cell;
+        let min_probed = Cell::new(u32::MAX);
+        // Would be stable even at 800 mV, but the loop must never probe below 950.
+        let probe = |target: u32, vbin: u32| {
+            min_probed.set(min_probed.get().min(vbin));
+            if vbin >= 800 {
+                stable_sample(target, 200.0, 0.95)
+            } else {
+                unstable_sample()
+            }
+        };
+        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 950 };
+        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), probe);
+        assert!(min_probed.get() >= 950, "never probe below the known-unsafe floor");
+        assert!(r.frontier[0].vf_table_voltage_mv.unwrap() >= 950);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sim_curve_verification_failure_rejects_or_aborts_point() {
+        // The 1830 ceiling never verifies → its clock is dropped; 1770 is kept.
+        let probe = |target: u32, _vbin: u32| {
+            let mut s = stable_sample(target, 180.0, 0.95);
+            if target == 1830 {
+                s.curve_verified = false;
+            }
+            s
+        };
+        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), probe);
+        assert_eq!(r.frontier.len(), 1, "unverified clock rejected");
+        assert_eq!(r.frontier[0].clock_mhz, 1770);
+        assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1770);
+        assert!(r.log.iter().any(|l| l.contains("curve not verified")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sim_partial_frontier_still_synthesizes_if_enough_points() {
+        // 1815 can never stabilize (min above safe_start) → dropped; 1830 + 1770 remain.
+        let probe = |target: u32, vbin: u32| {
+            let min_mv = match target {
+                1830 => 900u32,
+                1815 => 1200, // > safe_start → first probe unstable → dropped
+                1770 => 850,
+                _ => 2000,
+            };
+            if vbin >= min_mv {
+                stable_sample(target, if target == 1830 { 190.0 } else { 156.0 }, 0.95)
+            } else {
+                unstable_sample()
+            }
+        };
+        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let r = build_frontier(&[1830u32, 1815, 1770], &d, &ForgePolicy::balanced(), probe);
+        assert_eq!(r.frontier.len(), 2, "partial frontier (1815 dropped)");
+        assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
+        assert!(r.profiles.deep_calm.is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sim_single_clock_collapse_does_not_panic() {
+        // Every target reports the SAME measured clock (1770) → collapse, handled.
+        let probe = |_target: u32, vbin: u32| {
+            if vbin >= 850 {
+                stable_sample(1770, 150.0 + (vbin - 850) as f32 * 0.2, 0.95)
+            } else {
+                unstable_sample()
+            }
+        };
+        let d = FrontierDescent { safe_start_mv: 950, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), probe);
+        assert!(r.profiles.godforge.is_some());
+        assert!(r.profiles.brokkrs.is_some());
+        assert!(r.profiles.deep_calm.is_some());
+        assert!(r.profiles.log.iter().any(|l| l.contains("single sustainable clock")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sim_no_valid_points_returns_safe_failure() {
+        let probe = |_t: u32, _v: u32| unstable_sample(); // nothing ever stable
+        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), probe);
+        assert!(r.frontier.is_empty());
+        assert!(r.profiles.godforge.is_none());
+        assert!(r.profiles.brokkrs.is_none());
+        assert!(r.profiles.deep_calm.is_none());
     }
 
     #[cfg(windows)]

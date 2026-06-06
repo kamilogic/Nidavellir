@@ -22,10 +22,15 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
     `ForgePolicy` (Balanced 0.98/0.90/0.85; Conservative/Aggressive presets), clock floors,
     Godforge=highest sustained clock (p5-aware), Brokkr's=max R within floor, Deep Calm=max
     MHz/W within floor, single-clock collapse handled, voltage not a selection axis. 44 tests.
-  - **F1b Phase 2 (next, NOT started)** — real multi-clock measurement loop over the safe
-    flatten sweep (outer loop over candidate clocks); simulated outer-loop scaffolding first,
-    then a supervised/approval-gated hardware run; verify ceiling per dwell (Patch A); add
-    `target_clock_mhz` to points.
+  - **F1b Phase 2A (DONE)** — simulated multi-clock outer-loop scaffolding: `build_frontier`
+    (generic over an injected probe closure) proves per-target voltage-bin descent, stopping
+    rules, known-unsafe boundary, frontier assembly, and synthesis wiring with NO hardware.
+    8 sim tests (3060 Ti + 4090 proven through the loop). No `load_and_measure`/`apply_vf_ceiling`
+    call, no VF write, no Safe Loop interaction.
+  - **F1b Phase 2B (next, NOT started)** — fill the real probe closure (apply ceiling at bin →
+    Safe-Loop-armed `load_and_measure` dwell → offset-readback `VerifiedCurve` gate), wire
+    `build_frontier` into a supervised/approval-gated entry point; add `target_clock_mhz` to
+    points if the real path needs it. Hardware-risky → supervised.
   - **F1b Phase 3** — knowledge keying by (target_clock, vf_table_voltage_bin) + global
     voltage-floor crash boundary; backward-compatible `gpu_knowledge.json` migration.
 - **F2** transparency (clock/power deltas) · **F3** Forge modes (Quick/Deep/

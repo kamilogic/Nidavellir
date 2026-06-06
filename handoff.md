@@ -3,7 +3,29 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-06) — F1b Phase 1: policy-driven multi-clock synthesis (DONE, not pushed)
+## Latest backend checkpoint (2026-06-06) — F1b Phase 2A: simulated multi-clock loop (DONE, not pushed)
+- **`build_frontier(candidate_clocks, &FrontierDescent, &ForgePolicy, probe: impl Fn(u32,u32)->
+  ProbeSample)`** in `gpu_power_sweep.rs` proves the multi-clock outer loop, per-target voltage-bin
+  descent, stopping rules, known-unsafe boundary, frontier assembly, and synthesis wiring **without
+  hardware**. The injected probe closure is the only seam to (future) hardware.
+- **Loop rules**: descend from `safe_start_mv` by `voltage_step_mv`, never below `lowest_safe_mv`
+  (known-crash floor as config); keep deepest stable; stop on first `Unstable`; stop/drop on
+  simulated `curve_verified=false` (Phase-2B Patch-A gate); drop a clock with no stable point.
+  Partial frontier allowed; empty → synthesis all-`None` (safe). Points record `vf_table_voltage_mv`
+  (deterministic bin); measured voltage stays telemetry.
+- **No hardware wired**: no `load_and_measure`, no `apply_vf_ceiling`, no VF write, no stress, no
+  Safe Loop interaction, no real power sweep. New types/fn `#[cfg(windows)] #[allow(dead_code)]`.
+- **Files**: `crates/service/src/gpu_power_sweep.rs` only. No IPC/persistence/`apps/ui` change.
+  `cargo check` clean · service **52/52** (+8 sim; 3060 Ti 1830/1815/1740 + 4090 2880/2860/2700
+  proven through the loop).
+- **F1b Phase 2B (next, NOT started)**: fill the real probe closure — apply ceiling at the bin →
+  Safe-Loop-armed `load_and_measure` dwell → offset-readback `VerifiedCurve` gate → map to
+  `ProbeSample`; wire `build_frontier` into a **supervised/approval-gated** entry point; feed
+  `candidate_clocks(...)` from a live `classify_regime`; add `target_clock_mhz` to points if needed.
+- **Phase 3 (future)**: knowledge re-key to `(target_clock, vf_table_voltage_bin)` + global
+  voltage-floor crash boundary; backward-compatible `gpu_knowledge.json` migration.
+
+## Backend checkpoint (2026-06-06) — F1b Phase 1: policy-driven multi-clock synthesis (DONE, pushed)
 - Pure, service-internal in `gpu_power_sweep.rs`. **`ForgePolicy`** centralizes thresholds —
   Balanced `brokkrs_min_clock_frac=0.98` / `deep_calm_min_clock_frac=0.90` / `confidence_threshold=
   0.85`; Conservative (0.99/0.92/0.95) and Aggressive (0.97/0.85/0.70) presets.
