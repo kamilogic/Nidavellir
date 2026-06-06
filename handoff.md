@@ -3,7 +3,29 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-06) — Forge action consolidation audit (recorded, no code change)
+## Latest backend checkpoint (2026-06-06) — F1b Phase 1: policy-driven multi-clock synthesis (DONE, not pushed)
+- Pure, service-internal in `gpu_power_sweep.rs`. **`ForgePolicy`** centralizes thresholds —
+  Balanced `brokkrs_min_clock_frac=0.98` / `deep_calm_min_clock_frac=0.90` / `confidence_threshold=
+  0.85`; Conservative (0.99/0.92/0.95) and Aggressive (0.97/0.85/0.70) presets.
+- **`synthesize_forge_profiles(frontier, &ForgePolicy)`** now applies clock floors:
+  Godforge = highest **sustainable** clock (prefers `p5_clock_mhz`, falls back to `clock_mhz`;
+  ties→lowest power); **Brokkr's = max R within the Brokkr's clock floor** (real trade: clock<gc,
+  power<gp); Deep Calm = max MHz/W within the Deep Calm floor. **Selection never uses measured
+  voltage** — `vf_table_voltage_mv` stays the deterministic apply axis. **Single-clock collapse**
+  detected + logged (still returns all three). **4090 doc ambiguity resolved: Brokkr's = 2860**
+  (max-R-within-floor).
+- Added Phase-2 helpers (pure, `#[allow(dead_code)]` until wired): `Regime` enum,
+  `classify_regime(...)`, `candidate_clocks(...)`.
+- **Files**: `crates/service/src/gpu_power_sweep.rs` only. No IPC, no `apps/ui`, no Safe Loop,
+  no hardware path. `cargo check` clean · service **44/44** (3 F1a tests unchanged + 9 F1b).
+- **F1b Phase 2 (next, NOT started)**: real multi-clock measurement loop over the safe flatten
+  sweep — build a **simulated/inject outer-loop scaffold first** (test loop/knowledge/stopping
+  without a GPU), then a **supervised, approval-gated** hardware run; verify the ceiling per dwell
+  (Patch A offset readback); SyntheticDwell context only; add `target_clock_mhz` to points then.
+- **Phase 3**: re-key knowledge by (target_clock, vf_table_voltage_bin) + global voltage-floor
+  crash boundary; backward-compatible `gpu_knowledge.json` migration.
+
+## Backend checkpoint (2026-06-06) — Forge action consolidation audit (recorded, no code change)
 - Backend has **two engine generations**. **Canonical Forge GPU core path = `gpu_power_sweep.rs`
   (Power Sweep)**: `set_core_offset_mhz` + `apply_vf_ceiling` (elastic VF ceiling), game-power
   render dwell, Safe-Loop-guarded, **no voltage lock**. Apply via `ApplyPowerGodforge/Brokkrs/

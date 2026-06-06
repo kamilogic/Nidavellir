@@ -27,6 +27,18 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   (+7 verifier). **Read-only runtime path**: `nidavellir-service.exe verify-applied` console
   subcommand runs the verifier with NO startup-recovery/heartbeat/`reapply_on_boot`/pipe server
   → no apply, no VF write (proven: `gpu_applied.json` mtime unchanged).
+- **F1b Phase 1 — policy-driven multi-clock synthesis (2026-06-06) — DONE, not pushed**: pure
+  service-internal logic in `gpu_power_sweep.rs`. `ForgePolicy` (Balanced 0.98/0.90/0.85 +
+  Conservative/Aggressive presets); `synthesize_forge_profiles` now takes `&ForgePolicy` and
+  applies clock floors: Godforge = highest **sustained** clock (prefers `p5_clock_mhz`, falls back
+  to `clock_mhz`; ties→lowest power); Brokkr's = **max R within the Brokkr's clock floor**; Deep
+  Calm = max MHz/W within the Deep Calm floor. Measured voltage is NOT a selection axis
+  (`vf_table_voltage_mv` stays the deterministic apply axis). Single-clock collapse detected +
+  logged (returns all three, no panic). Added `Regime` enum + pure `classify_regime` +
+  `candidate_clocks` (Phase-2 helpers). **4090 example resolved: Brokkr's = 2860** (max-R-within-
+  floor). No IPC/apps-ui/Safe-Loop/hardware change. `cargo check` clean · service **44/44** (F1a
+  assertions unchanged, +9 F1b tests). **Phase 2 NOT started** — needs simulated outer-loop
+  scaffolding before any (supervised/approval-gated) hardware multi-clock sweep. See `decisions.md`.
 - **Forge action consolidation audit (2026-06-06) — recorded, no code change**: backend has two
   engine generations. **Canonical = `gpu_power_sweep.rs` (Power Sweep)**: offset + elastic VF
   ceiling, game-power dwell, no voltage lock → the Forge GPU core path (apply via

@@ -2,6 +2,28 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 1: policy-driven multi-clock synthesis (pure, service-internal)
+- **Decision** (2026-06-06): the three profiles are synthesized from ONE multi-clock frontier
+  via centralized policy, not three independent sweeps. `ForgePolicy` (in `gpu_power_sweep.rs`)
+  holds the thresholds — **Balanced default: Brokkr's ≥ 0.98 × Godforge clock, Deep Calm ≥ 0.90,
+  confidence ≥ 0.85**; Conservative (0.99/0.92/0.95) and Aggressive (0.97/0.85/0.70) presets exist.
+- **Selection rules** (`synthesize_forge_profiles(frontier, &ForgePolicy)`):
+  - **Godforge** = highest **sustainable** clock — uses `p5_clock_mhz` when present (dip-aware),
+    falls back to `clock_mhz`; ties → lowest power.
+  - **Brokkr's Best** = **max R = %power_saved ÷ %clock_lost within the Brokkr's clock floor**
+    (real trade: clock < Godforge, power < Godforge). Resolves the F1b-doc 4090 ambiguity:
+    Brokkr's = **2860** (max R within floor), NOT 2840 — keeps Brokkr's nearest Godforge rather
+    than drifting into the eco profile.
+  - **Deep Calm** = max MHz/W within the Deep Calm clock floor (stays useful).
+- **Measured voltage is NOT a selection axis** — selection uses clock/power/p5/confidence only;
+  `vf_table_voltage_mv` stays the deterministic apply axis (per the voltage-split decision).
+- **Single-clock collapse** (the old single-clock sweep's failure mode) is detected and logged;
+  synthesis still returns all three profiles (no panic/empty).
+- **Scope**: pure, service-internal, additive — no IPC change, no `apps/ui`, no Safe Loop, no
+  hardware path. `cargo check` clean; service 44 tests (F1a assertions unchanged). **Phase 2 (real
+  multi-clock measurement loop) NOT started** — needs simulated outer-loop scaffolding first, then
+  a supervised/approval-gated hardware run.
+
 ## Forge action consolidation: Power Sweep is canonical; Real Sweep / Forge Everything are legacy
 - **Decision** (Forge Action Consolidation audit, 2026-06-06): **`gpu_power_sweep.rs` (Power
   Sweep) is the canonical Forge GPU core path** — offset + elastic VF ceiling

@@ -1000,6 +1000,98 @@ fn select_brokkrs_v2(
 }
 
 /// The three forge profiles synthesized from a power frontier (F1 product model).
+/// Centralized product policy for profile synthesis (F1b) — thresholds live here, not
+/// scattered through the algorithm. Clock floors keep Brokkr's near Godforge and keep
+/// Deep Calm useful; the confidence threshold reuses the V2 Wilson gate.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // presets wired into the live sweep by F1b Phase 2
+struct ForgePolicy {
+    /// Brokkr's Best must keep >= this fraction of Godforge's (sustained) clock.
+    brokkrs_min_clock_frac: f64,
+    /// Deep Calm must keep >= this fraction of Godforge's (sustained) clock.
+    deep_calm_min_clock_frac: f64,
+    /// Minimum stability confidence (Wilson LB) a point must clear to be eligible.
+    confidence_threshold: f64,
+}
+
+#[cfg(windows)]
+#[allow(dead_code)] // conservative/aggressive wired by F1b Phase 2 (profile selector)
+impl ForgePolicy {
+    /// Default daily-use policy: Brokkr's >= 98% clock, Deep Calm >= 90% clock, gate .85.
+    fn balanced() -> Self {
+        Self { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 }
+    }
+    fn conservative() -> Self {
+        Self { brokkrs_min_clock_frac: 0.99, deep_calm_min_clock_frac: 0.92, confidence_threshold: 0.95 }
+    }
+    fn aggressive() -> Self {
+        Self { brokkrs_min_clock_frac: 0.97, deep_calm_min_clock_frac: 0.85, confidence_threshold: 0.70 }
+    }
+}
+
+/// Observed GPU constraint regime — descriptive, and drives the candidate-clock range.
+/// `VoltageLimited` is reserved: it can't be told from a single stock sample (it emerges
+/// during the sweep when raising voltage stops raising clock), so `classify_regime`
+/// does not yet produce it.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // wired into the live sweep by F1b Phase 2
+enum Regime {
+    PowerLimited,
+    VoltageLimited,
+    ThermalLimited,
+    Mixed,
+    Unconstrained,
+}
+
+/// Classify the regime from a stock heavy-load telemetry sample. Pure + testable.
+/// `cap_fraction` 0..1, `power_limit_w`/`temp_c` optional context. A conservative ~83 °C
+/// thermal-throttle threshold is assumed when a temperature is present.
+#[cfg(windows)]
+#[allow(dead_code)] // wired into the live sweep by F1b Phase 2
+fn classify_regime(cap_fraction: f32, power_w: f32, power_limit_w: f32, temp_c: Option<f32>) -> Regime {
+    let near_power = cap_fraction > 0.5 || (power_limit_w > 0.0 && power_w >= 0.95 * power_limit_w);
+    let near_thermal = temp_c.map_or(false, |t| t >= 83.0);
+    match (near_power, near_thermal) {
+        (true, true) => Regime::Mixed,
+        (true, false) => Regime::PowerLimited,
+        (false, true) => Regime::ThermalLimited,
+        (false, false) => Regime::Unconstrained,
+    }
+}
+
+/// Build the descending candidate target-clock list to probe. Power/thermal/mixed
+/// regimes don't probe above the sustained clock (the cap/heat holds it); an
+/// unconstrained GPU may explore a few steps ABOVE the stock boost ceiling (real OC).
+/// The floor is `floor_frac × stock_sustained` (the Deep Calm floor). Pure + testable.
+#[cfg(windows)]
+#[allow(dead_code)] // wired into the live sweep by F1b Phase 2
+fn candidate_clocks(
+    stock_sustained_mhz: u32,
+    stock_boost_max_mhz: u32,
+    regime: Regime,
+    step: u32,
+    floor_frac: f64,
+) -> Vec<u32> {
+    let step = step.max(1);
+    let top = match regime {
+        Regime::Unconstrained => stock_boost_max_mhz.max(stock_sustained_mhz) + 3 * step,
+        _ => stock_sustained_mhz,
+    };
+    let floor = ((stock_sustained_mhz as f64) * floor_frac).round() as u32;
+    let mut out = Vec::new();
+    let mut c = top;
+    while c >= floor {
+        out.push(c);
+        if c < step {
+            break;
+        }
+        c -= step;
+    }
+    out
+}
+
 #[cfg(windows)]
 #[allow(dead_code)] // wired into the live sweep by F1b (multi-clock measurement)
 struct ForgeProfiles {
@@ -1009,29 +1101,40 @@ struct ForgeProfiles {
     log: Vec<String>,
 }
 
-/// Synthesize the three forge profiles from a power frontier — each entry a measured
-/// operating point plus its accumulated stability confidence (Wilson LB):
-/// - **Godforge**  = highest sustained clock (performance).
-/// - **Brokkr's**  = best benefit/cost `R = %power_saved ÷ %clock_lost` vs Godforge
-///   (balance) — deliberately NOT simply the best MHz/W.
-/// - **Deep Calm** = best MHz/W (efficiency).
-/// Only points with confidence ≥ `threshold` are eligible; if none qualify the gate
-/// is dropped (best-effort) and logged, so synthesis never returns nothing. Pure +
-/// unit-tested; the multi-clock frontier that feeds it is produced by F1b.
+/// Synthesize the three forge profiles from a (multi-clock) power frontier — each entry
+/// a measured operating point plus its accumulated stability confidence (Wilson LB):
+/// - **Godforge**  = highest SUSTAINED clock (performance); ties → lowest power.
+/// - **Brokkr's**  = best benefit/cost `R = %power_saved ÷ %clock_lost` vs Godforge,
+///   among points that keep ≥ `policy.brokkrs_min_clock_frac` of Godforge's clock
+///   (so Brokkr's stays near Godforge and never collapses into Deep Calm). Max R wins.
+/// - **Deep Calm** = best MHz/W among points that keep ≥ `policy.deep_calm_min_clock_frac`
+///   of Godforge's clock (so it stays useful, never a near-idle clock).
+///
+/// Sustainability uses `p5_clock_mhz` when present (dip-aware), else `clock_mhz`
+/// (legacy fallback). Selection uses clock / power / p5 / confidence ONLY — NEVER
+/// measured voltage (`vf_table_voltage_mv` is the deterministic apply axis, not used
+/// for selection here). Only points with confidence ≥ `policy.confidence_threshold`
+/// are eligible; if none qualify the gate is dropped (best-effort) and logged, so
+/// synthesis never returns nothing. Pure + unit-tested; the multi-clock frontier that
+/// feeds it is produced by F1b Phase 2.
 #[cfg(windows)]
-#[allow(dead_code)] // wired into the live sweep by F1b (multi-clock measurement)
-fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], threshold: f64) -> ForgeProfiles {
+#[allow(dead_code)] // wired into the live sweep by F1b Phase 2 (multi-clock measurement)
+fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &ForgePolicy) -> ForgeProfiles {
     use std::cmp::Ordering as Ord;
     let mut log = Vec::new();
 
     // Confidence gate (reuses V2): trust only well-tested points; else best-effort.
     let pool: Vec<(PowerSweepPoint, f64)> = {
-        let trusted: Vec<(PowerSweepPoint, f64)> =
-            frontier.iter().copied().filter(|(_, c)| *c >= threshold).collect();
+        let trusted: Vec<(PowerSweepPoint, f64)> = frontier
+            .iter()
+            .copied()
+            .filter(|(_, c)| *c >= policy.confidence_threshold)
+            .collect();
         if trusted.is_empty() {
             let best = frontier.iter().map(|(_, c)| *c).fold(0.0_f64, f64::max);
             log.push(format!(
-                "FORGE: no point met confidence ≥ {threshold:.2} (best {best:.2}) — best-effort synthesis"
+                "FORGE: no point met confidence ≥ {:.2} (best {best:.2}) — best-effort synthesis",
+                policy.confidence_threshold
             ));
             frontier.to_vec()
         } else {
@@ -1042,45 +1145,71 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], threshold: f64
         return ForgeProfiles { godforge: None, brokkrs: None, deep_calm: None, log };
     }
 
-    // Godforge = highest sustained clock (ties → the lowest power that holds it).
+    // Sustained clock = p5 when available (dip-aware), else average (legacy fallback).
+    let sustained = |p: &PowerSweepPoint| p.p5_clock_mhz.unwrap_or(p.clock_mhz);
+
+    // Godforge = highest sustainable clock (ties → the lowest power that holds it).
     let godforge = pool
         .iter()
         .copied()
         .max_by(|a, b| {
-            a.0.clock_mhz
-                .cmp(&b.0.clock_mhz)
+            sustained(&a.0)
+                .cmp(&sustained(&b.0))
                 .then(b.0.power_w.partial_cmp(&a.0.power_w).unwrap_or(Ord::Equal))
         })
         .unwrap();
+    let gc = sustained(&godforge.0) as f64;
+    let gp = godforge.0.power_w as f64;
 
-    // Deep Calm = best efficiency (MHz/W).
+    // Collapse detection: a single distinct sustainable clock → can't differentiate on
+    // clock (the failure mode of the old single-clock sweep). Still return valid profiles.
+    let distinct_clocks = {
+        let mut cs: Vec<u32> = pool.iter().map(|(p, _)| sustained(p)).collect();
+        cs.sort_unstable();
+        cs.dedup();
+        cs.len()
+    };
+    if distinct_clocks <= 1 {
+        log.push(format!(
+            "FORGE: frontier has a single sustainable clock ({} MHz) — profiles cannot \
+             differentiate on clock; run a multi-clock sweep (F1b)",
+            gc as u32
+        ));
+    }
+
+    // Deep Calm = best MHz/W within the Deep Calm clock floor (stays useful).
+    let dc_floor = gc * policy.deep_calm_min_clock_frac;
     let deep_calm = pool
         .iter()
         .copied()
+        .filter(|(p, _)| sustained(p) as f64 >= dc_floor)
         .max_by(|a, b| a.0.perf_per_watt.partial_cmp(&b.0.perf_per_watt).unwrap_or(Ord::Equal))
-        .unwrap();
+        .unwrap_or(godforge);
 
-    // Brokkr's = best R = %power_saved ÷ %clock_lost vs Godforge, among points that
-    // trade some clock for a power win; falls back to Godforge if no such trade exists.
-    let gc = godforge.0.clock_mhz as f64;
-    let gp = godforge.0.power_w as f64;
+    // Brokkr's = best R within the Brokkr's clock floor; must be a real trade (clock
+    // below Godforge AND less power). Falls back to Godforge if no such point exists.
+    let br_floor = gc * policy.brokkrs_min_clock_frac;
     let r_of = |p: &PowerSweepPoint| -> f64 {
-        let clk_lost = (gc - p.clock_mhz as f64) / gc;
+        let clk_lost = (gc - sustained(p) as f64) / gc;
         let pwr_saved = (gp - p.power_w as f64) / gp;
         if clk_lost > 0.0 { pwr_saved / clk_lost } else { 0.0 }
     };
     let brokkrs = pool
         .iter()
         .copied()
-        .filter(|(p, _)| (p.clock_mhz as f64) < gc && (p.power_w as f64) < gp)
+        .filter(|(p, _)| {
+            let s = sustained(p) as f64;
+            s >= br_floor && s < gc && (p.power_w as f64) < gp
+        })
         .max_by(|a, b| r_of(&a.0).partial_cmp(&r_of(&b.0)).unwrap_or(Ord::Equal))
         .unwrap_or(godforge);
 
     log.push(format!(
-        "FORGE: Godforge {}MHz/{:.0}W · Brokkr's {}MHz/{:.0}W (R={:.2}) · Deep Calm {}MHz/{:.0}W ({:.2} MHz/W)",
-        godforge.0.clock_mhz, godforge.0.power_w,
-        brokkrs.0.clock_mhz, brokkrs.0.power_w, r_of(&brokkrs.0),
-        deep_calm.0.clock_mhz, deep_calm.0.power_w, deep_calm.0.perf_per_watt
+        "FORGE: Godforge {}MHz/{:.0}W · Brokkr's {}MHz/{:.0}W (R={:.2}, floor {:.0}%) · \
+         Deep Calm {}MHz/{:.0}W ({:.2} MHz/W, floor {:.0}%)",
+        sustained(&godforge.0), godforge.0.power_w,
+        sustained(&brokkrs.0), brokkrs.0.power_w, r_of(&brokkrs.0), policy.brokkrs_min_clock_frac * 100.0,
+        sustained(&deep_calm.0), deep_calm.0.power_w, deep_calm.0.perf_per_watt, policy.deep_calm_min_clock_frac * 100.0
     ));
 
     ForgeProfiles {
@@ -1484,7 +1613,7 @@ mod tests {
             (fp(1770, 164.0), 0.95),
             (fp(1740, 158.0), 0.95), // best MHz/W
         ];
-        let p = synthesize_forge_profiles(&frontier, 0.85);
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
         assert_eq!(p.godforge.unwrap().clock_mhz, 1830, "Godforge = highest clock");
         assert_eq!(p.brokkrs.unwrap().clock_mhz, 1815, "Brokkr's = best benefit/cost R");
         assert_eq!(p.deep_calm.unwrap().clock_mhz, 1740, "Deep Calm = best MHz/W");
@@ -1499,7 +1628,7 @@ mod tests {
             (fp(1815, 181.0), 0.95),
             (fp(1770, 164.0), 0.95),
         ];
-        let p = synthesize_forge_profiles(&frontier, 0.85);
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
         assert_eq!(p.godforge.unwrap().clock_mhz, 1815);
     }
 
@@ -1508,9 +1637,145 @@ mod tests {
     fn forge_falls_back_when_nothing_is_trusted() {
         // Immature data → nothing clears the gate → best-effort, still returns profiles.
         let frontier = vec![(fp(1830, 200.0), 0.21), (fp(1770, 164.0), 0.21)];
-        let p = synthesize_forge_profiles(&frontier, 0.85);
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
         assert!(p.godforge.is_some());
         assert!(p.log.iter().any(|l| l.contains("best-effort")));
+    }
+
+    // ── F1b Phase 1: multi-clock frontier synthesis with policy floors ──────────
+    #[cfg(windows)]
+    #[test]
+    fn f1b_rtx3060ti_power_capped_frontier() {
+        // Hard power-capped frontier (200 W); Balanced floors 98% / 90% of Godforge.
+        let frontier = vec![
+            (fp(1830, 190.0), 0.95),
+            (fp(1815, 177.0), 0.95),
+            (fp(1800, 170.0), 0.95),
+            (fp(1770, 156.0), 0.95),
+            (fp(1740, 150.0), 0.95),
+        ];
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        assert_eq!(p.godforge.unwrap().clock_mhz, 1830, "Godforge = highest sustainable clock");
+        // Brokkr's floor 0.98*1830 = 1793.4 → only 1815/1800 eligible; max R = 1815.
+        assert_eq!(p.brokkrs.unwrap().clock_mhz, 1815, "Brokkr's = best R within 98% floor");
+        // Deep Calm floor 0.90*1830 = 1647 → all eligible; max MHz/W = 1740.
+        assert_eq!(p.deep_calm.unwrap().clock_mhz, 1740, "Deep Calm = best MHz/W within 90% floor");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f1b_rtx4090_high_headroom_frontier() {
+        // Unconstrained frontier with headroom; Godforge may be a real OC.
+        let frontier = vec![
+            (fp(2880, 405.0), 0.95),
+            (fp(2860, 365.0), 0.95),
+            (fp(2840, 335.0), 0.95),
+            (fp(2800, 285.0), 0.95),
+            (fp(2760, 260.0), 0.95),
+            (fp(2700, 245.0), 0.95),
+        ];
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        assert_eq!(p.godforge.unwrap().clock_mhz, 2880, "Godforge = highest sustainable clock");
+        // Floor 0.98*2880 = 2822.4 → 2860/2840 eligible. Max-R rule: 2860 (R≈14.3) beats
+        // 2840 (R≈12.4) → principled choice is 2860 (stays nearest Godforge).
+        assert_eq!(p.brokkrs.unwrap().clock_mhz, 2860, "Brokkr's = max R within 98% floor");
+        // Floor 0.90*2880 = 2592 → all eligible; max MHz/W = 2700.
+        assert_eq!(p.deep_calm.unwrap().clock_mhz, 2700, "Deep Calm = best MHz/W within 90% floor");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f1b_single_clock_collapse_is_handled() {
+        // The old single-clock failure mode: one clock at several powers. Synthesis must
+        // still return all three profiles and log the collapse (no panic / no empty).
+        let frontier = vec![
+            (fp(1770, 156.0), 0.95),
+            (fp(1770, 165.0), 0.95),
+            (fp(1770, 170.0), 0.95),
+        ];
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        assert_eq!(p.godforge.unwrap().clock_mhz, 1770);
+        assert_eq!(p.deep_calm.unwrap().clock_mhz, 1770);
+        assert_eq!(p.brokkrs.unwrap().clock_mhz, 1770); // no clock<gc candidate → Godforge
+        assert!(p.log.iter().any(|l| l.contains("single sustainable clock")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f1b_brokkrs_floor_boundary() {
+        // Godforge 2000; Brokkr's floor 0.98 = 1960. A point at 1960 is eligible; 1959 is not.
+        let at_floor = vec![(fp(2000, 200.0), 0.95), (fp(1960, 150.0), 0.95)];
+        let p = synthesize_forge_profiles(&at_floor, &ForgePolicy::balanced());
+        assert_eq!(p.brokkrs.unwrap().clock_mhz, 1960, "exactly at floor → eligible");
+
+        let below_floor = vec![(fp(2000, 200.0), 0.95), (fp(1959, 150.0), 0.95)];
+        let p2 = synthesize_forge_profiles(&below_floor, &ForgePolicy::balanced());
+        assert_eq!(p2.brokkrs.unwrap().clock_mhz, 2000, "below floor → no candidate → Godforge");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f1b_deep_calm_floor_boundary() {
+        // Godforge 2000; Deep Calm floor 0.90 = 1800. 1799 has the best MHz/W but is below
+        // the floor → excluded; best within floor (1850) wins.
+        let frontier = vec![
+            (fp(2000, 200.0), 0.95), // 10.0 MHz/W
+            (fp(1850, 150.0), 0.95), // 12.33 MHz/W (within floor)
+            (fp(1799, 100.0), 0.95), // 17.99 MHz/W but below the 1800 floor
+        ];
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        assert_eq!(p.deep_calm.unwrap().clock_mhz, 1850, "below 90% floor excluded despite best MHz/W");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f1b_sustainability_uses_p5_when_present() {
+        // Two points at the same average clock (1830) but different p5: the dippy one
+        // (p5 1700) must rank below the stable one (p5 1830) for Godforge.
+        let mut stable = fp(1830, 190.0);
+        stable.p5_clock_mhz = Some(1830);
+        let mut dippy = fp(1830, 185.0); // lower power, but dips
+        dippy.p5_clock_mhz = Some(1700);
+        let frontier = vec![(stable, 0.95), (dippy, 0.95)];
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        // sustained(stable)=1830 > sustained(dippy)=1700 → Godforge = stable, despite its
+        // higher power (p5 dominates the tie that average clock would have hidden).
+        assert_eq!(p.godforge.unwrap().p5_clock_mhz, Some(1830));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f1b_legacy_points_without_p5_fall_back_to_avg_clock() {
+        // fp() leaves p5_clock_mhz = None → sustained() falls back to clock_mhz; synthesis
+        // still works exactly as the average-clock model (no panic on missing p5).
+        let a = fp(1830, 190.0);
+        let b = fp(1770, 156.0);
+        assert_eq!(a.p5_clock_mhz, None);
+        let p = synthesize_forge_profiles(&[(a, 0.95), (b, 0.95)], &ForgePolicy::balanced());
+        assert_eq!(p.godforge.unwrap().clock_mhz, 1830);
+        assert_eq!(p.deep_calm.unwrap().clock_mhz, 1770);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f1b_regime_classification() {
+        assert_eq!(classify_regime(1.0, 200.0, 200.0, Some(70.0)), Regime::PowerLimited);
+        assert_eq!(classify_regime(0.0, 330.0, 450.0, Some(65.0)), Regime::Unconstrained);
+        assert_eq!(classify_regime(0.0, 300.0, 450.0, Some(85.0)), Regime::ThermalLimited);
+        assert_eq!(classify_regime(0.9, 440.0, 450.0, Some(86.0)), Regime::Mixed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f1b_candidate_clock_ranges() {
+        // Power-capped: never probe above the sustained clock; descend to the 90% floor.
+        let capped = candidate_clocks(1830, 1920, Regime::PowerLimited, 15, 0.90);
+        assert_eq!(*capped.first().unwrap(), 1830);
+        assert!(capped.iter().all(|&c| c <= 1830));
+        assert!(*capped.last().unwrap() >= ((1830.0_f64 * 0.90).round() as u32));
+        // Unconstrained: explore a few steps ABOVE the stock boost ceiling (real OC).
+        let oc = candidate_clocks(2800, 2880, Regime::Unconstrained, 20, 0.90);
+        assert!(oc.iter().any(|&c| c > 2800), "unconstrained explores above stock");
     }
 
     #[cfg(windows)]

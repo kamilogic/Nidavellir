@@ -18,8 +18,16 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
 - **F1 — Profile model**: 3-profile synthesis (Godforge=clock / Brokkr's=R / Deep
   Calm=MHz/W) + V2 confidence gate.
   - **F1a (DONE)** — pure `synthesize_forge_profiles` + unit tests. Not yet wired.
-  - **F1b (next)** — extend the safe flatten sweep to multiple target clocks (real
-    game-power frontier); knowledge keying by (clock, offset); wire synthesis in.
+  - **F1b Phase 1 (DONE)** — policy-driven multi-clock synthesis (pure, service-internal):
+    `ForgePolicy` (Balanced 0.98/0.90/0.85; Conservative/Aggressive presets), clock floors,
+    Godforge=highest sustained clock (p5-aware), Brokkr's=max R within floor, Deep Calm=max
+    MHz/W within floor, single-clock collapse handled, voltage not a selection axis. 44 tests.
+  - **F1b Phase 2 (next, NOT started)** — real multi-clock measurement loop over the safe
+    flatten sweep (outer loop over candidate clocks); simulated outer-loop scaffolding first,
+    then a supervised/approval-gated hardware run; verify ceiling per dwell (Patch A); add
+    `target_clock_mhz` to points.
+  - **F1b Phase 3** — knowledge keying by (target_clock, vf_table_voltage_bin) + global
+    voltage-floor crash boundary; backward-compatible `gpu_knowledge.json` migration.
 - **F2** transparency (clock/power deltas) · **F3** Forge modes (Quick/Deep/
   Continuous; breadth = #clock levels) · **F4** reboot→knowledge + limits 1/2/3 ·
   **F5** lifecycle (Forged→Legendary) · **F6** passive monitoring · **F7** UI
