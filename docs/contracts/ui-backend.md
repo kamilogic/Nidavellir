@@ -106,6 +106,52 @@ result (see `decisions.md`):
 
 
 
+\## Frontend request (2026-06-06): Voltage semantics wording — no hard voltage cap (backend → Codex)
+
+
+
+The VF ceiling caps FREQUENCY, not voltage (see `decisions.md`: "Elastic VF ceiling caps
+
+frequency, not effective voltage"). The current "MHz @ mV" wording implies a hard voltage cap
+
+that the backend does NOT provide. Backend audit result:
+
+
+
+\- \*\*Replace "X MHz @ Y mV"\*\* wherever it implies a voltage cap. The `Y mV` is a VF-table
+
+&#x20; CURVE BIN (the deterministic `vf_table_voltage_mv` apply key), NOT a guaranteed rail-voltage
+
+&#x20; ceiling. Measured / HWiNFO "GPU Core Voltage" is a different domain and may read ABOVE it.
+
+
+
+\- \*\*Prefer\*\* wording such as `1785 MHz target · 843 mV VF bin` (or "curve bin"): "target" for
+
+&#x20; the clock, "VF bin" / "curve bin" for the voltage.
+
+
+
+\- \*\*Keep measured voltage separate\*\* from the deterministic VF bin. When available, show the
+
+&#x20; measured-under-load voltage (avg/min/max from the applied point's dwell stats) as a SEPARATE
+
+&#x20; value — never merge it into one "@ mV" figure.
+
+
+
+\- \*\*Do NOT imply a hard effective-voltage cap\*\* anywhere in copy. Nidavellir guarantees a
+
+&#x20; frequency plateau and preserved power-management elasticity, not a voltage ceiling.
+
+
+
+\- \*\*Migration / compatibility\*\*: wording/labelling only. No backend methods, IPC names, or
+
+&#x20; payload fields change. Backend does not edit `apps/ui/**`.
+
+
+
 \## Additive (2026-06-05): PowerSweepPoint voltage fields
 
 
@@ -253,6 +299,44 @@ load data NEVER downgrades a verified curve. `verified_under_load` here means ve
 from stored synthetic-dwell stats, NOT live real-game telemetry. UI must use the
 
 structured `status` + `load_state` fields, not parse `message`. No UI change required.
+
+
+
+\## Additive (2026-06-06): Voltage semantics clarification (frequency-only VF ceiling)
+
+
+
+Documentation-only clarification of fields already in the contract (no schema change):
+
+
+
+\- The applied core profile flattens the modern VF curve to a frequency PLATEAU at/above the
+
+&#x20; deterministic `vf_table_voltage_mv` bin via per-point FREQUENCY offsets. It writes no voltage
+
+&#x20; and does not hard-cap measured / rail voltage in any P-state.
+
+\- `vf_table_voltage_mv` (the VF / curve bin) is the deterministic apply / verify / frontier key.
+
+\- `measured_voltage_mv` / `avg|min|max_measured_voltage_mv` and HWiNFO "GPU Core Voltage" are a
+
+&#x20; DIFFERENT domain (measured rail incl. load-line / droop) — telemetry + cross-check only, and
+
+&#x20; may legitimately read ABOVE the VF bin. Measured ≠ the bin is EXPECTED, not a mismatch.
+
+\- `VerifyAppliedProfile` proves the frequency-flatten OFFSETS are resident (plus a load axis from
+
+&#x20; stored dwell stats); it proves nothing about effective / measured voltage. A verified curve is
+
+&#x20; NOT a verified voltage cap.
+
+
+
+No UI change is required by this note (it documents existing fields); the wording request above is
+
+the actionable UI item. Rationale: `decisions.md` → "Elastic VF ceiling caps frequency, not
+
+effective voltage".
 
 
 

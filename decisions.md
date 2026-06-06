@@ -2,6 +2,42 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Elastic VF ceiling caps frequency, not effective voltage (no hard voltage cap)
+- **Decision** (Applied Voltage Behavior investigation, 2026-06-06): the canonical apply path
+  (`apply_vf_ceiling`, `crates/gpu-nvapi/src/lib.rs`) writes **per-point frequency offsets** to
+  every modern ClkVfPoints curve point whose VF-table voltage is **≥ the selected ceiling bin**,
+  flattening them to `target_mhz`; points below the bin are left untouched (elastic). It writes
+  **no voltage**, holds no rail lock, pins no clock. It therefore **caps frequency, not
+  effective/rail voltage**, and **does not hard-cap measured voltage in any P-state**.
+- **`vf_table_voltage_mv` (the VF/curve bin) is the deterministic apply/verify/frontier key** —
+  re-derived by snapping the measured dwell voltage UP to the lowest table bin ≥ it
+  (`nearest_vf_bin_at_or_above`). `measured_voltage_mv` (NVAPI `core_voltage`) and HWiNFO's
+  "GPU Core Voltage" are a DIFFERENT domain (measured rail incl. load-line/droop) — telemetry +
+  cross-check only. They may legitimately read **above** the VF bin (idle/2D especially, and under
+  load by the VID→rail offset). **Measured ≠ the bin is EXPECTED, not a mismatch** (idle ~1.075 V
+  and in-game ~0.887–0.956 V for an ~850 mV bin are normal).
+- **Nidavellir must NOT imply a hard voltage cap.** "X MHz @ Y mV" reads as a rail-voltage ceiling
+  the engine does not provide; prefer "1785 MHz target · 843 mV VF bin". Profile cards should
+  eventually show the VF bin AND the measured-under-load voltage (avg/min/max — fields already on
+  `PowerSweepPoint`) as SEPARATE values.
+- **A true hard voltage cap would require the legacy voltage-lock path** (`lock_core_voltage_mv` /
+  `set_vfp_locks`) — the documented TDR cause under game load. There is no "soft voltage ceiling"
+  NvAPI mechanism. A hard cap is therefore **not aligned with safety-first**; Nidavellir stays on
+  the elastic VF ceiling only.
+- **What verification proves**: `VerifyAppliedProfile` confirms the frequency-flatten OFFSETS are
+  resident (≥90% of plateau points carry a non-zero offset) plus a load axis from stored dwell
+  stats. It proves **nothing about effective/measured voltage** and cannot (yet) detect a
+  present-but-wrong-valued offset or a live-load plateau.
+- **Open suspect (not confirmed; read-only-testable, deferred)**: offsets are computed as
+  `target − base_mhz` with `base_mhz` from GetStatus at apply time, and GetStatus under-reports
+  freq at idle — so a plateau applied at idle could land above `target` (consistent with observed
+  ~1815–1830 MHz vs ~1785, alongside normal 15 MHz boost-bin quantization). To be confirmed by a
+  future read-only live diagnostic, NOT changed here.
+- **Scope**: documentation/contract only (Patch 11A) — `decisions.md`, `docs/contracts/ui-backend.md`
+  (incl. a Codex wording request), `memory.md`, `handoff.md`. **No backend code, no `apps/ui`, no
+  apply/verify change, no F1b Phase 2B, no hardware.** Live diagnostic (11C) and the UI copy
+  implementation (Codex) are deferred.
+
 ## F1b Phase 2A: simulated multi-clock outer-loop scaffolding (no hardware)
 - **Decision** (2026-06-06): prove the multi-clock loop in isolation BEFORE touching hardware.
   `build_frontier(candidate_clocks, &FrontierDescent, &ForgePolicy, probe: impl Fn(u32,u32) ->

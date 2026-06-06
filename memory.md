@@ -15,6 +15,20 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **Applied voltage behavior — investigation + Patch 11A docs (2026-06-06) — DOCS ONLY, not pushed**:
+  confirmed (read-only) that the elastic VF ceiling (`apply_vf_ceiling`) writes **per-point
+  FREQUENCY offsets** to every modern VF point at/above the deterministic `vf_table_voltage_mv`
+  bin (flatten to `target_mhz`); it writes **no voltage** and does **not** hard-cap measured/rail
+  voltage. `vf_table_voltage_mv` (VF/curve bin) = the deterministic apply/verify/frontier key;
+  `measured_voltage_mv` / HWiNFO "GPU Core Voltage" are a different (rail, load-line/droop) domain
+  and may read ABOVE the bin (idle ~1.075 V and in-game ~0.887–0.956 V for an ~850 mV bin are
+  EXPECTED, not a mismatch). Nidavellir must not imply a hard voltage cap; a true cap = the legacy
+  voltage-lock (TDR) path, rejected by safety-first. **Patch 11A** records this in `decisions.md` +
+  `docs/contracts/ui-backend.md` (incl. a Codex wording request: drop "MHz @ mV", use "target" +
+  "VF bin", keep measured voltage separate) + `handoff.md`. **No backend code, no `apps/ui`, no
+  apply/verify/F1b/hardware change.** Open suspect (read-only-testable, deferred to 11C): apply
+  offsets are `target − GetStatus_base` and GetStatus under-reports at idle → a plateau applied at
+  idle may land above target (~1815–1830 vs ~1785, on top of normal 15 MHz boost-bin quantization).
 - **Applied curve verifier — Patch A (this session) — IMPLEMENTED, not pushed**: read-only
   `VerifyAppliedProfile` IPC + `crate::gpu_verify`. Classifies the live modern VF curve vs
   the applied profile into `CurveVerification` = NotApplicable / MetadataOnly /

@@ -3,7 +3,30 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-06) — F1b Phase 2A: simulated multi-clock loop (DONE, not pushed)
+## Latest backend checkpoint (2026-06-06) — Applied voltage semantics (Patch 11A, DOCS ONLY, not pushed)
+- **Read-only investigation** confirmed the elastic VF ceiling caps **frequency, not voltage**:
+  `apply_vf_ceiling` (`crates/gpu-nvapi/src/lib.rs`) writes per-point FREQUENCY offsets to every
+  modern VF point whose table voltage ≥ the selected bin (flatten to `target_mhz`); points below
+  are untouched. It writes **no voltage** and does **not** hard-cap measured/rail voltage in any
+  P-state. The apply key is the deterministic `vf_table_voltage_mv` (VF/curve bin), re-derived by
+  snapping measured voltage UP to the lowest table bin ≥ it (`nearest_vf_bin_at_or_above`).
+- **Semantics resolved**: `measured_voltage_mv` / HWiNFO "GPU Core Voltage" are a DIFFERENT (rail,
+  load-line/droop) domain and may legitimately read ABOVE the VF bin — idle ~1.075 V and in-game
+  ~0.887–0.956 V for an ~850 mV bin are EXPECTED, not a mismatch. `VerifyAppliedProfile` proves
+  offset PRESENCE (+ a stored-dwell load axis), nothing about effective voltage. Nidavellir must
+  NOT imply a hard voltage cap; a true cap = the legacy voltage-lock (TDR) path → rejected.
+- **Patch 11A (this change) = DOCS/CONTRACT ONLY**: updated `decisions.md` (new doctrine entry),
+  `docs/contracts/ui-backend.md` (semantics clarification + Codex wording request: drop "MHz @ mV",
+  use "target" + "VF bin", keep measured voltage separate), `memory.md`, this file. **No backend
+  code, no `apps/ui`, no apply/verify change, no F1b Phase 2B, no hardware.**
+- **Open suspect (deferred, read-only-testable — Patch 11C, not started)**: offsets are computed as
+  `target − GetStatus_base` and GetStatus under-reports freq at idle → a plateau applied at idle may
+  land above `target` (consistent with observed ~1815–1830 MHz vs ~1785, on top of normal 15 MHz
+  boost-bin quantization). To be confirmed by a future read-only live diagnostic — NOT changed here.
+- **Does NOT block F1b Phase 2B** (it already keys on the VF bin + offset-readback VerifiedCurve
+  gate); sequence the Codex copy fix + (optional) 11C live diagnostic before the supervised HW run.
+
+## Backend checkpoint (2026-06-06) — F1b Phase 2A: simulated multi-clock loop (DONE, not pushed)
 - **`build_frontier(candidate_clocks, &FrontierDescent, &ForgePolicy, probe: impl Fn(u32,u32)->
   ProbeSample)`** in `gpu_power_sweep.rs` proves the multi-clock outer loop, per-target voltage-bin
   descent, stopping rules, known-unsafe boundary, frontier assembly, and synthesis wiring **without
