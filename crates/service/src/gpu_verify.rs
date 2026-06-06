@@ -13,42 +13,64 @@ use nidavellir_core::ipc::{ApplyVerificationStatus, CurveVerification};
 #[cfg(windows)]
 use tracing::info;
 
-/// Per-point plateau-match clock tolerance: ~one boost bin (the sweep's EXPLORE_STEP).
+/// GetStatus clock tolerance for the SECONDARY corroboration count: ~one boost bin.
 const TOL_MHZ: u32 = 15;
 
-/// Classify the live modern VF curve against the expected flattened plateau.
+/// Evidence for one expected-flattened curve point (a point at/above the ceiling bin).
+#[derive(Debug, Clone, Copy)]
+struct PointEvidence {
+    /// Applied frequency offset (kHz) from `vf_get_point_khz` — the PRIMARY signal.
+    /// `None` = the offset readback failed for this point.
+    offset_khz: Option<i32>,
+    /// GetStatus actual freq (MHz) — SECONDARY corroboration / diagnostics only.
+    freq_mhz: u32,
+}
+
+/// Classify the applied VF ceiling using the GET-control **offset readback** as the
+/// primary criterion. Runtime QA proved GetStatus actual-freq is unreliable at idle —
+/// it under-reports the plateau even when the flatten offsets are resident (see
+/// `handoff.md`). A point at/above the deterministic ceiling bin counts as flattened
+/// when it carries a non-zero applied frequency offset.
 ///
-/// `live` = `(index, voltage_mv, freq_mhz)` from `read_vf_curve_modern()` (GetStatus).
-/// Expectation: every point with `voltage_mv >= ceiling_mv` is flattened to
-/// `target_mhz`. Returns `(state, matched, expected)`. Pure + table-to-table.
+/// We verify **presence** of the flatten offset, not its exact value: the exact
+/// expected offset is `target - stock_base_freq` per point and the per-point stock
+/// base is not persisted, so an exact comparison isn't available. Presence of a
+/// non-zero offset on the expected points is the strongest signal we can read.
+///
+/// Returns `(state, offset_present, freq_match, expected_n)`. `freq_match` (GetStatus)
+/// is for logging only and never gates. Pure + testable.
 fn classify_curve(
     target_mhz: u32,
-    ceiling_mv: u32,
-    live: &[(usize, u32, u32)],
+    expected: &[PointEvidence],
     tol_mhz: u32,
-) -> (CurveVerification, u32, u32) {
-    if live.is_empty() {
-        return (CurveVerification::VerificationFailed, 0, 0);
-    }
-    let expected_n = live.iter().filter(|(_, mv, _)| *mv >= ceiling_mv).count() as u32;
-    if expected_n == 0 {
-        // Ceiling above every bin → can't locate the plateau region to evaluate.
-        return (CurveVerification::VerificationFailed, 0, 0);
-    }
-    let matched = live
+) -> (CurveVerification, u32, u32, u32) {
+    let expected_n = expected.len() as u32;
+    let freq_match = expected
         .iter()
-        .filter(|(_, mv, _)| *mv >= ceiling_mv)
-        .filter(|(_, _, freq)| freq.abs_diff(target_mhz) <= tol_mhz)
+        .filter(|e| e.freq_mhz.abs_diff(target_mhz) <= tol_mhz)
         .count() as u32;
-    // Require ≥90% of the expected-flattened points to read the target (tolerate the
-    // boundary point / sensor noise), and at least one real match.
-    let ratio = matched as f32 / expected_n as f32;
-    let state = if matched >= 1 && ratio >= 0.9 {
+    if expected_n == 0 {
+        // Ceiling above every bin / no plateau region → can't evaluate.
+        return (CurveVerification::VerificationFailed, 0, freq_match, 0);
+    }
+    let readable = expected.iter().filter(|e| e.offset_khz.is_some()).count();
+    if readable == 0 {
+        // Primary evidence unreadable → report failure, don't assert a mismatch (safer).
+        return (CurveVerification::VerificationFailed, 0, freq_match, expected_n);
+    }
+    let offset_present = expected
+        .iter()
+        .filter(|e| e.offset_khz.map_or(false, |o| o != 0))
+        .count() as u32;
+    // Require ≥90% of expected points to carry the flatten offset (tolerate the
+    // boundary point — its stock base can already equal target → zero offset).
+    let ratio = offset_present as f32 / expected_n as f32;
+    let state = if offset_present >= 1 && ratio >= 0.9 {
         CurveVerification::VerifiedCurve
     } else {
         CurveVerification::LiveMismatch
     };
-    (state, matched, expected_n)
+    (state, offset_present, freq_match, expected_n)
 }
 
 #[cfg(windows)]
@@ -146,31 +168,36 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
             "could not map applied voltage to a VF-table bin",
         );
     };
-    let (state, matched, expected) = classify_curve(core.freq_mhz, ceiling_mv, &live, TOL_MHZ);
-    // Offset corroboration (logged only; not gating in Patch A): how many of the
-    // expected-flattened points carry a non-zero applied frequency offset.
-    let offsets_nonzero = live
+    // PRIMARY evidence: the GET-control offset readback per expected point. GetStatus
+    // actual freq is kept only as secondary corroboration (see classify_curve docs).
+    let expected: Vec<PointEvidence> = live
         .iter()
         .filter(|(_, mv, _)| *mv >= ceiling_mv)
-        .filter_map(|(i, _, _)| nidavellir_gpu_nvapi::vf_get_point_khz(*i))
-        .filter(|o| *o != 0)
-        .count();
+        .map(|(i, _, freq)| PointEvidence {
+            offset_khz: nidavellir_gpu_nvapi::vf_get_point_khz(*i),
+            freq_mhz: *freq,
+        })
+        .collect();
+    let (state, offset_present, freq_match, expected_n) =
+        classify_curve(core.freq_mhz, &expected, TOL_MHZ);
     let message = match state {
         CurveVerification::VerifiedCurve => format!(
-            "live curve matches: {matched}/{expected} plateau points at {} MHz",
-            core.freq_mhz
+            "live curve matches: {offset_present}/{expected_n} plateau points carry the flatten \
+             offset (GetStatus freq match {freq_match}/{expected_n}, diagnostic)"
         ),
         CurveVerification::LiveMismatch => format!(
-            "live curve mismatch: only {matched}/{expected} plateau points at {} MHz",
-            core.freq_mhz
+            "live curve mismatch: only {offset_present}/{expected_n} plateau points carry the \
+             flatten offset (GetStatus freq match {freq_match}/{expected_n})"
         ),
-        _ => "verification incomplete".to_string(),
+        _ => format!(
+            "verification incomplete: could not read VF offsets for the {expected_n} plateau points"
+        ),
     };
     info!(
         "apply_verify: label={:?} target={} vf_table_mv={} legacy_mv={} ceiling_idx={} \
-         matched={}/{} offsets_nonzero={} curve_state={:?} status={:?}",
-        label, core.freq_mhz, ceiling_mv, core.voltage_mv, ceiling_idx, matched, expected,
-        offsets_nonzero, state, state
+         offset_match={}/{} getstatus_freq_match={}/{} curve_state={:?} status={:?}",
+        label, core.freq_mhz, ceiling_mv, core.voltage_mv, ceiling_idx, offset_present,
+        expected_n, freq_match, expected_n, state, state
     );
     make_status(
         state,
@@ -178,8 +205,8 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
         Some(core.freq_mhz),
         Some(ceiling_mv),
         Some(core.voltage_mv),
-        Some(matched),
-        Some(expected),
+        Some(offset_present),
+        Some(expected_n),
         message,
     )
 }
@@ -203,76 +230,64 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
 mod tests {
     use super::*;
 
-    // (index, voltage_mv, freq_mhz) like read_vf_curve_modern(). A flattened curve:
-    // every point at/above `ceiling_mv` reads the `target`.
-    fn flattened(target: u32, ceiling_mv: u32) -> Vec<(usize, u32, u32)> {
-        vec![
-            (0, 800, 1500),
-            (1, 837, 1650),
-            (2, ceiling_mv, target),
-            (3, 900, target),
-            (4, 1062, target),
-        ]
+    fn ev(offset_khz: Option<i32>, freq_mhz: u32) -> PointEvidence {
+        PointEvidence { offset_khz, freq_mhz }
     }
 
     #[test]
-    fn exact_match_is_verified() {
-        let live = flattened(1770, 875);
-        let (s, m, e) = classify_curve(1770, 875, &live, TOL_MHZ);
+    fn offsets_present_but_getstatus_freq_mismatch_is_verified() {
+        // The real idle case (offsets_nonzero=63/65, getstatus 31/65): every plateau
+        // point carries a flatten offset but GetStatus reports a non-target freq.
+        // Offset readback is primary → VerifiedCurve.
+        let expected: Vec<PointEvidence> = (0..10).map(|_| ev(Some(-120_000), 1500)).collect();
+        let (s, present, freq_match, n) = classify_curve(1770, &expected, TOL_MHZ);
         assert_eq!(s, CurveVerification::VerifiedCurve);
-        assert_eq!((m, e), (3, 3));
+        assert_eq!((present, freq_match, n), (10, 0, 10));
     }
 
     #[test]
-    fn within_one_bin_is_verified() {
-        // Plateau points +15 MHz (one boost bin) → still inside tolerance.
-        let mut live = flattened(1770, 875);
-        for p in live.iter_mut().filter(|(_, mv, _)| *mv >= 875) {
-            p.2 = 1785;
-        }
-        let (s, _, _) = classify_curve(1770, 875, &live, TOL_MHZ);
-        assert_eq!(s, CurveVerification::VerifiedCurve);
-    }
-
-    #[test]
-    fn stock_like_curve_is_live_mismatch() {
-        // Rising (stock) freqs above the ceiling, none near target → mismatch.
-        let live = vec![(0, 800, 1500), (1, 875, 1850), (2, 950, 1920), (3, 1062, 1980)];
-        let (s, m, _) = classify_curve(1770, 875, &live, TOL_MHZ);
+    fn missing_offsets_is_live_mismatch() {
+        // Offsets readable but all zero (reset / never flattened) → mismatch.
+        let expected: Vec<PointEvidence> = (0..10).map(|_| ev(Some(0), 1900)).collect();
+        let (s, present, _, _) = classify_curve(1770, &expected, TOL_MHZ);
         assert_eq!(s, CurveVerification::LiveMismatch);
-        assert_eq!(m, 0);
+        assert_eq!(present, 0);
     }
 
     #[test]
-    fn empty_curve_is_verification_failed() {
-        let (s, _, _) = classify_curve(1770, 875, &[], TOL_MHZ);
-        assert_eq!(s, CurveVerification::VerificationFailed);
-    }
-
-    #[test]
-    fn ceiling_above_all_points_is_verification_failed() {
-        let live = flattened(1770, 875);
-        let (s, _, _) = classify_curve(1770, 5000, &live, TOL_MHZ);
-        assert_eq!(s, CurveVerification::VerificationFailed);
-    }
-
-    #[test]
-    fn single_unflattened_plateau_point_is_mismatch() {
-        // One expected point that does NOT match must not pass on the boundary rule.
-        let live = vec![(0, 800, 1500), (1, 875, 1900)];
-        let (s, m, e) = classify_curve(1770, 875, &live, TOL_MHZ);
-        assert_eq!((m, e), (0, 1));
+    fn partial_offsets_below_threshold_is_live_mismatch() {
+        // 5/10 carry the offset → 0.5 < 0.9 → mismatch.
+        let mut expected: Vec<PointEvidence> = (0..5).map(|_| ev(Some(-100_000), 1770)).collect();
+        expected.extend((0..5).map(|_| ev(Some(0), 1900)));
+        let (s, present, _, n) = classify_curve(1770, &expected, TOL_MHZ);
+        assert_eq!((present, n), (5, 10));
         assert_eq!(s, CurveVerification::LiveMismatch);
     }
 
     #[test]
-    fn one_outlier_in_large_plateau_tolerated() {
-        // 10 plateau points, one far off → still ≥90% match → Verified.
-        let mut live: Vec<(usize, u32, u32)> =
-            (0..10usize).map(|i| (i, 875 + i as u32, 1770)).collect();
-        live[9].2 = 1900;
-        let (s, m, e) = classify_curve(1770, 875, &live, TOL_MHZ);
-        assert_eq!((m, e), (9, 10));
+    fn large_plateau_one_missing_offset_is_verified() {
+        // 9/10 carry the offset → ≥90% → Verified (boundary point already at target).
+        let mut expected: Vec<PointEvidence> = (0..9).map(|_| ev(Some(-90_000), 1770)).collect();
+        expected.push(ev(Some(0), 1770));
+        let (s, present, _, n) = classify_curve(1770, &expected, TOL_MHZ);
+        assert_eq!((present, n), (9, 10));
         assert_eq!(s, CurveVerification::VerifiedCurve);
+    }
+
+    #[test]
+    fn empty_expected_set_is_verification_failed() {
+        let (s, _, _, n) = classify_curve(1770, &[], TOL_MHZ);
+        assert_eq!(s, CurveVerification::VerificationFailed);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn unreadable_offsets_is_verification_failed() {
+        // Every offset read failed (None) → can't evaluate primary evidence → failed,
+        // not mismatch (safer).
+        let expected: Vec<PointEvidence> = (0..6).map(|_| ev(None, 1770)).collect();
+        let (s, present, _, n) = classify_curve(1770, &expected, TOL_MHZ);
+        assert_eq!(s, CurveVerification::VerificationFailed);
+        assert_eq!((present, n), (0, 6));
     }
 }

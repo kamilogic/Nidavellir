@@ -234,7 +234,8 @@ pub struct ApplyVerificationStatus {
     pub vf_table_voltage_mv: Option<u32>,
     /// Legacy/measured voltage from the applied profile, for diagnostics only.
     pub legacy_voltage_mv: Option<u32>,
-    /// Expected-flattened plateau points and how many matched the target within tol.
+    /// Expected-flattened plateau points and how many carry the flatten offset
+    /// (offset readback is the primary criterion; GetStatus freq is diagnostic only).
     pub matched_points: Option<u32>,
     pub expected_points: Option<u32>,
     /// True only when `status == VerifiedCurve` (structured; UI must not parse message).

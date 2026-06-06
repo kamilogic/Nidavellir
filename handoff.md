@@ -23,13 +23,17 @@ How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
   with NO `run_startup_recovery`/`spawn_heartbeat`/`reapply_on_boot`/pipe server, so **no apply,
   no VF write**. Prints `ApplyVerificationStatus` JSON + the `apply_verify:` log. Proven
   non-mutating (`gpu_applied.json` mtime unchanged across a run).
-- **⚠ KEY runtime finding**: on the idle rig `verify-applied` returned **LiveMismatch (31/65
-  plateau points at 1770)** while **offsets_nonzero=63/65**. The flatten offsets are resident
-  (curve IS applied), but `read_vf_curve_modern` (GetStatus actual freq) does not uniformly
-  report the target at idle. **GetStatus actual-freq is NOT a reliable plateau-verification
-  source; the GET-control offset readback (`vf_get_point_khz`) is.** → **Patch A.1 (recommended,
-  not done)**: switch `classify_curve` to gate on offset presence on points ≥ ceiling, keep
-  GetStatus as corroboration. Needs approval (changes verdicts + tests).
+- **Patch A.1 — offset-based verification (2026-06-06) — DONE**: runtime QA proved GetStatus
+  actual-freq is unreliable at idle (under-reported the plateau 31/65 while the flatten offsets
+  were resident 63/65). `classify_curve` now gates on the **GET-control offset readback**
+  (`vf_get_point_khz`): a point ≥ ceiling counts as flattened if it carries a **non-zero** offset
+  (presence, not exact value — per-point stock base isn't persisted); ≥90% → VerifiedCurve;
+  unreadable offsets → VerificationFailed (safer than mismatch). GetStatus freq match stays a
+  logged diagnostic (`getstatus_freq_match=...`). Re-ran `verify-applied` → **VerifiedCurve**
+  (offset_match 63/65, getstatus 31/65), no write (`gpu_applied.json` mtime unchanged). Service
+  25/25, check clean. **Known caveat**: presence-only offset check can't yet distinguish a
+  Nidavellir flatten from an external tool's offsets (ExternalUnknown = Patch C); and it can't
+  detect an offset that's present but wrong-valued (would need persisted stock base).
 - **Unblocks**: Patch B (load classification) can reuse the applied `PowerSweepPoint` dwell stats.
 
 ## Backend checkpoint (2026-06-05) — Richer dwell stats (IMPLEMENTED, pushed)
