@@ -44,6 +44,68 @@ To be documented as the frontend/backend contract stabilizes.
 
 
 
+\## Frontend request (2026-06-06): Forge action consolidation (backend → Codex)
+
+
+
+The UI currently exposes too many tuning/test buttons, several of which are LEGACY
+
+voltage-lock paths (TDR risk) that should not be normal user actions. Backend audit
+
+result (see `decisions.md`):
+
+
+
+\- \*\*Primary action\*\*: a single \*\*Forge GPU\*\* (→ \*\*Refine Profiles\*\* once profiles exist).
+
+&#x20; Canonical backend path = `StartPowerSweep` (+ progress `GetPowerSweepProgress`) and apply
+
+&#x20; via \*\*`ApplyPowerGodforge` / `ApplyPowerBrokkrs` / `ApplyPowerDeepCalm`\*\* only.
+
+
+
+\- \*\*Move to Advanced Diagnostics\*\* (secondary, collapsed — safe, non-primary):
+
+&#x20; `GetGpuCurve` (Read curve), `StartGpuValidation` (Validate stability),
+
+&#x20; `StartBenchmark` (Benchmark), `VerifyAppliedProfile`, `StartMemSweep`
+
+&#x20; (label it "Memory sweep (experimental)").
+
+
+
+\- \*\*Hide as legacy / developer-only\*\* (do NOT surface as normal actions; do NOT call):
+
+&#x20; `StartForgeAll` (Forge Everything), `StartRealSweep` + `StartRealSweepFast` (Real Sweep),
+
+&#x20; and the legacy `ApplyGodforge` / `ApplyBrokkrs` / `ApplyDeepCalm` trio (these read the
+
+&#x20; legacy voltage-lock `real_sweep` profiles). Backend keeps these IPC methods wired for now
+
+&#x20; (removal scheduled after F1b); the UI should simply stop exposing them.
+
+
+
+\- \*\*VRAM optimization\*\*: represent as a \*\*future pipeline step INSIDE Forge GPU\*\*, not a
+
+&#x20; separate primary button. VRAM tuning must run AFTER the core VF curve is forged + validated
+
+&#x20; and adapt to it. Until the VRAM redesign, memory sweep stays under Advanced Diagnostics only.
+
+
+
+\- \*\*Labels\*\*: `Forge GPU`, `Refine Profiles`, `Advanced Diagnostics`. Avoid exposing
+
+&#x20; "Real sweep" / "Forge everything" as user actions.
+
+
+
+\- \*\*Migration / compatibility\*\*: no IPC fields change; this is a visibility/labelling request.
+
+&#x20; All listed methods remain available. Backend does not edit `apps/ui/**`.
+
+
+
 \## Additive (2026-06-05): PowerSweepPoint voltage fields
 
 

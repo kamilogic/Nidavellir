@@ -3,7 +3,23 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-06) — Patch B load-state classification (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-06) — Forge action consolidation audit (recorded, no code change)
+- Backend has **two engine generations**. **Canonical Forge GPU core path = `gpu_power_sweep.rs`
+  (Power Sweep)**: `set_core_offset_mhz` + `apply_vf_ceiling` (elastic VF ceiling), game-power
+  render dwell, Safe-Loop-guarded, **no voltage lock**. Apply via `ApplyPowerGodforge/Brokkrs/
+  DeepCalm`. **F1b must extend ONLY this engine.**
+- **Legacy (voltage-lock, TDR risk)**: `gpu_sweep_real.rs` (Real Sweep — `lock_core_voltage_mv`
+  L239/L370, ALU load) and `gpu_forge_all.rs` (Forge Everything — fixed `CORE_VOLTAGE_MV=900`
+  lock L193, VRAM around a fixed-voltage core) + the legacy `ApplyGodforge/Brokkrs/DeepCalm` trio.
+  → hide from normal UI, schedule removal AFTER F1b. Keep IPC methods wired for now (no mid-stream
+  break).
+- **Memory/VRAM** (`gpu_mem_sweep.rs`): no core voltage lock, but runs independent of the forged
+  core. **VRAM tuning remains future work and must adapt to the forged core curve** (run after
+  core VF forge + validation, never define/destabilize it). Advanced Diagnostic until redesigned.
+- **Action audit table + answers**: see this session's audit; frontend request in
+  `docs/contracts/ui-backend.md`; rationale in `decisions.md`. No code removed, no `apps/ui` change.
+
+## Backend checkpoint (2026-06-06) — Patch B load-state classification (IMPLEMENTED, pushed)
 - Adds an orthogonal **LOAD axis** to `ApplyVerificationStatus`: `load_state: LoadVerification`
   (`NotEvaluated/VerifiedUnderLoad/TelemetryInsufficient/LoadMismatch/WorkloadStateMismatch
   (reserved)/LoadVerificationFailed`) + `load_reason`, `telemetry_match`, and diagnostic dwell

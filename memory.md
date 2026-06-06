@@ -27,6 +27,17 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   (+7 verifier). **Read-only runtime path**: `nidavellir-service.exe verify-applied` console
   subcommand runs the verifier with NO startup-recovery/heartbeat/`reapply_on_boot`/pipe server
   → no apply, no VF write (proven: `gpu_applied.json` mtime unchanged).
+- **Forge action consolidation audit (2026-06-06) — recorded, no code change**: backend has two
+  engine generations. **Canonical = `gpu_power_sweep.rs` (Power Sweep)**: offset + elastic VF
+  ceiling, game-power dwell, no voltage lock → the Forge GPU core path (apply via
+  `ApplyPower*`). **Legacy (voltage-lock, TDR risk) = `gpu_sweep_real.rs` (Real Sweep) +
+  `gpu_forge_all.rs` (Forge Everything)** + the legacy `ApplyGodforge/Brokkrs/DeepCalm` trio →
+  hide from normal UI, remove later (keep IPC wired for now). **Memory sweep** (`gpu_mem_sweep.rs`)
+  = no core voltage lock but runs independent of the forged core → Advanced Diagnostic until the
+  VRAM redesign. **Product action model**: primary = **Forge GPU** (→ **Refine Profiles** once
+  profiles exist); **Advanced Diagnostics** = GetGpuCurve / StartGpuValidation / StartBenchmark /
+  VerifyAppliedProfile / StartMemSweep; legacy paths hidden/developer-only. VRAM = future Forge GPU
+  pipeline step, never a separate primary button. See `decisions.md` + `docs/contracts/ui-backend.md`.
 - **Patch B — load-state classification (2026-06-06) — DONE, not pushed**: adds a second
   orthogonal LOAD axis to `ApplyVerificationStatus` (`load_state: LoadVerification` =
   NotEvaluated / VerifiedUnderLoad / TelemetryInsufficient / LoadMismatch /

@@ -2,6 +2,30 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Forge action consolidation: Power Sweep is canonical; Real Sweep / Forge Everything are legacy
+- **Decision** (Forge Action Consolidation audit, 2026-06-06): **`gpu_power_sweep.rs` (Power
+  Sweep) is the canonical Forge GPU core path** — offset + elastic VF ceiling
+  (`apply_vf_ceiling`), game-power render dwell, Safe-Loop-guarded, knowledge-bounded, **no
+  voltage lock**. It is the only current safe core-optimization engine and the one F1a/F1b
+  build on. Canonical apply path = `ApplyPowerGodforge/ApplyPowerBrokkrs/ApplyPowerDeepCalm`.
+- **`gpu_sweep_real.rs` (Real Sweep) and `gpu_forge_all.rs` (Forge Everything) are LEGACY
+  voltage-lock paths**: both call `lock_core_voltage_mv` (Real Sweep L239/L370; Forge Everything
+  fixed `CORE_VOLTAGE_MV=900` L193) — the documented TDR cause under load. Real Sweep also uses
+  compute (ALU) load, not game power. Forge Everything tunes VRAM around a *fixed-voltage* core,
+  not a forged curve. The legacy `ApplyGodforge/ApplyBrokkrs/ApplyDeepCalm` trio (from
+  `real_sweep.profiles`) belongs to this generation.
+- **Legacy core paths should be hidden from normal UI** (developer/diagnostic only) and
+  **scheduled for removal in a later patch** (after F1b makes the Power Sweep pipeline the whole
+  story). Do NOT remove the IPC methods yet — keep them wired to avoid mid-stream build/IPC breaks.
+- **VRAM tuning is a FUTURE Forge GPU pipeline step**, not an independent primary action. It MUST
+  run **after** the core VF curve is forged + validated and **adapt to** that curve — it must
+  never define or destabilize the core. `gpu_mem_sweep.rs` is safer than the legacy core paths
+  (no core voltage lock) but today runs independently of the forged core, so it stays an Advanced
+  Diagnostic until redesigned. The Gen-1 `Forge Everything` ordering (VRAM around fixed-voltage
+  core) is exactly what this rule forbids.
+- **Status**: audit only — no code removed, no `apps/ui` change. Frontend request recorded in
+  `docs/contracts/ui-backend.md`.
+
 ## Voltage is three concepts, not one number; F1b keys on VF-table, not measured dwell voltage
 - **Decision** (Sensor Quality Audit, 2026-06-05): GPU voltage must be split into
   explicitly-named, never-conflated fields:
