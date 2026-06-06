@@ -160,3 +160,46 @@ Suggested commit messages:
 
 - `chore(release): align project metadata for v0.4.0`
 - `chore(version): update package metadata for v0.3.2`
+
+## Post-Implementation Validation
+
+After any code change, do not stop at unit tests only.
+
+Before reporting completion, perform the safest available validation for the scope of the change.
+
+Prefer:
+
+- `cargo check`
+- relevant `cargo test`
+- frontend build only when frontend files changed
+- service startup in console mode when backend service behavior changed
+- read-only IPC/status checks when available
+- JSON persistence encode/decode validation
+- log inspection for warnings/errors
+
+For hardware-risky operations, do not run them automatically.
+
+Hardware-risky operations include:
+
+- GPU stress runs
+- power sweeps
+- memory sweeps
+- VF curve writes
+- profile apply
+- overclock/undervolt changes
+- any operation that may cause TDR, reboot, or driver reset
+
+For risky operations:
+
+1. Explain what should be manually tested.
+2. Provide exact commands or UI steps.
+3. State expected results.
+4. State what logs to capture.
+5. Wait for user approval before running anything risky.
+
+When reporting completion, include:
+
+- automated validation performed
+- manual validation still required
+- risks not exercised
+- whether the service/UI was actually run
