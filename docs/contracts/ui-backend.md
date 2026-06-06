@@ -44,7 +44,39 @@ To be documented as the frontend/backend contract stabilizes.
 
 
 
-(No active requests)
+\## Additive (2026-06-05): PowerSweepPoint voltage fields
+
+
+
+`PowerSweepPoint` (in `GetPowerSweepProgress` / `ApplyPower*` payloads) gains two
+
+OPTIONAL fields (`#[serde(default)]`, backend-only, backward-compatible):
+
+
+
+\- `measured_voltage_mv: Option<u32>` — measured effective dwell voltage (telemetry
+
+&#x20; only; descriptive). Same source/value as the legacy `voltage_mv`.
+
+\- `vf_table_voltage_mv: Option<u32>` — deterministic VF-table bin voltage (the apply
+
+&#x20; key). `None` for legacy points produced before the split.
+
+
+
+The legacy `voltage_mv` is retained for display/back-compat and still means the
+
+measured max. UI must keep treating voltage as MEASURED telemetry, NOT as a
+
+guaranteed cap; the deterministic key is `vf_table_voltage_mv` when present. No UI
+
+change is required (missing optional fields tolerated). Rationale: `decisions.md`
+
+→ "Voltage is three concepts, not one number".
+
+
+
+(No other active requests)
 
 
 

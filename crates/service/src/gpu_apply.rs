@@ -61,14 +61,46 @@ fn curve_freq_at(voltage_mv: u32) -> Option<u32> {
 /// light load) yet never boosts past the validated point — the true Afterburner
 /// curve-flatten. Fallback (older driver / no modern curve API): a global clock
 /// offset + an NVML max-clock cap (less elastic, but works everywhere).
+/// Choose the VF-ceiling threshold for an apply. The profile's `voltage_mv` is a
+/// MEASURED dwell value (a sparse sensor max), NOT a deterministic curve point, so
+/// we snap it to a real VF-table bin (the lowest table voltage at/above it) — the
+/// ceiling must land on an actual curve voltage (see `decisions.md`: voltage split).
+/// Returns `(ceiling_mv, legacy_fallback)`; `legacy_fallback` is true only when no
+/// bin could be resolved (empty/unknown curve) and the raw measured value is used as
+/// a last resort. Pure + testable without hardware.
+fn choose_ceiling_mv(curve: &[(usize, u32, u32)], measured_mv: u32) -> (u32, bool) {
+    match nidavellir_gpu_nvapi::nearest_vf_bin_at_or_above(curve, measured_mv) {
+        Some((_, table_mv)) => (table_mv, false),
+        None => (measured_mv, true),
+    }
+}
+
 #[cfg(windows)]
 pub fn apply_core(point: VfPoint) -> Result<(), String> {
     if nidavellir_gpu_nvapi::vf_curve_supported() {
-        match nidavellir_gpu_nvapi::apply_vf_ceiling(point.voltage_mv, point.freq_mhz) {
+        // Snap the MEASURED voltage to a deterministic VF-table bin and key the
+        // ceiling on that — never on the raw measured value. The measured number is
+        // kept only as descriptive telemetry on the point.
+        let curve = nidavellir_gpu_nvapi::read_vf_curve_modern();
+        let (ceiling_mv, legacy) = choose_ceiling_mv(&curve, point.voltage_mv);
+        if legacy {
+            warn!(
+                "voltage_semantics: unable to map measured {} mV to a VF-table bin \
+                 (empty/unknown curve); apply uses measured value as legacy ceiling",
+                point.voltage_mv
+            );
+        } else {
+            info!(
+                "voltage_semantics: using vf_table_voltage_mv={ceiling_mv} \
+                 measured_voltage_mv={} target={} MHz",
+                point.voltage_mv, point.freq_mhz
+            );
+        }
+        match nidavellir_gpu_nvapi::apply_vf_ceiling(ceiling_mv, point.freq_mhz) {
             Ok(n) => {
                 info!(
                     "VF ceiling: {n} pts achatados para {} MHz acima de {} mV (elástico)",
-                    point.freq_mhz, point.voltage_mv
+                    point.freq_mhz, ceiling_mv
                 );
                 return Ok(());
             }
@@ -177,3 +209,31 @@ pub fn reapply_on_boot(store: &SafeLoopStore) {
 
 #[cfg(not(windows))]
 pub fn reapply_on_boot(_store: &SafeLoopStore) {}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_ceiling_mv;
+
+    // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
+    fn curve() -> Vec<(usize, u32, u32)> {
+        vec![(0, 800, 1700), (1, 837, 1750), (2, 850, 1770), (3, 1062, 1900)]
+    }
+
+    #[test]
+    fn ceiling_prefers_vf_table_bin_over_measured() {
+        // Measured 843 (between bins) must snap UP to the real 850 table bin, not 843.
+        let (mv, legacy) = choose_ceiling_mv(&curve(), 843);
+        assert_eq!(mv, 850);
+        assert!(!legacy);
+        // An exact-bin measurement stays on its bin.
+        assert_eq!(choose_ceiling_mv(&curve(), 837), (837, false));
+    }
+
+    #[test]
+    fn ceiling_falls_back_to_measured_only_when_no_curve() {
+        // No deterministic curve available (legacy/unknown) → use measured, flag legacy.
+        let (mv, legacy) = choose_ceiling_mv(&[], 843);
+        assert_eq!(mv, 843);
+        assert!(legacy);
+    }
+}

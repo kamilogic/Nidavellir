@@ -488,6 +488,36 @@ pub fn read_vf_curve_modern() -> Vec<(usize, u32, u32)> {
     out
 }
 
+/// Snap a *measured* (sensor) voltage to a deterministic VF-table bin: the lowest
+/// curve voltage at or above `measured_mv`. If `measured_mv` is above every bin,
+/// clamps to the highest bin (safe top-of-curve). Empty curve → `None`.
+/// `curve` is `(index, voltage_mv, freq_mhz)` as returned by [`read_vf_curve_modern`].
+///
+/// This exists because a measured dwell voltage is a sparse sensor reading, NOT a
+/// deterministic curve point; the apply ceiling must land on a real table bin, not
+/// the raw measurement (see `decisions.md`: voltage field split). Pure + deterministic
+/// so it is unit-testable without hardware, and platform-agnostic.
+pub fn nearest_vf_bin_at_or_above(
+    curve: &[(usize, u32, u32)],
+    measured_mv: u32,
+) -> Option<(usize, u32)> {
+    if curve.is_empty() {
+        return None;
+    }
+    if let Some(&(idx, mv, _)) = curve
+        .iter()
+        .filter(|(_, mv, _)| *mv >= measured_mv)
+        .min_by_key(|(_, mv, _)| *mv)
+    {
+        return Some((idx, mv));
+    }
+    // Measured above all bins → clamp to the highest available table voltage.
+    curve
+        .iter()
+        .max_by_key(|(_, mv, _)| *mv)
+        .map(|&(idx, mv, _)| (idx, mv))
+}
+
 /// Apply an Afterburner-style **VF ceiling**: flatten every curve point whose
 /// voltage is ≥ `ceiling_mv` to `target_mhz` (via per-point freq offsets), leaving
 /// lower-voltage points untouched (elastic). This caps the top of the curve at
@@ -585,4 +615,41 @@ pub fn probe() -> Result<usize, String> {
 #[cfg(not(windows))]
 pub fn probe() -> Result<usize, String> {
     Err("NVAPI is Windows-only".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nearest_vf_bin_at_or_above;
+
+    // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
+    fn curve() -> Vec<(usize, u32, u32)> {
+        vec![(0, 800, 1700), (1, 837, 1750), (2, 850, 1770), (3, 1062, 1900)]
+    }
+
+    #[test]
+    fn exact_match_returns_that_bin() {
+        assert_eq!(nearest_vf_bin_at_or_above(&curve(), 850), Some((2, 850)));
+    }
+
+    #[test]
+    fn below_a_bin_rounds_up_to_it() {
+        // 820 → the next table voltage at/above is 837.
+        assert_eq!(nearest_vf_bin_at_or_above(&curve(), 820), Some((1, 837)));
+    }
+
+    #[test]
+    fn between_bins_picks_lowest_at_or_above() {
+        // 843 sits between the 837 and 850 bins → snaps up to 850.
+        assert_eq!(nearest_vf_bin_at_or_above(&curve(), 843), Some((2, 850)));
+    }
+
+    #[test]
+    fn above_all_bins_clamps_to_highest() {
+        assert_eq!(nearest_vf_bin_at_or_above(&curve(), 1100), Some((3, 1062)));
+    }
+
+    #[test]
+    fn empty_curve_is_none() {
+        assert_eq!(nearest_vf_bin_at_or_above(&[], 850), None);
+    }
 }

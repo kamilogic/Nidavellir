@@ -15,6 +15,18 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **Voltage field separation (this session) — IMPLEMENTED, not pushed**: first patch
+  off the Sensor Audit decision. `PowerSweepPoint` now separates `measured_voltage_mv`
+  (telemetry) from `vf_table_voltage_mv` (deterministic apply/frontier key); legacy
+  `voltage_mv` kept for compat/display. **Apply path snaps the measured voltage to a
+  real VF-table bin (`nearest_vf_bin_at_or_above`) before `apply_vf_ceiling`** — it no
+  longer keys the ceiling on raw measured voltage. Persisted state stays
+  backward-compatible (no schema bump; old JSON loads new optional fields as `None`;
+  `VfPoint`/`gpu_applied.json` unchanged → apply re-snaps at runtime). Additive IPC
+  fields noted in `docs/contracts/ui-backend.md`. Tests: `cargo check -p
+  nidavellir-service` clean · gpu-nvapi 5/5 · service 15/15. **Limitations**: the
+  frequency-only flatten is unchanged; the ~1062 mV unfocused/desktop state is NOT
+  solved by this patch; richer dwell stats + apply verification still pending.
 - **Sensor Quality Audit (this session, investigation-only — no code)**: GPU telemetry
   sources are right (NVML clock/power/cap/temp/util; NVAPI curve), but three structural
   gaps found: (1) two disconnected telemetry worlds — "sensor world" (`SensorEngine`/

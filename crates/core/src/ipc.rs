@@ -49,6 +49,11 @@ pub enum IpcRequest {
 /// One measured (locked voltage → sustained clock + power) point of the sweep.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PowerSweepPoint {
+    /// LEGACY / display: the measured dwell voltage (a sparse NVAPI sensor max).
+    /// Kept for backward compat + existing selection/logging. It is **measured
+    /// telemetry, NOT a deterministic apply key** — for that use
+    /// `vf_table_voltage_mv`. Equals `measured_voltage_mv` for points produced
+    /// after the voltage split.
     pub voltage_mv: u32,
     pub clock_mhz: u32,
     /// Clock offset (MHz) that realizes this point — applied WITHOUT a hard
@@ -65,6 +70,15 @@ pub struct PowerSweepPoint {
     pub stable: bool,
     /// Efficiency proxy: sustained clock per watt.
     pub perf_per_watt: f64,
+    /// Measured effective voltage under the dwell (telemetry only — same source as
+    /// `voltage_mv`). Descriptive; never an apply/frontier key. `None` for points
+    /// produced before the voltage split (see `decisions.md`).
+    #[serde(default)]
+    pub measured_voltage_mv: Option<u32>,
+    /// Deterministic VF-table bin voltage this point snaps to — the apply/frontier
+    /// key. `None` for legacy points produced before the split. (Added: voltage split.)
+    #[serde(default)]
+    pub vf_table_voltage_mv: Option<u32>,
 }
 
 /// Power-target sweep: for a range of locked voltages, the max stable clock and

@@ -3,7 +3,25 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-05) — Sensor Quality Audit (Review 2, investigation-only)
+## Latest backend checkpoint (2026-06-05) — Voltage field separation (IMPLEMENTED, not pushed)
+- First patch off the Sensor Audit decision. **`PowerSweepPoint` now separates
+  `measured_voltage_mv` (telemetry) from `vf_table_voltage_mv` (deterministic apply/
+  frontier key)**; legacy `voltage_mv` retained for compat/display.
+- **Apply path snaps measured voltage → real VF-table bin** (`nearest_vf_bin_at_or_above`
+  in gpu-nvapi; `choose_ceiling_mv` in `gpu_apply.rs`) **before `apply_vf_ceiling`** — no
+  longer keys the ceiling on raw measured voltage. Logs `voltage_semantics: …`.
+- **Backward-compatible**: no schema bump; old `forge_state.json`/`PowerSweepPoint` JSON
+  loads new optional fields as `None`; `VfPoint`/`gpu_applied.json` unchanged → apply
+  re-snaps at runtime (legacy warning only if the live curve is empty). Additive IPC
+  fields documented in `docs/contracts/ui-backend.md`.
+- **Files**: `crates/gpu-nvapi/src/lib.rs`, `crates/core/src/ipc.rs`,
+  `crates/service/src/gpu_apply.rs`, `crates/service/src/gpu_power_sweep.rs`,
+  `docs/contracts/ui-backend.md`. No `apps/ui`, Safe Loop, or synthesis change.
+- **Tests**: `cargo check -p nidavellir-service` clean · gpu-nvapi 5/5 · service 15/15.
+- **Limitations (next work)**: frequency-only flatten unchanged; the ~1062 mV unfocused/
+  desktop state is NOT solved here; richer dwell stats + applied-curve verification pending.
+
+## Backend checkpoint (2026-06-05) — Sensor Quality Audit (Review 2, investigation-only)
 - **No code/IPC/UI change.** GPU telemetry sources are right (NVML clock/power/cap/temp/
   util; NVAPI curve). Three structural gaps found:
   1. **Two disconnected telemetry worlds**: "sensor world" (`SensorEngine`/`GpuSensors`,

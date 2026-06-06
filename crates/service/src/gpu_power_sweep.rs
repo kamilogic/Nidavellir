@@ -1036,6 +1036,14 @@ fn run_power_sweep(
         ));
         match m.result {
             StabilityResult::Stable if m.clock_mhz > 0 && m.power_w > 0.0 && m.volt_mv > 0 => {
+                // Snap the measured dwell voltage to a deterministic VF-table bin so
+                // the point carries BOTH concepts: measured telemetry AND the
+                // deterministic apply/frontier key (decisions.md: voltage split).
+                // Read-only; once per stable step (not in the hot sampling loop).
+                let vf_curve = nidavellir_gpu_nvapi::read_vf_curve_modern();
+                let vf_table_voltage_mv =
+                    nidavellir_gpu_nvapi::nearest_vf_bin_at_or_above(&vf_curve, m.volt_mv)
+                        .map(|(_, mv)| mv);
                 prog.points.push(PowerSweepPoint {
                     voltage_mv: m.volt_mv,
                     clock_mhz: m.clock_mhz,
@@ -1046,6 +1054,8 @@ fn run_power_sweep(
                     power_capped_frac: m.capped_frac,
                     stable: true,
                     perf_per_watt: m.clock_mhz as f64 / m.power_w as f64,
+                    measured_voltage_mv: Some(m.volt_mv),
+                    vf_table_voltage_mv,
                 });
                 // Continuous learning: accumulate this offset's stats + raise the
                 // clean frontier. Persisted, so confidence grows across runs.
@@ -1204,6 +1214,8 @@ mod tests {
             power_capped_frac: capped,
             stable: true,
             perf_per_watt,
+            measured_voltage_mv: Some(900),
+            vf_table_voltage_mv: None,
         }
     }
 
@@ -1259,6 +1271,8 @@ mod tests {
             power_capped_frac: 0.0,
             stable: true,
             perf_per_watt: clock_mhz as f64 / power_w as f64,
+            measured_voltage_mv: Some(900),
+            vf_table_voltage_mv: None,
         }
     }
 
@@ -1299,6 +1313,32 @@ mod tests {
         let p = synthesize_forge_profiles(&frontier, 0.85);
         assert!(p.godforge.is_some());
         assert!(p.log.iter().any(|l| l.contains("best-effort")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn power_point_legacy_json_loads_without_new_fields() {
+        // A pre-split point (no measured_/vf_table_ fields) must still deserialize,
+        // with the new optional fields defaulting to None — no panic on missing fields.
+        let legacy = r#"{"voltage_mv":843,"clock_mhz":1785,"offset_mhz":180,
+            "power_w":180.0,"max_power_w":185.0,"power_std_w":1.0,
+            "power_capped_frac":0.0,"stable":true,"perf_per_watt":9.9}"#;
+        let p: PowerSweepPoint = serde_json::from_str(legacy).expect("legacy point loads");
+        assert_eq!(p.voltage_mv, 843);
+        assert_eq!(p.measured_voltage_mv, None);
+        assert_eq!(p.vf_table_voltage_mv, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn power_point_roundtrips_new_voltage_fields() {
+        let mut p = fp(1785, 180.0);
+        p.measured_voltage_mv = Some(843);
+        p.vf_table_voltage_mv = Some(850);
+        let json = serde_json::to_string(&p).expect("encode");
+        let back: PowerSweepPoint = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.measured_voltage_mv, Some(843));
+        assert_eq!(back.vf_table_voltage_mv, Some(850));
     }
 
     #[cfg(windows)]
