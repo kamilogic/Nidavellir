@@ -186,6 +186,7 @@
     <ProfileCards
       {powerSweep}
       {applied}
+      {verification}
       showPlaceholders
       onApplyPower={applyPower}
     />

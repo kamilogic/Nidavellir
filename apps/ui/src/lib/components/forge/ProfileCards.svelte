@@ -6,6 +6,7 @@
     mode = "real",
     powerSweep = null,
     applied = null,
+    verification = null,
     showPlaceholders = false,
     onApplyPower,
   } = $props();
@@ -60,18 +61,6 @@
     return String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
   }
 
-  function pointMatches(m) {
-    if (!applied?.core) return false;
-    const pp = powerProfile(m);
-    const freq = pp?.clock_mhz;
-    const voltage = pp?.voltage_mv;
-    return Boolean(freq && voltage && applied.core.freq_mhz === freq && applied.core.voltage_mv === voltage);
-  }
-
-  function isApplied(m) {
-    return normalize(applied?.label) === normalize(m.name) || pointMatches(m);
-  }
-
   function powerName(key) {
     if (key === "godforge") return "Godforge";
     if (key === "brokkrs") return "Brokkr's Best";
@@ -79,14 +68,35 @@
     return key;
   }
 
-  function isPowerApplied(key, p) {
-    if (!p) return false;
-    return normalize(applied?.label) === normalize(powerName(key)) ||
-      Boolean(applied?.core && applied.core.freq_mhz === p.clock_mhz && applied.core.voltage_mv === p.voltage_mv);
+  function sameNumber(a, b) {
+    return a != null && b != null && Number(a) === Number(b);
+  }
+
+  function voltageMatches(p) {
+    if (!p || !applied?.core) return false;
+    if (verification?.vf_table_voltage_mv != null && p.vf_table_voltage_mv != null) {
+      return sameNumber(verification.vf_table_voltage_mv, p.vf_table_voltage_mv);
+    }
+    return sameNumber(applied.core.voltage_mv, p.voltage_mv);
+  }
+
+  function profileState(name, p) {
+    const labelMatches = normalize(applied?.label) === normalize(name);
+    const clockMatches = Boolean(applied?.core && p && sameNumber(applied.core.freq_mhz, p.clock_mhz));
+    const numericMatches = Boolean(clockMatches && voltageMatches(p));
+    const curveMismatch = Boolean(labelMatches && verification?.status === "live_mismatch");
+    const active = Boolean(labelMatches && numericMatches && !curveMismatch);
+    return {
+      active,
+      updated: Boolean(labelMatches && p && !numericMatches),
+      curveMismatch,
+      stale: Boolean(labelMatches && p && (!numericMatches || curveMismatch)),
+    };
   }
 
   async function applyPowerCard(key, p) {
-    if (!p || isPowerApplied(key, p) || applyingKey) return;
+    const state = profileState(powerName(key), p);
+    if (!p || state.active || applyingKey) return;
     applyingKey = key;
     try {
       await onApplyPower?.(key);
@@ -96,7 +106,8 @@
   }
 
   async function applyProfile(m) {
-    if (!hasData(m) || isApplied(m) || applyingKey) return;
+    const state = profileState(m.name, powerProfile(m));
+    if (!hasData(m) || state.active || applyingKey) return;
     applyingKey = m.key;
     try {
       await onApplyPower?.(m.key);
@@ -110,22 +121,26 @@
   {#if !powerSweep?.running && (powerSweep?.godforge || powerSweep?.brokkrs)}
     <div class="profiles">
       {#each [["godforge", powerSweep.godforge], ["brokkrs", powerSweep.brokkrs]] as [key, p]}
-        {@const active = isPowerApplied(key, p)}
-        <div class={`profile profile-${key}`} class:active>
+        {@const state = profileState(powerName(key), p)}
+        <div class={`profile profile-${key}`} class:active={state.active} class:stale={state.stale}>
           <div class="prof-name">{$t("forge.prof_" + key)}</div>
           {#if p}
             <div class="prof-val">{p.clock_mhz} MHz @ {p.voltage_mv} mV</div>
             <div class="prof-sub">{p.power_w.toFixed(0)} W / {p.perf_per_watt.toFixed(1)} MHz/W</div>
             <button
               class="btn small"
-              class:go={!active}
-              disabled={active || applyingKey === key}
+              class:go={!state.active}
+              disabled={state.active || applyingKey === key}
               onclick={() => applyPowerCard(key, p)}
             >
-              {#if active}
-                Applied ✓
-              {:else if applyingKey === key}
+              {#if applyingKey === key}
                 Applying...
+              {:else if state.active}
+                Applied ✓
+              {:else if state.updated}
+                Apply Updated Profile
+              {:else if state.curveMismatch}
+                Reapply
               {:else}
                 {$t("forge.apply")}
               {/if}
@@ -140,22 +155,28 @@
 {:else if powerSweep || showPlaceholders}
   <div class="profiles">
     {#each meta as item}
-      {@const active = isApplied(item)}
-        <article class={`profile profile-${item.key}`} class:recommended={item.recommended} class:active>
-          <div class="profile-top">
-            <div>
-              <h4>{item.name}</h4>
-              <span class="stance">{item.stance}</span>
-            </div>
-            <div class="profile-badges">
-              {#if item.recommended}
-                <StatusBadge label="Recommended" variant="recommended" compact />
-              {/if}
-              {#if active}
-                <StatusBadge label="Active" variant="active" compact />
-              {/if}
-            </div>
+      {@const point = powerProfile(item)}
+      {@const state = profileState(item.name, point)}
+      <article class={`profile profile-${item.key}`} class:recommended={item.recommended} class:active={state.active} class:stale={state.stale}>
+        <div class="profile-top">
+          <div>
+            <h4>{item.name}</h4>
+            <span class="stance">{item.stance}</span>
           </div>
+          <div class="profile-badges">
+            {#if item.recommended}
+              <StatusBadge label="Recommended" variant="recommended" compact />
+            {/if}
+            {#if state.active}
+              <StatusBadge label="Active" variant="active" compact />
+            {:else if state.updated}
+              <StatusBadge label="Updated" variant="tempered" compact />
+            {/if}
+            {#if state.curveMismatch}
+              <StatusBadge label="Curve mismatch" variant="attention" compact />
+            {/if}
+          </div>
+        </div>
         <p class="desc">{item.summary}</p>
         <div class="expected">
           <span>Expected Result</span>
@@ -173,14 +194,18 @@
         {#if hasData(item)}
           <button
             class="btn small"
-            class:go={!active}
-            disabled={active || applyingKey === item.key}
+            class:go={!state.active}
+            disabled={state.active || applyingKey === item.key}
             onclick={() => applyProfile(item)}
           >
-            {#if active}
-              Applied ✓
-            {:else if applyingKey === item.key}
+            {#if applyingKey === item.key}
               Applying...
+            {:else if state.active}
+              Applied ✓
+            {:else if state.updated}
+              Apply Updated Profile
+            {:else if state.curveMismatch}
+              Reapply
             {:else}
               {$t("forge.apply")}
             {/if}
@@ -241,6 +266,12 @@
   .profile.recommended {
     border-color: rgba(214, 168, 93, 0.44);
     box-shadow: var(--forge-shadow-active);
+  }
+  .profile.stale {
+    border-color: rgba(214, 168, 93, 0.5);
+    box-shadow:
+      inset 0 0 0 1px rgba(214, 168, 93, 0.08),
+      var(--forge-panel-edge);
   }
   .profile.active {
     border-color: rgba(157, 191, 145, 0.62);
