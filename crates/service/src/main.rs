@@ -5,6 +5,7 @@ mod gpu_mem_sweep;
 mod gpu_power_sweep;
 mod gpu_real;
 mod gpu_sweep_real;
+mod gpu_verify;
 mod ipc_server;
 mod safe_loop_runtime;
 mod sensor_gather;

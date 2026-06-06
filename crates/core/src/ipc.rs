@@ -32,6 +32,7 @@ pub enum IpcRequest {
     ApplyMemPeak,
     ResetGpuTuning,
     GetAppliedProfile,
+    VerifyAppliedProfile,
     StartForgeAll,
     StopForgeAll,
     GetForgeAllProgress,
@@ -201,6 +202,46 @@ pub struct GpuApplyStatus {
     pub message: String,
 }
 
+/// Read-only verification of whether the live modern VF curve matches the applied
+/// Nidavellir profile (Patch A: curve-only — no telemetry/load classification yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveVerification {
+    /// No applied profile recorded — nothing to verify.
+    NotApplicable,
+    /// A profile is recorded but the live curve was not / could not be checked
+    /// against it (e.g. a memory-only profile with no core point).
+    MetadataOnly,
+    /// The live modern VF curve shows the expected flattening at/above the
+    /// deterministic ceiling bin (within tolerance).
+    VerifiedCurve,
+    /// The live modern VF curve does NOT show the expected flattening.
+    LiveMismatch,
+    /// Verification could not be completed reliably (no modern API, empty readback,
+    /// unmappable bin, …).
+    VerificationFailed,
+}
+
+/// Structured result of a read-only applied-curve verification. Telemetry/load and
+/// workload-context fields are intentionally absent (later patches B/C).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyVerificationStatus {
+    pub status: CurveVerification,
+    pub label: Option<String>,
+    pub target_mhz: Option<u32>,
+    /// Deterministic VF-table ceiling bin used for comparison — re-derived the same
+    /// way apply derives its key. NOT the measured voltage.
+    pub vf_table_voltage_mv: Option<u32>,
+    /// Legacy/measured voltage from the applied profile, for diagnostics only.
+    pub legacy_voltage_mv: Option<u32>,
+    /// Expected-flattened plateau points and how many matched the target within tol.
+    pub matched_points: Option<u32>,
+    pub expected_points: Option<u32>,
+    /// True only when `status == VerifiedCurve` (structured; UI must not parse message).
+    pub live_curve_match: bool,
+    pub message: String,
+}
+
 /// One step of the memory sweep: a clock offset with its measured effective
 /// bandwidth and integrity verdict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +344,7 @@ pub enum ResponseData {
     GpuValidation(GpuValidationStatus),
     MemSweep(MemSweepProgress),
     GpuApply(GpuApplyStatus),
+    ApplyVerification(ApplyVerificationStatus),
     ForgeAll(ForgeAllProgress),
     Benchmark(BenchmarkProgress),
     PowerSweep(PowerSweepProgress),

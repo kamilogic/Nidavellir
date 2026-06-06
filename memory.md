@@ -15,6 +15,18 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **Applied curve verifier — Patch A (this session) — IMPLEMENTED, not pushed**: read-only
+  `VerifyAppliedProfile` IPC + `crate::gpu_verify`. Classifies the live modern VF curve vs
+  the applied profile into `CurveVerification` = NotApplicable / MetadataOnly /
+  VerifiedCurve / LiveMismatch / VerificationFailed. **Table-to-table only**: re-derives the
+  deterministic ceiling bin via `nearest_vf_bin_at_or_above(core.voltage_mv)` (same as apply),
+  reads `read_vf_curve_modern` (GetStatus) + `vf_get_point_khz` (offset corroboration, logged);
+  expected = points ≥ ceiling read target ±15 MHz, ≥90% match → VerifiedCurve. **Read-only**:
+  no apply/reapply/write/stress. No telemetry/load/context/stock-fingerprint yet (Patches B/C).
+  Additive IPC (`ApplyVerificationStatus`), contract noted. Tests: check clean · service 26/26
+  (+7 verifier). **Runtime QA BLOCKED**: `gpu_applied.json` exists → console startup would
+  reapply (VF write, prohibited) → live IPC test deferred. Patch B (load classification from
+  existing dwell stats) is now unblocked.
 - **Richer dwell stats (this session) — IMPLEMENTED, not pushed**: second patch off the
   Sensor Audit. `PowerSweepPoint` gains optional `min_clock_mhz`/`p5_clock_mhz`,
   measured-voltage `avg/min/max` + `voltage_sample_count`, `dwell_sample_count`/

@@ -114,6 +114,50 @@ are UNCHANGED. No UI change required. Rationale: `decisions.md` Sensor Quality A
 
 
 
+\## Additive (2026-06-06): VerifyAppliedProfile (read-only curve verifier)
+
+
+
+New OPTIONAL read-only IPC method `VerifyAppliedProfile` (Patch A — curve-only). It
+
+reads the live modern VF curve and classifies it against the applied profile; it
+
+NEVER applies, reapplies, or mutates GPU state. `GetAppliedProfile` stays the cheap
+
+metadata path — verification is explicit/opt-in.
+
+
+
+Response: `ResponseData::ApplyVerification(ApplyVerificationStatus)`:
+
+
+
+\- `status`: enum `CurveVerification` → `"not_applicable"` / `"metadata_only"` /
+
+&#x20; `"verified_curve"` / `"live_mismatch"` / `"verification_failed"`.
+
+\- `live_curve_match: bool` (structured; UI must not parse `message`).
+
+\- `label`, `target_mhz`, `vf_table_voltage_mv` (deterministic ceiling bin used for
+
+&#x20; comparison), `legacy_voltage_mv` (diagnostic), `matched_points`,
+
+&#x20; `expected_points`, `message`.
+
+
+
+Comparison is table-to-table against the deterministic VF-table bin (re-derived like
+
+apply), NOT measured voltage. Telemetry/load classification (`verified_under_load`,
+
+`workload_state_mismatch`), `stock_detected`/`external_unknown`, and workload context
+
+are NOT included yet (later patches). No UI change required. Rationale: `decisions.md`
+
+Applied Curve Verification.
+
+
+
 (No other active requests)
 
 

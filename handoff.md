@@ -3,7 +3,29 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-05) — Richer dwell stats (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-06) — Applied curve verifier, Patch A (IMPLEMENTED, not pushed)
+- **Read-only `VerifyAppliedProfile` IPC** + new `crates/service/src/gpu_verify.rs`. Answers
+  "does the live modern VF curve match the applied profile?" → `CurveVerification` =
+  `NotApplicable | MetadataOnly | VerifiedCurve | LiveMismatch | VerificationFailed`.
+- **Table-to-table only**: re-derives the deterministic ceiling bin the same way apply does
+  (`nearest_vf_bin_at_or_above(core.voltage_mv)` — NOT measured voltage); reads
+  `read_vf_curve_modern` (GetStatus) + `vf_get_point_khz` (offset corroboration, logged only).
+  Rule: points with `mv ≥ ceiling` should read `target ±15 MHz`; ≥90% match (and ≥1) →
+  VerifiedCurve, else LiveMismatch; empty/unmappable → VerificationFailed.
+- **Read-only**: never applies/reapplies/writes/stresses. Patch B (telemetry/load),
+  Patch C (workload context, stock fingerprint, ExternalUnknown) NOT implemented.
+- **Files**: `crates/core/src/ipc.rs` (enum `CurveVerification`, `ApplyVerificationStatus`,
+  `VerifyAppliedProfile` request, `ApplyVerification` response), `crates/service/src/gpu_verify.rs`,
+  `main.rs` (mod), `ipc_server.rs` (handler), `docs/contracts/ui-backend.md`. Additive only.
+- **Tests**: `cargo check -p nidavellir-service` clean · service 26/26 (+7 verifier pure tests).
+- **⚠ Runtime QA BLOCKED (safety)**: `gpu_applied.json` exists (Brokkr's 1770@837), so
+  console startup runs `reapply_on_boot` → `apply_vf_ceiling` = a VF WRITE (prohibited for this
+  QA). Service was NOT started. To live-test read-only verify without a write, either (a) approve
+  the normal reapply-on-boot then call `scripts/ipc.ps1 -Method VerifyAppliedProfile`, or
+  (b) add a no-reapply read path. **Manual live IPC test still required.**
+- **Unblocks**: Patch B (load classification) can reuse the applied `PowerSweepPoint` dwell stats.
+
+## Backend checkpoint (2026-06-05) — Richer dwell stats (IMPLEMENTED, pushed)
 - Second patch off the Sensor Audit. **`PowerSweepPoint` gains optional dwell-quality
   fields**: `min_clock_mhz`/`p5_clock_mhz`, measured-voltage `avg/min/max` +
   `voltage_sample_count`, `dwell_sample_count`/`dwell_duration_ms`, `start/end/avg_temp_c`,

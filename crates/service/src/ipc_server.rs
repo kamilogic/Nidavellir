@@ -274,6 +274,13 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetAppliedProfile => {
             IpcResponse::success(ResponseData::GpuApply(applied_status(String::new())))
         }
+        IpcRequest::VerifyAppliedProfile => {
+            // Read-only: classifies the live modern VF curve vs the applied profile.
+            // Never applies, reapplies, or mutates GPU state.
+            IpcResponse::success(ResponseData::ApplyVerification(
+                crate::gpu_verify::verify_applied_curve(),
+            ))
+        }
         IpcRequest::StartForgeAll => {
             let store = guard.safe_store.clone();
             if guard.forge_all.start(store) {
