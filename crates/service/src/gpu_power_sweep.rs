@@ -1282,7 +1282,7 @@ struct FrontierBuildResult {
 /// VF-table bin is recorded as the apply axis; measured voltage stays telemetry.
 #[cfg(windows)]
 #[allow(dead_code)]
-fn probe_to_point(vbin: u32, s: &ProbeSample) -> PowerSweepPoint {
+fn probe_to_point(target_mhz: u32, vbin: u32, s: &ProbeSample) -> PowerSweepPoint {
     PowerSweepPoint {
         clock_mhz: s.avg_clock_mhz,
         power_w: s.power_w,
@@ -1297,7 +1297,55 @@ fn probe_to_point(vbin: u32, s: &ProbeSample) -> PowerSweepPoint {
         p5_clock_mhz: s.p5_clock_mhz,
         voltage_quality: Some(s.voltage_quality),
         telemetry_quality: Some(s.telemetry_quality),
+        // The clock we asked for (vs `clock_mhz` = measured achieved). F1b Phase 2B.1.
+        target_clock_mhz: Some(target_mhz),
         ..Default::default()
+    }
+}
+
+/// Pure conversion of a real dwell `Measured` into a `ProbeSample` (Phase 2B.1). This is
+/// the seam the real probe closure (Phase 2B.2) will use to feed `build_frontier` — it
+/// performs NO hardware I/O, only a conservative interpretation of already-collected dwell
+/// data. `curve_verified` comes from the read-only offset-readback gate; `confidence` from
+/// accumulated Forge Knowledge (both supplied by the future caller).
+///
+/// Conservative rules:
+/// - A `Stable` verdict becomes `ProbeOutcome::Stable` ONLY when the telemetry is trustworthy
+///   enough to believe it: clock/power quality ≥ Medium AND a sustained-clock p5 is present.
+/// - Any other verdict (`SilentError`, `Crash` — which also covers a TDR / device-lost dwell
+///   that returns `Measured::degenerate(Crash, …)`) or weak telemetry → `ProbeOutcome::Unstable`.
+/// - `p5_clock_mhz` is preserved as the sustained-clock signal (`0` / no samples → `None`).
+/// - Measured voltage uses the ramp-filtered avg and stays `None` when missing — never a fake 0.
+#[cfg(windows)]
+#[allow(dead_code)] // wired into the real probe closure in Phase 2B.2
+fn measured_to_probe(m: &Measured, curve_verified: bool, confidence: f64) -> ProbeSample {
+    let telemetry_quality = clock_power_quality(m.sample_count);
+    let voltage_quality = voltage_quality(m.volt_sample_count);
+    let p5_clock_mhz = (m.p5_clock_mhz > 0).then_some(m.p5_clock_mhz);
+    // Telemetry-only; filtered avg. Missing voltage lowers `voltage_quality` (above) but is
+    // reported as `None`, NOT 0.
+    let measured_voltage_mv = m.volt_avg_mv;
+
+    let telemetry_trustworthy =
+        matches!(telemetry_quality, DwellQuality::Medium | DwellQuality::High)
+            && p5_clock_mhz.is_some();
+    let outcome = match m.result {
+        StabilityResult::Stable if telemetry_trustworthy => ProbeOutcome::Stable,
+        _ => ProbeOutcome::Unstable,
+    };
+
+    ProbeSample {
+        outcome,
+        curve_verified,
+        avg_clock_mhz: m.clock_mhz,
+        p5_clock_mhz,
+        power_w: m.power_w,
+        max_power_w: m.max_power_w,
+        power_capped_frac: m.capped_frac,
+        measured_voltage_mv,
+        telemetry_quality,
+        voltage_quality,
+        confidence,
     }
 }
 
@@ -1334,7 +1382,7 @@ fn build_frontier(
             }
             match s.outcome {
                 ProbeOutcome::Stable => {
-                    deepest = Some((probe_to_point(v, &s), s.confidence));
+                    deepest = Some((probe_to_point(target, v, &s), s.confidence));
                     if v < descent.voltage_step_mv {
                         break;
                     }
@@ -1521,6 +1569,8 @@ fn run_power_sweep(
                     end_temp_c: m.end_temp_c,
                     avg_temp_c: m.avg_temp_c,
                     telemetry_quality: Some(telemetry_q),
+                    // Single-clock live sweep: no multi-clock frontier target (F1b Phase 2B.1).
+                    target_clock_mhz: None,
                 });
                 // Continuous learning: accumulate this offset's stats + raise the
                 // clean frontier. Persisted, so confidence grows across runs.
@@ -1951,6 +2001,107 @@ mod tests {
             voltage_quality: DwellQuality::Unavailable,
             confidence: 0.0,
         }
+    }
+
+    // ── Phase 2B.1: measured_to_probe (pure conversion) + target_clock plumbing ───
+    #[cfg(windows)]
+    fn m_good(result: StabilityResult) -> Measured {
+        Measured {
+            result,
+            clock_mhz: 1815,
+            power_w: 180.0,
+            max_power_w: 188.0,
+            power_std_w: 2.0,
+            capped_frac: 0.2,
+            volt_mv: 869,
+            sample_count: 120, // ≥100 → High clock/power quality
+            duration_ms: 15_000,
+            min_clock_mhz: 1770,
+            p5_clock_mhz: 1800,
+            volt_min_mv: Some(840),
+            volt_avg_mv: Some(862),
+            volt_max_mv: Some(869),
+            volt_sample_count: 24, // 10..=49 → Medium voltage quality
+            start_temp_c: Some(60.0),
+            end_temp_c: Some(66.0),
+            avg_temp_c: Some(63.0),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_to_probe_stable_with_good_telemetry_is_stable() {
+        let s = measured_to_probe(&m_good(StabilityResult::Stable), true, 0.9);
+        assert!(matches!(s.outcome, ProbeOutcome::Stable));
+        assert!(s.curve_verified);
+        assert_eq!(s.avg_clock_mhz, 1815);
+        assert_eq!(s.p5_clock_mhz, Some(1800)); // sustained-clock preserved
+        assert_eq!(s.measured_voltage_mv, Some(862)); // filtered avg, telemetry only
+        assert_eq!(s.telemetry_quality, DwellQuality::High);
+        assert_eq!(s.voltage_quality, DwellQuality::Medium);
+        assert_eq!(s.confidence, 0.9);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_to_probe_silent_error_is_unstable() {
+        let s = measured_to_probe(&m_good(StabilityResult::SilentError), true, 0.9);
+        assert!(matches!(s.outcome, ProbeOutcome::Unstable));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_to_probe_crash_or_tdr_is_unstable() {
+        // A TDR / device-lost dwell surfaces as Measured::degenerate(Crash, …).
+        let s = measured_to_probe(&Measured::degenerate(StabilityResult::Crash, 0), true, 0.0);
+        assert!(matches!(s.outcome, ProbeOutcome::Unstable));
+        assert_eq!(s.p5_clock_mhz, None); // no samples → None, not a 0 clock
+        assert_eq!(s.measured_voltage_mv, None); // missing voltage → None, never 0
+        assert_eq!(s.telemetry_quality, DwellQuality::Unavailable);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_to_probe_stable_but_low_telemetry_is_unstable() {
+        // A Stable verdict with too few samples must NOT become a trusted stable probe.
+        let mut m = m_good(StabilityResult::Stable);
+        m.sample_count = 10; // Low (< 30)
+        let s = measured_to_probe(&m, true, 0.9);
+        assert!(matches!(s.outcome, ProbeOutcome::Unstable));
+        assert_eq!(s.telemetry_quality, DwellQuality::Low);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_to_probe_stable_without_p5_is_unstable() {
+        let mut m = m_good(StabilityResult::Stable);
+        m.p5_clock_mhz = 0; // no sustained-clock signal
+        let s = measured_to_probe(&m, true, 0.9);
+        assert!(matches!(s.outcome, ProbeOutcome::Unstable));
+        assert_eq!(s.p5_clock_mhz, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_to_probe_missing_voltage_is_none_not_zero() {
+        let mut m = m_good(StabilityResult::Stable);
+        m.volt_avg_mv = None;
+        m.volt_sample_count = 0;
+        let s = measured_to_probe(&m, true, 0.9);
+        assert_eq!(s.measured_voltage_mv, None); // never a fake 0
+        assert_eq!(s.voltage_quality, DwellQuality::Unavailable);
+        // Missing voltage alone does not flip a well-sampled stable dwell to unstable.
+        assert!(matches!(s.outcome, ProbeOutcome::Stable));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_to_point_records_target_clock() {
+        let s = stable_sample(1815, 180.0, 0.9);
+        let p = probe_to_point(1830, 850, &s);
+        assert_eq!(p.target_clock_mhz, Some(1830)); // the asked-for clock
+        assert_eq!(p.clock_mhz, 1815); // the measured achieved clock
+        assert_eq!(p.vf_table_voltage_mv, Some(850));
     }
 
     #[cfg(windows)]

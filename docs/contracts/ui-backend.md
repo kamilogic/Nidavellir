@@ -408,6 +408,32 @@ UI is NOT required to use these now. `live_voltage_mv` may legitimately read ABO
 
 
 
+\## Additive (2026-06-07): PowerSweepPoint.target_clock_mhz (F1b Phase 2B.1)
+
+
+
+`PowerSweepPoint` (in `GetPowerSweepProgress` / `ApplyPower*` payloads) gains one OPTIONAL
+
+`#[serde(default)]` field (backend-only, backward-compatible):
+
+
+
+\- `target_clock_mhz: Option<u32>` — the TARGET clock the point was probed at in the F1b
+
+&#x20; multi-clock frontier. Distinct from `clock_mhz`, which is the MEASURED achieved clock (the
+
+&#x20; two may differ by boost-bin behavior). `None` for single-clock / pre-2B.1 points.
+
+
+
+No schema bump; old `forge_state.json` / `GetPowerSweepProgress` payloads load with the field as
+
+`None`. No UI change required (UI may later show target vs measured clock). Rationale:
+
+`decisions.md` → "F1b Phase 2B.1".
+
+
+
 (No other active requests)
 
 

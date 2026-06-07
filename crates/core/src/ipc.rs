@@ -130,6 +130,12 @@ pub struct PowerSweepPoint {
     /// Overall dwell telemetry confidence (worst of clock/power/voltage quality).
     #[serde(default)]
     pub telemetry_quality: Option<DwellQuality>,
+    /// The TARGET clock (MHz) this point was probed at in the F1b multi-clock frontier
+    /// (vs `clock_mhz` = the measured ACHIEVED clock, which may differ). `None` for
+    /// single-clock / legacy points. Additive, backward-compatible — no schema bump.
+    /// (Added: F1b Phase 2B.1.)
+    #[serde(default)]
+    pub target_clock_mhz: Option<u32>,
 }
 
 /// Power-target sweep: for a range of locked voltages, the max stable clock and
@@ -509,5 +515,26 @@ mod tests {
         let json = serialize_response(&resp).unwrap();
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"type\":\"Pong\""));
+    }
+
+    #[test]
+    fn power_sweep_point_target_clock_roundtrips() {
+        let p = PowerSweepPoint { target_clock_mhz: Some(1830), ..Default::default() };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: PowerSweepPoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.target_clock_mhz, Some(1830));
+    }
+
+    #[test]
+    fn legacy_power_sweep_point_json_loads_target_clock_none() {
+        // A payload produced before Phase 2B.1 has no `target_clock_mhz` key → defaults None.
+        let legacy = r#"{
+            "voltage_mv": 843, "clock_mhz": 1785, "offset_mhz": 150,
+            "power_w": 180.0, "max_power_w": 185.0, "power_std_w": 2.0,
+            "power_capped_frac": 0.2, "stable": true, "perf_per_watt": 9.9
+        }"#;
+        let p: PowerSweepPoint = serde_json::from_str(legacy).unwrap();
+        assert_eq!(p.target_clock_mhz, None);
+        assert_eq!(p.clock_mhz, 1785);
     }
 }

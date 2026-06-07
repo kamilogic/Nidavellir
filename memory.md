@@ -15,6 +15,16 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **F1b Phase 2B.1 — pure probe-mapping prep (2026-06-07) — IMPLEMENTED, not pushed**: added pure
+  `measured_to_probe` (Measured→ProbeSample, conservative: Stable only on ≥Medium clock/power
+  telemetry + p5 present; SilentError/Crash/TDR→Unstable; p5 preserved 0→None; missing voltage None
+  not 0) + additive `PowerSweepPoint.target_clock_mhz: Option<u32>` (serde default, backward-
+  compatible, no schema bump). Phase 2A `probe_to_point` stamps the target; single-clock live sweep
+  sets None. **NO hardware path, NO real probe, NO apply/sweep/stress, NO apps-ui/Safe-Loop/synthesis
+  /Phase-3/11D change.** `cargo check` clean · service **68/68** (+7) · core **46/46** (+2). Files:
+  `crates/service/src/gpu_power_sweep.rs`, `crates/core/src/ipc.rs`, contract, decisions/memory/
+  handoff. Phase 2B.2 (real probe closure + supervised console entry) and the hardware QA run remain
+  separately gated; 11D deferred to after Phase 2B.
 - **Patch 11C — read-only live VF-ceiling diagnostic (2026-06-06) — IMPLEMENTED, not pushed**:
   extended the read-only verifier (`gpu_verify::verify_applied_curve` / `verify-applied`) with a pure
   `compute_curve_diag` (first modified bin idx/mv, modified vs expected count, GetStatus freq-match,

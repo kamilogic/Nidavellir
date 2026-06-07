@@ -2,6 +2,24 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 2B.1: pure probe-mapping prep + target_clock_mhz (no hardware)
+- **Decision** (2026-06-07): land the pure, hardware-free half of Phase 2B first. Adds
+  `measured_to_probe(&Measured, curve_verified, confidence) -> ProbeSample` (in
+  `gpu_power_sweep.rs`) — the seam the real probe closure (2B.2) will use to feed `build_frontier`
+  — performing NO hardware I/O, only a conservative interpretation of already-collected dwell data.
+- **Conservative mapping rules**: a `Stable` verdict becomes `ProbeOutcome::Stable` ONLY when
+  clock/power telemetry quality ≥ Medium AND a sustained-clock `p5` is present; `SilentError` /
+  `Crash` (incl. a TDR / device-lost dwell → `Measured::degenerate(Crash, …)`) or weak telemetry →
+  `Unstable`. `p5_clock` is preserved as the sustained-clock signal (0 / no samples → `None`);
+  measured voltage uses the ramp-filtered avg and stays `None` when missing — never a fake 0.
+- **Additive schema**: `PowerSweepPoint.target_clock_mhz: Option<u32>` (`#[serde(default)]`,
+  backward-compatible, no schema bump) records the asked-for clock vs `clock_mhz` (measured
+  achieved). Phase 2A `probe_to_point` now stamps it; the single-clock live sweep sets `None`.
+- **Scope**: pure / backend-safe only. NO real probe closure, NO `apply_vf_ceiling`, NO
+  `load_and_measure` loop, NO supervised console command, NO Safe-Loop / synthesis / `apps/ui` /
+  Phase-3 / 11D change, NO hardware. `cargo check` clean; service 68/68 (+7), core 46/46 (+2).
+  Phase 2B.2 (real probe + supervised entry point) and the hardware run remain separately gated.
+
 ## Read-only live diagnostic for the elastic VF ceiling (Patch 11C)
 - **Decision** (2026-06-06): extend the existing read-only verifier (`gpu_verify::verify_applied_curve`
   / `verify-applied`) with structured diagnostic evidence + a single live telemetry snapshot, so the

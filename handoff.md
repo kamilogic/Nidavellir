@@ -3,7 +3,28 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-06) — Patch 11C: read-only live VF-ceiling diagnostic (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.1: pure probe-mapping prep (IMPLEMENTED, not pushed)
+- **Pure, hardware-free half of Phase 2B.** `measured_to_probe(&Measured, curve_verified, confidence)
+  -> ProbeSample` in `gpu_power_sweep.rs` — the seam the real probe closure (2B.2) will use to feed
+  `build_frontier`. No hardware I/O; conservative interpretation of already-collected dwell data only.
+- **Conservative rules**: Stable→`ProbeOutcome::Stable` ONLY if clock/power quality ≥ Medium AND p5
+  present; else (SilentError / Crash / TDR-degenerate, or weak telemetry) → Unstable. p5 preserved
+  (0 → None); measured voltage = ramp-filtered avg, None when missing (never 0).
+- **Additive schema**: `PowerSweepPoint.target_clock_mhz: Option<u32>` (serde default, no schema
+  bump). Phase 2A `probe_to_point` now stamps the target; the single-clock live sweep sets None.
+- **Files**: `crates/service/src/gpu_power_sweep.rs`, `crates/core/src/ipc.rs`,
+  `docs/contracts/ui-backend.md`, decisions/memory/handoff. **No real probe, no `apply_vf_ceiling`,
+  no `load_and_measure` loop, no supervised console cmd, no Safe-Loop/synthesis/`apps/ui`/Phase-3/11D,
+  no hardware.**
+- **Tests**: `cargo check -p nidavellir-service` clean · service **68/68** (+7 mapping/target tests) ·
+  core **46/46** (+2 serde roundtrip + legacy-load). No hardware run.
+- **Next — Phase 2B.2 (NOT started, separately gated)**: the real `#[cfg(windows)]` probe closure
+  (arm Safe Loop → `apply_vf_ceiling(vbin,target)` → read-only offset-readback verify + 11C diag →
+  `load_and_measure` dwell → clear → `measured_to_probe`) + a supervised console subcommand that calls
+  `build_frontier` with it behind explicit confirm. Then a supervised hardware QA run. 11D
+  (exact-offset stock-base persistence) deferred to AFTER Phase 2B unless QA shows need.
+
+## Backend checkpoint (2026-06-06) — Patch 11C: read-only live VF-ceiling diagnostic (IMPLEMENTED, not pushed)
 - **Read-only diagnostic** added to `gpu_verify::verify_applied_curve` (and the `verify-applied`
   console subcommand): pure `compute_curve_diag` over the existing per-point evidence + one
   `LiveSnapshot`. No mutation, no stress, no apply. Classifier semantics UNCHANGED (offset-presence
