@@ -7,13 +7,23 @@
 
   const W = 960;
   const padL = 56, padR = 18, padT = 16, padB = 48;
-  const CELL_W = 7, CELL_H = 3, CELL_GAP_X = 7, CELL_GAP_Y = 1;
+  const CELL_W = 3.8, CELL_H = 2.4, CELL_GAP_X = 4.8, CELL_GAP_Y = 1.2, MAX_MATRIX_COLS = 76;
 
   const H = $derived(height);
-  const matrixRows = $derived(H >= 500 ? 9 : 7);
+  const matrixRows = $derived(H >= 500 ? 13 : 11);
   const matrixHeight = $derived(matrixRows * CELL_H + (matrixRows - 1) * CELL_GAP_Y);
   const sx = (v) => padL + ((v - V_MIN) / (V_MAX - V_MIN)) * (W - padL - padR);
   const sy = (f) => H - padB - ((f - F_MIN) / (F_MAX - F_MIN)) * (H - padT - padB);
+  const voltageAtX = (x) => V_MIN + ((x - padL) / (W - padL - padR)) * (V_MAX - V_MIN);
+  const clamp = (v, min = 0, max = 1) => Math.max(min, Math.min(max, v));
+  const smoothstep = (v) => {
+    const t = clamp(v);
+    return t * t * (3 - 2 * t);
+  };
+  const cellHash = (col, row, salt = 0) => {
+    const n = Math.sin((col + 1) * 127.1 + (row + 1) * 311.7 + (salt + 1) * 74.7) * 43758.5453;
+    return n - Math.floor(n);
+  };
 
   const inDomain = (p) =>
     p.voltage_mv >= V_MIN && p.voltage_mv <= V_MAX && p.freq_mhz >= F_MIN && p.freq_mhz <= F_MAX;
@@ -27,9 +37,7 @@
 
   const anchorMv = $derived.by(() => {
     const v = Number(overlay?.anchorMv);
-    return overlay?.showBand && overlay?.anchorPrecise && Number.isFinite(v) && v >= V_MIN && v <= V_MAX
-      ? v
-      : null;
+    return Number.isFinite(v) && v >= V_MIN && v <= V_MAX ? v : null;
   });
 
   const baselinePath = $derived.by(() => {
@@ -44,43 +52,169 @@
 
   const bifrostBand = $derived.by(() => {
     if (targetMhz == null || anchorMv == null) return null;
-    const x = sx(anchorMv);
+    const startMv = pts[0]?.voltage_mv ?? V_MIN;
+    const x = sx(startMv);
     const width = W - padR - x;
     if (width < 8) return null;
-    const y = sy(targetMhz);
-    const bandHeight = matrixHeight + 8;
-    return { x, y, width, height: bandHeight, yTop: y - bandHeight / 2 };
+    return { x, width, startMv };
   });
 
-  const bifrostCells = $derived.by(() => {
-    if (!bifrostBand) return [];
+  function curveFreqAt(voltage) {
+    if (!pts.length) return targetMhz;
+    if (voltage <= pts[0].voltage_mv) return pts[0].freq_mhz;
+    for (let i = 1; i < pts.length; i += 1) {
+      const prev = pts[i - 1];
+      const next = pts[i];
+      if (voltage <= next.voltage_mv) {
+        const span = Math.max(1, next.voltage_mv - prev.voltage_mv);
+        const t = clamp((voltage - prev.voltage_mv) / span);
+        return prev.freq_mhz + (next.freq_mhz - prev.freq_mhz) * t;
+      }
+    }
+    return pts[pts.length - 1].freq_mhz;
+  }
+
+  function cellPalette({ edgeDist, progress, sectionEnergy, accentCell, goldCell, warmCell }) {
+    const rowEnergy = Math.max(0, 1 - Math.pow(edgeDist, 1.75));
+    const startFade = smoothstep(progress / 0.08);
+    const endFade = 1 - smoothstep((progress - 0.88) / 0.12) * 0.34;
+    const energy = clamp(rowEnergy * Math.max(0.34, startFade) * endFade * sectionEnergy);
+    const edge = edgeDist > 0.78;
+    const core = edgeDist < 0.22;
+    const idle = edge ? 0.035 + energy * 0.06 : 0.07 + energy * 0.12 + (core ? 0.035 : 0);
+    const glow = edge ? 0.12 + energy * 0.18 : 0.22 + energy * 0.36 + (core ? 0.06 : 0);
+    const peak = edge ? 0.18 + energy * 0.26 : 0.38 + energy * 0.5 + (core ? 0.08 : 0);
+
+    if (accentCell) {
+      return {
+        rest: "#253344",
+        glow: "#5b96a8",
+        peak: "#a084d2",
+        idle: idle + 0.015,
+        glowOpacity: glow + 0.04,
+        peakOpacity: Math.min(0.72, peak + 0.06),
+      };
+    }
+    if (goldCell || warmCell) {
+      return {
+        rest: "#523d2a",
+        glow: "#b88548",
+        peak: "#f0c979",
+        idle: idle + (warmCell ? 0.07 : 0.025),
+        glowOpacity: glow + (warmCell ? 0.11 : 0.045),
+        peakOpacity: Math.min(0.88, peak + (warmCell ? 0.15 : 0.07)),
+      };
+    }
+    return {
+      rest: "#202b36",
+      glow: "#486878",
+      peak: "#7eadbe",
+      idle,
+      glowOpacity: glow,
+      peakOpacity: Math.min(0.7, peak),
+    };
+  }
+
+  const bifrostMatrix = $derived.by(() => {
+    if (!bifrostBand) return null;
     const pitchX = CELL_W + CELL_GAP_X;
-    const cols = Math.max(1, Math.floor((bifrostBand.width - 8) / pitchX));
-    const gridWidth = cols * CELL_W + Math.max(0, cols - 1) * CELL_GAP_X;
-    const startX = bifrostBand.x + Math.max(4, (bifrostBand.width - gridWidth) / 2);
-    const startY = bifrostBand.yTop + (bifrostBand.height - matrixHeight) / 2;
+    const cols = Math.max(1, Math.min(MAX_MATRIX_COLS, Math.floor((bifrostBand.width - 8) / pitchX)));
+    const livePitchX = cols > 1 ? Math.max(pitchX, (bifrostBand.width - 8 - CELL_W) / (cols - 1)) : 0;
+    const startX = bifrostBand.x + 4;
     const center = (matrixRows - 1) / 2;
-    const out = [];
+    const cells = [];
+    const core = [];
+    const upper = [];
+    const lower = [];
+
     for (let col = 0; col < cols; col += 1) {
+      const progress = cols > 1 ? col / (cols - 1) : 0;
+      const x = startX + col * livePitchX;
+      const voltage = voltageAtX(x);
+      const curveFreq = curveFreqAt(voltage);
+      const preAnchor = voltage < anchorMv;
+      const preSpan = Math.max(1, anchorMv - bifrostBand.startMv);
+      const postSpan = Math.max(1, V_MAX - anchorMv);
+      const preProgress = clamp((voltage - bifrostBand.startMv) / preSpan);
+      const postProgress = clamp((voltage - anchorMv) / postSpan);
+      const anchorFocus = 1 - smoothstep(Math.abs(voltage - anchorMv) / 74);
+      const settle = smoothstep((voltage - (anchorMv - 32)) / 148);
+      const postEnergy = smoothstep(postProgress / 0.34);
+      const sectionEnergy = clamp(
+        preAnchor
+          ? 0.3 + preProgress * 0.24 + anchorFocus * 0.34
+          : 0.78 + postEnergy * 0.2 + anchorFocus * 0.18,
+        0.28,
+        1,
+      );
+      const rowSpread = clamp(
+        preAnchor
+          ? 0.48 + preProgress * 0.18 + anchorFocus * 0.18
+          : 0.76 + postEnergy * 0.2 + anchorFocus * 0.08,
+        0.46,
+        1.08,
+      );
+      const halfEnvelope = (matrixHeight / 2 + 7) * rowSpread;
+      const centerFreq = curveFreq + (targetMhz - curveFreq) * settle;
+      const centerY = sy(centerFreq);
+      core.push({ x, y: centerY });
+      upper.push({ x, y: centerY - halfEnvelope });
+      lower.push({ x, y: centerY + halfEnvelope });
+
       for (let row = 0; row < matrixRows; row += 1) {
         const edgeDist = Math.abs(row - center) / Math.max(1, center);
-        const phase = (col * 5 + row * 3) % 16;
-        const accent = (col * 11 + row * 7) % 47 === 0;
-        out.push({
-          x: startX + col * pitchX,
-          y: startY + row * (CELL_H + CELL_GAP_Y),
+        const centerCell = edgeDist < 0.18;
+        const phaseSeed = cellHash(col, row, 1);
+        const colorSeed = cellHash(col, row, 2);
+        const accentSeed = cellHash(col, row, 3);
+        const accentCell = edgeDist < 0.58 && accentSeed > (preAnchor ? 0.996 : 0.984);
+        const anchorGold = anchorFocus > 0.28 && edgeDist < 0.42 && colorSeed > 0.48;
+        const targetGold = !preAnchor && edgeDist < 0.38 && colorSeed > 0.84;
+        const goldCell = anchorGold || targetGold;
+        const phase = Math.floor(phaseSeed * 48);
+        const warmCell = centerCell && (!preAnchor || anchorFocus > 0.36);
+        const palette = cellPalette({ edgeDist, progress, sectionEnergy, accentCell, goldCell, warmCell });
+        const offset = (row - center) * (CELL_H + CELL_GAP_Y) * rowSpread;
+        const delay = `-${(phase * 0.098).toFixed(3)}s`;
+        cells.push({
+          x,
+          y: centerY + offset,
           row,
           col,
-          phase,
-          accent,
-          bright: edgeDist < 0.22,
-          mid: edgeDist < 0.58,
+          center: centerCell,
+          mid: edgeDist < 0.62,
           edge: edgeDist > 0.78,
-          delay: `-${(phase * 0.42).toFixed(2)}s`,
+          gold: goldCell,
+          accent: accentCell,
+          style: [
+            `--phase-delay: ${delay}`,
+            `--rest-fill: ${palette.rest}`,
+            `--glow-fill: ${palette.glow}`,
+            `--peak-fill: ${palette.peak}`,
+            `--idle-opacity: ${palette.idle.toFixed(3)}`,
+            `--glow-opacity: ${palette.glowOpacity.toFixed(3)}`,
+            `--peak-opacity: ${palette.peakOpacity.toFixed(3)}`,
+            `--static-opacity: ${((palette.idle + palette.glowOpacity) / 2).toFixed(3)}`,
+          ].join("; "),
         });
       }
     }
-    return out;
+
+    const linePath = (items) =>
+      items.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+    const envelopePath = `${linePath(upper)} ${[...lower]
+      .reverse()
+      .map((p) => `L${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+      .join(" ")} Z`;
+
+    return {
+      cells,
+      corePath: linePath(core),
+      upperPath: linePath(upper),
+      lowerPath: linePath(lower),
+      envelopePath,
+      cols,
+    };
   });
 
   const anchorMarker = $derived.by(() => {
@@ -127,53 +261,44 @@
     </line>
   {/if}
 
-  {#if bifrostBand}
+  {#if bifrostBand && bifrostMatrix}
     <g class="bifrost-band">
-      <rect
-        class="band-base"
-        x={bifrostBand.x}
-        y={bifrostBand.yTop}
-        width={bifrostBand.width}
-        height={bifrostBand.height}
-        rx="4"
-      />
-      <line class="band-boundary" x1={bifrostBand.x} y1={bifrostBand.yTop} x2={W - padR} y2={bifrostBand.yTop} />
-      <line
-        class="band-boundary"
-        x1={bifrostBand.x}
-        y1={bifrostBand.yTop + bifrostBand.height}
-        x2={W - padR}
-        y2={bifrostBand.yTop + bifrostBand.height}
-      />
+      <path class="band-glow" d={bifrostMatrix.envelopePath} />
+      <path class="band-base" d={bifrostMatrix.envelopePath} />
+      <path class="band-boundary upper" d={bifrostMatrix.upperPath} />
+      <path class="band-boundary lower" d={bifrostMatrix.lowerPath} />
       <g class="band-matrix" aria-hidden="true">
-        {#each bifrostCells as cell}
+        {#each bifrostMatrix.cells as cell}
           <rect
-            class="matrix-cell"
-            class:bright={cell.bright}
+            class="matrix-cell bifrost-cell"
+            class:center={cell.center}
             class:mid={cell.mid}
             class:edge={cell.edge}
+            class:gold={cell.gold}
             class:accent={cell.accent}
             x={cell.x}
             y={cell.y}
             width={CELL_W}
             height={CELL_H}
             rx="1"
-            style={`--phase-delay: ${cell.delay}`}
+            style={cell.style}
           />
         {/each}
       </g>
-      <line
-        class="band-core"
-        x1={bifrostBand.x}
-        y1={bifrostBand.y}
-        x2={W - padR}
-        y2={bifrostBand.y}
+      <path
+        class="band-core-glow"
+        d={bifrostMatrix.corePath}
       />
-      <title>Expected operating range from curve anchor across higher curve bins. Not a hard voltage cap.</title>
+      <path
+        class="band-core"
+        d={bifrostMatrix.corePath}
+      />
+      <title>Optimized boost curve flow. Not a hard voltage cap.</title>
     </g>
   {/if}
 
   {#if anchorMarker}
+    <circle class="anchor-halo" cx={anchorMarker.x} cy={anchorMarker.y} r="20" role="presentation" />
     <line class="anchor-line" x1={anchorMarker.x} y1={padT} x2={anchorMarker.x} y2={H - padB} />
     <circle
       class="anchor-dot"
@@ -227,11 +352,11 @@
     border-radius: 10px;
   }
   .grid {
-    stroke: rgba(136, 192, 208, 0.07);
+    stroke: rgba(136, 192, 208, 0.045);
     stroke-width: 1;
   }
   .grid.major {
-    stroke: rgba(136, 192, 208, 0.16);
+    stroke: rgba(136, 192, 208, 0.105);
   }
   .axis {
     fill: var(--nord-dim);
@@ -254,80 +379,82 @@
     stroke-linecap: round;
   }
   .target-line {
-    stroke: rgba(214, 168, 93, 0.55);
-    stroke-width: 1.2;
-    stroke-dasharray: 8 7;
+    stroke: rgba(214, 168, 93, 0.28);
+    stroke-width: 1.35;
+    stroke-linecap: round;
+    filter: drop-shadow(0 0 4px rgba(126, 173, 190, 0.18));
   }
   .bifrost-band {
-    opacity: 0.94;
+    opacity: 0.98;
+  }
+  .band-glow {
+    fill: rgba(50, 72, 86, 0.18);
+    stroke: rgba(214, 168, 93, 0.08);
+    stroke-width: 4.4;
+    stroke-linejoin: round;
+    filter: drop-shadow(0 0 7px rgba(126, 173, 190, 0.14));
   }
   .band-base {
-    fill: rgba(12, 14, 18, 0.78);
-    stroke: rgba(214, 168, 93, 0.16);
-    stroke-width: 1;
+    fill: rgba(37, 48, 61, 0.3);
+    stroke: none;
   }
   .band-boundary {
-    stroke: rgba(214, 168, 93, 0.32);
+    fill: none;
+    stroke: rgba(126, 173, 190, 0.28);
     stroke-width: 1;
     stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .band-boundary.upper,
+  .band-boundary.lower {
+    opacity: 0.66;
   }
   .band-matrix {
-    opacity: 0.96;
+    opacity: 1;
   }
   .matrix-cell {
-    --idle-opacity: 0.18;
-    --glow-opacity: 0.34;
-    --peak-opacity: 0.46;
-    fill: #27313d;
+    fill: var(--rest-fill);
     opacity: var(--idle-opacity);
-    animation: bifrost-cell-flow 8.8s ease-in-out infinite;
+  }
+  .bifrost-cell {
+    animation: bifrost-cell-pulse 4.5s cubic-bezier(0.45, 0, 0.25, 1) infinite;
     animation-delay: var(--phase-delay);
+    animation-fill-mode: both;
   }
-  .matrix-cell.mid {
-    --idle-opacity: 0.26;
-    --glow-opacity: 0.46;
-    --peak-opacity: 0.62;
-    fill: #486878;
-  }
-  .matrix-cell.bright {
-    --idle-opacity: 0.38;
-    --glow-opacity: 0.64;
-    --peak-opacity: 0.82;
-    fill: #d6a85d;
-  }
-  .matrix-cell.edge {
-    --idle-opacity: 0.1;
-    --glow-opacity: 0.18;
-    --peak-opacity: 0.28;
-    fill: #202933;
-  }
-  .matrix-cell.accent {
-    --idle-opacity: 0.3;
-    --glow-opacity: 0.48;
-    --peak-opacity: 0.62;
-    fill: #79bdc4;
-  }
-  .matrix-cell.bright.accent {
-    --idle-opacity: 0.34;
-    --glow-opacity: 0.54;
-    --peak-opacity: 0.7;
-    fill: #a084d2;
+  .band-core-glow {
+    fill: none;
+    stroke: rgba(126, 173, 190, 0.3);
+    stroke-width: 5.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    opacity: 0.52;
+    filter: drop-shadow(0 0 7px rgba(214, 168, 93, 0.16));
   }
   .band-core {
-    stroke: rgba(214, 168, 93, 0.72);
-    stroke-width: 2.5;
+    fill: none;
+    stroke: rgba(231, 188, 107, 0.74);
+    stroke-width: 2.1;
     stroke-linecap: round;
-    opacity: 0.72;
+    stroke-linejoin: round;
+    opacity: 0.9;
+  }
+  .anchor-halo {
+    fill: rgba(214, 168, 93, 0.1);
+    stroke: rgba(126, 173, 190, 0.22);
+    stroke-width: 1;
+    filter: drop-shadow(0 0 8px rgba(214, 168, 93, 0.2));
+    pointer-events: none;
   }
   .anchor-line {
-    stroke: rgba(214, 168, 93, 0.55);
+    stroke: rgba(214, 168, 93, 0.66);
     stroke-width: 1;
     stroke-dasharray: 3 5;
   }
   .anchor-dot {
     fill: var(--forge-gold);
     stroke: #0a101c;
-    stroke-width: 1.5;
+    stroke-width: 1.8;
+    filter: drop-shadow(0 0 5px rgba(214, 168, 93, 0.36));
   }
   .pt.beyond {
     fill: var(--nord-frost-dim);
@@ -361,40 +488,33 @@
   }
   @media (prefers-reduced-motion: reduce) {
     .pt,
-    .matrix-cell {
+    .bifrost-cell {
       animation: none;
       transition: none;
     }
-    .matrix-cell {
-      opacity: var(--idle-opacity);
-    }
-    .matrix-cell.mid {
-      opacity: var(--glow-opacity);
-    }
-    .matrix-cell.bright {
-      opacity: var(--glow-opacity);
-    }
-    .matrix-cell.edge {
-      opacity: var(--idle-opacity);
+    .bifrost-cell {
+      fill: var(--glow-fill);
+      opacity: var(--static-opacity);
     }
   }
-  @keyframes bifrost-cell-flow {
+  @keyframes bifrost-cell-pulse {
     0%,
+    38%,
     100% {
+      fill: var(--rest-fill);
       opacity: var(--idle-opacity);
-      filter: saturate(0.82);
-    }
-    34% {
-      opacity: var(--glow-opacity);
-      filter: saturate(1);
     }
     50% {
-      opacity: var(--peak-opacity);
-      filter: saturate(1.1);
-    }
-    66% {
+      fill: var(--glow-fill);
       opacity: var(--glow-opacity);
-      filter: saturate(0.92);
+    }
+    60% {
+      fill: var(--peak-fill);
+      opacity: var(--peak-opacity);
+    }
+    72% {
+      fill: var(--glow-fill);
+      opacity: var(--glow-opacity);
     }
   }
 </style>
