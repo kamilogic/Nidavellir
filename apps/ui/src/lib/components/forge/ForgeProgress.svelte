@@ -65,11 +65,26 @@
     return Number.isFinite(n) ? n.toFixed(digits) : "0";
   }
 
-  function voltageLabel(point) {
+  function targetLabel(point) {
     if (!point) return "Not available";
-    const bin = point.vf_table_voltage_mv;
-    const voltage = bin ?? point.voltage_mv;
-    return `${point.clock_mhz} MHz @ ${voltage} mV${bin != null ? " VF bin" : ""}`;
+    return `${point.clock_mhz} MHz target`;
+  }
+
+  function curveAnchor(point) {
+    if (point?.vf_table_voltage_mv != null) return `Curve anchor: ${point.vf_table_voltage_mv} mV`;
+    return null;
+  }
+
+  function measuredVoltage(point) {
+    if (!point) return null;
+    const avg = point.avg_measured_voltage_mv;
+    const min = point.min_measured_voltage_mv;
+    const max = point.max_measured_voltage_mv;
+    if (avg != null && min != null && max != null) {
+      return `Measured voltage under load: ${avg} / ${min} / ${max} mV`;
+    }
+    if (point.measured_voltage_mv != null) return `Measured voltage under load: ${point.measured_voltage_mv} mV`;
+    return null;
   }
 </script>
 
@@ -120,8 +135,15 @@
         <Gauge size={13} strokeWidth={1.85} />
         Latest tested point
       </span>
-      <strong>{voltageLabel(latestPoint)}</strong>
+      <strong>{targetLabel(latestPoint)}</strong>
       {#if latestPoint}
+        <small>Optimized boost curve</small>
+        {#if curveAnchor(latestPoint)}
+          <small>{curveAnchor(latestPoint)}</small>
+        {/if}
+        {#if measuredVoltage(latestPoint)}
+          <small>{measuredVoltage(latestPoint)}</small>
+        {/if}
         <small>{fixed(latestPoint.power_w)} W / {fixed(latestPoint.perf_per_watt, 1)} MHz/W / {latestPoint.stable ? "stable" : "failed"}</small>
       {:else}
         <small>Appears after the first measured point.</small>
@@ -157,7 +179,14 @@
         {#each profileRows as [name, point]}
           <article>
             <strong>{name}</strong>
-            <span>{voltageLabel(point)}</span>
+            <span>{targetLabel(point)}</span>
+            <small>Optimized boost curve</small>
+            {#if curveAnchor(point)}
+              <small>{curveAnchor(point)}</small>
+            {/if}
+            {#if measuredVoltage(point)}
+              <small>{measuredVoltage(point)}</small>
+            {/if}
             <small>{fixed(point.power_w)} W / {fixed(point.perf_per_watt, 1)} MHz/W</small>
           </article>
         {/each}
@@ -362,7 +391,8 @@
     padding-left: 0.6rem;
   }
   .result-grid strong,
-  .result-grid span {
+  .result-grid span,
+  .result-grid small {
     display: block;
   }
   .result-grid strong {

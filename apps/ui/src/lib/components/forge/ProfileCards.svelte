@@ -43,7 +43,7 @@
 
   function technical(m) {
     const pp = powerProfile(m);
-    if (pp) return `${pp.clock_mhz} MHz @ ${pp.voltage_mv} mV`;
+    if (pp) return `${pp.clock_mhz} MHz target`;
     return "Not forged yet";
   }
 
@@ -51,6 +51,23 @@
     const pp = powerProfile(m);
     if (pp) return `${pp.power_w.toFixed(0)} W / ${pp.perf_per_watt.toFixed(1)} MHz/W`;
     return "Technical values appear after a completed forge run.";
+  }
+
+  function curveAnchor(point) {
+    if (point?.vf_table_voltage_mv != null) return `Curve anchor: ${point.vf_table_voltage_mv} mV`;
+    return null;
+  }
+
+  function measuredVoltage(point) {
+    if (!point) return null;
+    const avg = point.avg_measured_voltage_mv;
+    const min = point.min_measured_voltage_mv;
+    const max = point.max_measured_voltage_mv;
+    if (avg != null && min != null && max != null) {
+      return `Measured voltage under load: ${avg} / ${min} / ${max} mV`;
+    }
+    if (point.measured_voltage_mv != null) return `Measured voltage under load: ${point.measured_voltage_mv} mV`;
+    return null;
   }
 
   function hasData(m) {
@@ -125,7 +142,14 @@
         <div class={`profile profile-${key}`} class:active={state.active} class:stale={state.stale}>
           <div class="prof-name">{$t("forge.prof_" + key)}</div>
           {#if p}
-            <div class="prof-val">{p.clock_mhz} MHz @ {p.voltage_mv} mV</div>
+            <div class="prof-val">{p.clock_mhz} MHz target</div>
+            <div class="prof-sub">Optimized boost curve</div>
+            {#if curveAnchor(p)}
+              <div class="prof-sub">{curveAnchor(p)}</div>
+            {/if}
+            {#if measuredVoltage(p)}
+              <div class="prof-sub">{measuredVoltage(p)}</div>
+            {/if}
             <div class="prof-sub">{p.power_w.toFixed(0)} W / {p.perf_per_watt.toFixed(1)} MHz/W</div>
             <button
               class="btn small"
@@ -189,6 +213,16 @@
         <div class="technical">
           <span>Technical</span>
           <strong>{technical(item)}</strong>
+          {#if hasData(item)}
+            <small>Optimized boost curve</small>
+          {/if}
+          {#if curveAnchor(point)}
+            <small>{curveAnchor(point)}</small>
+            <small>Not a hard voltage cap. Measured voltage can vary by workload.</small>
+          {/if}
+          {#if measuredVoltage(point)}
+            <small>{measuredVoltage(point)}</small>
+          {/if}
           <small>{secondary(item)}</small>
         </div>
         {#if hasData(item)}

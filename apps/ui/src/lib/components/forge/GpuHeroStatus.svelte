@@ -67,9 +67,21 @@
   });
   const technicalSummary = $derived.by(() => {
     const parts = [];
-    if (applied?.core) parts.push(`${applied.core.freq_mhz} MHz @ ${applied.core.voltage_mv} mV`);
+    if (applied?.core) parts.push(`${applied.core.freq_mhz} MHz target`);
     if (applied?.mem_offset_mhz) parts.push(`Memory +${applied.mem_offset_mhz} MHz`);
     return parts.length ? parts.join(" / ") : "Stock clocks active";
+  });
+  const curveAnchorSummary = $derived(
+    verification?.vf_table_voltage_mv != null ? `Curve anchor: ${verification.vf_table_voltage_mv} mV` : null,
+  );
+  const measuredVoltageSummary = $derived.by(() => {
+    const avg = verification?.avg_measured_voltage_mv;
+    const min = verification?.min_measured_voltage_mv;
+    const max = verification?.max_measured_voltage_mv;
+    if (avg != null && min != null && max != null) {
+      return `Measured voltage under load: ${avg} / ${min} / ${max} mV`;
+    }
+    return null;
   });
   const heroSummary = $derived.by(() => {
     if (forgeState === "Forged") return "Nidavellir has forged this GPU and selected a daily profile.";
@@ -102,6 +114,16 @@
       <span class="lab">Current Profile</span>
       <strong>{currentProfile}</strong>
       <small>{technicalSummary}</small>
+      {#if applied?.core}
+        <small>Optimized boost curve</small>
+      {/if}
+      {#if curveAnchorSummary}
+        <small>{curveAnchorSummary}</small>
+        <small>Not a hard voltage cap. Measured voltage can vary by workload.</small>
+      {/if}
+      {#if measuredVoltageSummary}
+        <small>{measuredVoltageSummary}</small>
+      {/if}
       <small class={`verification ${verificationClass}`}>
         {#if verificationClass === "verified"}
           <CircleCheck size={13} strokeWidth={1.9} />

@@ -14,14 +14,14 @@
     const points = powerSweep?.points ?? [];
     return [...points].reverse().find((point) => point.stable) ?? null;
   });
-  const knownSafeEdge = $derived.by(() => {
-    if (latestBoundary) return `${latestBoundary.freq_mhz} MHz @ ${latestBoundary.vmin_mv} mV`;
-    if (latestPowerStable) {
-      const voltage = latestPowerStable.vf_table_voltage_mv ?? latestPowerStable.voltage_mv;
-      return `${latestPowerStable.clock_mhz} MHz @ ${voltage} mV`;
-    }
+  const knownSafeEdgeTarget = $derived.by(() => {
+    if (latestBoundary) return `${latestBoundary.freq_mhz} MHz target`;
+    if (latestPowerStable) return `${latestPowerStable.clock_mhz} MHz target`;
     return "Not learned yet";
   });
+  const knownSafeEdgeAnchor = $derived(
+    latestPowerStable?.vf_table_voltage_mv != null ? `Curve anchor: ${latestPowerStable.vf_table_voltage_mv} mV` : null,
+  );
 </script>
 
 {#if summary}
@@ -46,7 +46,10 @@
       </article>
       <article>
         <span>Known safe edge</span>
-        <strong>{knownSafeEdge}</strong>
+        <strong>{knownSafeEdgeTarget}</strong>
+        {#if knownSafeEdgeAnchor}
+          <small>{knownSafeEdgeAnchor}</small>
+        {/if}
       </article>
       <article>
         <span>Latest validation</span>
@@ -142,9 +145,17 @@
     padding: 0.56rem 0.65rem;
   }
   .knowledge-grid strong {
+    display: block;
     color: var(--text);
     font-size: 0.88rem;
     font-variant-numeric: tabular-nums;
+  }
+  .knowledge-grid small {
+    display: block;
+    margin-top: 0.2rem;
+    color: var(--muted);
+    font-size: 0.74rem;
+    line-height: 1.35;
   }
   .section-head {
     margin: 0 0 0.5rem;

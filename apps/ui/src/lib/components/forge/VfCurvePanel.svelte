@@ -48,10 +48,12 @@
         <p class="point accent">
           {$t("forge.plateau", { f: appliedLimit.freq_mhz, v: appliedLimit.voltage_mv })}
         </p>
+        <p class="sub curve-note">{$t("forge.curveAnchorNote")}</p>
       {:else if realCurve.plateau}
         <p class="point">
           {$t("forge.plateau", { f: realCurve.plateau.freq_mhz, v: realCurve.plateau.voltage_mv })}
         </p>
+        <p class="sub curve-note">{$t("forge.curveAnchorNote")}</p>
       {/if}
       <VfChart points={realCurve.points} plateau={chartLimit} height={300} />
       <p class="sub vf-method" class:ok={realCurve.vf_curve_supported}>
@@ -192,6 +194,9 @@
   }
   .vf-method.ok {
     color: var(--nord-success, #a3be8c);
+  }
+  .curve-note {
+    color: var(--nord-dim);
   }
   .err {
     color: var(--nord-danger);

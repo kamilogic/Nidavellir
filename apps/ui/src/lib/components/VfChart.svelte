@@ -18,14 +18,11 @@
   // Points within the visible domain, sorted by voltage.
   const pts = $derived([...points].filter(inDomain).sort((a, b) => a.voltage_mv - b.voltage_mv));
 
-  // Is there a chosen undervolt limit (plateau) to lock the curve at?
+  // Is there a selected curve anchor for the frequency plateau?
   const hasPlateau = $derived(plateau && inDomain(plateau));
 
-  // The APPLIED curve. With an undervolt limit we lock the voltage at the
-  // plateau: the curve follows stock up to that voltage, then is FLAT at the
-  // locked frequency for every higher voltage (it does NOT keep climbing — the
-  // GPU is clamped). Without a limit it's the stock curve, extended flat at the
-  // last read point just to reach the right edge.
+  // The applied curve follows stock up to the anchor, then flattens frequency
+  // for higher V/F-table bins. This is not a hard measured-voltage cap.
   const path = $derived.by(() => {
     if (!pts.length) return "";
     const first = pts[0];
@@ -35,8 +32,8 @@
       for (const p of pts) {
         if (p.voltage_mv < pv) d += ` L${sx(p.voltage_mv).toFixed(1)},${sy(p.freq_mhz).toFixed(1)}`;
       }
-      d += ` L${sx(pv).toFixed(1)},${sy(pf).toFixed(1)}`;       // join the locked point
-      d += ` L${sx(V_MAX).toFixed(1)},${sy(pf).toFixed(1)}`;    // flat after the limit
+      d += ` L${sx(pv).toFixed(1)},${sy(pf).toFixed(1)}`;       // join the anchor point
+      d += ` L${sx(V_MAX).toFixed(1)},${sy(pf).toFixed(1)}`;    // frequency plateau after the anchor
       return d;
     }
     const last = pts[pts.length - 1];
@@ -45,8 +42,8 @@
     return d;
   });
 
-  // Faint "stock continuation" above the limit — where the curve WOULD go
-  // unclamped, shown dimmed so it's clear the limit flattened it (not lost it).
+  // Faint stock continuation above the anchor, shown dimmed so the frequency
+  // plateau is understandable without implying a voltage lock.
   const stockTail = $derived.by(() => {
     if (!hasPlateau || !pts.length) return "";
     const tail = pts.filter((p) => p.voltage_mv >= plateau.voltage_mv);
@@ -119,7 +116,7 @@
       onmouseenter={() => (hovered = p)}
       onmouseleave={() => (hovered = null)}
     >
-      <title>{p.freq_mhz} MHz @ {p.voltage_mv} mV</title>
+      <title>{p.freq_mhz} MHz table point · V/F bin: {p.voltage_mv} mV</title>
     </circle>
   {/each}
 
@@ -133,7 +130,7 @@
       onmouseenter={() => (hovered = plateau)}
       onmouseleave={() => (hovered = null)}
     >
-      <title>Plateau: {plateau.freq_mhz} MHz @ {plateau.voltage_mv} mV</title>
+      <title>{plateau.freq_mhz} MHz target · V/F bin: {plateau.voltage_mv} mV · not a hard voltage cap</title>
     </circle>
   {/if}
 </svg>
