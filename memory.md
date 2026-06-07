@@ -15,6 +15,15 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **F1b Phase 2B.2-a — shared live-ceiling classifier (2026-06-07) — IMPLEMENTED, not pushed**:
+  factored `classify_live_ceiling` (read-only) + pure `eval_ceiling_evidence` → `LiveCeilingEval`
+  out of `verify_applied_curve` so the verifier and the future transient-ceiling probe (2B.2-b)
+  share one classification path. **VerifyAppliedProfile output byte-identical** (same offset-presence
+  `classify_curve` gate + 11C diag; voltage never affects classification). Service-internal only —
+  no core/contract/apps-ui/Safe-Loop/synthesis change, no hardware, no apply/load/sweep/stress.
+  `cargo check` clean · service **73/73** (+5 pure tests) · core 46/46. File:
+  `crates/service/src/gpu_verify.rs`. Seeding helpers deferred to 2B.2-b (avoid dead code). 2B.2-b
+  (real probe + supervised `--confirm` console entry) separately gated.
 - **F1b Phase 2B.1 — pure probe-mapping prep (2026-06-07) — IMPLEMENTED, not pushed**: added pure
   `measured_to_probe` (Measured→ProbeSample, conservative: Stable only on ≥Medium clock/power
   telemetry + p5 present; SilentError/Crash/TDR→Unstable; p5 preserved 0→None; missing voltage None

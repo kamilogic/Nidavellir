@@ -2,6 +2,23 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 2B.2-a: shared live-ceiling classification helper (pure refactor)
+- **Decision** (2026-06-07): factor live-curve classification out of `verify_applied_curve`
+  into a reusable path so the persisted-profile verifier (today) and the future transient-ceiling
+  probe (2B.2-b) share ONE classifier. `classify_live_ceiling(live, ceiling_idx, ceiling_mv,
+  target, tol)` (read-only; builds the offset-readback evidence at/above the bin) →
+  `eval_ceiling_evidence(target, anchor_idx, &expected, tol)` (pure; runs the UNCHANGED
+  offset-presence `classify_curve` gate + the 11C `compute_curve_diag`) → `LiveCeilingEval`
+  bundle.
+- **Behavior unchanged**: `VerifyAppliedProfile` output is byte-identical (same classifier, same
+  diagnostic, same inputs) — the refactor only removes inline duplication. Offset-presence remains
+  the gate; GetStatus plateau spread stays diagnostic-only; voltage never affects classification.
+- **Scope**: service-internal refactor + 5 pure tests in `gpu_verify.rs`. NO real probe, NO
+  `build-frontier` subcommand, NO `apply_vf_ceiling` / `load_and_measure`, NO Safe-Loop / synthesis /
+  `apps/ui` / core / contract / Phase-3 / 11D change, NO hardware. `cargo check` clean; service
+  73/73 (+5), core 46/46. Pure seeding helpers were NOT added (dead code until 2B.2-b). 2B.2-b
+  (real probe + supervised `--confirm` entry) and the hardware QA run remain separately gated.
+
 ## F1b Phase 2B.1: pure probe-mapping prep + target_clock_mhz (no hardware)
 - **Decision** (2026-06-07): land the pure, hardware-free half of Phase 2B first. Adds
   `measured_to_probe(&Measured, curve_verified, confidence) -> ProbeSample` (in

@@ -130,6 +130,59 @@ fn compute_curve_diag(target_mhz: u32, anchor_idx: usize, expected: &[PointEvide
     }
 }
 
+/// Bundled result of evaluating a live VF ceiling: the curve verdict (offset-presence gate,
+/// UNCHANGED) plus its 11C diagnostic. Lets the persisted-profile verifier (today) and the
+/// future transient-ceiling probe (Phase 2B.2-b) share ONE classification path.
+#[derive(Debug, Clone)]
+struct LiveCeilingEval {
+    state: CurveVerification,
+    offset_present: u32,
+    freq_match: u32,
+    expected_n: u32,
+    diag: CurveDiag,
+}
+
+/// Pure: run the (unchanged) offset-presence `classify_curve` gate + the 11C diagnostic over
+/// an ALREADY-built evidence set. No I/O — this is the unit the Phase 2B.2-a tests target.
+fn eval_ceiling_evidence(
+    target_mhz: u32,
+    anchor_idx: usize,
+    expected: &[PointEvidence],
+    tol_mhz: u32,
+) -> LiveCeilingEval {
+    let (state, offset_present, freq_match, expected_n) =
+        classify_curve(target_mhz, expected, tol_mhz);
+    let diag = compute_curve_diag(target_mhz, anchor_idx, expected, tol_mhz);
+    LiveCeilingEval { state, offset_present, freq_match, expected_n, diag }
+}
+
+/// Read-only (NVAPI GET-control offset readback): build the live per-point evidence at/above
+/// the ceiling bin, then classify it via [`eval_ceiling_evidence`]. Reusable by the
+/// persisted-profile verifier (today) and the future transient-ceiling probe (Phase 2B.2-b).
+/// NEVER writes / applies / stresses.
+#[cfg(windows)]
+fn classify_live_ceiling(
+    live: &[(usize, u32, u32)],
+    ceiling_idx: usize,
+    ceiling_mv: u32,
+    target_mhz: u32,
+    tol_mhz: u32,
+) -> LiveCeilingEval {
+    // PRIMARY evidence: the GET-control offset readback per expected point. GetStatus
+    // actual freq is kept only as secondary corroboration (see classify_curve docs).
+    let expected: Vec<PointEvidence> = live
+        .iter()
+        .filter(|(_, mv, _)| *mv >= ceiling_mv)
+        .map(|(i, mv, freq)| PointEvidence {
+            index: *i,
+            voltage_mv: *mv,
+            offset_khz: nidavellir_gpu_nvapi::vf_get_point_khz(*i),
+            freq_mhz: *freq,
+        })
+        .collect();
+    eval_ceiling_evidence(target_mhz, ceiling_idx, &expected, tol_mhz)
+}
+
 /// Clock tolerance (MHz) for the load-state p5 check: ~two boost bins.
 const LOAD_CLOCK_TOL_MHZ: u32 = 30;
 /// Clock match tolerance (MHz) when confirming the applied point. Apply sets
@@ -453,20 +506,11 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
             "could not map applied voltage to a VF-table bin",
         );
     };
-    // PRIMARY evidence: the GET-control offset readback per expected point. GetStatus
-    // actual freq is kept only as secondary corroboration (see classify_curve docs).
-    let expected: Vec<PointEvidence> = live
-        .iter()
-        .filter(|(_, mv, _)| *mv >= ceiling_mv)
-        .map(|(i, mv, freq)| PointEvidence {
-            index: *i,
-            voltage_mv: *mv,
-            offset_khz: nidavellir_gpu_nvapi::vf_get_point_khz(*i),
-            freq_mhz: *freq,
-        })
-        .collect();
-    let (state, offset_present, freq_match, expected_n) =
-        classify_curve(core.freq_mhz, &expected, TOL_MHZ);
+    // Classify the live curve against the deterministic ceiling bin (offset-presence gate)
+    // and compute the 11C diagnostic via the shared helper — the same path the future
+    // transient-ceiling probe (Phase 2B.2-b) will use.
+    let LiveCeilingEval { state, offset_present, freq_match, expected_n, diag } =
+        classify_live_ceiling(&live, ceiling_idx, ceiling_mv, core.freq_mhz, TOL_MHZ);
     let message = match state {
         CurveVerification::VerifiedCurve => format!(
             "live curve matches: {offset_present}/{expected_n} plateau points carry the flatten \
@@ -504,8 +548,8 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
     );
 
     // ── Read-only live diagnostic (Patch 11C): offset/plateau shape + one telemetry
-    //    snapshot. Computed from the SAME evidence; it NEVER affects `state`/classification.
-    let diag = compute_curve_diag(core.freq_mhz, ceiling_idx, &expected, TOL_MHZ);
+    //    snapshot. `diag` came from `classify_live_ceiling` (the SAME evidence); it NEVER
+    //    affects `state`/classification.
     let snap = read_live_snapshot();
     let diag_msg = match state {
         CurveVerification::VerifiedCurve => format!(
@@ -779,6 +823,70 @@ mod tests {
         let expected: Vec<PointEvidence> = (0..10).map(|_| ev(Some(-120_000), 1500)).collect();
         let (s, _, _, _) = classify_curve(1770, &expected, TOL_MHZ);
         assert_eq!(s, CurveVerification::VerifiedCurve);
+    }
+
+    // ── Phase 2B.2-a: shared live-ceiling evaluation (pure) ──────────────────────
+    #[test]
+    fn eval_ceiling_verified_bundles_state_and_diag() {
+        // All plateau points carry the flatten offset → VerifiedCurve; diag reflects it.
+        let expected: Vec<PointEvidence> =
+            (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-120_000), 1785)).collect();
+        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ);
+        assert_eq!(e.state, CurveVerification::VerifiedCurve);
+        assert_eq!((e.offset_present, e.expected_n), (10, 10));
+        assert_eq!(e.diag.modified_bin_count, 10);
+        assert_eq!(e.diag.first_modified_bin, Some(60));
+    }
+
+    #[test]
+    fn eval_ceiling_mismatch_when_offsets_absent() {
+        // Offsets readable but all zero (reset / never flattened) → LiveMismatch.
+        let expected: Vec<PointEvidence> =
+            (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(0), 1900)).collect();
+        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ);
+        assert_eq!(e.state, CurveVerification::LiveMismatch);
+        assert_eq!(e.offset_present, 0);
+    }
+
+    #[test]
+    fn eval_ceiling_failed_when_unreadable_or_empty() {
+        // Unreadable offsets → VerificationFailed (safer than asserting a mismatch).
+        let unreadable: Vec<PointEvidence> =
+            (0..5).map(|i| evx(60 + i, 850, None, 1785)).collect();
+        assert_eq!(
+            eval_ceiling_evidence(1785, 60, &unreadable, TOL_MHZ).state,
+            CurveVerification::VerificationFailed
+        );
+        // Empty plateau set → VerificationFailed.
+        assert_eq!(
+            eval_ceiling_evidence(1785, 60, &[], TOL_MHZ).state,
+            CurveVerification::VerificationFailed
+        );
+    }
+
+    #[test]
+    fn eval_ceiling_plateau_spread_is_diagnostic_only() {
+        // Plateau overshoots target (1830 vs 1785) but offsets ARE present → still Verified;
+        // the spread surfaces in `diag`, never in the verdict (offset-presence is the gate).
+        let expected: Vec<PointEvidence> =
+            (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-100_000), 1830)).collect();
+        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ);
+        assert_eq!(e.state, CurveVerification::VerifiedCurve);
+        assert_eq!(e.diag.max_target_overshoot_mhz, Some(45));
+    }
+
+    #[test]
+    fn eval_ceiling_voltage_does_not_affect_classification() {
+        // Same offsets/freqs, different VF-table voltages → identical verdict (measured/table
+        // voltage is never a classification input).
+        let low: Vec<PointEvidence> =
+            (0..6).map(|i| evx(60 + i, 850, Some(-90_000), 1785)).collect();
+        let high: Vec<PointEvidence> =
+            (0..6).map(|i| evx(60 + i, 1062, Some(-90_000), 1785)).collect();
+        assert_eq!(
+            eval_ceiling_evidence(1785, 60, &low, TOL_MHZ).state,
+            eval_ceiling_evidence(1785, 60, &high, TOL_MHZ).state
+        );
     }
 
     // ── Patch B: load classification ───────────────────────────────────────────

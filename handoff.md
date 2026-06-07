@@ -3,7 +3,28 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.1: pure probe-mapping prep (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.2-a: shared live-ceiling classifier (IMPLEMENTED, not pushed)
+- **Pure refactor** in `gpu_verify.rs`: extracted `classify_live_ceiling(live, ceiling_idx,
+  ceiling_mv, target, tol)` (read-only; offset-readback evidence build) + pure
+  `eval_ceiling_evidence(target, anchor_idx, &expected, tol)` (runs the UNCHANGED offset-presence
+  `classify_curve` gate + 11C `compute_curve_diag`) → `LiveCeilingEval`. `verify_applied_curve` now
+  routes through it.
+- **Behavior identical**: `VerifyAppliedProfile` output is byte-for-byte unchanged (same classifier,
+  diagnostic, inputs); only inline duplication removed. Offset-presence stays the gate; plateau spread
+  stays diagnostic; voltage never affects classification. This is the shared path the 2B.2-b
+  transient-ceiling probe will reuse to verify a JUST-applied ceiling (not the persisted profile).
+- **Files**: `crates/service/src/gpu_verify.rs` only. **No core/contract/`apps/ui`/Safe-Loop/synthesis
+  /Phase-3/11D change; no real probe; no `apply_vf_ceiling`/`load_and_measure`; no `build-frontier`
+  subcommand; no hardware.** Pure seeding helpers deferred to 2B.2-b (would be dead code now).
+- **Tests**: `cargo check -p nidavellir-service` clean · service **73/73** (+5 `eval_ceiling_*` pure
+  tests; all pre-existing verify tests green) · core 46/46.
+- **Next — Phase 2B.2-b (NOT started, separately gated)**: real `#[cfg(windows)]` probe closure (arm
+  Safe Loop → `apply_vf_ceiling(vbin,target)` → `classify_live_ceiling` verify + 11C diag →
+  `load_and_measure` dwell → clear → `measured_to_probe`) + supervised `build-frontier --confirm`
+  console subcommand (print/log-only; runs startup recovery; no auto-apply). Then supervised hardware
+  QA. 11D deferred to after Phase 2B.
+
+## Backend checkpoint (2026-06-07) — F1b Phase 2B.1: pure probe-mapping prep (IMPLEMENTED, not pushed)
 - **Pure, hardware-free half of Phase 2B.** `measured_to_probe(&Measured, curve_verified, confidence)
   -> ProbeSample` in `gpu_power_sweep.rs` — the seam the real probe closure (2B.2) will use to feed
   `build_frontier`. No hardware I/O; conservative interpretation of already-collected dwell data only.
