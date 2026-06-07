@@ -22,6 +22,10 @@ const TOL_MHZ: u32 = 15;
 /// Evidence for one expected-flattened curve point (a point at/above the ceiling bin).
 #[derive(Debug, Clone, Copy)]
 struct PointEvidence {
+    /// VF curve point index (from `read_vf_curve_modern`). Diagnostic only.
+    index: usize,
+    /// VF-table voltage (mV) of this point. Diagnostic only.
+    voltage_mv: u32,
     /// Applied frequency offset (kHz) from `vf_get_point_khz` — the PRIMARY signal.
     /// `None` = the offset readback failed for this point.
     offset_khz: Option<i32>,
@@ -74,6 +78,56 @@ fn classify_curve(
         CurveVerification::LiveMismatch
     };
     (state, offset_present, freq_match, expected_n)
+}
+
+/// Pure, read-only diagnostic evidence about the live applied curve (Patch 11C).
+/// Derived from the SAME per-point evidence `classify_curve` consumes; it NEVER feeds
+/// classification. Reveals the offset/plateau shape so we can tell normal GPU-Boost
+/// overshoot apart from an offset-value miscalibration — without persisting stock base.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CurveDiag {
+    first_modified_bin: Option<u32>,
+    first_modified_mv: Option<u32>,
+    modified_bin_count: u32,
+    expected_bin_count: u32,
+    getstatus_freq_match_count: u32,
+    getstatus_plateau_min_mhz: Option<u32>,
+    getstatus_plateau_max_mhz: Option<u32>,
+    max_target_overshoot_mhz: Option<i32>,
+    max_target_undershoot_mhz: Option<i32>,
+    first_modified_offset_khz: Option<i32>,
+    anchor_offset_khz: Option<i32>,
+    highest_bin_offset_khz: Option<i32>,
+}
+
+/// Compute the read-only curve diagnostic over the expected (≥ anchor) plateau points.
+/// `anchor_idx` is the deterministic ceiling bin index. Pure + unit-testable; no I/O.
+fn compute_curve_diag(target_mhz: u32, anchor_idx: usize, expected: &[PointEvidence], tol_mhz: u32) -> CurveDiag {
+    let first_modified = expected.iter().find(|e| e.offset_khz.map_or(false, |o| o != 0));
+    let plateau_min = expected.iter().map(|e| e.freq_mhz).min();
+    let plateau_max = expected.iter().map(|e| e.freq_mhz).max();
+    CurveDiag {
+        first_modified_bin: first_modified.map(|e| e.index as u32),
+        first_modified_mv: first_modified.map(|e| e.voltage_mv),
+        modified_bin_count: expected
+            .iter()
+            .filter(|e| e.offset_khz.map_or(false, |o| o != 0))
+            .count() as u32,
+        expected_bin_count: expected.len() as u32,
+        getstatus_freq_match_count: expected
+            .iter()
+            .filter(|e| e.freq_mhz.abs_diff(target_mhz) <= tol_mhz)
+            .count() as u32,
+        getstatus_plateau_min_mhz: plateau_min,
+        getstatus_plateau_max_mhz: plateau_max,
+        // `Some(0)` when a plateau exists but is flat at/below(above) target; `None` only
+        // when there are no plateau points at all.
+        max_target_overshoot_mhz: plateau_max.map(|mx| (mx as i32 - target_mhz as i32).max(0)),
+        max_target_undershoot_mhz: plateau_min.map(|mn| (target_mhz as i32 - mn as i32).max(0)),
+        first_modified_offset_khz: first_modified.and_then(|e| e.offset_khz),
+        anchor_offset_khz: expected.iter().find(|e| e.index == anchor_idx).and_then(|e| e.offset_khz),
+        highest_bin_offset_khz: expected.iter().max_by_key(|e| e.voltage_mv).and_then(|e| e.offset_khz),
+    }
 }
 
 /// Clock tolerance (MHz) for the load-state p5 check: ~two boost bins.
@@ -242,6 +296,27 @@ fn make_status(
         voltage_sample_count: None,
         voltage_quality: None,
         telemetry_quality: None,
+        // Read-only diagnostic (Patch 11C) — populated only on the windows verify path.
+        first_modified_bin: None,
+        first_modified_mv: None,
+        modified_bin_count: None,
+        expected_bin_count: None,
+        getstatus_freq_match_count: None,
+        getstatus_plateau_min_mhz: None,
+        getstatus_plateau_max_mhz: None,
+        max_target_overshoot_mhz: None,
+        max_target_undershoot_mhz: None,
+        first_modified_offset_khz: None,
+        anchor_offset_khz: None,
+        highest_bin_offset_khz: None,
+        live_voltage_mv: None,
+        live_clock_mhz: None,
+        live_power_w: None,
+        live_utilization_pct: None,
+        live_temperature_c: None,
+        live_power_limit_w: None,
+        live_power_capped: None,
+        diagnostic_message: None,
     }
 }
 
@@ -272,6 +347,39 @@ fn fill_load_axis(st: &mut ApplyVerificationStatus, curve_state: CurveVerificati
         st.voltage_sample_count = p.voltage_sample_count;
         st.voltage_quality = p.voltage_quality;
         st.telemetry_quality = p.telemetry_quality;
+    }
+}
+
+/// A single read-only live telemetry snapshot (Patch 11C). Telemetry ONLY — captured
+/// once at verification time, never a sampling loop and NOT load verification. Any
+/// unavailable field stays `None` (never a fake zero).
+#[cfg(windows)]
+#[derive(Debug, Clone, Default)]
+struct LiveSnapshot {
+    voltage_mv: Option<u32>,
+    clock_mhz: Option<u32>,
+    power_w: Option<f32>,
+    utilization_pct: Option<f32>,
+    temperature_c: Option<f32>,
+    power_limit_w: Option<f32>,
+    power_capped: Option<bool>,
+}
+
+/// Read one read-only live snapshot: NVAPI measured core voltage + the first NVML GPU
+/// reading (clock/power/util/temp/cap). No writes, no stress, no sampling loop.
+#[cfg(windows)]
+fn read_live_snapshot() -> LiveSnapshot {
+    let voltage_mv = nidavellir_gpu_nvapi::read_core_voltage_mv();
+    let nvml = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml();
+    let g = nvml.first();
+    LiveSnapshot {
+        voltage_mv,
+        clock_mhz: g.and_then(|r| r.core_clock_mhz),
+        power_w: g.and_then(|r| r.power_w),
+        utilization_pct: g.and_then(|r| r.utilization_pct).map(|u| u as f32),
+        temperature_c: g.and_then(|r| r.temperature_c),
+        power_limit_w: g.and_then(|r| r.power_limit_w),
+        power_capped: g.and_then(|r| r.power_capped),
     }
 }
 
@@ -350,7 +458,9 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
     let expected: Vec<PointEvidence> = live
         .iter()
         .filter(|(_, mv, _)| *mv >= ceiling_mv)
-        .map(|(i, _, freq)| PointEvidence {
+        .map(|(i, mv, freq)| PointEvidence {
+            index: *i,
+            voltage_mv: *mv,
             offset_khz: nidavellir_gpu_nvapi::vf_get_point_khz(*i),
             freq_mhz: *freq,
         })
@@ -392,6 +502,58 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
         expected_n, freq_match, expected_n, load, st.p5_clock_mhz, st.telemetry_quality,
         st.voltage_quality, headline
     );
+
+    // ── Read-only live diagnostic (Patch 11C): offset/plateau shape + one telemetry
+    //    snapshot. Computed from the SAME evidence; it NEVER affects `state`/classification.
+    let diag = compute_curve_diag(core.freq_mhz, ceiling_idx, &expected, TOL_MHZ);
+    let snap = read_live_snapshot();
+    let diag_msg = match state {
+        CurveVerification::VerifiedCurve => format!(
+            "Curve offsets resident ({}/{} plateau bins). Live voltage is telemetry, NOT a hard \
+             cap (may sit above the {} mV VF anchor). GetStatus plateau {:?}..{:?} MHz vs target \
+             {} is diagnostic; live boost may exceed it.",
+            diag.modified_bin_count, diag.expected_bin_count, ceiling_mv,
+            diag.getstatus_plateau_min_mhz, diag.getstatus_plateau_max_mhz, core.freq_mhz
+        ),
+        _ => format!(
+            "Curve offsets NOT fully resident ({}/{}); see status. Live snapshot is telemetry only.",
+            diag.modified_bin_count, diag.expected_bin_count
+        ),
+    };
+    st.first_modified_bin = diag.first_modified_bin;
+    st.first_modified_mv = diag.first_modified_mv;
+    st.modified_bin_count = Some(diag.modified_bin_count);
+    st.expected_bin_count = Some(diag.expected_bin_count);
+    st.getstatus_freq_match_count = Some(diag.getstatus_freq_match_count);
+    st.getstatus_plateau_min_mhz = diag.getstatus_plateau_min_mhz;
+    st.getstatus_plateau_max_mhz = diag.getstatus_plateau_max_mhz;
+    st.max_target_overshoot_mhz = diag.max_target_overshoot_mhz;
+    st.max_target_undershoot_mhz = diag.max_target_undershoot_mhz;
+    st.first_modified_offset_khz = diag.first_modified_offset_khz;
+    st.anchor_offset_khz = diag.anchor_offset_khz;
+    st.highest_bin_offset_khz = diag.highest_bin_offset_khz;
+    st.live_voltage_mv = snap.voltage_mv;
+    st.live_clock_mhz = snap.clock_mhz;
+    st.live_power_w = snap.power_w;
+    st.live_utilization_pct = snap.utilization_pct;
+    st.live_temperature_c = snap.temperature_c;
+    st.live_power_limit_w = snap.power_limit_w;
+    st.live_power_capped = snap.power_capped;
+    st.diagnostic_message = Some(diag_msg);
+    info!(
+        "apply_verify_diag: label={:?} target={} anchor_mv={} first_modified_bin={:?} \
+         first_modified_mv={:?} modified_bins={}/{} getstatus_freq_match={}/{} \
+         plateau_mhz={:?}..{:?} max_overshoot={:?} max_undershoot={:?} \
+         offset_khz[first={:?} anchor={:?} highest={:?}] live[voltage_mv={:?} clock_mhz={:?} \
+         power_w={:?} util_pct={:?} temp_c={:?} limit_w={:?} capped={:?}]",
+        label, core.freq_mhz, ceiling_mv, diag.first_modified_bin, diag.first_modified_mv,
+        diag.modified_bin_count, diag.expected_bin_count, diag.getstatus_freq_match_count,
+        diag.expected_bin_count, diag.getstatus_plateau_min_mhz, diag.getstatus_plateau_max_mhz,
+        diag.max_target_overshoot_mhz, diag.max_target_undershoot_mhz,
+        diag.first_modified_offset_khz, diag.anchor_offset_khz, diag.highest_bin_offset_khz,
+        snap.voltage_mv, snap.clock_mhz, snap.power_w, snap.utilization_pct,
+        snap.temperature_c, snap.power_limit_w, snap.power_capped
+    );
     st
 }
 
@@ -418,6 +580,26 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
         voltage_sample_count: None,
         voltage_quality: None,
         telemetry_quality: None,
+        first_modified_bin: None,
+        first_modified_mv: None,
+        modified_bin_count: None,
+        expected_bin_count: None,
+        getstatus_freq_match_count: None,
+        getstatus_plateau_min_mhz: None,
+        getstatus_plateau_max_mhz: None,
+        max_target_overshoot_mhz: None,
+        max_target_undershoot_mhz: None,
+        first_modified_offset_khz: None,
+        anchor_offset_khz: None,
+        highest_bin_offset_khz: None,
+        live_voltage_mv: None,
+        live_clock_mhz: None,
+        live_power_w: None,
+        live_utilization_pct: None,
+        live_temperature_c: None,
+        live_power_limit_w: None,
+        live_power_capped: None,
+        diagnostic_message: None,
     }
 }
 
@@ -426,7 +608,11 @@ mod tests {
     use super::*;
 
     fn ev(offset_khz: Option<i32>, freq_mhz: u32) -> PointEvidence {
-        PointEvidence { offset_khz, freq_mhz }
+        PointEvidence { index: 0, voltage_mv: 900, offset_khz, freq_mhz }
+    }
+
+    fn evx(index: usize, voltage_mv: u32, offset_khz: Option<i32>, freq_mhz: u32) -> PointEvidence {
+        PointEvidence { index, voltage_mv, offset_khz, freq_mhz }
     }
 
     #[test]
@@ -484,6 +670,115 @@ mod tests {
         let (s, present, _, n) = classify_curve(1770, &expected, TOL_MHZ);
         assert_eq!(s, CurveVerification::VerificationFailed);
         assert_eq!((present, n), (0, 6));
+    }
+
+    // ── Patch 11C: read-only curve diagnostic (pure) ─────────────────────────────
+    #[test]
+    fn diag_no_offsets_reports_none_modified() {
+        // Offsets readable but all zero → nothing modified; safe Nones, no panic.
+        let expected: Vec<PointEvidence> =
+            (0..5).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(0), 1900)).collect();
+        let d = compute_curve_diag(1785, 60, &expected, TOL_MHZ);
+        assert_eq!(d.modified_bin_count, 0);
+        assert_eq!(d.expected_bin_count, 5);
+        assert_eq!(d.first_modified_bin, None);
+        assert_eq!(d.first_modified_mv, None);
+        assert_eq!(d.first_modified_offset_khz, None);
+    }
+
+    #[test]
+    fn diag_first_offset_at_anchor() {
+        let expected = vec![
+            evx(62, 850, Some(-90_000), 1785),
+            evx(63, 875, Some(-120_000), 1785),
+            evx(64, 1062, Some(-160_000), 1785),
+        ];
+        let d = compute_curve_diag(1785, 62, &expected, TOL_MHZ);
+        assert_eq!(d.first_modified_bin, Some(62));
+        assert_eq!(d.first_modified_mv, Some(850));
+        assert_eq!(d.first_modified_offset_khz, Some(-90_000));
+        assert_eq!(d.anchor_offset_khz, Some(-90_000));
+        assert_eq!(d.highest_bin_offset_khz, Some(-160_000)); // highest voltage = 1062 mV
+        assert_eq!((d.modified_bin_count, d.expected_bin_count), (3, 3));
+    }
+
+    #[test]
+    fn diag_sparse_offsets_counts_correctly() {
+        let expected = vec![
+            evx(62, 850, Some(0), 1900),
+            evx(63, 875, Some(-100_000), 1785),
+            evx(64, 950, Some(0), 1900),
+            evx(65, 1062, Some(-150_000), 1785),
+        ];
+        let d = compute_curve_diag(1785, 62, &expected, TOL_MHZ);
+        assert_eq!(d.modified_bin_count, 2);
+        assert_eq!(d.first_modified_bin, Some(63));
+        assert_eq!(d.anchor_offset_khz, Some(0)); // the anchor bin (62) itself carries zero
+    }
+
+    #[test]
+    fn diag_all_offsets_modified() {
+        let expected: Vec<PointEvidence> =
+            (0..6).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-100_000), 1785)).collect();
+        let d = compute_curve_diag(1785, 60, &expected, TOL_MHZ);
+        assert_eq!((d.modified_bin_count, d.expected_bin_count), (6, 6));
+        assert_eq!(d.first_modified_bin, Some(60));
+    }
+
+    #[test]
+    fn diag_plateau_exact_target_zero_over_undershoot() {
+        let expected: Vec<PointEvidence> =
+            (0..4).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-90_000), 1785)).collect();
+        let d = compute_curve_diag(1785, 60, &expected, TOL_MHZ);
+        assert_eq!(d.getstatus_plateau_min_mhz, Some(1785));
+        assert_eq!(d.getstatus_plateau_max_mhz, Some(1785));
+        assert_eq!(d.max_target_overshoot_mhz, Some(0));
+        assert_eq!(d.max_target_undershoot_mhz, Some(0));
+        assert_eq!(d.getstatus_freq_match_count, 4);
+    }
+
+    #[test]
+    fn diag_overshoot_detected() {
+        // Plateau reads up to 1830 while target is 1785 → 45 MHz overshoot (the suspect).
+        let expected = vec![
+            evx(60, 850, Some(-80_000), 1815),
+            evx(61, 875, Some(-80_000), 1830),
+            evx(62, 1062, Some(-120_000), 1830),
+        ];
+        let d = compute_curve_diag(1785, 60, &expected, TOL_MHZ);
+        assert_eq!(d.getstatus_plateau_max_mhz, Some(1830));
+        assert_eq!(d.max_target_overshoot_mhz, Some(45));
+        assert_eq!(d.max_target_undershoot_mhz, Some(0));
+    }
+
+    #[test]
+    fn diag_undershoot_detected() {
+        let expected = vec![
+            evx(60, 850, Some(-90_000), 1740),
+            evx(61, 875, Some(-90_000), 1785),
+        ];
+        let d = compute_curve_diag(1785, 60, &expected, TOL_MHZ);
+        assert_eq!(d.getstatus_plateau_min_mhz, Some(1740));
+        assert_eq!(d.max_target_undershoot_mhz, Some(45));
+        assert_eq!(d.max_target_overshoot_mhz, Some(0));
+    }
+
+    #[test]
+    fn diag_empty_is_safe() {
+        let d = compute_curve_diag(1785, 60, &[], TOL_MHZ);
+        assert_eq!(d, CurveDiag::default());
+        assert_eq!((d.modified_bin_count, d.expected_bin_count), (0, 0));
+        assert_eq!(d.max_target_overshoot_mhz, None);
+    }
+
+    #[test]
+    fn live_voltage_above_anchor_does_not_downgrade_curve() {
+        // The diagnostic + live snapshot are independent of classification: a curve whose
+        // plateau points carry the flatten offset stays VerifiedCurve regardless of any
+        // (high) measured voltage — measured voltage is never an input to classify_curve.
+        let expected: Vec<PointEvidence> = (0..10).map(|_| ev(Some(-120_000), 1500)).collect();
+        let (s, _, _, _) = classify_curve(1770, &expected, TOL_MHZ);
+        assert_eq!(s, CurveVerification::VerifiedCurve);
     }
 
     // ── Patch B: load classification ───────────────────────────────────────────

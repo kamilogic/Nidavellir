@@ -3,7 +3,42 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-06) — Applied voltage semantics (Patch 11A, DOCS ONLY, not pushed)
+## Latest backend checkpoint (2026-06-06) — Patch 11C: read-only live VF-ceiling diagnostic (IMPLEMENTED, not pushed)
+- **Read-only diagnostic** added to `gpu_verify::verify_applied_curve` (and the `verify-applied`
+  console subcommand): pure `compute_curve_diag` over the existing per-point evidence + one
+  `LiveSnapshot`. No mutation, no stress, no apply. Classifier semantics UNCHANGED (offset-presence
+  gate; live voltage above the VF anchor never downgrades; GetStatus freq stays diagnostic).
+- **New evidence**: first modified bin idx/mv, modified vs expected bin count, GetStatus freq-match,
+  GetStatus plateau min/max MHz, max target overshoot/undershoot, 3 offset samples (first/anchor/
+  highest), and a live snapshot (NVAPI voltage + first NVML clock/power/util/temp/limit/cap). Surfaced
+  via additive `Option`/`serde(default)` fields on `ApplyVerificationStatus` + one `apply_verify_diag:`
+  log line. Additive IPC documented in `docs/contracts/ui-backend.md`.
+- **Files**: `crates/service/src/gpu_verify.rs`, `crates/core/src/ipc.rs`,
+  `docs/contracts/ui-backend.md`, `decisions.md`, `memory.md`, this file. **No apply/Safe-Loop/
+  synthesis/F1b/`apps/ui`/`nvml_gpu.rs` change. P-state + full ThrottleReasons deferred.**
+- **Tests**: `cargo check -p nidavellir-service` clean · service **61/61** (+9 pure diag tests) ·
+  core **44/44** (additive serde fields, nothing broken).
+- **Runtime QA** (`verify-applied`, read-only — confirmed non-mutating: all four
+  `%ProgramData%\Nidavellir\*.json` mtimes unchanged across the run): curve=`VerifiedCurve` (62/64
+  offsets present), load=`VerifiedUnderLoad`. Diagnostic revealed `anchor_offset_khz=+255000`,
+  `highest_bin_offset_khz=−120000`, GetStatus plateau **1770–1830 MHz** (overshoot 45, undershoot 15),
+  live `voltage_mv=1068 clock_mhz=1815 util_pct=6 temp_c=47 power_w=66 cap=200W capped=false`.
+  Interpretation: offsets are resident and *curve-flatten-shaped* (big `+` at the 843 mV anchor, `−`
+  at the top) → curve IS applied; the plateau spread + overshoot is consistent with BOTH normal
+  GPU-Boost behavior AND the open overshoot suspect, but GetStatus idle noise (freq_match 18/64) keeps
+  it **non-conclusive** — exactly what 11C was meant to surface. Live voltage 1068 mV ≫ 843 mV anchor
+  confirms (again) measured voltage is NOT capped (telemetry only).
+- **Exact-offset verification still deferred**: expected offset = `target − stock_base_mhz`, but
+  per-point stock base is not persisted and GetStatus freq is idle-unreliable. Future "11D" options:
+  persist the pre-apply stock curve, or validate the GetStatus `base` tuple (`StatusEntry.base`,
+  currently decoded but discarded in `vfcurve::get_status`). Only then can the overshoot suspect be
+  proven/refuted.
+- **F1b Phase 2B**: still NOT started; UNBLOCKED by this diagnostic — Phase 2B's `curve_verified`
+  gate (offset-readback) is the same axis 11C reports, so the supervised HW run can now log the
+  plateau/offset evidence per dwell. Sequence the Codex copy fix + (optionally) 11D before relying on
+  exact-offset proof.
+
+## Backend checkpoint (2026-06-06) — Applied voltage semantics (Patch 11A, DOCS ONLY, not pushed)
 - **Read-only investigation** confirmed the elastic VF ceiling caps **frequency, not voltage**:
   `apply_vf_ceiling` (`crates/gpu-nvapi/src/lib.rs`) writes per-point FREQUENCY offsets to every
   modern VF point whose table voltage ≥ the selected bin (flatten to `target_mhz`); points below

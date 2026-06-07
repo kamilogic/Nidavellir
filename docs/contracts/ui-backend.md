@@ -340,6 +340,74 @@ effective voltage".
 
 
 
+\## Additive (2026-06-06): VerifyAppliedProfile read-only live diagnostic (Patch 11C)
+
+
+
+`ApplyVerificationStatus` gains OPTIONAL `#[serde(default)]` diagnostic fields (backend-only,
+
+backward-compatible; `None` on older payloads). They are populated by the read-only verifier
+
+(`VerifyAppliedProfile` / `verify-applied`). \*\*None of them affect `status` / classification\*\*,
+
+and the `live_*` snapshot is telemetry only — a single read at verification time, NOT load
+
+verification, and it does NOT imply a hard voltage cap.
+
+
+
+Curve / offset evidence:
+
+
+
+\- `first_modified_bin: Option<u32>`, `first_modified_mv: Option<u32>` — first plateau bin carrying
+
+&#x20; a non-zero flatten offset, and its VF-table voltage.
+
+\- `modified_bin_count: Option<u32>`, `expected_bin_count: Option<u32>` — modified vs expected
+
+&#x20; (points at/above the anchor).
+
+\- `getstatus_freq_match_count: Option<u32>` — GetStatus plateau points within tolerance of target
+
+&#x20; (diagnostic only; GetStatus is unreliable at idle).
+
+\- `getstatus_plateau_min_mhz` / `getstatus_plateau_max_mhz: Option<u32>` — observed plateau spread.
+
+\- `max_target_overshoot_mhz` / `max_target_undershoot_mhz: Option<i32>` — plateau vs target
+
+&#x20; (`Some(0)` when flat; `None` only when no plateau points).
+
+\- `first_modified_offset_khz`, `anchor_offset_khz`, `highest_bin_offset_khz: Option<i32>` —
+
+&#x20; representative offset samples (kHz).
+
+
+
+Live telemetry snapshot (telemetry only; unavailable → `None`, never a fake zero):
+
+
+
+\- `live_voltage_mv: Option<u32>` (NVAPI measured core voltage), `live_clock_mhz: Option<u32>`,
+
+&#x20; `live_power_w: Option<f32>`, `live_utilization_pct: Option<f32>`, `live_temperature_c:
+
+&#x20; Option<f32>`, `live_power_limit_w: Option<f32>`, `live_power_capped: Option<bool>`.
+
+\- `diagnostic_message: Option<String>` — compact human-readable note (UI must NOT parse it for
+
+&#x20; logic; use the structured fields).
+
+
+
+UI is NOT required to use these now. `live_voltage_mv` may legitimately read ABOVE
+
+`vf_table_voltage_mv` — it is measured rail telemetry, not a cap. Rationale: `decisions.md`
+
+→ "Read-only live diagnostic for the elastic VF ceiling (Patch 11C)".
+
+
+
 (No other active requests)
 
 

@@ -2,6 +2,39 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Read-only live diagnostic for the elastic VF ceiling (Patch 11C)
+- **Decision** (2026-06-06): extend the existing read-only verifier (`gpu_verify::verify_applied_curve`
+  / `verify-applied`) with structured diagnostic evidence + a single live telemetry snapshot, so the
+  applied-curve↔telemetry relationship is provable **without mutating GPU state**. Classifier
+  semantics are **unchanged**: `VerifiedCurve` still gates on flatten-offset *presence*; measured/live
+  voltage above the VF anchor never downgrades; GetStatus freq stays diagnostic only.
+- **Added (pure, testable)**: `compute_curve_diag` over the same per-point evidence → first modified
+  bin index/voltage, modified vs expected bin count, GetStatus freq-match count, GetStatus plateau
+  min/max MHz, max target overshoot/undershoot, and 3 representative offset samples (first-modified,
+  anchor, highest-voltage). Plus one read-only `LiveSnapshot` (NVAPI measured voltage + first NVML
+  reading: clock/power/util/temp/limit/cap). Surfaced via additive `Option`/`serde(default)` fields on
+  `ApplyVerificationStatus` and one compact `apply_verify_diag:` log line.
+- **What it proves**: the flatten offsets are resident and *curve-flatten-shaped* (big `+` at the
+  low-voltage anchor, `−` at the top), and how far the GetStatus plateau spreads vs target. **What it
+  does NOT prove**: effective/measured voltage behavior, exact per-point offset correctness, or live
+  in-game stability. The live snapshot is telemetry, not load verification.
+- **Exact-offset verification deferred**: expected offset is `target − stock_base_mhz`, but per-point
+  stock base is not persisted and GetStatus freq is idle-unreliable, so exact-offset classification is
+  NOT implemented (would need a persisted pre-apply stock curve, or validating the GetStatus `base`
+  tuple — a future patch). 11C reports the *symptom* (plateau spread / offset distribution) instead.
+- **Runtime QA finding (read-only, 3060 Ti)**: `VerifiedCurve` (62/64 offsets present), but the
+  diagnostic revealed `anchor_offset_khz=+255000`, `highest_bin_offset_khz=−120000`, GetStatus plateau
+  **1770–1830 MHz** (overshoot 45, undershoot 15) and live snapshot `voltage=1068 mV, clock=1815 MHz,
+  util=6%`. This is consistent with both (a) a genuinely curve-flatten-shaped offset set and (b) the
+  open **overshoot suspect** (plateau not landing exactly on target) — but GetStatus idle noise
+  (freq_match 18/64) means it is **not yet conclusive**. Confirms the diagnostic does its job: surface
+  the evidence, defer the verdict to exact-offset work. No state mutated (`gpu_applied.json` mtime
+  unchanged).
+- **Scope**: additive IPC + log only. Files: `crates/service/src/gpu_verify.rs`,
+  `crates/core/src/ipc.rs`, `docs/contracts/ui-backend.md`, docs. **No apply/classifier/Safe-Loop/
+  synthesis/`apps/ui`/`nvml_gpu.rs` change; P-state + full ThrottleReasons deferred; no hardware
+  writes.** `cargo check` clean; service 61/61 (+9 diag tests), core 44/44.
+
 ## Elastic VF ceiling caps frequency, not effective voltage (no hard voltage cap)
 - **Decision** (Applied Voltage Behavior investigation, 2026-06-06): the canonical apply path
   (`apply_vf_ceiling`, `crates/gpu-nvapi/src/lib.rs`) writes **per-point frequency offsets** to

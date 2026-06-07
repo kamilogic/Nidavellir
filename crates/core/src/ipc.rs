@@ -291,6 +291,63 @@ pub struct ApplyVerificationStatus {
     pub voltage_quality: Option<DwellQuality>,
     #[serde(default)]
     pub telemetry_quality: Option<DwellQuality>,
+
+    // ── Read-only live diagnostic (Patch 11C; additive). ALL optional + serde-default,
+    //    backward-compatible. NONE of these affect `status`/classification. The `live_*`
+    //    snapshot is telemetry only (a single read, NOT load verification) and does NOT
+    //    imply a hard voltage cap — measured voltage may sit ABOVE the VF/curve anchor. ──
+    /// Index of the first (lowest-voltage) plateau bin carrying a non-zero flatten offset.
+    #[serde(default)]
+    pub first_modified_bin: Option<u32>,
+    /// VF-table voltage (mV) of that first modified bin.
+    #[serde(default)]
+    pub first_modified_mv: Option<u32>,
+    /// How many of the expected plateau bins carry a non-zero offset.
+    #[serde(default)]
+    pub modified_bin_count: Option<u32>,
+    /// How many bins were expected to be flattened (points at/above the anchor).
+    #[serde(default)]
+    pub expected_bin_count: Option<u32>,
+    /// GetStatus diagnostic: plateau points whose actual freq is within tolerance of target.
+    #[serde(default)]
+    pub getstatus_freq_match_count: Option<u32>,
+    /// GetStatus observed plateau frequency spread (MHz) over the expected bins.
+    #[serde(default)]
+    pub getstatus_plateau_min_mhz: Option<u32>,
+    #[serde(default)]
+    pub getstatus_plateau_max_mhz: Option<u32>,
+    /// Max GetStatus plateau freq above target (MHz); `Some(0)` when flat at/below target.
+    #[serde(default)]
+    pub max_target_overshoot_mhz: Option<i32>,
+    /// Max GetStatus plateau freq below target (MHz); `Some(0)` when flat at/above target.
+    #[serde(default)]
+    pub max_target_undershoot_mhz: Option<i32>,
+    /// Representative offset samples (kHz) — first-modified, anchor bin, highest-voltage bin.
+    #[serde(default)]
+    pub first_modified_offset_khz: Option<i32>,
+    #[serde(default)]
+    pub anchor_offset_khz: Option<i32>,
+    #[serde(default)]
+    pub highest_bin_offset_khz: Option<i32>,
+    /// Single read-only live telemetry snapshot (telemetry only; may be unavailable → None,
+    /// never a fake zero). Captured at verification time, NOT a sustained-load measurement.
+    #[serde(default)]
+    pub live_voltage_mv: Option<u32>,
+    #[serde(default)]
+    pub live_clock_mhz: Option<u32>,
+    #[serde(default)]
+    pub live_power_w: Option<f32>,
+    #[serde(default)]
+    pub live_utilization_pct: Option<f32>,
+    #[serde(default)]
+    pub live_temperature_c: Option<f32>,
+    #[serde(default)]
+    pub live_power_limit_w: Option<f32>,
+    #[serde(default)]
+    pub live_power_capped: Option<bool>,
+    /// Compact human-readable diagnostic note (UI must not parse it for logic).
+    #[serde(default)]
+    pub diagnostic_message: Option<String>,
 }
 
 /// One step of the memory sweep: a clock offset with its measured effective

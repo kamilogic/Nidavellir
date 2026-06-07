@@ -15,6 +15,22 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **Patch 11C — read-only live VF-ceiling diagnostic (2026-06-06) — IMPLEMENTED, not pushed**:
+  extended the read-only verifier (`gpu_verify::verify_applied_curve` / `verify-applied`) with a pure
+  `compute_curve_diag` (first modified bin idx/mv, modified vs expected count, GetStatus freq-match,
+  GetStatus plateau min/max, max target overshoot/undershoot, 3 offset samples) + a single read-only
+  `LiveSnapshot` (NVAPI voltage + first NVML clock/power/util/temp/limit/cap). Surfaced via additive
+  `Option`/`serde(default)` fields on `ApplyVerificationStatus` + one `apply_verify_diag:` log line.
+  **Classifier unchanged** (offset-presence gate; live voltage above anchor never downgrades; GetStatus
+  freq diagnostic only). Exact-offset verification deferred (needs persisted stock base or validating
+  the GetStatus `base` tuple). Files: `crates/service/src/gpu_verify.rs`, `crates/core/src/ipc.rs`,
+  `docs/contracts/ui-backend.md`, decisions/memory/handoff. **No apply/Safe-Loop/synthesis/`apps/ui`/
+  `nvml_gpu.rs` change; no hardware writes.** `cargo check` clean · service **61/61** (+9 diag) · core
+  44/44. **Runtime QA** (`verify-applied`, read-only, no writes — all state-file mtimes unchanged):
+  `VerifiedCurve` 62/64 offsets present, but diagnostic showed `anchor_offset=+255000`,
+  `highest_bin_offset=−120000`, GetStatus plateau **1770–1830** (overshoot 45), live
+  `voltage=1068 mV, clock=1815, util=6%` — consistent with both a curve-flatten-shaped offset set AND
+  the open overshoot suspect; GetStatus idle noise (18/64) makes it non-conclusive (as designed).
 - **Applied voltage behavior — investigation + Patch 11A docs (2026-06-06) — DOCS ONLY, not pushed**:
   confirmed (read-only) that the elastic VF ceiling (`apply_vf_ceiling`) writes **per-point
   FREQUENCY offsets** to every modern VF point at/above the deterministic `vf_table_voltage_mv`
