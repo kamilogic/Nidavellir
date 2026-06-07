@@ -7,11 +7,11 @@
 
   const W = 960;
   const padL = 56, padR = 18, padT = 16, padB = 48;
-  const uid = Math.random().toString(36).slice(2);
-  const bandGradientId = `bifrost-band-gradient-${uid}`;
-  const pixelPatternId = `bifrost-pixels-${uid}`;
+  const CELL_W = 7, CELL_H = 3, CELL_GAP_X = 7, CELL_GAP_Y = 1;
 
   const H = $derived(height);
+  const matrixRows = $derived(H >= 500 ? 9 : 7);
+  const matrixHeight = $derived(matrixRows * CELL_H + (matrixRows - 1) * CELL_GAP_Y);
   const sx = (v) => padL + ((v - V_MIN) / (V_MAX - V_MIN)) * (W - padL - padR);
   const sy = (f) => H - padB - ((f - F_MIN) / (F_MAX - F_MIN)) * (H - padT - padB);
 
@@ -48,7 +48,39 @@
     const width = W - padR - x;
     if (width < 8) return null;
     const y = sy(targetMhz);
-    return { x, y, width, height: 24, yTop: y - 12 };
+    const bandHeight = matrixHeight + 8;
+    return { x, y, width, height: bandHeight, yTop: y - bandHeight / 2 };
+  });
+
+  const bifrostCells = $derived.by(() => {
+    if (!bifrostBand) return [];
+    const pitchX = CELL_W + CELL_GAP_X;
+    const cols = Math.max(1, Math.floor((bifrostBand.width - 8) / pitchX));
+    const gridWidth = cols * CELL_W + Math.max(0, cols - 1) * CELL_GAP_X;
+    const startX = bifrostBand.x + Math.max(4, (bifrostBand.width - gridWidth) / 2);
+    const startY = bifrostBand.yTop + (bifrostBand.height - matrixHeight) / 2;
+    const center = (matrixRows - 1) / 2;
+    const out = [];
+    for (let col = 0; col < cols; col += 1) {
+      for (let row = 0; row < matrixRows; row += 1) {
+        const edgeDist = Math.abs(row - center) / Math.max(1, center);
+        const phase = (col * 5 + row * 3) % 16;
+        const accent = (col * 11 + row * 7) % 47 === 0;
+        out.push({
+          x: startX + col * pitchX,
+          y: startY + row * (CELL_H + CELL_GAP_Y),
+          row,
+          col,
+          phase,
+          accent,
+          bright: edgeDist < 0.22,
+          mid: edgeDist < 0.58,
+          edge: edgeDist > 0.78,
+          delay: `-${(phase * 0.42).toFixed(2)}s`,
+        });
+      }
+    }
+    return out;
   });
 
   const anchorMarker = $derived.by(() => {
@@ -72,21 +104,6 @@
 </script>
 
 <svg class="vfchart" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Voltage/Frequency curve">
-  <defs>
-    <linearGradient id={bandGradientId} x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#7eadbe" stop-opacity="0.26" />
-      <stop offset="42%" stop-color="#d6a85d" stop-opacity="0.7" />
-      <stop offset="72%" stop-color="#a084d2" stop-opacity="0.28" />
-      <stop offset="100%" stop-color="#7eadbe" stop-opacity="0.18" />
-    </linearGradient>
-    <pattern id={pixelPatternId} width="22" height="12" patternUnits="userSpaceOnUse">
-      <rect x="1" y="2" width="3" height="3" fill="#d6a85d" opacity="0.62" />
-      <rect x="8" y="7" width="2" height="2" fill="#7eadbe" opacity="0.5" />
-      <rect x="14" y="3" width="4" height="2" fill="#b9754b" opacity="0.42" />
-      <rect x="19" y="8" width="2" height="2" fill="#a084d2" opacity="0.34" />
-    </pattern>
-  </defs>
-
   {#each hLines as l}
     <line class="grid" class:major={l.label} x1={padL} y1={l.y} x2={W - padR} y2={l.y} />
     {#if l.label}
@@ -120,22 +137,37 @@
         height={bifrostBand.height}
         rx="4"
       />
-      <rect
-        class="band-pixels"
-        x={bifrostBand.x}
-        y={bifrostBand.yTop}
-        width={bifrostBand.width}
-        height={bifrostBand.height}
-        rx="4"
-        fill={`url(#${pixelPatternId})`}
+      <line class="band-boundary" x1={bifrostBand.x} y1={bifrostBand.yTop} x2={W - padR} y2={bifrostBand.yTop} />
+      <line
+        class="band-boundary"
+        x1={bifrostBand.x}
+        y1={bifrostBand.yTop + bifrostBand.height}
+        x2={W - padR}
+        y2={bifrostBand.yTop + bifrostBand.height}
       />
+      <g class="band-matrix" aria-hidden="true">
+        {#each bifrostCells as cell}
+          <rect
+            class="matrix-cell"
+            class:bright={cell.bright}
+            class:mid={cell.mid}
+            class:edge={cell.edge}
+            class:accent={cell.accent}
+            x={cell.x}
+            y={cell.y}
+            width={CELL_W}
+            height={CELL_H}
+            rx="1"
+            style={`--phase-delay: ${cell.delay}`}
+          />
+        {/each}
+      </g>
       <line
         class="band-core"
         x1={bifrostBand.x}
         y1={bifrostBand.y}
         x2={W - padR}
         y2={bifrostBand.y}
-        stroke={`url(#${bandGradientId})`}
       />
       <title>Expected operating range from curve anchor across higher curve bins. Not a hard voltage cap.</title>
     </g>
@@ -234,12 +266,58 @@
     stroke: rgba(214, 168, 93, 0.16);
     stroke-width: 1;
   }
-  .band-pixels {
-    opacity: 0.58;
+  .band-boundary {
+    stroke: rgba(214, 168, 93, 0.32);
+    stroke-width: 1;
+    stroke-linecap: round;
+  }
+  .band-matrix {
+    opacity: 0.96;
+  }
+  .matrix-cell {
+    --idle-opacity: 0.18;
+    --glow-opacity: 0.34;
+    --peak-opacity: 0.46;
+    fill: #27313d;
+    opacity: var(--idle-opacity);
+    animation: bifrost-cell-flow 8.8s ease-in-out infinite;
+    animation-delay: var(--phase-delay);
+  }
+  .matrix-cell.mid {
+    --idle-opacity: 0.26;
+    --glow-opacity: 0.46;
+    --peak-opacity: 0.62;
+    fill: #486878;
+  }
+  .matrix-cell.bright {
+    --idle-opacity: 0.38;
+    --glow-opacity: 0.64;
+    --peak-opacity: 0.82;
+    fill: #d6a85d;
+  }
+  .matrix-cell.edge {
+    --idle-opacity: 0.1;
+    --glow-opacity: 0.18;
+    --peak-opacity: 0.28;
+    fill: #202933;
+  }
+  .matrix-cell.accent {
+    --idle-opacity: 0.3;
+    --glow-opacity: 0.48;
+    --peak-opacity: 0.62;
+    fill: #79bdc4;
+  }
+  .matrix-cell.bright.accent {
+    --idle-opacity: 0.34;
+    --glow-opacity: 0.54;
+    --peak-opacity: 0.7;
+    fill: #a084d2;
   }
   .band-core {
+    stroke: rgba(214, 168, 93, 0.72);
     stroke-width: 2.5;
     stroke-linecap: round;
+    opacity: 0.72;
   }
   .anchor-line {
     stroke: rgba(214, 168, 93, 0.55);
@@ -281,25 +359,42 @@
     font-weight: 700;
     font-variant-numeric: tabular-nums;
   }
-  @media (prefers-reduced-motion: no-preference) {
-    .band-pixels {
-      animation: bifrost-breathe 14s ease-in-out infinite;
-    }
-  }
   @media (prefers-reduced-motion: reduce) {
     .pt,
-    .band-pixels {
+    .matrix-cell {
       animation: none;
       transition: none;
     }
+    .matrix-cell {
+      opacity: var(--idle-opacity);
+    }
+    .matrix-cell.mid {
+      opacity: var(--glow-opacity);
+    }
+    .matrix-cell.bright {
+      opacity: var(--glow-opacity);
+    }
+    .matrix-cell.edge {
+      opacity: var(--idle-opacity);
+    }
   }
-  @keyframes bifrost-breathe {
+  @keyframes bifrost-cell-flow {
     0%,
     100% {
-      opacity: 0.48;
+      opacity: var(--idle-opacity);
+      filter: saturate(0.82);
+    }
+    34% {
+      opacity: var(--glow-opacity);
+      filter: saturate(1);
     }
     50% {
-      opacity: 0.68;
+      opacity: var(--peak-opacity);
+      filter: saturate(1.1);
+    }
+    66% {
+      opacity: var(--glow-opacity);
+      filter: saturate(0.92);
     }
   }
 </style>
