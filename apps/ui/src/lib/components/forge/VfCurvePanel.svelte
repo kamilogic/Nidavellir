@@ -6,13 +6,38 @@
   let {
     realCurve = null,
     validation = null,
-    chartLimit = null,
-    appliedLimit = null,
+    curveOverlay = null,
     advanced = $bindable(false),
     expanded = $bindable(false),
     onReadRealCurve,
     onStartValidation,
   } = $props();
+
+  const overlaySource = $derived.by(() => {
+    if (!curveOverlay?.anchorPrecise) return null;
+    if (curveOverlay.anchorSource === "verified_vf_bin") return "Verified profile anchor";
+    if (curveOverlay.anchorSource === "verification_vf_bin") return "Profile verification anchor";
+    if (curveOverlay.anchorSource === "profile_vf_bin") return "Profile anchor";
+    if (curveOverlay.anchorSource === "curve_read_plateau") return "Detected curve plateau";
+    return "Curve anchor";
+  });
+
+  const overlaySummary = $derived.by(() => {
+    if (!curveOverlay?.targetMhz) return null;
+    const target = `Target: ${curveOverlay.targetMhz} MHz`;
+    if (curveOverlay.anchorPrecise && curveOverlay.anchorMv != null) {
+      return `${target} · Curve anchor: ${curveOverlay.anchorMv} mV`;
+    }
+    return target;
+  });
+
+  const overlayNote = $derived.by(() => {
+    if (!curveOverlay?.targetMhz) return null;
+    if (curveOverlay.showBand) {
+      return "Optimized boost curve. Expected operating range is shown from the curve anchor across higher curve bins. Not a hard voltage cap. Measured voltage can vary by workload.";
+    }
+    return "Optimized boost curve. No deterministic curve anchor is available, so the chart shows the target line only. Not a hard voltage cap. Measured voltage can vary by workload.";
+  });
 </script>
 
 <div class="vf-panel">
@@ -44,18 +69,16 @@
 
   {#if realCurve}
     {#if realCurve.real}
-      {#if appliedLimit}
+      {#if overlaySummary}
         <p class="point accent">
-          {$t("forge.plateau", { f: appliedLimit.freq_mhz, v: appliedLimit.voltage_mv })}
+          {overlaySummary}
         </p>
-        <p class="sub curve-note">{$t("forge.curveAnchorNote")}</p>
-      {:else if realCurve.plateau}
-        <p class="point">
-          {$t("forge.plateau", { f: realCurve.plateau.freq_mhz, v: realCurve.plateau.voltage_mv })}
-        </p>
-        <p class="sub curve-note">{$t("forge.curveAnchorNote")}</p>
+        {#if overlaySource}
+          <p class="sub curve-source">{overlaySource}</p>
+        {/if}
+        <p class="sub curve-note">{overlayNote}</p>
       {/if}
-      <VfChart points={realCurve.points} plateau={chartLimit} height={300} />
+      <VfChart points={realCurve.points} overlay={curveOverlay} height={300} />
       <p class="sub vf-method" class:ok={realCurve.vf_curve_supported}>
         {$t(realCurve.vf_curve_supported ? "forge.vfElastic" : "forge.vfFallback")}
       </p>
@@ -63,7 +86,7 @@
         <p class="sub">{$t("forge.curvePoints", { name: realCurve.name, n: realCurve.points.length })}</p>
         <ul class="list">
           {#each realCurve.points.filter((_, i) => i % 4 === 0) as p}
-            <li><span class="mono">{p.voltage_mv} mV</span><span class="mono accent">{p.freq_mhz} MHz</span></li>
+            <li><span class="mono">V/F bin {p.voltage_mv} mV</span><span class="mono accent">{p.freq_mhz} MHz</span></li>
           {/each}
         </ul>
       {/if}
@@ -197,6 +220,9 @@
   }
   .curve-note {
     color: var(--nord-dim);
+  }
+  .curve-source {
+    color: var(--nord-mist);
   }
   .err {
     color: var(--nord-danger);

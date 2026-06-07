@@ -50,10 +50,99 @@
     return Number.isFinite(n) ? n.toFixed(digits) : "0";
   }
 
-  const appliedLimit = $derived(
-    applied?.core ? { voltage_mv: applied.core.voltage_mv, freq_mhz: applied.core.freq_mhz } : null,
-  );
-  const chartLimit = $derived(appliedLimit ?? realCurve?.plateau ?? null);
+  function numeric(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function sameNumber(a, b) {
+    return a != null && b != null && Number(a) === Number(b);
+  }
+
+  function normalizeProfile(s) {
+    return String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  }
+
+  const powerProfileSlots = [
+    { key: "godforge", label: "Godforge" },
+    { key: "brokkrs", label: "Brokkr's Best" },
+    { key: "deep_calm", label: "Deep Calm" },
+  ];
+
+  const appliedPowerPoint = $derived.by(() => {
+    if (!applied?.core || !powerSweep) return null;
+    for (const slot of powerProfileSlots) {
+      const point = powerSweep?.[slot.key];
+      if (!point) continue;
+      const labelMatches = normalizeProfile(applied.label) === normalizeProfile(slot.label);
+      const clockMatches = sameNumber(applied.core.freq_mhz, point.clock_mhz);
+      if (labelMatches && clockMatches) return { ...slot, point };
+    }
+    return null;
+  });
+
+  function verificationMatchesAppliedProfile() {
+    if (verification?.vf_table_voltage_mv == null || verification?.target_mhz == null || !applied?.core) return false;
+    const targetMatches = sameNumber(verification.target_mhz, applied.core.freq_mhz);
+    const labelMatches =
+      !verification.label ||
+      !applied.label ||
+      normalizeProfile(verification.label) === normalizeProfile(applied.label);
+    return targetMatches && labelMatches;
+  }
+
+  function buildCurveOverlay({ targetMhz, anchorMv = null, anchorSource = "none", anchorPrecise = false }) {
+    const target = numeric(targetMhz);
+    if (target == null) return null;
+    const anchor = numeric(anchorMv);
+    const hasTrustedAnchor = anchor != null && anchorPrecise;
+    return {
+      targetMhz: target,
+      anchorMv: hasTrustedAnchor ? anchor : null,
+      anchorSource,
+      anchorPrecise: hasTrustedAnchor,
+      showBand: hasTrustedAnchor,
+    };
+  }
+
+  const curveOverlay = $derived.by(() => {
+    if (verificationMatchesAppliedProfile()) {
+      return buildCurveOverlay({
+        targetMhz: verification.target_mhz,
+        anchorMv: verification.vf_table_voltage_mv,
+        anchorSource: verification.status === "verified_curve" ? "verified_vf_bin" : "verification_vf_bin",
+        anchorPrecise: true,
+      });
+    }
+
+    if (appliedPowerPoint?.point?.vf_table_voltage_mv != null) {
+      return buildCurveOverlay({
+        targetMhz: appliedPowerPoint.point.clock_mhz,
+        anchorMv: appliedPowerPoint.point.vf_table_voltage_mv,
+        anchorSource: "profile_vf_bin",
+        anchorPrecise: true,
+      });
+    }
+
+    if (realCurve?.real && realCurve?.plateau?.voltage_mv != null && realCurve?.plateau?.freq_mhz != null) {
+      return buildCurveOverlay({
+        targetMhz: realCurve.plateau.freq_mhz,
+        anchorMv: realCurve.plateau.voltage_mv,
+        anchorSource: "curve_read_plateau",
+        anchorPrecise: true,
+      });
+    }
+
+    if (applied?.core?.freq_mhz != null) {
+      return buildCurveOverlay({
+        targetMhz: applied.core.freq_mhz,
+        anchorSource: "none",
+        anchorPrecise: false,
+      });
+    }
+
+    return null;
+  });
 
   async function loadHardware() {
     if (hardwareLoaded) return;
@@ -244,8 +333,7 @@
         <VfCurvePanel
           {realCurve}
           {validation}
-          {chartLimit}
-          {appliedLimit}
+          {curveOverlay}
           bind:advanced
           bind:expanded
           onReadRealCurve={readRealCurve}
@@ -392,7 +480,7 @@
         <strong>{realCurve.name}</strong>
         <button class="btn ghost" onclick={() => (expanded = false)}>{$t("forge.close")}</button>
       </div>
-      <VfChart points={realCurve.points} plateau={chartLimit} height={560} />
+      <VfChart points={realCurve.points} overlay={curveOverlay} height={560} />
     </div>
   </div>
 {/if}
