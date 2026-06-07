@@ -2,6 +2,23 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 2B.2-b.1: seeding + dry-run plan + vf_bin propagation (pure prep)
+- **Decision** (2026-06-07): land the pure half of 2B.2-b. Exposes the verifier's
+  `classify_live_ceiling` / `LiveCeilingEval` / `CurveDiag` as `pub(crate)` (intra-crate visibility
+  only — NO IPC/contract change) so the future transient-ceiling probe (2B.2-b.2) reuses ONE
+  classification path. Adds pure seeding: `derive_descent(curve_bins, lowest_safe, step) ->
+  FrontierDescent` (safe_start = top live bin, clamped ≥ the operator crash floor) and a read-only
+  dry-run `plan_frontier(targets, &descent, dwell_ms) -> FrontierPlan` (worst-case dwell count +
+  wall-time estimate + safety notice). `candidate_clocks` / `classify_regime` (Phase 1) supply targets.
+- **Internal `ProbeSample.vf_bin_mv: Option<u32>`** (NOT IPC): the actually-applied snapped bin.
+  `probe_to_point` now records `vf_table_voltage_mv = vf_bin_mv.or(descent vbin)`; the pure
+  `measured_to_probe` leaves it `None` (the real probe fills it after the apply in 2B.2-b.2).
+- **Scope**: pure prep only — NO real probe, NO `apply_vf_ceiling` / `load_and_measure`, NO
+  `build-frontier` subcommand / `--confirm`, NO Safe-Loop arm/clear, NO startup-recovery wiring, NO
+  forge_state / gpu_knowledge writes, NO Phase-3 / 11D / `apps/ui` / core / contract change, NO
+  hardware. `cargo check` clean; service 80/80 (+7), core 46/46 (untouched). 2B.2-b.2 (real probe +
+  supervised `--confirm` entry) and the hardware QA run remain separately gated.
+
 ## F1b Phase 2B.2-a: shared live-ceiling classification helper (pure refactor)
 - **Decision** (2026-06-07): factor live-curve classification out of `verify_applied_curve`
   into a reusable path so the persisted-profile verifier (today) and the future transient-ceiling

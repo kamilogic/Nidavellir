@@ -3,7 +3,32 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.2-a: shared live-ceiling classifier (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.1: seeding + dry-run plan + vf_bin (IMPLEMENTED, not pushed)
+- **Pure prep for 2B.2-b.** Exposed `classify_live_ceiling` / `LiveCeilingEval` / `CurveDiag` as
+  `pub(crate)` in `gpu_verify.rs` (intra-crate visibility only — NO IPC/contract change) so the
+  future transient-ceiling probe reuses one classification path.
+- **Pure seeding** in `gpu_power_sweep.rs`: `derive_descent(curve_bins, lowest_safe, step) ->
+  FrontierDescent` (safe_start = top live bin, clamped ≥ operator crash floor) + read-only
+  `plan_frontier(targets, &descent, dwell_ms) -> FrontierPlan` (worst-case dwell count + wall-time +
+  safety notice). Targets via existing `classify_regime` / `candidate_clocks`.
+- **Internal `ProbeSample.vf_bin_mv: Option<u32>`** (NOT IPC): the actually-applied snapped bin.
+  `probe_to_point` records `vf_table_voltage_mv = vf_bin_mv.or(descent vbin)`; `measured_to_probe`
+  leaves it None (the real probe fills it after the apply in 2B.2-b.2).
+- **Files**: `crates/service/src/gpu_power_sweep.rs`, `crates/service/src/gpu_verify.rs`. **No real
+  probe; no `apply_vf_ceiling`/`load_and_measure`; no `build-frontier` subcommand / `--confirm`; no
+  Safe-Loop arm/clear; no startup-recovery wiring; no forge_state / gpu_knowledge writes; no
+  Phase-3/11D/apps-ui/core/contract change; no hardware.**
+- **Tests**: `cargo check -p nidavellir-service` clean · service **80/80** (+7 pure: regime→targets,
+  derive_descent, plan_frontier estimates, vf_bin propagation + fallback, mapper-leaves-None,
+  build_frontier abort short-circuit via fake probe) · core 46/46 (untouched).
+- **Next — Phase 2B.2-b.2 (NOT started, separately gated)**: real `#[cfg(windows)]` probe closure
+  (arm Safe Loop → `apply_vf_ceiling(vbin,target)` → `classify_live_ceiling` verify + 11C diag →
+  `load_and_measure` dwell → clear → `measured_to_probe` + set `vf_bin_mv`) + supervised
+  `build-frontier --confirm` console subcommand (dry-run default via `plan_frontier`; runs startup
+  recovery; print/log-only, no auto-apply, no persistence). Then supervised hardware QA (2B.2-c).
+  11D deferred to after Phase 2B.
+
+## Backend checkpoint (2026-06-07) — F1b Phase 2B.2-a: shared live-ceiling classifier (IMPLEMENTED, not pushed)
 - **Pure refactor** in `gpu_verify.rs`: extracted `classify_live_ceiling(live, ceiling_idx,
   ceiling_mv, target, tol)` (read-only; offset-readback evidence build) + pure
   `eval_ceiling_evidence(target, anchor_idx, &expected, tol)` (runs the UNCHANGED offset-presence

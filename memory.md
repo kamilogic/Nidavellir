@@ -15,6 +15,16 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **F1b Phase 2B.2-b.1 — seeding + dry-run plan + vf_bin propagation (2026-06-07) — IMPLEMENTED, not
+  pushed**: exposed `classify_live_ceiling`/`LiveCeilingEval`/`CurveDiag` `pub(crate)` (intra-crate;
+  no IPC/contract change); added pure `derive_descent` (FrontierDescent from live curve bins + crash
+  floor) + read-only `plan_frontier` (dry-run worst-case dwell count/wall-time + safety notice);
+  added internal `ProbeSample.vf_bin_mv` (NOT IPC) so `probe_to_point` records the actually-applied
+  snapped bin (fallback = descent vbin); `measured_to_probe` leaves it None (the real probe fills it).
+  NO real probe / apply / load / sweep / stress / subcommand / Safe-Loop / startup-recovery /
+  persistence / Phase-3 / 11D / apps-ui / core / contract change, NO hardware. `cargo check` clean ·
+  service **80/80** (+7) · core 46/46. Files: `gpu_power_sweep.rs`, `gpu_verify.rs`. 2B.2-b.2 (real
+  probe + supervised `--confirm`) separately gated.
 - **F1b Phase 2B.2-a — shared live-ceiling classifier (2026-06-07) — IMPLEMENTED, not pushed**:
   factored `classify_live_ceiling` (read-only) + pure `eval_ceiling_evidence` → `LiveCeilingEval`
   out of `verify_applied_curve` so the verifier and the future transient-ceiling probe (2B.2-b)

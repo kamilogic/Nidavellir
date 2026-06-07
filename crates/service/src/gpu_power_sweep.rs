@@ -1252,6 +1252,10 @@ struct ProbeSample {
     max_power_w: f32,
     power_capped_frac: f32,
     measured_voltage_mv: Option<u32>,
+    /// The deterministic VF-table bin ACTUALLY applied (snapped). Set by the real probe
+    /// (Phase 2B.2-b); `None` from the pure mapper. When present it becomes the frontier
+    /// point's `vf_table_voltage_mv` apply key. Internal only — NOT IPC.
+    vf_bin_mv: Option<u32>,
     telemetry_quality: DwellQuality,
     voltage_quality: DwellQuality,
     /// Accumulated stability confidence (Wilson LB) for this point — feeds the gate.
@@ -1290,7 +1294,8 @@ fn probe_to_point(target_mhz: u32, vbin: u32, s: &ProbeSample) -> PowerSweepPoin
         power_capped_frac: s.power_capped_frac,
         stable: true,
         perf_per_watt: if s.power_w > 0.0 { s.avg_clock_mhz as f64 / s.power_w as f64 } else { 0.0 },
-        vf_table_voltage_mv: Some(vbin),
+        // Prefer the actually-applied snapped bin (real probe); fall back to the descent vbin.
+        vf_table_voltage_mv: s.vf_bin_mv.or(Some(vbin)),
         measured_voltage_mv: s.measured_voltage_mv,
         avg_measured_voltage_mv: s.measured_voltage_mv,
         max_measured_voltage_mv: s.measured_voltage_mv,
@@ -1343,6 +1348,9 @@ fn measured_to_probe(m: &Measured, curve_verified: bool, confidence: f64) -> Pro
         max_power_w: m.max_power_w,
         power_capped_frac: m.capped_frac,
         measured_voltage_mv,
+        // The snapped applied bin is known only to the real probe (it does the apply),
+        // not to this pure mapper — the probe sets it after calling `measured_to_probe`.
+        vf_bin_mv: None,
         telemetry_quality,
         voltage_quality,
         confidence,
@@ -1405,6 +1413,70 @@ fn build_frontier(
         frontier: paired.into_iter().map(|(p, _)| p).collect(),
         profiles,
         log,
+    }
+}
+
+/// Estimated non-dwell overhead per probe (apply + read-only verify + fresh GpuCtx
+/// create/drop), for the dry-run wall-time estimate only. Conservative.
+#[cfg(windows)]
+#[allow(dead_code)] // used by `plan_frontier` (wired into the dry-run in Phase 2B.2-b)
+const PROBE_OVERHEAD_MS: u64 = 5_000;
+
+/// Derive a `FrontierDescent` from the live VF-curve bin voltages + the operator-confirmed
+/// crash floor. `safe_start_mv` = the highest real bin (top of the curve), clamped to be ≥
+/// the floor; the descent never goes below `lowest_safe_mv`. Pure + testable (the caller
+/// reads the bins from `read_vf_curve_modern` in Phase 2B.2-b). No hardware here.
+#[cfg(windows)]
+#[allow(dead_code)] // wired into the dry-run / supervised run in Phase 2B.2-b
+fn derive_descent(curve_bins_mv: &[u32], lowest_safe_mv: u32, step_mv: u32) -> FrontierDescent {
+    let top = curve_bins_mv.iter().copied().max().unwrap_or(lowest_safe_mv);
+    FrontierDescent {
+        safe_start_mv: top.max(lowest_safe_mv),
+        voltage_step_mv: step_mv.max(1),
+        lowest_safe_mv,
+    }
+}
+
+/// A read-only dry-run plan: what a supervised `build-frontier` run WOULD do, with worst-case
+/// (no-early-stop) dwell-count and wall-time estimates. Computed purely; never touches hardware.
+#[cfg(windows)]
+#[allow(dead_code)] // surfaced by the dry-run path in Phase 2B.2-b
+#[derive(Debug, Clone, PartialEq)]
+struct FrontierPlan {
+    targets: Vec<u32>,
+    safe_start_mv: u32,
+    lowest_safe_mv: u32,
+    voltage_step_mv: u32,
+    bins_per_descent: u32,
+    est_dwell_count: u32,
+    est_wall_secs: u64,
+    safety_notice: String,
+}
+
+/// Compute the dry-run plan from candidate `targets` + a `FrontierDescent`. `est_dwell_count`
+/// is the WORST case (every target descends every bin with no early stop); real runs stop
+/// earlier on first instability. Pure + testable.
+#[cfg(windows)]
+#[allow(dead_code)] // surfaced by the dry-run path in Phase 2B.2-b
+fn plan_frontier(targets: Vec<u32>, descent: &FrontierDescent, dwell_ms: u64) -> FrontierPlan {
+    let step = descent.voltage_step_mv.max(1);
+    let span = descent.safe_start_mv.saturating_sub(descent.lowest_safe_mv);
+    let bins_per_descent = span / step + 1;
+    let est_dwell_count = targets.len() as u32 * bins_per_descent;
+    let est_wall_secs = est_dwell_count as u64 * (dwell_ms + PROBE_OVERHEAD_MS) / 1000;
+    FrontierPlan {
+        targets,
+        safe_start_mv: descent.safe_start_mv,
+        lowest_safe_mv: descent.lowest_safe_mv,
+        voltage_step_mv: step,
+        bins_per_descent,
+        est_dwell_count,
+        est_wall_secs,
+        safety_notice: "SUPERVISED ONLY: applies transient VF ceilings and runs game-power \
+            dwells that can TDR or hard-reboot. Operator must be present and able to reboot. \
+            Never probes below the known crash floor. No profile is applied or persisted by \
+            this run."
+            .to_string(),
     }
 }
 
@@ -1980,6 +2052,7 @@ mod tests {
             max_power_w: power + 5.0,
             power_capped_frac: 0.0,
             measured_voltage_mv: None,
+            vf_bin_mv: None,
             telemetry_quality: DwellQuality::Medium,
             voltage_quality: DwellQuality::Medium,
             confidence: conf,
@@ -1997,6 +2070,7 @@ mod tests {
             max_power_w: 0.0,
             power_capped_frac: 0.0,
             measured_voltage_mv: None,
+            vf_bin_mv: None,
             telemetry_quality: DwellQuality::Unavailable,
             voltage_quality: DwellQuality::Unavailable,
             confidence: 0.0,
@@ -2102,6 +2176,99 @@ mod tests {
         assert_eq!(p.target_clock_mhz, Some(1830)); // the asked-for clock
         assert_eq!(p.clock_mhz, 1815); // the measured achieved clock
         assert_eq!(p.vf_table_voltage_mv, Some(850));
+    }
+
+    // ── Phase 2B.2-b.1: seeding + dry-run plan + vf_bin propagation (pure) ────────
+    #[cfg(windows)]
+    #[test]
+    fn f1b_seed_targets_from_regime() {
+        // Power-limited regime → never probe above the sustained clock; floored at 90%.
+        let regime = classify_regime(1.0, 200.0, 200.0, Some(70.0));
+        assert_eq!(regime, Regime::PowerLimited);
+        let targets = candidate_clocks(1830, 1920, regime, 30, 0.90);
+        assert_eq!(targets.first().copied(), Some(1830)); // top = sustained, not boost
+        assert!(targets.iter().all(|&c| c <= 1830));
+        assert!(*targets.last().unwrap() >= (1830.0 * 0.90) as u32);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn derive_descent_from_curve_bins() {
+        let bins = [800u32, 837, 850, 1062];
+        let d = derive_descent(&bins, 820, 25);
+        assert_eq!(d.safe_start_mv, 1062); // top of the live curve
+        assert_eq!(d.lowest_safe_mv, 820); // operator-confirmed crash floor
+        assert_eq!(d.voltage_step_mv, 25);
+        // Empty bins → safe_start clamps to the floor (degenerate but safe).
+        assert_eq!(derive_descent(&[], 900, 25).safe_start_mv, 900);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plan_frontier_estimates_dwells_and_time() {
+        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 900 };
+        let plan = plan_frontier(vec![1830, 1800, 1770], &d, 15_000);
+        assert_eq!(plan.bins_per_descent, 5); // (1000-900)/25 + 1
+        assert_eq!(plan.est_dwell_count, 15); // 3 targets × 5 bins (worst case, no early stop)
+        assert_eq!(plan.est_wall_secs, 300); // 15 × (15000 + 5000) / 1000
+        assert_eq!(plan.targets.len(), 3);
+        assert!(plan.safety_notice.contains("SUPERVISED"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_to_point_prefers_vf_bin_over_descent_vbin() {
+        let mut s = stable_sample(1815, 180.0, 0.9);
+        s.vf_bin_mv = Some(850); // the actually-applied snapped bin
+        let p = probe_to_point(1830, 999, &s); // descent vbin (999) deliberately differs
+        assert_eq!(p.vf_table_voltage_mv, Some(850)); // recorded from vf_bin_mv, not 999
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_to_point_falls_back_to_vbin_when_no_vf_bin() {
+        let s = stable_sample(1815, 180.0, 0.9); // vf_bin_mv == None
+        let p = probe_to_point(1830, 850, &s);
+        assert_eq!(p.vf_table_voltage_mv, Some(850)); // fallback to the descent vbin
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_to_probe_leaves_vf_bin_none() {
+        // The pure mapper does not know the applied bin; the real probe fills it later.
+        let s = measured_to_probe(&m_good(StabilityResult::Stable), true, 0.9);
+        assert_eq!(s.vf_bin_mv, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_frontier_short_circuits_after_abort_flag() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+        // Models the real probe's abort behavior: 1830 is stable at high bins, then "crashes"
+        // deeper and trips an abort flag; every later probe short-circuits to Unstable. Proves
+        // later targets are NOT fully descended (1 probe each, not 5).
+        let abort = AtomicBool::new(false);
+        let calls = AtomicU32::new(0);
+        let probe = |target: u32, vbin: u32| {
+            calls.fetch_add(1, SeqCst);
+            if abort.load(SeqCst) {
+                return unstable_sample();
+            }
+            if target == 1830 && vbin >= 950 {
+                return stable_sample(1830, 190.0, 0.95);
+            }
+            if target == 1830 {
+                abort.store(true, SeqCst); // crash deeper → abort the whole run
+                return unstable_sample();
+            }
+            unstable_sample()
+        };
+        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 900 };
+        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), probe);
+        // 1830: 1000/975/950 stable (3) + 925 abort (1) = 4 calls; 1800 & 1770: 1 call each.
+        assert_eq!(calls.load(SeqCst), 6);
+        assert_eq!(r.frontier.len(), 1);
+        assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(950)); // deepest stable bin kept
     }
 
     #[cfg(windows)]

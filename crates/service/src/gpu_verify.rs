@@ -84,20 +84,21 @@ fn classify_curve(
 /// Derived from the SAME per-point evidence `classify_curve` consumes; it NEVER feeds
 /// classification. Reveals the offset/plateau shape so we can tell normal GPU-Boost
 /// overshoot apart from an offset-value miscalibration — without persisting stock base.
+// `pub(crate)` so the future transient-ceiling probe (Phase 2B.2-b) can read the diagnostic.
 #[derive(Debug, Clone, Default, PartialEq)]
-struct CurveDiag {
-    first_modified_bin: Option<u32>,
-    first_modified_mv: Option<u32>,
-    modified_bin_count: u32,
-    expected_bin_count: u32,
-    getstatus_freq_match_count: u32,
-    getstatus_plateau_min_mhz: Option<u32>,
-    getstatus_plateau_max_mhz: Option<u32>,
-    max_target_overshoot_mhz: Option<i32>,
-    max_target_undershoot_mhz: Option<i32>,
-    first_modified_offset_khz: Option<i32>,
-    anchor_offset_khz: Option<i32>,
-    highest_bin_offset_khz: Option<i32>,
+pub(crate) struct CurveDiag {
+    pub(crate) first_modified_bin: Option<u32>,
+    pub(crate) first_modified_mv: Option<u32>,
+    pub(crate) modified_bin_count: u32,
+    pub(crate) expected_bin_count: u32,
+    pub(crate) getstatus_freq_match_count: u32,
+    pub(crate) getstatus_plateau_min_mhz: Option<u32>,
+    pub(crate) getstatus_plateau_max_mhz: Option<u32>,
+    pub(crate) max_target_overshoot_mhz: Option<i32>,
+    pub(crate) max_target_undershoot_mhz: Option<i32>,
+    pub(crate) first_modified_offset_khz: Option<i32>,
+    pub(crate) anchor_offset_khz: Option<i32>,
+    pub(crate) highest_bin_offset_khz: Option<i32>,
 }
 
 /// Compute the read-only curve diagnostic over the expected (≥ anchor) plateau points.
@@ -133,13 +134,14 @@ fn compute_curve_diag(target_mhz: u32, anchor_idx: usize, expected: &[PointEvide
 /// Bundled result of evaluating a live VF ceiling: the curve verdict (offset-presence gate,
 /// UNCHANGED) plus its 11C diagnostic. Lets the persisted-profile verifier (today) and the
 /// future transient-ceiling probe (Phase 2B.2-b) share ONE classification path.
+// `pub(crate)` so the future transient-ceiling probe (Phase 2B.2-b) can reuse this path.
 #[derive(Debug, Clone)]
-struct LiveCeilingEval {
-    state: CurveVerification,
-    offset_present: u32,
-    freq_match: u32,
-    expected_n: u32,
-    diag: CurveDiag,
+pub(crate) struct LiveCeilingEval {
+    pub(crate) state: CurveVerification,
+    pub(crate) offset_present: u32,
+    pub(crate) freq_match: u32,
+    pub(crate) expected_n: u32,
+    pub(crate) diag: CurveDiag,
 }
 
 /// Pure: run the (unchanged) offset-presence `classify_curve` gate + the 11C diagnostic over
@@ -161,7 +163,7 @@ fn eval_ceiling_evidence(
 /// persisted-profile verifier (today) and the future transient-ceiling probe (Phase 2B.2-b).
 /// NEVER writes / applies / stresses.
 #[cfg(windows)]
-fn classify_live_ceiling(
+pub(crate) fn classify_live_ceiling(
     live: &[(usize, u32, u32)],
     ceiling_idx: usize,
     ceiling_mv: u32,
