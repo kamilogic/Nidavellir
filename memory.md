@@ -15,6 +15,18 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **F1b Phase 2B.2-b.2 — real probe + supervised `build-frontier` (2026-06-07) — IMPLEMENTED (code
+  only, NOT run), not pushed**: added the real Windows probe `real_probe_step` (snap bin → arm Safe
+  Loop → `apply_vf_ceiling` → shared `classify_live_ceiling` verify + 11C diag → `load_and_measure`
+  → clear → `measured_to_probe` + `vf_bin_mv`; dwell-crash → reset + abort-flag short-circuit) and
+  `run_build_frontier(store, confirm)` (always prints the plan; dry-run read-only; `--confirm` runs
+  the real frontier then ALWAYS resets to stock). Console subcommand `build-frontier` in `main.rs`
+  (`--confirm` runs startup recovery first; dry-run does not). **No auto-apply, no forge_state, no
+  gpu_knowledge writes, no IPC/contract/core/apps-ui change, hardware path NOT executed.** Conservative
+  first-run consts (lowest_safe=875 mV, 25 mV step, idle Unconstrained→PowerLimited). `cargo check`
+  clean · service **81/81** (+1) · core 46/46. Files: `gpu_power_sweep.rs`, `main.rs`. Dry-run:
+  `nidavellir-service.exe build-frontier`; confirmed (NOT run): `... build-frontier --confirm`.
+  Supervised QA = 2B.2-c (separately gated); 11D after Phase 2B.
 - **F1b Phase 2B.2-b.1 — seeding + dry-run plan + vf_bin propagation (2026-06-07) — IMPLEMENTED, not
   pushed**: exposed `classify_live_ceiling`/`LiveCeilingEval`/`CurveDiag` `pub(crate)` (intra-crate;
   no IPC/contract change); added pure `derive_descent` (FrontierDescent from live curve bins + crash

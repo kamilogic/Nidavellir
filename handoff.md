@@ -3,7 +3,34 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.1: seeding + dry-run plan + vf_bin (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.2: real probe + supervised build-frontier (CODE ONLY, not run, not pushed)
+- **Real Windows probe `real_probe_step`** (the `build_frontier` seam under `--confirm`):
+  abort/boundary guard → snap vbin to a real VF bin → arm Safe Loop → `apply_vf_ceiling(bin,target)`
+  → read-only verify via shared `classify_live_ceiling` (+ 11C diag log) → on not-VerifiedCurve
+  reset+clear+return → `load_and_measure` dwell → clear flag → `measured_to_probe` + set `vf_bin_mv`.
+  Dwell CRASH → reset to stock + set `abort` so remaining probes short-circuit (run drains safely);
+  a normal Unstable/unverified only stops that clock's descent.
+- **`run_build_frontier(store, confirm)`** + console `build-frontier` (main.rs): always prints the
+  `plan_frontier` plan. Dry-run (no `--confirm`) = read-only (no arm/apply/dwell/VF-write, no startup
+  recovery). `--confirm` = startup recovery (parachute) first, then `build_frontier` with the real
+  probe, then ALWAYS `reset_to_stock` + clears the flag. **No auto-apply; no forge_state; no
+  gpu_knowledge writes.**
+- **Conservative first-run consts** (review the printed dry-run plan before any run): lowest_safe=875
+  mV (above the ~855 mV known reboot), 25 mV step, 30 MHz clock step, 0.90 floor; idle Unconstrained
+  regime clamped → PowerLimited (no OC on a first run); sustained ≈ curve top freq; confidence 0.21.
+- **Files**: `crates/service/src/gpu_power_sweep.rs`, `crates/service/src/main.rs`. **No IPC/contract
+  /core/apps-ui/Safe-Loop-behavior/gpu_apply/nvml_gpu/Phase-3/11D change. Hardware path NOT executed.**
+- **Tests**: `cargo check -p nidavellir-service` clean · service **81/81** (+1 `--confirm` arg parse)
+  · core 46/46. `real_probe_step`/`run_build_frontier` are hardware → not unit-tested; the abort
+  short-circuit PATTERN is covered by the 2B.2-b.1 fake-probe test.
+- **Commands**: dry-run `nidavellir-service.exe build-frontier`; confirmed (DO NOT RUN until QA)
+  `nidavellir-service.exe build-frontier --confirm`.
+- **Next — Phase 2B.2-c (supervised hardware QA, separately gated)**: run the dry-run, review the
+  plan, then `--confirm` with the user present and able to reboot; verify gpu_applied.json /
+  forge_state.json unchanged, boot flag armed/cleared per probe, abort on TDR. 11D deferred to after
+  Phase 2B.
+
+## Backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.1: seeding + dry-run plan + vf_bin (IMPLEMENTED, not pushed)
 - **Pure prep for 2B.2-b.** Exposed `classify_live_ceiling` / `LiveCeilingEval` / `CurveDiag` as
   `pub(crate)` in `gpu_verify.rs` (intra-crate visibility only — NO IPC/contract change) so the
   future transient-ceiling probe reuses one classification path.

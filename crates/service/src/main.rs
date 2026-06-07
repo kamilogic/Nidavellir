@@ -59,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args[1].to_string_lossy().as_ref() {
             "run" | "console" => return run_standalone(),
             "verify-applied" => return run_verify_only(),
+            "build-frontier" => return run_build_frontier_cmd(&args),
             _ => {}
         }
     }
@@ -77,6 +78,49 @@ fn run_verify_only() -> Result<(), Box<dyn std::error::Error>> {
     // Structured result to stdout for headless QA (in addition to the apply_verify log).
     println!("{}", serde_json::to_string_pretty(&status)?);
     Ok(())
+}
+
+/// `--confirm` present? Pure (unit-testable without hardware).
+fn has_confirm_flag(args: &[OsString]) -> bool {
+    args.iter().any(|a| a.to_string_lossy() == "--confirm")
+}
+
+/// Supervised console entry for the F1b multi-clock frontier (`build-frontier`). WITHOUT
+/// `--confirm` it is a read-only DRY-RUN that only prints the plan (no hardware). WITH
+/// `--confirm` it runs startup recovery (parachute) FIRST, then the real supervised hardware
+/// frontier (transient VF ceilings + game-power dwells), always restoring stock. It never
+/// applies or persists a profile.
+fn run_build_frontier_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let confirm = has_confirm_flag(args);
+    let store = SafeLoopStore::system();
+    if confirm {
+        tracing::warn!(
+            "build-frontier: --confirm set — running startup recovery, then the SUPERVISED hardware frontier"
+        );
+        safe_loop_runtime::run_startup_recovery(&store);
+    } else {
+        tracing::info!("build-frontier: dry-run (pass --confirm to execute the supervised hardware run)");
+    }
+    gpu_power_sweep::run_build_frontier(&store, confirm);
+    Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::has_confirm_flag;
+    use std::ffi::OsString;
+
+    fn os(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn confirm_flag_detected_only_when_present() {
+        assert!(!has_confirm_flag(&os(&["build-frontier"])));
+        assert!(has_confirm_flag(&os(&["build-frontier", "--confirm"])));
+        assert!(has_confirm_flag(&os(&["build-frontier", "--confirm", "x"])));
+        assert!(!has_confirm_flag(&os(&["build-frontier", "confirm"]))); // must be the flag form
+    }
 }
 
 fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {

@@ -1480,6 +1480,250 @@ fn plan_frontier(targets: Vec<u32>, descent: &FrontierDescent, dwell_ms: u64) ->
     }
 }
 
+// ── F1b Phase 2B.2-b.2: real probe closure + supervised `build-frontier` entry ──────
+// First-version, CONSERVATIVE seeding/limits. These are operator-tunable and should be
+// reviewed against the printed dry-run plan before any supervised `--confirm` run.
+/// GetStatus tolerance for the per-probe curve verify (~one boost bin).
+#[cfg(windows)]
+const FRONTIER_VERIFY_TOL_MHZ: u32 = 15;
+/// Per-probe stability confidence for the FIRST run (single-trial Wilson LB). Low → synthesis
+/// falls back to best-effort/V1; it matures across runs (V3). No knowledge writes here.
+#[cfg(windows)]
+const FRONTIER_PROBE_CONFIDENCE: f64 = 0.21;
+/// Crash floor (mV) — NEVER probe below this. Conservatively ABOVE the ~855 mV known hard-reboot.
+#[cfg(windows)]
+const FRONTIER_LOWEST_SAFE_MV: u32 = 875;
+/// Coarse voltage descent step (mV) for the first supervised run (fewer dwells = less exposure).
+#[cfg(windows)]
+const FRONTIER_VOLT_STEP_MV: u32 = 25;
+/// Target-clock spacing (MHz) ~ two boost bins.
+#[cfg(windows)]
+const FRONTIER_CLOCK_STEP_MHZ: u32 = 30;
+/// Deep Calm clock floor fraction for candidate clocks.
+#[cfg(windows)]
+const FRONTIER_FLOOR_FRAC: f64 = 0.90;
+
+/// Restore the GPU to stock: zero the core offset, clear the modern VF-curve offsets, and
+/// release any NVML clock cap. Idempotent; called on every exit path of the supervised run.
+#[cfg(windows)]
+fn reset_to_stock() {
+    let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(0);
+    let _ = nidavellir_gpu_nvapi::reset_vf_curve();
+    let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+}
+
+/// A no-hardware "unverified" probe result: tells `build_frontier` to stop this clock's
+/// descent (curve_verified=false) without recording a point. Used for the boundary guard,
+/// the post-crash short-circuit, and any apply/verify failure.
+#[cfg(windows)]
+fn unverified_probe() -> ProbeSample {
+    ProbeSample {
+        outcome: ProbeOutcome::Unstable,
+        curve_verified: false,
+        avg_clock_mhz: 0,
+        p5_clock_mhz: None,
+        power_w: 0.0,
+        max_power_w: 0.0,
+        power_capped_frac: 0.0,
+        measured_voltage_mv: None,
+        vf_bin_mv: None,
+        telemetry_quality: DwellQuality::Unavailable,
+        voltage_quality: DwellQuality::Unavailable,
+        confidence: 0.0,
+    }
+}
+
+/// The REAL hardware probe for one `(target, vbin)` — the seam `build_frontier` calls under
+/// `--confirm`. Snaps `vbin` to a real VF bin, arms the Safe Loop, applies the elastic VF
+/// ceiling, read-only-verifies it (shared `classify_live_ceiling` + 11C diag), runs a
+/// game-power dwell, clears the flag, and maps the result. On a dwell CRASH it resets to
+/// stock and sets `abort` so the remaining probes short-circuit (whole run drains safely).
+/// A normal `Unstable`/unverified result only stops THIS clock's descent (not the run).
+#[cfg(windows)]
+fn real_probe_step(
+    store: &SafeLoopStore,
+    abort: &AtomicBool,
+    descent: &FrontierDescent,
+    tol_mhz: u32,
+    target: u32,
+    vbin: u32,
+) -> ProbeSample {
+    use nidavellir_gpu_nvapi as gpu;
+    // 1. abort / boundary guards — no hardware.
+    if abort.load(Ordering::SeqCst) || vbin < descent.lowest_safe_mv {
+        return unverified_probe();
+    }
+    // 2. snap the requested voltage to a real VF-table bin (same as apply/verify).
+    let live = gpu::read_vf_curve_modern();
+    let Some((ceiling_idx, ceiling_mv)) = gpu::nearest_vf_bin_at_or_above(&live, vbin) else {
+        return unverified_probe();
+    };
+    // 3. arm the Safe Loop BEFORE the VF write (a crash anytime after → not reapplied on boot).
+    let intent = TuningPoint::from_axes([
+        ("gpu_freq_mhz", target as i64),
+        ("gpu_vf_bin_mv", ceiling_mv as i64),
+    ]);
+    let _ = store.arm_boot_flag(&BootFlag::new(intent, "f1b_frontier"));
+    // 4. apply the elastic VF ceiling.
+    if let Err(e) = gpu::apply_vf_ceiling(ceiling_mv, target) {
+        warn!("build-frontier probe: apply_vf_ceiling({ceiling_mv} mV, {target} MHz) failed: {e}");
+        reset_to_stock();
+        let _ = store.clear_boot_flag();
+        return unverified_probe();
+    }
+    // 5. read-only verify the JUST-applied transient ceiling (shared path) + log 11C diag.
+    let after = gpu::read_vf_curve_modern();
+    let eval = crate::gpu_verify::classify_live_ceiling(&after, ceiling_idx, ceiling_mv, target, tol_mhz);
+    info!(
+        "build-frontier probe: target={target} ceiling_mv={ceiling_mv} verify={:?} \
+         offsets={}/{} plateau={:?}..{:?} overshoot={:?}",
+        eval.state, eval.offset_present, eval.expected_n,
+        eval.diag.getstatus_plateau_min_mhz, eval.diag.getstatus_plateau_max_mhz,
+        eval.diag.max_target_overshoot_mhz
+    );
+    if eval.state != nidavellir_core::ipc::CurveVerification::VerifiedCurve {
+        // The ceiling did not take — don't dwell; stop this clock's descent.
+        reset_to_stock();
+        let _ = store.clear_boot_flag();
+        return unverified_probe();
+    }
+    // 6. game-power dwell, then clear the flag.
+    let measured = load_and_measure(DWELL_MS);
+    let _ = store.clear_boot_flag();
+    // 7. map; record the actually-applied bin; abort the whole run on a hard crash.
+    let crashed = matches!(measured.result, StabilityResult::Crash);
+    let mut s = measured_to_probe(&measured, true, FRONTIER_PROBE_CONFIDENCE);
+    s.vf_bin_mv = Some(ceiling_mv);
+    if crashed {
+        reset_to_stock();
+        abort.store(true, Ordering::SeqCst);
+        warn!("build-frontier probe: dwell CRASH at {ceiling_mv} mV / {target} MHz — aborting run.");
+    }
+    s
+}
+
+/// Supervised console entry for the F1b multi-clock frontier. Always prints the plan. WITHOUT
+/// `confirm` it is a read-only DRY-RUN (no Safe Loop arm, no apply, no dwell, no VF write).
+/// WITH `confirm` it runs the real supervised hardware path (transient VF ceilings + game-power
+/// dwells) and ALWAYS restores stock afterwards. It NEVER applies or persists a profile, and
+/// writes neither `forge_state.json` nor `gpu_knowledge.json`.
+#[cfg(windows)]
+pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
+    use nidavellir_gpu_nvapi as gpu;
+    if !gpu::vf_curve_supported() {
+        warn!("build-frontier: modern VF curve API unsupported on this GPU/driver — aborting.");
+        return;
+    }
+    let live = gpu::read_vf_curve_modern();
+    if live.is_empty() {
+        warn!("build-frontier: VF curve readback returned no points — aborting.");
+        return;
+    }
+    let bins: Vec<u32> = live.iter().map(|(_, mv, _)| *mv).collect();
+    let stock_boost_max = live.iter().map(|(_, _, f)| *f).max().unwrap_or(0);
+    // First-version approximation: without a heavy-load sample we treat the curve's top freq
+    // as the sustained reference (the dwells measure the real achieved clock anyway).
+    let stock_sustained = stock_boost_max;
+
+    // One NON-LOAD telemetry snapshot for regime context. At idle this tends to read
+    // Unconstrained; we CLAMP that to PowerLimited so the first supervised run never explores
+    // ABOVE stock (no OC on a first run). Live regime-driven OC is a later refinement.
+    let snap = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml().into_iter().next();
+    let (cap_frac, power_w, limit_w, temp_c) = match &snap {
+        Some(r) => (
+            if r.power_capped == Some(true) { 1.0 } else { 0.0 },
+            r.power_w.unwrap_or(0.0),
+            r.power_limit_w.unwrap_or(0.0),
+            r.temperature_c,
+        ),
+        None => (0.0, 0.0, 0.0, None),
+    };
+    let regime_raw = classify_regime(cap_frac, power_w, limit_w, temp_c);
+    let regime = if matches!(regime_raw, Regime::Unconstrained) {
+        Regime::PowerLimited
+    } else {
+        regime_raw
+    };
+
+    let targets = candidate_clocks(
+        stock_sustained,
+        stock_boost_max,
+        regime,
+        FRONTIER_CLOCK_STEP_MHZ,
+        FRONTIER_FLOOR_FRAC,
+    );
+    let descent = derive_descent(&bins, FRONTIER_LOWEST_SAFE_MV, FRONTIER_VOLT_STEP_MV);
+    let plan = plan_frontier(targets.clone(), &descent, DWELL_MS);
+
+    println!("=== build-frontier PLAN (dry-run preview) ===");
+    println!("targets (MHz)      : {:?}", plan.targets);
+    println!(
+        "voltage descent    : {} mV -> {} mV, step {} mV  ({} bins/descent)",
+        plan.safe_start_mv, plan.lowest_safe_mv, plan.voltage_step_mv, plan.bins_per_descent
+    );
+    println!(
+        "worst-case dwells  : {} (~{} s, no early stop)",
+        plan.est_dwell_count, plan.est_wall_secs
+    );
+    println!("regime             : raw={regime_raw:?} used={regime:?}");
+    println!("SAFETY             : {}", plan.safety_notice);
+    info!(
+        "build-frontier PLAN: targets={:?} {}..{} mV step {} bins/descent={} est_dwells={} \
+         est_wall_s={} regime_raw={:?} regime_used={:?} confirm={}",
+        plan.targets, plan.safe_start_mv, plan.lowest_safe_mv, plan.voltage_step_mv,
+        plan.bins_per_descent, plan.est_dwell_count, plan.est_wall_secs, regime_raw, regime, confirm
+    );
+
+    if !confirm {
+        println!("(dry-run — pass --confirm to execute the SUPERVISED hardware run)");
+        info!("build-frontier: DRY-RUN — no Safe Loop arm, no apply, no dwell, no VF write.");
+        return;
+    }
+
+    warn!("build-frontier: CONFIRMED — supervised hardware run begins (game-power dwells; can TDR/reboot).");
+    let policy = ForgePolicy::balanced();
+    let abort = AtomicBool::new(false);
+    let probe = |target: u32, vbin: u32| {
+        real_probe_step(store, &abort, &descent, FRONTIER_VERIFY_TOL_MHZ, target, vbin)
+    };
+    let result = build_frontier(&targets, &descent, &policy, probe);
+
+    // ALWAYS restore stock after the run (success, partial, or abort). No profile is applied.
+    reset_to_stock();
+    let _ = store.clear_boot_flag();
+
+    if abort.load(Ordering::SeqCst) {
+        warn!("build-frontier: run ABORTED after a crash/TDR.");
+    }
+    println!("=== build-frontier RESULT ({} frontier points) ===", result.frontier.len());
+    for p in &result.frontier {
+        println!(
+            "  target={:?} achieved={} MHz  vf_bin={:?} mV  power={:.0} W  p5={:?}",
+            p.target_clock_mhz, p.clock_mhz, p.vf_table_voltage_mv, p.power_w, p.p5_clock_mhz
+        );
+    }
+    let fmt = |label: &str, pt: &Option<PowerSweepPoint>| match pt {
+        Some(p) => format!(
+            "{label}: target={:?} achieved={} MHz @ vf_bin {:?} mV, {:.0} W",
+            p.target_clock_mhz, p.clock_mhz, p.vf_table_voltage_mv, p.power_w
+        ),
+        None => format!("{label}: (none)"),
+    };
+    println!("{}", fmt("Godforge   ", &result.profiles.godforge));
+    println!("{}", fmt("Brokkr's   ", &result.profiles.brokkrs));
+    println!("{}", fmt("Deep Calm  ", &result.profiles.deep_calm));
+    for l in &result.profiles.log {
+        info!("build-frontier: {l}");
+    }
+    info!("build-frontier: done — GPU restored to stock; no profile applied or persisted.");
+}
+
+/// Non-Windows stub — the frontier build is Windows-only (NVAPI/NVML).
+#[cfg(not(windows))]
+pub fn run_build_frontier(_store: &SafeLoopStore, _confirm: bool) {
+    tracing::warn!("build-frontier is Windows-only");
+}
+
 #[cfg(windows)]
 fn run_power_sweep(
     progress: Arc<Mutex<PowerSweepProgress>>,

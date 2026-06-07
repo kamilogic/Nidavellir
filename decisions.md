@@ -2,6 +2,29 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 2B.2-b.2: real probe closure + supervised `build-frontier` (code only, not run)
+- **Decision** (2026-06-07): implement the real Windows-only probe + supervised console entry, but
+  DO NOT execute the hardware path in this patch (validated by `cargo check`/tests only).
+- **`real_probe_step`** (the `build_frontier` seam under `--confirm`): abort/boundary guard → snap
+  `vbin` to a real VF bin (`nearest_vf_bin_at_or_above`) → arm Safe Loop → `apply_vf_ceiling` →
+  read-only verify via the shared `classify_live_ceiling` (+ 11C diag log) → on not-VerifiedCurve
+  reset+clear+return → `load_and_measure` dwell → clear flag → `measured_to_probe` + set `vf_bin_mv`.
+  A dwell **Crash** resets to stock and sets an `abort` flag so the remaining probes short-circuit
+  (run drains safely); a normal Unstable/unverified only stops THAT clock's descent.
+- **`run_build_frontier(store, confirm)`**: always prints the `plan_frontier` plan. Dry-run (no
+  `--confirm`) is read-only — no arm/apply/dwell/VF-write, no startup recovery. Confirmed runs
+  `build_frontier` with the real probe, then ALWAYS `reset_to_stock` + clears the flag. **No
+  auto-apply, no `forge_state` write, no `gpu_knowledge` write.** Console subcommand `build-frontier`
+  in `main.rs`; `--confirm` runs startup recovery (parachute) first.
+- **First-version conservative seeding** (operator-tunable consts; review the printed plan before a
+  run): `lowest_safe_mv=875` (above the ~855 mV known reboot), 25 mV step, 30 MHz clock step, 0.90
+  floor; an idle `Unconstrained` regime is clamped to `PowerLimited` (no OC on a first run);
+  sustained ≈ curve top freq; per-probe confidence = 0.21 (single-trial Wilson; matures via V3).
+- **Scope**: `gpu_power_sweep.rs` + `main.rs` only. No IPC/contract/core/`apps/ui`/Safe-Loop-behavior
+  /`gpu_apply`/`nvml_gpu`/Phase-3/11D change. `cargo check` clean; service 81/81 (+1 arg-parse test),
+  core 46/46. **Hardware path NOT executed** — supervised dry-run + `--confirm` QA is 2B.2-c
+  (separately gated).
+
 ## F1b Phase 2B.2-b.1: seeding + dry-run plan + vf_bin propagation (pure prep)
 - **Decision** (2026-06-07): land the pure half of 2B.2-b. Exposes the verifier's
   `classify_live_ceiling` / `LiveCeilingEval` / `CurveDiag` as `pub(crate)` (intra-crate visibility
