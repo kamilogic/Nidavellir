@@ -2,6 +2,48 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 2B.2-b.4: derive safe_start from the stock core VF cluster (refines b.3)
+- **Decision** (2026-06-07): b.3's generic guard rejected absurd values (7001 MHz, 1237 mV) but
+  still let `safe_start` come from the global max of *all* sane points — which on the 3060 Ti was
+  1150 mV (the hard-cap boundary, likely a non-core point inside the generous range). b.4 adds a
+  stage-2 derivation: select the actual contiguous core VF cluster and derive boost/sustained/
+  safe_start from the CLUSTER TOP, never the global sane max.
+- **`select_core_cluster`** (pure): sort sane points by voltage; split into contiguous runs where
+  the voltage gap ≤ `CORE_CLUSTER_GAP_MV` (60 mV); pick the LARGEST run (ties → lowest voltage = the
+  dense core); FAIL CLOSED if it has < `MIN_CORE_CLUSTER_POINTS` (8). Isolated high-voltage points
+  above the cluster top are reported as rejected outliers.
+- **Diagnostics**: the dry-run now prints raw/retained/rejected counts, rejected extremes, the
+  selected core-cluster mV+MHz range, outliers-above count, the stock reference (from cluster top),
+  the safe_start source, and a WARNING when a profile appears applied (`gpu_apply::load_applied()`).
+- **b.3 generic hard guards retained** (freq [500,3500] MHz, voltage [600,1150] mV); b.4 only changes
+  WHICH sane point becomes safe_start.
+- **Scope**: `gpu_power_sweep.rs` + docs only. No IPC/contract/core/`apps/ui`/Safe-Loop/`gpu_apply`/
+  `nvml_gpu`/Phase-3/11D change, no auto-reset, no hardware. `cargo check` clean; service 88/88,
+  core 46/46. **Stock dry-run QA pending the user's manual reset; `--confirm` remains forbidden.**
+  Future: NVML `max_clock_info(Graphics)` could corroborate boost (frozen `nvml_gpu.rs` this patch).
+
+## F1b Phase 2B.2-b.3: graphics-core sanity-domain seeding guard (safety fix)
+- **Decision** (2026-06-07): the first `build-frontier` dry-run revealed the seeding derived
+  candidate clocks + safe_start from the UNFILTERED global max over `read_vf_curve_modern()`, which
+  includes non-core / memory-domain points → a bogus plan (targets 7001..6311 MHz, safe_start
+  1237 mV). The dry-run gate correctly blocked it (zero hardware). Fix: never seed from the global
+  max; seed ONLY from sane graphics-core points and FAIL CLOSED otherwise.
+- **Guard** (pure, in `gpu_power_sweep.rs`): `sane_core_points` keeps points with freq ∈ [500, 3500]
+  MHz and voltage ∈ [600, 1150] mV; `derive_core_seed` derives boost/sustained/safe_start from those
+  only, records rejected-point diagnostics (rejected max freq/voltage), emits soft-limit warnings
+  (freq > 3200, voltage > 1125), and returns `Err` (fail-closed) when no sane points remain or a
+  derived value exceeds a hard guard. `run_build_frontier` aborts (no Safe Loop arm / apply / dwell /
+  VF write) on `Err` or if any candidate target > 3500 MHz. Constants are SANITY guards, NOT tuning
+  targets; a future GPU outside them fails closed and prompts a code update.
+- **Result** (re-run dry-run, same card): 132 raw points → 88 sane-core retained, 44 rejected (incl.
+  the 7001 MHz / 1237 mV memory points); boost~1935 MHz; targets 1755..1935; 84 worst-case dwells
+  (~1680 s). safe_start landed at 1150 mV (the hard-max boundary) → flagged by the soft-max warning;
+  the live curve is currently in an applied state, so a stock read would be cleaner.
+- **Scope**: `gpu_power_sweep.rs` + docs only. No IPC/contract/core/`apps/ui`/Safe-Loop-behavior/
+  `gpu_apply`/`nvml_gpu`/Phase-3/11D change, no auto-reset, no hardware. `cargo check` clean; service
+  86/86 (+5 guard tests), core 46/46. Dry-run QA: sane plan, no state writes. **`--confirm` remains
+  forbidden until the fixed dry-run is reviewed.**
+
 ## F1b Phase 2B.2-b.2: real probe closure + supervised `build-frontier` (code only, not run)
 - **Decision** (2026-06-07): implement the real Windows-only probe + supervised console entry, but
   DO NOT execute the hardware path in this patch (validated by `cargo check`/tests only).

@@ -15,6 +15,27 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **F1b Phase 2B.2-b.4 — stock core VF cluster seeding (2026-06-07) — IMPLEMENTED, not pushed**:
+  refines b.3 so `safe_start`/boost come from the actual contiguous core VF cluster, not the global
+  max of sane points (which gave 1150 mV). `select_core_cluster` (pure): sort by voltage, split on
+  gaps > 60 mV, pick the largest run (≥ 8 pts else FAIL CLOSED), derive safe_start/boost from the
+  cluster top; isolated high-V points reported as rejected outliers. b.3 generic hard guards
+  (500..3500 MHz, 600..1150 mV) retained. Dry-run prints cluster range + outliers + safe_start
+  source + applied-profile warning. No IPC/core/contract/apps-ui/Safe-Loop/gpu_apply/nvml_gpu/
+  Phase-3/11D change, no auto-reset, no hardware. `cargo check` clean · service **88/88** · core
+  46/46. File: `gpu_power_sweep.rs`. **Stock dry-run QA pending user's manual reset; --confirm still
+  forbidden.** (b.3 + b.4 both uncommitted — eventual commit bundles them unless split.)
+- **F1b Phase 2B.2-b.3 — core-domain seeding guard (2026-06-07) — IMPLEMENTED, not pushed**: the
+  first dry-run exposed seeding from the UNFILTERED global max of `read_vf_curve_modern()` (picked up
+  memory-domain points → bogus plan: targets 7001..6311 MHz, safe_start 1237 mV; the dry-run gate
+  blocked it, no hardware). Fix (pure): `sane_core_points` (freq 500..3500 MHz, voltage 600..1150 mV)
+  + `derive_core_seed` (seed from sane points only; reject diagnostics; soft-warn >3200 MHz / >1125
+  mV; FAIL CLOSED if no sane points or > hard guard). `run_build_frontier` aborts with no
+  arm/apply/dwell/VF-write on fail-closed or any target > 3500 MHz. Re-run dry-run: 132 raw → 88 sane
+  / 44 rejected (incl. 7001/1237), boost~1935, targets 1755..1935, 84 dwells (~1680 s), safe_start
+  1150 mV (flagged soft-max). NO hardware, NO state writes (mtimes unchanged), NO --confirm. `cargo
+  check` clean · service **86/86** (+5) · core 46/46. File: `gpu_power_sweep.rs`. `--confirm` still
+  forbidden pending review. NB: plan reflects the currently-applied curve; a stock read is cleaner.
 - **F1b Phase 2B.2-b.2 — real probe + supervised `build-frontier` (2026-06-07) — IMPLEMENTED (code
   only, NOT run), not pushed**: added the real Windows probe `real_probe_step` (snap bin → arm Safe
   Loop → `apply_vf_ceiling` → shared `classify_live_ceiling` verify + 11C diag → `load_and_measure`

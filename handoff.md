@@ -3,7 +3,56 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.2: real probe + supervised build-frontier (CODE ONLY, not run, not pushed)
+## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.4: stock core VF cluster seeding (IMPLEMENTED, not pushed)
+- **Refines b.3.** b.3's generic guard rejected absurd values but still let `safe_start` = global max
+  of all sane points (1150 mV on the 3060 Ti — the hard-cap boundary / a non-core point). b.4 derives
+  safe_start/boost from the actual contiguous core VF cluster instead.
+- **`select_core_cluster`** (pure, `gpu_power_sweep.rs`): sort sane points by voltage; split into
+  contiguous runs where voltage gap ≤ 60 mV; pick the LARGEST (ties → lowest voltage = dense core);
+  FAIL CLOSED if < 8 points. `derive_core_seed` seeds boost/safe_start from the cluster top and
+  reports isolated high-V outliers above it. b.3 generic hard guards (500..3500 MHz, 600..1150 mV)
+  retained.
+- **Dry-run diagnostics** now print raw/retained/rejected counts, rejected extremes, selected
+  core-cluster mV+MHz range, outliers-above count, stock reference (cluster top), safe_start source,
+  and a WARNING when a profile appears applied (`gpu_apply::load_applied()`).
+- **Files**: `crates/service/src/gpu_power_sweep.rs` + docs. **No IPC/contract/core/apps-ui/Safe-Loop/
+  gpu_apply/nvml_gpu/Phase-3/11D change; no auto-reset; no hardware.**
+- **Tests**: `cargo check -p nidavellir-service` clean · service **88/88** (cluster tests: isolated
+  1150 rejected; ends-at-1075→1075; legit-1150→1150; empty/ambiguous fail-closed; targets seed from
+  cluster not outlier; diagnostics report cluster range) · core 46/46.
+- **Stock dry-run QA PENDING the user's manual reset to stock** (this patch does NOT auto-reset).
+  Then run `nidavellir-service.exe build-frontier` (no --confirm) and confirm: no arm/apply/dwell/
+  VF-write, no state-file mtime change, plausible targets, safe_start = stock core cluster top,
+  applied-profile warning if not reset. **`--confirm` remains forbidden until reviewed.**
+- NB: b.3 + b.4 are both UNCOMMITTED — the eventual commit bundles them unless split. Future: NVML
+  `max_clock_info(Graphics)` could corroborate boost (nvml_gpu.rs frozen here).
+
+## Backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.3: core-domain seeding guard (IMPLEMENTED, not pushed)
+- **Safety fix.** The first `build-frontier` dry-run (read-only) caught a seeding bug:
+  `run_build_frontier` derived candidate clocks + safe_start from the UNFILTERED global max of
+  `read_vf_curve_modern()` (includes non-core / memory-domain points) → bogus plan (targets
+  7001..6311 MHz, safe_start 1237 mV). The dry-run gate blocked it with zero hardware risk.
+- **Guard** (pure, `gpu_power_sweep.rs`): `sane_core_points` keeps freq ∈ [500,3500] MHz & voltage ∈
+  [600,1150] mV; `derive_core_seed` seeds boost/sustained/safe_start from sane points only, records
+  rejected max freq/voltage, soft-warns (>3200 MHz / >1125 mV), FAILS CLOSED (Err) if no sane points
+  or a derived value exceeds a hard guard. `run_build_frontier` aborts (no arm/apply/dwell/VF-write)
+  on Err or any candidate target > 3500 MHz. Consts are sanity guards, NOT tuning targets.
+- **Files**: `crates/service/src/gpu_power_sweep.rs` + docs. **No IPC/contract/core/apps-ui/
+  Safe-Loop-behavior/gpu_apply/nvml_gpu/Phase-3/11D change; no auto-reset; no hardware.**
+- **Tests**: `cargo check -p nidavellir-service` clean · service **86/86** (+5 guard tests:
+  sane_core rejects 7001/1237 & keeps plausible; seed uses sane max not global max; fail-closed on no
+  sane points; targets never > hard max; soft-limit warnings) · core 46/46.
+- **Dry-run QA (read-only, no --confirm, no state writes — all 4 mtimes unchanged)**: 132 raw VF
+  points → 88 sane-core retained, 44 rejected (incl. 7001 MHz / 1237 mV); boost~1935 MHz; targets
+  [1935,1905,1875,1845,1815,1785,1755]; 1150→875 mV step 25 (12 bins); 84 worst-case dwells
+  (~1680 s); WARNING safe_start 1150 mV > soft max 1125 mV. **NB**: the live curve is in an APPLIED
+  state, so the numbers reflect the applied curve, not stock; a stock read (reset first) would be
+  cleaner, and safe_start 1150 mV is high for a 3060 Ti core (~1075) → review before --confirm.
+- **`--confirm` remains forbidden** until this fixed plan is reviewed. **Next — Phase 2B.2-c**
+  (supervised hardware QA, separately gated): optionally reset to stock first for a clean plan,
+  re-review the dry-run, then `--confirm` with the user present and able to reboot. 11D deferred.
+
+## Backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.2: real probe + supervised build-frontier (CODE ONLY, not run, not pushed)
 - **Real Windows probe `real_probe_step`** (the `build_frontier` seam under `--confirm`):
   abort/boundary guard → snap vbin to a real VF bin → arm Safe Loop → `apply_vf_ceiling(bin,target)`
   → read-only verify via shared `classify_live_ceiling` (+ 11C diag log) → on not-VerifiedCurve

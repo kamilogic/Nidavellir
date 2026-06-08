@@ -1503,6 +1503,200 @@ const FRONTIER_CLOCK_STEP_MHZ: u32 = 30;
 #[cfg(windows)]
 const FRONTIER_FLOOR_FRAC: f64 = 0.90;
 
+// ── Phase 2B.2-b.3: graphics-core SANITY-DOMAIN guards ──────────────────────────────
+// NOT tuning targets — only safety guards to reject non-core / memory-domain / implausible
+// VF points so seeding can never derive a target like 7001 MHz or a safe_start like 1237 mV.
+// A future GPU outside these bounds should FAIL CLOSED and prompt a code update, not run.
+#[cfg(windows)]
+const CORE_FREQ_MIN_MHZ: u32 = 500;
+#[cfg(windows)]
+const CORE_FREQ_SOFT_WARN_MHZ: u32 = 3200;
+#[cfg(windows)]
+const CORE_FREQ_HARD_MAX_MHZ: u32 = 3500;
+#[cfg(windows)]
+const CORE_VF_MIN_MV: u32 = 600;
+#[cfg(windows)]
+const CORE_VF_SOFT_MAX_MV: u32 = 1125;
+#[cfg(windows)]
+const CORE_VF_HARD_MAX_MV: u32 = 1150;
+/// Max voltage gap (mV) between consecutive points within ONE contiguous core VF cluster;
+/// a larger gap marks a domain / outlier boundary (Phase 2B.2-b.4).
+#[cfg(windows)]
+const CORE_CLUSTER_GAP_MV: u32 = 60;
+/// Minimum points for a cluster to be trusted as the stock core VF curve (else fail closed).
+#[cfg(windows)]
+const MIN_CORE_CLUSTER_POINTS: usize = 8;
+
+/// True iff a VF point is a plausible graphics-core point (within the sanity domain). Pure.
+#[cfg(windows)]
+fn is_sane_core_point(voltage_mv: u32, freq_mhz: u32) -> bool {
+    (CORE_FREQ_MIN_MHZ..=CORE_FREQ_HARD_MAX_MHZ).contains(&freq_mhz)
+        && (CORE_VF_MIN_MV..=CORE_VF_HARD_MAX_MV).contains(&voltage_mv)
+}
+
+/// Keep only plausible graphics-core VF points from a raw `read_vf_curve_modern` read,
+/// discarding non-core / memory-domain / implausible points. Pure + testable.
+#[cfg(windows)]
+fn sane_core_points(curve: &[(usize, u32, u32)]) -> Vec<(usize, u32, u32)> {
+    curve
+        .iter()
+        .copied()
+        .filter(|(_, mv, f)| is_sane_core_point(*mv, *f))
+        .collect()
+}
+
+/// The selected contiguous graphics-core VF cluster (stage 2). Geometry only; pure.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq)]
+struct CoreCluster {
+    v_min_mv: u32,
+    v_max_mv: u32,
+    f_min_mhz: u32,
+    f_max_mhz: u32,
+    point_count: usize,
+}
+
+/// Select the actual stock core VF cluster from already-sane points: sort by voltage, split
+/// into contiguous runs wherever the voltage gap exceeds `CORE_CLUSTER_GAP_MV`, and pick the
+/// LARGEST run (ties → the lowest-voltage run, i.e. the real dense core). FAILS CLOSED if the
+/// chosen run has fewer than `MIN_CORE_CLUSTER_POINTS` (ambiguous / not a real curve). This is
+/// what isolates an outlier like a lone 1150 mV point from the dense ~600–1075 mV core curve.
+/// Pure + testable; no hardware.
+#[cfg(windows)]
+fn select_core_cluster(sane: &[(usize, u32, u32)]) -> Result<CoreCluster, String> {
+    if sane.is_empty() {
+        return Err("no sane core points to cluster — failing closed".into());
+    }
+    let mut pts = sane.to_vec();
+    pts.sort_by_key(|(idx, mv, _)| (*mv, *idx));
+    let mut clusters: Vec<Vec<(usize, u32, u32)>> = Vec::new();
+    for p in pts {
+        match clusters.last_mut() {
+            Some(c) if p.1.saturating_sub(c.last().unwrap().1) <= CORE_CLUSTER_GAP_MV => c.push(p),
+            _ => clusters.push(vec![p]),
+        }
+    }
+    // Largest by point count; ties → lowest starting voltage (the real core is dense + low).
+    clusters.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].1.cmp(&b[0].1)));
+    let chosen = &clusters[0];
+    if chosen.len() < MIN_CORE_CLUSTER_POINTS {
+        return Err(format!(
+            "largest core VF cluster has only {} point(s) (< {} required) — ambiguous, failing closed",
+            chosen.len(),
+            MIN_CORE_CLUSTER_POINTS
+        ));
+    }
+    Ok(CoreCluster {
+        v_min_mv: chosen.first().unwrap().1,
+        v_max_mv: chosen.last().unwrap().1,
+        f_min_mhz: chosen.iter().map(|(_, _, f)| *f).min().unwrap(),
+        f_max_mhz: chosen.iter().map(|(_, _, f)| *f).max().unwrap(),
+        point_count: chosen.len(),
+    })
+}
+
+/// Stock reference derived from the SELECTED core VF cluster (not the global max of all sane
+/// points), plus rejection + cluster diagnostics.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq)]
+struct CoreSeed {
+    stock_boost_max_mhz: u32,
+    stock_sustained_mhz: u32,
+    safe_start_mv: u32,
+    raw_count: usize,
+    retained_count: usize,
+    rejected_count: usize,
+    rejected_max_freq_mhz: Option<u32>,
+    rejected_max_voltage_mv: Option<u32>,
+    cluster_point_count: usize,
+    cluster_v_min_mv: u32,
+    cluster_v_max_mv: u32,
+    cluster_f_min_mhz: u32,
+    cluster_f_max_mhz: u32,
+    outliers_above_count: usize,
+    warnings: Vec<String>,
+}
+
+/// Derive the stock reference: generic sanity filter (stage 1) → select the contiguous core VF
+/// cluster (stage 2) → derive boost/sustained/safe_start from the CLUSTER TOP (never the global
+/// max of sane points, which can include isolated high-voltage outliers). FAILS CLOSED (`Err`)
+/// when no sane points remain, the cluster is too small/ambiguous, or a derived value exceeds a
+/// hard guard. Records rejected-point + cluster diagnostics and soft-limit warnings. Pure.
+#[cfg(windows)]
+fn derive_core_seed(curve: &[(usize, u32, u32)]) -> Result<CoreSeed, String> {
+    let raw_count = curve.len();
+    let sane = sane_core_points(curve);
+    let retained_count = sane.len();
+    let rejected_count = raw_count - retained_count;
+    let rejected_max_freq_mhz = curve
+        .iter()
+        .filter(|(_, mv, f)| !is_sane_core_point(*mv, *f))
+        .map(|(_, _, f)| *f)
+        .max();
+    let rejected_max_voltage_mv = curve
+        .iter()
+        .filter(|(_, mv, f)| !is_sane_core_point(*mv, *f))
+        .map(|(_, mv, _)| *mv)
+        .max();
+    if sane.is_empty() {
+        return Err(format!(
+            "no sane graphics-core VF points among {raw_count} read (rejected max freq={:?} MHz, \
+             max voltage={:?} mV) — failing closed; a GPU outside the sanity domain needs a code update",
+            rejected_max_freq_mhz, rejected_max_voltage_mv
+        ));
+    }
+    // Stage 2: select the real contiguous core cluster (fails closed if ambiguous/too small).
+    let cluster = select_core_cluster(&sane)?;
+    let stock_boost_max_mhz = cluster.f_max_mhz;
+    let safe_start_mv = cluster.v_max_mv;
+    // Isolated high-voltage sane points ABOVE the cluster top (e.g. a lone 1150 mV outlier).
+    let outliers_above_count = sane.iter().filter(|(_, mv, _)| *mv > cluster.v_max_mv).count();
+    // Defensive belt-and-suspenders (the filter + cluster already bound these).
+    if stock_boost_max_mhz > CORE_FREQ_HARD_MAX_MHZ {
+        return Err(format!(
+            "derived boost {stock_boost_max_mhz} MHz exceeds core hard max {CORE_FREQ_HARD_MAX_MHZ} — failing closed"
+        ));
+    }
+    if safe_start_mv > CORE_VF_HARD_MAX_MV {
+        return Err(format!(
+            "derived safe_start {safe_start_mv} mV exceeds core hard max {CORE_VF_HARD_MAX_MV} — failing closed"
+        ));
+    }
+    let mut warnings = Vec::new();
+    if stock_boost_max_mhz > CORE_FREQ_SOFT_WARN_MHZ {
+        warnings.push(format!(
+            "stock boost {stock_boost_max_mhz} MHz is above the soft-warn {CORE_FREQ_SOFT_WARN_MHZ} MHz"
+        ));
+    }
+    if safe_start_mv > CORE_VF_SOFT_MAX_MV {
+        warnings.push(format!(
+            "safe_start {safe_start_mv} mV is above the soft max {CORE_VF_SOFT_MAX_MV} mV (allowed, flagged)"
+        ));
+    }
+    if outliers_above_count > 0 {
+        warnings.push(format!(
+            "rejected {outliers_above_count} isolated high-voltage outlier(s) above the core cluster top ({safe_start_mv} mV)"
+        ));
+    }
+    Ok(CoreSeed {
+        stock_boost_max_mhz,
+        stock_sustained_mhz: stock_boost_max_mhz,
+        safe_start_mv,
+        raw_count,
+        retained_count,
+        rejected_count,
+        rejected_max_freq_mhz,
+        rejected_max_voltage_mv,
+        cluster_point_count: cluster.point_count,
+        cluster_v_min_mv: cluster.v_min_mv,
+        cluster_v_max_mv: cluster.v_max_mv,
+        cluster_f_min_mhz: cluster.f_min_mhz,
+        cluster_f_max_mhz: cluster.f_max_mhz,
+        outliers_above_count,
+        warnings,
+    })
+}
+
 /// Restore the GPU to stock: zero the core offset, clear the modern VF-curve offsets, and
 /// release any NVML clock cap. Idempotent; called on every exit path of the supervised run.
 #[cfg(windows)]
@@ -1619,11 +1813,19 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
         warn!("build-frontier: VF curve readback returned no points — aborting.");
         return;
     }
-    let bins: Vec<u32> = live.iter().map(|(_, mv, _)| *mv).collect();
-    let stock_boost_max = live.iter().map(|(_, _, f)| *f).max().unwrap_or(0);
-    // First-version approximation: without a heavy-load sample we treat the curve's top freq
-    // as the sustained reference (the dwells measure the real achieved clock anyway).
-    let stock_sustained = stock_boost_max;
+    // SANITY-DOMAIN GUARD (Phase 2B.2-b.3): derive the stock reference ONLY from sane
+    // graphics-core VF points — NEVER from the unfiltered global max, which can include
+    // non-core / memory-domain / spurious points (a 3060 Ti dry-run produced 7001 MHz /
+    // 1237 mV). Fail closed if no sane core points remain.
+    let seed = match derive_core_seed(&live) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("=== build-frontier ABORTED (fail-closed) ===");
+            println!("{e}");
+            warn!("build-frontier: {e}");
+            return;
+        }
+    };
 
     // One NON-LOAD telemetry snapshot for regime context. At idle this tends to read
     // Unconstrained; we CLAMP that to PowerLimited so the first supervised run never explores
@@ -1646,16 +1848,49 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
     };
 
     let targets = candidate_clocks(
-        stock_sustained,
-        stock_boost_max,
+        seed.stock_sustained_mhz,
+        seed.stock_boost_max_mhz,
         regime,
         FRONTIER_CLOCK_STEP_MHZ,
         FRONTIER_FLOOR_FRAC,
     );
-    let descent = derive_descent(&bins, FRONTIER_LOWEST_SAFE_MV, FRONTIER_VOLT_STEP_MV);
+    // Defensive: a sane seed cannot produce an out-of-range target, but fail closed if it ever does.
+    if targets.iter().any(|&t| t > CORE_FREQ_HARD_MAX_MHZ) {
+        println!("=== build-frontier ABORTED (fail-closed) ===");
+        println!("candidate target exceeds core hard max {CORE_FREQ_HARD_MAX_MHZ} MHz: {targets:?}");
+        warn!("build-frontier: candidate target > {CORE_FREQ_HARD_MAX_MHZ} MHz — failing closed");
+        return;
+    }
+    let descent = FrontierDescent {
+        safe_start_mv: seed.safe_start_mv,
+        voltage_step_mv: FRONTIER_VOLT_STEP_MV,
+        lowest_safe_mv: FRONTIER_LOWEST_SAFE_MV,
+    };
     let plan = plan_frontier(targets.clone(), &descent, DWELL_MS);
 
     println!("=== build-frontier PLAN (dry-run preview) ===");
+    println!(
+        "VF points          : {} read, {} sane-core retained, {} rejected",
+        seed.raw_count, seed.retained_count, seed.rejected_count
+    );
+    println!(
+        "rejected extremes  : max freq {:?} MHz, max voltage {:?} mV (non-core / implausible)",
+        seed.rejected_max_freq_mhz, seed.rejected_max_voltage_mv
+    );
+    println!(
+        "core cluster       : {} pts, {}..{} mV, {}..{} MHz (selected stock core VF domain)",
+        seed.cluster_point_count, seed.cluster_v_min_mv, seed.cluster_v_max_mv,
+        seed.cluster_f_min_mhz, seed.cluster_f_max_mhz
+    );
+    println!(
+        "outliers above     : {} sane point(s) above the cluster top (isolated high-V, rejected)",
+        seed.outliers_above_count
+    );
+    println!(
+        "stock reference    : boost~{} MHz, sustained~{} MHz (from core cluster top)",
+        seed.stock_boost_max_mhz, seed.stock_sustained_mhz
+    );
+    println!("safe_start source  : stock core cluster top ({} mV)", seed.safe_start_mv);
     println!("targets (MHz)      : {:?}", plan.targets);
     println!(
         "voltage descent    : {} mV -> {} mV, step {} mV  ({} bins/descent)",
@@ -1666,12 +1901,28 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
         plan.est_dwell_count, plan.est_wall_secs
     );
     println!("regime             : raw={regime_raw:?} used={regime:?}");
+    if crate::gpu_apply::load_applied().is_some() {
+        println!(
+            "WARNING            : a profile appears applied (gpu_applied.json) — for STOCK frontier \
+             seeding, reset to stock and re-run the dry-run (numbers reflect the applied curve)."
+        );
+        warn!("build-frontier: a profile appears applied; reset to stock for accurate stock seeding");
+    }
+    for w in &seed.warnings {
+        println!("WARNING            : {w}");
+    }
     println!("SAFETY             : {}", plan.safety_notice);
     info!(
-        "build-frontier PLAN: targets={:?} {}..{} mV step {} bins/descent={} est_dwells={} \
-         est_wall_s={} regime_raw={:?} regime_used={:?} confirm={}",
-        plan.targets, plan.safe_start_mv, plan.lowest_safe_mv, plan.voltage_step_mv,
-        plan.bins_per_descent, plan.est_dwell_count, plan.est_wall_secs, regime_raw, regime, confirm
+        "build-frontier PLAN: raw={} sane={} rejected={} rej_max_freq={:?} rej_max_mv={:?} \
+         cluster_pts={} cluster_v={}..{} cluster_f={}..{} outliers_above={} boost~{} targets={:?} \
+         {}..{} mV step {} bins/descent={} est_dwells={} est_wall_s={} regime_raw={:?} \
+         regime_used={:?} confirm={}",
+        seed.raw_count, seed.retained_count, seed.rejected_count, seed.rejected_max_freq_mhz,
+        seed.rejected_max_voltage_mv, seed.cluster_point_count, seed.cluster_v_min_mv,
+        seed.cluster_v_max_mv, seed.cluster_f_min_mhz, seed.cluster_f_max_mhz,
+        seed.outliers_above_count, seed.stock_boost_max_mhz, plan.targets, plan.safe_start_mv,
+        plan.lowest_safe_mv, plan.voltage_step_mv, plan.bins_per_descent, plan.est_dwell_count,
+        plan.est_wall_secs, regime_raw, regime, confirm
     );
 
     if !confirm {
@@ -2457,6 +2708,111 @@ mod tests {
         assert_eq!(plan.est_wall_secs, 300); // 15 × (15000 + 5000) / 1000
         assert_eq!(plan.targets.len(), 3);
         assert!(plan.safety_notice.contains("SUPERVISED"));
+    }
+
+    // ── Phase 2B.2-b.3/b.4: core sanity filter + stock core VF cluster (pure) ─────
+    /// A dense, monotonic graphics-core VF cluster (freq rises 1:1 with mV above a base).
+    #[cfg(windows)]
+    fn dense_core(v_lo: u32, v_hi: u32, step: u32) -> Vec<(usize, u32, u32)> {
+        let mut out = Vec::new();
+        let (mut mv, mut i) = (v_lo, 0usize);
+        while mv <= v_hi {
+            out.push((i, mv, 1400 + (mv - v_lo)));
+            mv += step;
+            i += 1;
+        }
+        out
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sane_core_points_rejects_noncore_values() {
+        // Stage-1 generic filter rejects memory-domain garbage; keeps plausible core points.
+        let sane = sane_core_points(&[(0, 900, 1700), (1, 1237, 1900), (2, 900, 7001)]);
+        assert_eq!(sane.len(), 1); // only (900, 1700)
+        assert!(!is_sane_core_point(1237, 1900)); // voltage > hard max 1150
+        assert!(!is_sane_core_point(900, 7001)); // freq > hard max 3500
+        assert!(!is_sane_core_point(900, 0)); // zero freq
+        assert!(!is_sane_core_point(500, 1900)); // voltage < min 600
+        assert!(is_sane_core_point(700, 1600)); // plausible
+        assert!(is_sane_core_point(1075, 2200)); // plausible high-end
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cluster_rejects_isolated_high_voltage_outlier() {
+        // Dense core to 1075 mV PLUS a lone 1150 mV point (75 mV gap > 60) → outlier rejected;
+        // safe_start derives from the cluster top (1075), NOT the 1150 outlier.
+        let mut c = dense_core(700, 1075, 25); // 16 pts: 1075 mV / 1775 MHz top
+        c.push((99, 1150, 1850)); // isolated outlier
+        let seed = derive_core_seed(&c).unwrap();
+        assert_eq!(seed.safe_start_mv, 1075); // NOT 1150
+        assert_eq!(seed.stock_boost_max_mhz, 1775); // cluster top freq, NOT the 1850 outlier
+        assert_eq!(seed.cluster_point_count, 16);
+        assert_eq!(seed.outliers_above_count, 1);
+        assert!(seed.warnings.iter().any(|w| w.contains("outlier")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cluster_ending_at_1075_derives_1075() {
+        let seed = derive_core_seed(&dense_core(700, 1075, 25)).unwrap();
+        assert_eq!(seed.safe_start_mv, 1075);
+        assert_eq!(seed.outliers_above_count, 0);
+        assert!(seed.warnings.is_empty()); // 1075 < soft max 1125, 1775 < soft-warn 3200
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cluster_legitimately_ending_at_1150_derives_1150() {
+        // A contiguous curve all the way to 1150 mV (no gap) → safe_start 1150, soft-max warned.
+        let seed = derive_core_seed(&dense_core(700, 1150, 25)).unwrap();
+        assert_eq!(seed.safe_start_mv, 1150);
+        assert!(seed.warnings.iter().any(|w| w.contains("soft max")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn derive_core_seed_fails_closed_when_empty_or_ambiguous() {
+        // No sane points at all (only memory garbage) → fail closed.
+        let only_bad: Vec<(usize, u32, u32)> = vec![(200, 1237, 7001), (201, 1300, 6800)];
+        assert!(derive_core_seed(&only_bad).is_err());
+        assert!(derive_core_seed(&[]).is_err());
+        // 3 widely-spaced sane points (gaps > 60 mV) → largest cluster = 1 < MIN(8) → fail closed.
+        let sparse: Vec<(usize, u32, u32)> = vec![(0, 700, 1500), (1, 820, 1600), (2, 950, 1700)];
+        assert!(derive_core_seed(&sparse).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn candidate_targets_seed_from_cluster_not_outlier() {
+        // Cluster boost 1775; the 1850-MHz / 1150-mV outlier and 7001-MHz garbage must not leak.
+        let mut c = dense_core(700, 1075, 25);
+        c.push((99, 1150, 1850));
+        c.push((200, 1237, 7001));
+        let seed = derive_core_seed(&c).unwrap();
+        assert_eq!(seed.stock_boost_max_mhz, 1775);
+        let targets = candidate_clocks(
+            seed.stock_sustained_mhz,
+            seed.stock_boost_max_mhz,
+            Regime::PowerLimited,
+            30,
+            0.90,
+        );
+        assert!(targets.iter().all(|&t| t <= CORE_FREQ_HARD_MAX_MHZ));
+        assert!(targets.iter().all(|&t| t <= 1775));
+        assert_eq!(targets.first().copied(), Some(1775));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn core_seed_diagnostics_report_cluster_range() {
+        let seed = derive_core_seed(&dense_core(700, 1075, 25)).unwrap();
+        assert_eq!((seed.cluster_v_min_mv, seed.cluster_v_max_mv), (700, 1075));
+        assert_eq!(seed.cluster_f_min_mhz, 1400);
+        assert_eq!(seed.cluster_f_max_mhz, 1775);
+        assert!(seed.cluster_point_count >= MIN_CORE_CLUSTER_POINTS);
+        assert_eq!((seed.raw_count, seed.retained_count), (16, 16));
     }
 
     #[cfg(windows)]
