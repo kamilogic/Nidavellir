@@ -1527,6 +1527,77 @@ const CORE_CLUSTER_GAP_MV: u32 = 60;
 #[cfg(windows)]
 const MIN_CORE_CLUSTER_POINTS: usize = 8;
 
+/// First-run limiter flags for the supervised `build-frontier` run (Phase 2B.2-c.0). All
+/// optional; `None` preserves the full default plan. Validated by `validate_limits`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FrontierLimits {
+    pub max_targets: Option<usize>,
+    pub max_probes: Option<u32>,
+    pub safe_start_cap_mv: Option<u32>,
+}
+
+/// Semantic validation of the limiter flags — FAIL CLOSED on absurd values. Pure + testable.
+#[cfg(windows)]
+fn validate_limits(l: &FrontierLimits, lowest_safe_mv: u32) -> Result<(), String> {
+    if l.max_targets == Some(0) {
+        return Err("--max-targets must be >= 1".into());
+    }
+    if l.max_probes == Some(0) {
+        return Err("--max-probes must be >= 1".into());
+    }
+    if let Some(cap) = l.safe_start_cap_mv {
+        if cap <= lowest_safe_mv {
+            return Err(format!(
+                "--safe-start-cap {cap} mV must be > the crash floor {lowest_safe_mv} mV"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply `--max-targets` (truncate to the top N) and `--safe-start-cap` (lower the descent start
+/// to the cap when it is below the derived cluster top, never below the floor, never raising it).
+/// Returns the effective `(targets, safe_start_mv)`. Pure + testable.
+#[cfg(windows)]
+fn apply_frontier_limits(
+    mut targets: Vec<u32>,
+    derived_safe_start_mv: u32,
+    lowest_safe_mv: u32,
+    limits: &FrontierLimits,
+) -> (Vec<u32>, u32) {
+    if let Some(n) = limits.max_targets {
+        targets.truncate(n);
+    }
+    let mut safe_start = derived_safe_start_mv;
+    if let Some(cap) = limits.safe_start_cap_mv {
+        if cap < safe_start {
+            safe_start = cap.max(lowest_safe_mv); // never below the floor; never raise above derived
+        }
+    }
+    (targets, safe_start)
+}
+
+/// Build the voltage soft-max warning, distinguishing the derived stock curve top from the
+/// effective (post `--safe-start-cap`) descent start. `None` when the curve top is within the
+/// soft max. Pure + testable.
+#[cfg(windows)]
+fn soft_max_voltage_warning(
+    curve_top_mv: u32,
+    effective_safe_start_mv: u32,
+    soft_max_mv: u32,
+) -> Option<String> {
+    if curve_top_mv <= soft_max_mv {
+        return None;
+    }
+    Some(if effective_safe_start_mv < curve_top_mv {
+        format!(
+            "curve top {curve_top_mv} mV exceeds soft max {soft_max_mv} mV; descent capped to {effective_safe_start_mv} mV"
+        )
+    } else {
+        format!("curve top {curve_top_mv} mV exceeds soft max {soft_max_mv} mV")
+    })
+}
+
 /// True iff a VF point is a plausible graphics-core point (within the sanity domain). Pure.
 #[cfg(windows)]
 fn is_sane_core_point(voltage_mv: u32, freq_mhz: u32) -> bool {
@@ -1668,11 +1739,9 @@ fn derive_core_seed(curve: &[(usize, u32, u32)]) -> Result<CoreSeed, String> {
             "stock boost {stock_boost_max_mhz} MHz is above the soft-warn {CORE_FREQ_SOFT_WARN_MHZ} MHz"
         ));
     }
-    if safe_start_mv > CORE_VF_SOFT_MAX_MV {
-        warnings.push(format!(
-            "safe_start {safe_start_mv} mV is above the soft max {CORE_VF_SOFT_MAX_MV} mV (allowed, flagged)"
-        ));
-    }
+    // NOTE: the voltage soft-max warning is emitted by `run_build_frontier` via
+    // `soft_max_voltage_warning`, where the effective (post --safe-start-cap) descent start is
+    // known — so it can distinguish the derived curve top from the capped descent start.
     if outliers_above_count > 0 {
         warnings.push(format!(
             "rejected {outliers_above_count} isolated high-voltage outlier(s) above the core cluster top ({safe_start_mv} mV)"
@@ -1802,7 +1871,7 @@ fn real_probe_step(
 /// dwells) and ALWAYS restores stock afterwards. It NEVER applies or persists a profile, and
 /// writes neither `forge_state.json` nor `gpu_knowledge.json`.
 #[cfg(windows)]
-pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
+pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: FrontierLimits) {
     use nidavellir_gpu_nvapi as gpu;
     if !gpu::vf_curve_supported() {
         warn!("build-frontier: modern VF curve API unsupported on this GPU/driver — aborting.");
@@ -1847,13 +1916,23 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
         regime_raw
     };
 
-    let targets = candidate_clocks(
+    // Validate first-run limiter flags (fail closed on absurd values).
+    if let Err(e) = validate_limits(&limits, FRONTIER_LOWEST_SAFE_MV) {
+        println!("=== build-frontier ABORTED (invalid limits) ===");
+        println!("{e}");
+        warn!("build-frontier: {e}");
+        return;
+    }
+    let raw_targets = candidate_clocks(
         seed.stock_sustained_mhz,
         seed.stock_boost_max_mhz,
         regime,
         FRONTIER_CLOCK_STEP_MHZ,
         FRONTIER_FLOOR_FRAC,
     );
+    // Apply first-run limiters: --max-targets truncation + --safe-start-cap.
+    let (targets, safe_start_mv) =
+        apply_frontier_limits(raw_targets, seed.safe_start_mv, FRONTIER_LOWEST_SAFE_MV, &limits);
     // Defensive: a sane seed cannot produce an out-of-range target, but fail closed if it ever does.
     if targets.iter().any(|&t| t > CORE_FREQ_HARD_MAX_MHZ) {
         println!("=== build-frontier ABORTED (fail-closed) ===");
@@ -1862,11 +1941,16 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
         return;
     }
     let descent = FrontierDescent {
-        safe_start_mv: seed.safe_start_mv,
+        safe_start_mv,
         voltage_step_mv: FRONTIER_VOLT_STEP_MV,
         lowest_safe_mv: FRONTIER_LOWEST_SAFE_MV,
     };
     let plan = plan_frontier(targets.clone(), &descent, DWELL_MS);
+    // Effective dwell budget after --max-probes (the run hard-stops at this many probes).
+    let capped_dwells = limits
+        .max_probes
+        .map_or(plan.est_dwell_count, |mp| plan.est_dwell_count.min(mp));
+    let capped_secs = capped_dwells as u64 * (DWELL_MS + PROBE_OVERHEAD_MS) / 1000;
 
     println!("=== build-frontier PLAN (dry-run preview) ===");
     println!(
@@ -1891,14 +1975,20 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
         seed.stock_boost_max_mhz, seed.stock_sustained_mhz
     );
     println!("safe_start source  : stock core cluster top ({} mV)", seed.safe_start_mv);
+    println!(
+        "limits             : max_targets={:?} max_probes={:?} safe_start_cap={:?}",
+        limits.max_targets, limits.max_probes, limits.safe_start_cap_mv
+    );
     println!("targets (MHz)      : {:?}", plan.targets);
     println!(
         "voltage descent    : {} mV -> {} mV, step {} mV  ({} bins/descent)",
         plan.safe_start_mv, plan.lowest_safe_mv, plan.voltage_step_mv, plan.bins_per_descent
     );
     println!(
-        "worst-case dwells  : {} (~{} s, no early stop)",
-        plan.est_dwell_count, plan.est_wall_secs
+        "worst-case dwells  : {} (~{} s, no early stop){}",
+        capped_dwells,
+        capped_secs,
+        if limits.max_probes.is_some() { " [capped by --max-probes]" } else { "" }
     );
     println!("regime             : raw={regime_raw:?} used={regime:?}");
     if crate::gpu_apply::load_applied().is_some() {
@@ -1911,6 +2001,13 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
     for w in &seed.warnings {
         println!("WARNING            : {w}");
     }
+    // Voltage soft-max warning with curve-top-vs-capped-descent context (Phase 2B.2-c.0 polish).
+    if let Some(w) =
+        soft_max_voltage_warning(seed.safe_start_mv, descent.safe_start_mv, CORE_VF_SOFT_MAX_MV)
+    {
+        println!("WARNING            : {w}");
+        warn!("build-frontier: {w}");
+    }
     println!("SAFETY             : {}", plan.safety_notice);
     info!(
         "build-frontier PLAN: raw={} sane={} rejected={} rej_max_freq={:?} rej_max_mv={:?} \
@@ -1921,8 +2018,8 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
         seed.rejected_max_voltage_mv, seed.cluster_point_count, seed.cluster_v_min_mv,
         seed.cluster_v_max_mv, seed.cluster_f_min_mhz, seed.cluster_f_max_mhz,
         seed.outliers_above_count, seed.stock_boost_max_mhz, plan.targets, plan.safe_start_mv,
-        plan.lowest_safe_mv, plan.voltage_step_mv, plan.bins_per_descent, plan.est_dwell_count,
-        plan.est_wall_secs, regime_raw, regime, confirm
+        plan.lowest_safe_mv, plan.voltage_step_mv, plan.bins_per_descent, capped_dwells,
+        capped_secs, regime_raw, regime, confirm
     );
 
     if !confirm {
@@ -1934,7 +2031,14 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
     warn!("build-frontier: CONFIRMED — supervised hardware run begins (game-power dwells; can TDR/reboot).");
     let policy = ForgePolicy::balanced();
     let abort = AtomicBool::new(false);
+    let probe_count = std::sync::atomic::AtomicU32::new(0);
     let probe = |target: u32, vbin: u32| {
+        // --max-probes hard stop: short-circuit (no hardware) once the budget is spent.
+        if let Some(mp) = limits.max_probes {
+            if probe_count.fetch_add(1, Ordering::SeqCst) >= mp {
+                return unverified_probe();
+            }
+        }
         real_probe_step(store, &abort, &descent, FRONTIER_VERIFY_TOL_MHZ, target, vbin)
     };
     let result = build_frontier(&targets, &descent, &policy, probe);
@@ -1971,7 +2075,7 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool) {
 
 /// Non-Windows stub — the frontier build is Windows-only (NVAPI/NVML).
 #[cfg(not(windows))]
-pub fn run_build_frontier(_store: &SafeLoopStore, _confirm: bool) {
+pub fn run_build_frontier(_store: &SafeLoopStore, _confirm: bool, _limits: FrontierLimits) {
     tracing::warn!("build-frontier is Windows-only");
 }
 
@@ -2765,10 +2869,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn cluster_legitimately_ending_at_1150_derives_1150() {
-        // A contiguous curve all the way to 1150 mV (no gap) → safe_start 1150, soft-max warned.
+        // A contiguous curve all the way to 1150 mV (no gap) → safe_start 1150. The voltage
+        // soft-max warning now lives in run_build_frontier (curve top vs capped descent), so it
+        // is no longer part of seed.warnings — see soft_max_warning_* tests below.
         let seed = derive_core_seed(&dense_core(700, 1150, 25)).unwrap();
         assert_eq!(seed.safe_start_mv, 1150);
-        assert!(seed.warnings.iter().any(|w| w.contains("soft max")));
+        assert_eq!(seed.outliers_above_count, 0);
     }
 
     #[cfg(windows)]
@@ -2813,6 +2919,97 @@ mod tests {
         assert_eq!(seed.cluster_f_max_mhz, 1775);
         assert!(seed.cluster_point_count >= MIN_CORE_CLUSTER_POINTS);
         assert_eq!((seed.raw_count, seed.retained_count), (16, 16));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn soft_max_warning_none_when_within_soft_max() {
+        assert!(soft_max_voltage_warning(1075, 1075, 1125).is_none());
+        assert!(soft_max_voltage_warning(1125, 1125, 1125).is_none()); // equal → no warning
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn soft_max_warning_above_soft_max_no_cap() {
+        // Curve top above soft max, descent NOT capped (effective == curve top) → curve-top only.
+        let w = soft_max_voltage_warning(1150, 1150, 1125).unwrap();
+        assert!(w.contains("curve top 1150"));
+        assert!(w.contains("soft max 1125"));
+        assert!(!w.contains("capped"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn soft_max_warning_above_soft_max_with_cap() {
+        // Curve top above soft max, descent capped below it → both values shown.
+        let w = soft_max_voltage_warning(1150, 1075, 1125).unwrap();
+        assert!(w.contains("curve top 1150"));
+        assert!(w.contains("soft max 1125"));
+        assert!(w.contains("capped to 1075"));
+    }
+
+    // ── Phase 2B.2-c.0: first-run limiter flags (pure) ───────────────────────────
+    #[cfg(windows)]
+    #[test]
+    fn validate_limits_fails_closed_on_absurd() {
+        let floor = FRONTIER_LOWEST_SAFE_MV; // 875
+        assert!(validate_limits(&FrontierLimits { max_targets: Some(0), ..Default::default() }, floor).is_err());
+        assert!(validate_limits(&FrontierLimits { max_probes: Some(0), ..Default::default() }, floor).is_err());
+        // cap at or below the crash floor → invalid.
+        assert!(validate_limits(&FrontierLimits { safe_start_cap_mv: Some(floor), ..Default::default() }, floor).is_err());
+        assert!(validate_limits(&FrontierLimits { safe_start_cap_mv: Some(floor - 1), ..Default::default() }, floor).is_err());
+        // cap above the floor → ok; defaults → ok.
+        assert!(validate_limits(&FrontierLimits { safe_start_cap_mv: Some(floor + 50), ..Default::default() }, floor).is_ok());
+        assert!(validate_limits(&FrontierLimits::default(), floor).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn apply_limits_truncates_targets_and_caps_safe_start() {
+        let limits = FrontierLimits { max_targets: Some(2), safe_start_cap_mv: Some(1075), ..Default::default() };
+        let (t, ss) = apply_frontier_limits(vec![1935, 1905, 1875, 1845], 1150, 875, &limits);
+        assert_eq!(t, vec![1935, 1905]); // top 2 kept
+        assert_eq!(ss, 1075); // capped below the derived 1150
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn apply_limits_cap_never_raises_and_defaults_preserve() {
+        // Cap ABOVE derived → no raise (keep derived).
+        let (_, ss) = apply_frontier_limits(
+            vec![1935],
+            1075,
+            875,
+            &FrontierLimits { safe_start_cap_mv: Some(1200), ..Default::default() },
+        );
+        assert_eq!(ss, 1075);
+        // No flags → targets + derived safe_start unchanged.
+        let (t, ss2) = apply_frontier_limits(vec![1935, 1905], 1150, 875, &FrontierLimits::default());
+        assert_eq!((t, ss2), (vec![1935, 1905], 1150));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn max_probes_caps_real_probe_execution() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        // Mirror run_build_frontier's --max-probes wrapper: cap real executions at 3.
+        let calls = AtomicU32::new(0);
+        let executed = AtomicU32::new(0);
+        let max = 3u32;
+        let probe = |target: u32, vbin: u32| {
+            if calls.fetch_add(1, SeqCst) >= max {
+                return unverified_probe(); // budget spent → short-circuit, no "hardware"
+            }
+            executed.fetch_add(1, SeqCst);
+            if vbin >= 900 {
+                stable_sample(target, 180.0, 0.95)
+            } else {
+                unstable_sample()
+            }
+        };
+        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 800 };
+        let _ = build_frontier(&[1935, 1905, 1875], &d, &ForgePolicy::balanced(), probe);
+        assert_eq!(executed.load(SeqCst), max); // exactly 3 real probes ran before the cap
     }
 
     #[cfg(windows)]

@@ -15,6 +15,16 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **F1b Phase 2B.2-c.0 — first-run limiter flags (2026-06-08) — IMPLEMENTED, not pushed**: added
+  `build-frontier` flags `--max-targets N` / `--max-probes N` / `--safe-start-cap MV` to bound the
+  first supervised run. Pure `FrontierLimits`/`validate_limits`/`apply_frontier_limits`
+  (gpu_power_sweep) + `parse_frontier_limits` (main.rs). FAIL CLOSED on absurd values (0 / cap ≤
+  crash floor / non-numeric / missing); cap never raises above the derived top nor below the floor;
+  max-probes short-circuits remaining probes then resets to stock. Defaults preserve the full plan.
+  No IPC/core/contract/apps-ui/Safe-Loop/persistence change, no hardware. `cargo check` clean ·
+  service **95/95** (+7) · core 46/46. Files: `gpu_power_sweep.rs`, `main.rs`. **Dry-run QA**
+  (`--max-targets 1 --max-probes 6 --safe-start-cap 1075`, stock, no --confirm, no state writes):
+  targets=[1935], descent 1075→875 (9 bins), 6 dwells (~120 s capped). --confirm still forbidden.
 - **F1b Phase 2B.2-b.4 — stock core VF cluster seeding (2026-06-07) — IMPLEMENTED, not pushed**:
   refines b.3 so `safe_start`/boost come from the actual contiguous core VF cluster, not the global
   max of sane points (which gave 1150 mV). `select_core_cluster` (pure): sort by voltage, split on

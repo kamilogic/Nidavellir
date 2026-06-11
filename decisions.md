@@ -2,6 +2,24 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 2B.2-c.0: first-run limiter flags for build-frontier
+- **Decision** (2026-06-08): bound the first supervised hardware run so it validates the pipeline
+  without the full 84-dwell plan. Added `build-frontier` flags: `--max-targets N` (truncate to the
+  top N targets), `--max-probes N` (hard-stop total probe executions), `--safe-start-cap MV` (lower
+  the descent start to the cap when below the derived cluster top).
+- **Semantics**: dry-run + confirmed both honor the flags; defaults (no flags) preserve the full
+  plan. `--safe-start-cap` never raises above the derived top and never goes below the crash floor.
+  FAIL CLOSED on absurd values (max-targets/max-probes = 0; cap ≤ crash floor; non-numeric/missing).
+  `--max-probes` short-circuits remaining probes (no hardware), then the run resets to stock + clears
+  the Safe Loop flag (no auto-apply, no `forge_state`/`gpu_knowledge` writes).
+- **Pure helpers**: `FrontierLimits` / `validate_limits` / `apply_frontier_limits` (gpu_power_sweep);
+  `parse_frontier_limits` (main.rs). Dry-run prints a `limits` line + the capped dwell budget.
+- **Scope**: `gpu_power_sweep.rs` + `main.rs` only. No IPC/contract/core/`apps/ui`/Safe-Loop/
+  `gpu_apply`/`nvml_gpu`/Phase-3/11D change, no hardware. `cargo check` clean; service 95/95 (+7),
+  core 46/46. **Dry-run QA** (`--max-targets 1 --max-probes 6 --safe-start-cap 1075`, stock, no
+  --confirm, no state writes): targets=[1935], descent 1075→875 mV (9 bins), 6 dwells (~120 s,
+  capped). `--confirm` remains forbidden.
+
 ## F1b Phase 2B.2-b.4: derive safe_start from the stock core VF cluster (refines b.3)
 - **Decision** (2026-06-07): b.3's generic guard rejected absurd values (7001 MHz, 1237 mV) but
   still let `safe_start` come from the global max of *all* sane points — which on the 3060 Ti was

@@ -3,7 +3,30 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.4: stock core VF cluster seeding (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-08) — F1b Phase 2B.2-c.0: first-run limiter flags (IMPLEMENTED, not pushed)
+- **Bounded first run.** `build-frontier` gains `--max-targets N`, `--max-probes N`,
+  `--safe-start-cap MV` so the first supervised QA validates the pipeline without the full 84-dwell
+  plan. Dry-run + confirmed both honor them; defaults preserve the full plan.
+- **Behavior**: `--max-targets` truncates to the top N; `--safe-start-cap` lowers the descent start
+  to the cap when below the derived cluster top (never raises above it, never below the crash floor);
+  `--max-probes` hard-stops total probe executions (short-circuits remaining, then resets to stock +
+  clears the flag). FAIL CLOSED on absurd values (0; cap ≤ crash floor; non-numeric/missing).
+- **Pure helpers**: `FrontierLimits` / `validate_limits` / `apply_frontier_limits` (gpu_power_sweep);
+  `parse_frontier_limits` (main.rs). Dry-run prints a `limits` line + the capped dwell budget.
+- **Files**: `crates/service/src/gpu_power_sweep.rs`, `crates/service/src/main.rs`. **No IPC/contract/
+  core/apps-ui/Safe-Loop/gpu_apply/nvml_gpu/Phase-3/11D change; no auto-apply; no persistence; no
+  hardware.**
+- **Tests**: `cargo check` clean · service **95/95** (+7: validate/apply/max-probes-cap + 3 parse
+  tests) · core 46/46.
+- **Dry-run QA** (stock, no --confirm, no state-file writes — mtimes unchanged):
+  `build-frontier --max-targets 1 --max-probes 6 --safe-start-cap 1075` → targets=[1935],
+  descent 1075→875 mV (9 bins), 6 dwells (~120 s, capped by --max-probes). NB: the soft-max warning
+  still cites the derived cluster top (1150 mV) even when --safe-start-cap lowers the effective start
+  (1075) — accurate about the curve, cosmetic next to the capped descent.
+- **Next — Phase 2B.2-c (supervised hardware QA, separately gated)**: a bounded `--confirm` run
+  (e.g. the flags above) with the user present and able to reboot. 11D deferred to after Phase 2B.
+
+## Backend checkpoint (2026-06-07) — F1b Phase 2B.2-b.4: stock core VF cluster seeding (IMPLEMENTED, not pushed)
 - **Refines b.3.** b.3's generic guard rejected absurd values but still let `safe_start` = global max
   of all sane points (1150 mV on the 3060 Ti — the hard-cap boundary / a non-core point). b.4 derives
   safe_start/boost from the actual contiguous core VF cluster instead.

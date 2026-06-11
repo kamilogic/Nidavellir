@@ -85,6 +85,39 @@ fn has_confirm_flag(args: &[OsString]) -> bool {
     args.iter().any(|a| a.to_string_lossy() == "--confirm")
 }
 
+/// Parse the first-run limiter flags (`--max-targets N`, `--max-probes N`, `--safe-start-cap MV`).
+/// Syntax-only: missing/non-numeric values FAIL CLOSED (`Err`). Semantic checks (0 values,
+/// cap vs crash floor) happen in `gpu_power_sweep::run_build_frontier`. Pure (unit-testable).
+fn parse_frontier_limits(args: &[OsString]) -> Result<gpu_power_sweep::FrontierLimits, String> {
+    let strs: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    let mut limits = gpu_power_sweep::FrontierLimits::default();
+    let mut i = 0;
+    while i < strs.len() {
+        match strs[i].as_str() {
+            "--max-targets" => {
+                let v = strs.get(i + 1).ok_or_else(|| "--max-targets needs a value".to_string())?;
+                limits.max_targets =
+                    Some(v.parse().map_err(|_| format!("--max-targets: invalid number '{v}'"))?);
+                i += 2;
+            }
+            "--max-probes" => {
+                let v = strs.get(i + 1).ok_or_else(|| "--max-probes needs a value".to_string())?;
+                limits.max_probes =
+                    Some(v.parse().map_err(|_| format!("--max-probes: invalid number '{v}'"))?);
+                i += 2;
+            }
+            "--safe-start-cap" => {
+                let v = strs.get(i + 1).ok_or_else(|| "--safe-start-cap needs a value".to_string())?;
+                limits.safe_start_cap_mv =
+                    Some(v.parse().map_err(|_| format!("--safe-start-cap: invalid number '{v}'"))?);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(limits)
+}
+
 /// Supervised console entry for the F1b multi-clock frontier (`build-frontier`). WITHOUT
 /// `--confirm` it is a read-only DRY-RUN that only prints the plan (no hardware). WITH
 /// `--confirm` it runs startup recovery (parachute) FIRST, then the real supervised hardware
@@ -92,6 +125,14 @@ fn has_confirm_flag(args: &[OsString]) -> bool {
 /// applies or persists a profile.
 fn run_build_frontier_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     let confirm = has_confirm_flag(args);
+    let limits = match parse_frontier_limits(args) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("build-frontier: invalid flags: {e}");
+            println!("build-frontier: invalid flags: {e}");
+            return Ok(()); // clean exit, no hardware
+        }
+    };
     let store = SafeLoopStore::system();
     if confirm {
         tracing::warn!(
@@ -101,7 +142,7 @@ fn run_build_frontier_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::E
     } else {
         tracing::info!("build-frontier: dry-run (pass --confirm to execute the supervised hardware run)");
     }
-    gpu_power_sweep::run_build_frontier(&store, confirm);
+    gpu_power_sweep::run_build_frontier(&store, confirm, limits);
     Ok(())
 }
 
@@ -120,6 +161,30 @@ mod cli_tests {
         assert!(has_confirm_flag(&os(&["build-frontier", "--confirm"])));
         assert!(has_confirm_flag(&os(&["build-frontier", "--confirm", "x"])));
         assert!(!has_confirm_flag(&os(&["build-frontier", "confirm"]))); // must be the flag form
+    }
+
+    #[test]
+    fn parse_limits_reads_all_flags() {
+        let l = super::parse_frontier_limits(&os(&[
+            "build-frontier", "--max-targets", "1", "--max-probes", "6", "--safe-start-cap", "1075",
+        ]))
+        .unwrap();
+        assert_eq!(l.max_targets, Some(1));
+        assert_eq!(l.max_probes, Some(6));
+        assert_eq!(l.safe_start_cap_mv, Some(1075));
+    }
+
+    #[test]
+    fn parse_limits_defaults_when_absent() {
+        let l = super::parse_frontier_limits(&os(&["build-frontier"])).unwrap();
+        assert_eq!(l, crate::gpu_power_sweep::FrontierLimits::default());
+    }
+
+    #[test]
+    fn parse_limits_rejects_nonnumeric_and_missing_value() {
+        assert!(super::parse_frontier_limits(&os(&["build-frontier", "--max-targets", "abc"])).is_err());
+        assert!(super::parse_frontier_limits(&os(&["build-frontier", "--max-probes"])).is_err());
+        assert!(super::parse_frontier_limits(&os(&["build-frontier", "--safe-start-cap", "x"])).is_err());
     }
 }
 
