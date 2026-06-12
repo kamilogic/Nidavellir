@@ -88,6 +88,41 @@ Performance gains are never worth risking user trust.
 
 ---
 
+## Nidavellir Project Agents
+
+Specialized project agents live under `.claude/agents/`. Prefer them when a task clearly matches their role, but keep delegation minimal.
+
+General rules:
+
+- Prefer a project agent when the task clearly matches its role; otherwise proceed normally.
+- Keep delegation minimal. Do not spawn workflows or multiple agents unless the task genuinely needs it.
+- Use at most one writer agent at a time.
+- Never let agents bypass safety rules.
+- Never run `--confirm`, hardware writes, VF curve writes, GPU stress, power sweep, profile apply, commit, or push unless the user explicitly approves that exact step.
+- Dynamic workflows / Ultracode are optional — use them only for genuinely multi-phase, safety-critical tasks.
+
+Agent routing:
+
+- **Discovery** — locating files, functions, tests, docs, or call sites:
+  use `nidavellir-context-scout`.
+- **Safety audit** — VF curve, Safe Loop, reset-to-stock, verifier semantics, build-frontier `--confirm`, crash/TDR/reboot, or persistence:
+  use `nidavellir-safety-auditor`.
+- **Implementation** — approved changes once the plan is clear:
+  use `nidavellir-code-surgeon`.
+- **Validation** — cargo check/test, diff stats, logs, build failures:
+  use `nidavellir-test-runner`.
+- **Git** — mechanical Git work after approval:
+  use `nidavellir-git-janitor`.
+
+Prompt behavior:
+
+- For ordinary tasks, Claude may choose the appropriate project agent automatically.
+- For safety-critical tasks, prefer explicit delegation to the relevant project agent.
+- If no agent is needed, proceed normally — do not use agents just to look busy or to produce long reports.
+- Keep responses compact and return only the relevant summary from agents.
+
+---
+
 ## Versioning and Release Metadata
 
 Never bump versions as part of a feature commit unless the user explicitly asks for a release/versioning pass.
