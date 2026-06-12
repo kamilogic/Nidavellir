@@ -730,6 +730,189 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
     }
 }
 
+// ── Legit-zero diagnostic foundation (read-only; NEVER feeds the verdict) ─────────────
+// Joins the PRE-WRITE stock write-plan with the POST-WRITE offset readback so a failed
+// probe can be inspected: are the zero-offset bins legitimately-zero (stock base already
+// at target) or an unexplained gap / reverted high bin? Classification is diagnostic ONLY
+// and is gated on having BOTH the stock write-plan AND the post-write offset — never
+// post-write data alone. It does not change `classify_curve`, the 0.90 threshold, or the
+// StockEquivalentCeiling path.
+
+/// Per-bin diagnostic classification for a failed probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinDiagClass {
+    /// Post-write offset is non-zero → the flatten is present on this bin.
+    Flattened,
+    /// Post-write offset is zero AND the stock write-plan wanted ~zero AND the stock base
+    /// is target-like → a LEGITIMATE-zero candidate (the future fix may count it as covered).
+    LegitZeroCandidate,
+    /// Post-write offset is zero but the stock base is NOT target-like → a real gap: the
+    /// flatten is missing on a bin that should carry a pull-down (skip / revert / contamination).
+    UnexplainedZero,
+    /// Post-write offset readback failed → cannot classify.
+    Unreadable,
+}
+
+/// One bin's row in the failed-probe diagnostic window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BinDiagRow {
+    pub(crate) index: usize,
+    pub(crate) voltage_mv: u32,
+    pub(crate) stock_base_mhz: u32,
+    pub(crate) desired_offset_mhz: i32,
+    pub(crate) post_offset_khz: Option<i32>,
+    pub(crate) class: BinDiagClass,
+}
+
+/// Classify ONE expected (flatten-set) bin. A zero post-write offset is a legit-zero
+/// candidate ONLY when the stock write-plan also wanted ~zero (`|desired| <= tol`) AND the
+/// stock base reads target-like (`|base - target| <= tol`) — both, never post-write alone.
+fn classify_bin_diag(
+    plan: &nidavellir_gpu_nvapi::VfWritePlanEntry,
+    post_offset_khz: Option<i32>,
+    target_mhz: u32,
+    tol_mhz: u32,
+) -> BinDiagClass {
+    match post_offset_khz {
+        None => BinDiagClass::Unreadable,
+        Some(o) if o != 0 => BinDiagClass::Flattened,
+        Some(_) => {
+            let desired_zeroish = plan.desired_offset_mhz.unsigned_abs() <= tol_mhz;
+            let base_targetish = plan.base_mhz.abs_diff(target_mhz) <= tol_mhz;
+            if desired_zeroish && base_targetish {
+                BinDiagClass::LegitZeroCandidate
+            } else {
+                BinDiagClass::UnexplainedZero
+            }
+        }
+    }
+}
+
+/// Read-only summary of a failed probe's flatten set.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FailedProbeDiag {
+    pub(crate) expected_n: u32,
+    pub(crate) non_zero_offsets: u32,
+    pub(crate) zero_offsets: u32,
+    pub(crate) legit_zero_candidates: u32,
+    pub(crate) unexplained_zeros: u32,
+    pub(crate) unreadable: u32,
+    pub(crate) first_unexplained_bin: Option<usize>,
+    /// Per-bin rows within the `[window_lo_mv, window_hi_mv]` ceiling window, in curve order.
+    pub(crate) window: Vec<BinDiagRow>,
+}
+
+/// Pure: join the stock write-plan (flatten-set bins) with the post-write offset readback
+/// and summarize. `post_offsets` maps bin index → post-write offset (kHz, `None` if the
+/// readback failed). Inspects ONLY bins at/above the ceiling. Never mutates classification.
+fn summarize_failed_probe(
+    plan: &[nidavellir_gpu_nvapi::VfWritePlanEntry],
+    post_offsets: &[(usize, Option<i32>)],
+    target_mhz: u32,
+    tol_mhz: u32,
+    window_lo_mv: u32,
+    window_hi_mv: u32,
+) -> FailedProbeDiag {
+    let lookup = |idx: usize| {
+        post_offsets
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .and_then(|(_, o)| *o)
+    };
+    let mut d = FailedProbeDiag {
+        expected_n: 0,
+        non_zero_offsets: 0,
+        zero_offsets: 0,
+        legit_zero_candidates: 0,
+        unexplained_zeros: 0,
+        unreadable: 0,
+        first_unexplained_bin: None,
+        window: Vec::new(),
+    };
+    for entry in plan.iter().filter(|e| e.in_flatten_set) {
+        d.expected_n += 1;
+        let post = lookup(entry.index);
+        let class = classify_bin_diag(entry, post, target_mhz, tol_mhz);
+        match class {
+            BinDiagClass::Flattened => d.non_zero_offsets += 1,
+            BinDiagClass::LegitZeroCandidate => {
+                d.zero_offsets += 1;
+                d.legit_zero_candidates += 1;
+            }
+            BinDiagClass::UnexplainedZero => {
+                d.zero_offsets += 1;
+                d.unexplained_zeros += 1;
+                if d.first_unexplained_bin.is_none() {
+                    d.first_unexplained_bin = Some(entry.index);
+                }
+            }
+            BinDiagClass::Unreadable => d.unreadable += 1,
+        }
+        if entry.voltage_mv >= window_lo_mv && entry.voltage_mv <= window_hi_mv {
+            d.window.push(BinDiagRow {
+                index: entry.index,
+                voltage_mv: entry.voltage_mv,
+                stock_base_mhz: entry.base_mhz,
+                desired_offset_mhz: entry.desired_offset_mhz,
+                post_offset_khz: post,
+                class,
+            });
+        }
+    }
+    d
+}
+
+impl FailedProbeDiag {
+    /// Compact single-line rendering for the failed-probe log.
+    pub(crate) fn fmt_compact(&self) -> String {
+        let win: Vec<String> = self
+            .window
+            .iter()
+            .map(|r| {
+                let post = r
+                    .post_offset_khz
+                    .map_or_else(|| "none".to_string(), |o| format!("{:+}", o / 1000));
+                format!(
+                    "[{} {}mV base={} want={:+} post={} {:?}]",
+                    r.index, r.voltage_mv, r.stock_base_mhz, r.desired_offset_mhz, post, r.class
+                )
+            })
+            .collect();
+        format!(
+            "expected={} non_zero={} zero={} legit_zero_candidates={} unexplained_zeros={} \
+             unreadable={} first_unexplained_bin={:?} window(850..950mV)={}",
+            self.expected_n,
+            self.non_zero_offsets,
+            self.zero_offsets,
+            self.legit_zero_candidates,
+            self.unexplained_zeros,
+            self.unreadable,
+            self.first_unexplained_bin,
+            win.join(" ")
+        )
+    }
+}
+
+/// Read-only failed-probe diagnostic entry point: build the stock write-plan preview, read
+/// back the GET-control offsets for the flatten set (read-only), and return a compact log
+/// line. `stock_curve` is the once-per-run pre-write stock curve (NOT the contaminated
+/// per-probe read). NEVER writes, applies, or changes the verdict.
+#[cfg(windows)]
+pub(crate) fn failed_probe_diag_line(
+    stock_curve: &[(usize, u32, u32)],
+    ceiling_mv: u32,
+    target_mhz: u32,
+    tol_mhz: u32,
+) -> String {
+    let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(stock_curve, ceiling_mv, target_mhz);
+    let post_offsets: Vec<(usize, Option<i32>)> = plan
+        .iter()
+        .filter(|e| e.in_flatten_set)
+        .map(|e| (e.index, nidavellir_gpu_nvapi::vf_get_point_khz(e.index)))
+        .collect();
+    summarize_failed_probe(&plan, &post_offsets, target_mhz, tol_mhz, 850, 950).fmt_compact()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1245,5 +1428,76 @@ mod tests {
         assert_eq!(effective_status(VerifiedCurve, TelemetryInsufficient), "verified_curve");
         assert_eq!(effective_status(LiveMismatch, VerifiedUnderLoad), "live_mismatch");
         assert_eq!(effective_status(LiveMismatch, NotEvaluated), "live_mismatch");
+    }
+
+    // ── Legit-zero diagnostic foundation (pure; never affects the verdict) ────────
+    #[test]
+    fn diag_labels_legit_zero_but_verdict_unchanged() {
+        // 9 flatten-set bins: 8 carry pull-down offsets, 1 is a legit zero (base==target).
+        // classify_curve verdict: 8/9 = 0.889 < 0.9 → LiveMismatch — UNCHANGED by diagnostics.
+        let target = 1755;
+        let mut evidence: Vec<PointEvidence> =
+            (0..8).map(|i| evx(60 + i, 1000, Some(-100_000), 1830)).collect();
+        evidence.push(evx(68, 900, Some(0), 1755)); // legit zero: already at target
+        let (state, present, _, n) = classify_curve(target, &evidence, TOL_MHZ);
+        assert_eq!(state, CurveVerification::LiveMismatch);
+        assert_eq!((present, n), (8, 9));
+
+        // Diagnostic over the stock write-plan: bin 68 is a legit-zero CANDIDATE (label only).
+        let stock: Vec<(usize, u32, u32)> = (60..68)
+            .map(|i| (i, 1000u32, 1890u32))
+            .chain([(68usize, 900u32, 1755u32)])
+            .collect();
+        let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(&stock, 900, target);
+        let post: Vec<(usize, Option<i32>)> = (60..68)
+            .map(|i| (i, Some(-100_000)))
+            .chain([(68usize, Some(0))])
+            .collect();
+        let d = summarize_failed_probe(&plan, &post, target, TOL_MHZ, 850, 950);
+        assert_eq!(d.expected_n, 9);
+        assert_eq!(d.non_zero_offsets, 8);
+        assert_eq!(d.legit_zero_candidates, 1);
+        assert_eq!(d.unexplained_zeros, 0);
+        assert_eq!(d.first_unexplained_bin, None);
+    }
+
+    #[test]
+    fn diag_unexplained_zero_flags_first_bin() {
+        // A zero post-write offset on a bin whose stock base is NOT target-like is a real gap.
+        let target = 1755;
+        let stock = vec![(70usize, 1000u32, 1890u32), (71, 1000, 1890)];
+        let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(&stock, 900, target);
+        let post = vec![(70usize, Some(0)), (71, Some(-100_000))];
+        let d = summarize_failed_probe(&plan, &post, target, TOL_MHZ, 850, 950);
+        assert_eq!(d.unexplained_zeros, 1);
+        assert_eq!(d.first_unexplained_bin, Some(70)); // base 1890 ≠ target, post 0
+        assert_eq!(d.non_zero_offsets, 1);
+        assert_eq!(d.legit_zero_candidates, 0);
+    }
+
+    #[test]
+    fn diag_excludes_below_ceiling_and_marks_unreadable() {
+        let target = 1755;
+        // 800 mV bin is below the 900 mV ceiling → excluded from the flatten-set summary.
+        let stock = vec![(80usize, 800u32, 1700u32), (81, 950, 1800)];
+        let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(&stock, 900, target);
+        let post = vec![(81usize, None)]; // 80 below ceiling; 81 readback failed
+        let d = summarize_failed_probe(&plan, &post, target, TOL_MHZ, 850, 950);
+        assert_eq!(d.expected_n, 1); // only the 950 mV bin is in the flatten set
+        assert_eq!(d.unreadable, 1);
+        assert_eq!(d.non_zero_offsets, 0);
+        assert_eq!(d.legit_zero_candidates, 0);
+    }
+
+    #[test]
+    fn diag_classify_bin_requires_both_plan_and_post_zero() {
+        let target = 1755;
+        let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(&[(5usize, 900u32, 1755u32)], 900, target);
+        // post non-zero → Flattened regardless of plan.
+        assert_eq!(classify_bin_diag(&plan[0], Some(-30_000), target, TOL_MHZ), BinDiagClass::Flattened);
+        // post zero + plan wants ~zero + base target-like → legit candidate.
+        assert_eq!(classify_bin_diag(&plan[0], Some(0), target, TOL_MHZ), BinDiagClass::LegitZeroCandidate);
+        // post unreadable → Unreadable.
+        assert_eq!(classify_bin_diag(&plan[0], None, target, TOL_MHZ), BinDiagClass::Unreadable);
     }
 }

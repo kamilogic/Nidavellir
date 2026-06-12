@@ -1813,6 +1813,7 @@ fn real_probe_step(
     target: u32,
     vbin: u32,
     stock_top_mhz: u32,
+    stock_curve: &[(usize, u32, u32)],
 ) -> ProbeSample {
     use nidavellir_gpu_nvapi as gpu;
     // 1. abort / boundary guards — no hardware.
@@ -1859,6 +1860,17 @@ fn real_probe_step(
         eval.diag.max_target_overshoot_mhz
     );
     if !verified {
+        // Read-only failed-probe diagnostic BEFORE reset (registers still hold the write).
+        // Joins the once-per-run STOCK write-plan with the post-write offset readback to
+        // label legit-zero candidates vs unexplained gaps. Diagnostic ONLY — no verdict change.
+        let diag = crate::gpu_verify::failed_probe_diag_line(stock_curve, ceiling_mv, target, tol_mhz);
+        info!(
+            "build-frontier probe DIAG (read-only, no verdict change): target={target} \
+             ceiling_mv={ceiling_mv} ceiling_idx={ceiling_idx} plateau={:?}..{:?} \
+             overshoot={:?} undershoot={:?} | {diag}",
+            eval.diag.getstatus_plateau_min_mhz, eval.diag.getstatus_plateau_max_mhz,
+            eval.diag.max_target_overshoot_mhz, eval.diag.max_target_undershoot_mhz,
+        );
         // The ceiling did not take — don't dwell; stop this clock's descent.
         reset_to_stock();
         let _ = store.clear_boot_flag();
@@ -2055,7 +2067,7 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         }
         real_probe_step(
             store, &abort, &descent, FRONTIER_VERIFY_TOL_MHZ, target, vbin,
-            seed.stock_boost_max_mhz,
+            seed.stock_boost_max_mhz, &live,
         )
     };
     let result = build_frontier(&targets, &descent, &policy, probe);

@@ -518,12 +518,89 @@ pub fn nearest_vf_bin_at_or_above(
         .map(|&(idx, mv, _)| (idx, mv))
 }
 
+/// Classification of one VF-curve bin under a flatten-ceiling write plan. Pure /
+/// diagnostic — lets a failed-probe analysis distinguish a legitimately-zero offset
+/// (a bin already at target) from an elastic below-ceiling bin or a real pull-down,
+/// WITHOUT post-write data alone deciding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfBinClass {
+    /// Below the ceiling — left elastic (offset 0 by design, NOT part of the flatten set).
+    BelowCeiling,
+    /// At/above the ceiling, stock base above target → needs a negative (pull-down) offset.
+    FlattenDown,
+    /// At/above the ceiling, stock base below target → needs a positive (raise) offset.
+    FlattenUp,
+    /// At/above the ceiling, stock base already at target → desired offset is legitimately 0.
+    AlreadyAtTarget,
+}
+
+/// One bin's entry in a flatten-ceiling write plan. Pure data; carries everything the
+/// apply path writes and the read-only failed-probe diagnostic inspects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VfWritePlanEntry {
+    pub index: usize,
+    pub voltage_mv: u32,
+    pub base_mhz: u32,
+    /// `target - base` for bins at/above the ceiling, else 0 (below-ceiling bins stay elastic).
+    pub desired_offset_mhz: i32,
+    pub below_ceiling: bool,
+    /// At/above the ceiling → part of the intended flatten set.
+    pub in_flatten_set: bool,
+    pub desired_offset_is_zero: bool,
+    pub class: VfBinClass,
+}
+
+/// Pure preview of the Afterburner-style VF-ceiling transform: for every point in
+/// `curve`, compute the per-point frequency offset [`apply_vf_ceiling`] would write,
+/// WITHOUT touching hardware. Points with voltage ≥ `ceiling_mv` are flattened to
+/// `target_mhz` (offset `target - base`); lower-voltage points stay elastic (offset 0).
+/// Preserves `curve` order. This is the single source of transform truth shared by the
+/// real apply and the read-only diagnostic. Pure + deterministic + unit-testable; takes
+/// the `(index, voltage_mv, freq_mhz)` shape returned by [`read_vf_curve_modern`].
+pub fn plan_vf_ceiling(
+    curve: &[(usize, u32, u32)],
+    ceiling_mv: u32,
+    target_mhz: u32,
+) -> Vec<VfWritePlanEntry> {
+    curve
+        .iter()
+        .map(|&(index, voltage_mv, base_mhz)| {
+            let in_flatten_set = voltage_mv >= ceiling_mv;
+            let desired_offset_mhz = if in_flatten_set {
+                target_mhz as i32 - base_mhz as i32
+            } else {
+                0
+            };
+            let class = if !in_flatten_set {
+                VfBinClass::BelowCeiling
+            } else if desired_offset_mhz == 0 {
+                VfBinClass::AlreadyAtTarget
+            } else if desired_offset_mhz < 0 {
+                VfBinClass::FlattenDown
+            } else {
+                VfBinClass::FlattenUp
+            };
+            VfWritePlanEntry {
+                index,
+                voltage_mv,
+                base_mhz,
+                desired_offset_mhz,
+                below_ceiling: !in_flatten_set,
+                in_flatten_set,
+                desired_offset_is_zero: desired_offset_mhz == 0,
+                class,
+            }
+        })
+        .collect()
+}
+
 /// Apply an Afterburner-style **VF ceiling**: flatten every curve point whose
 /// voltage is ≥ `ceiling_mv` to `target_mhz` (via per-point freq offsets), leaving
 /// lower-voltage points untouched (elastic). This caps the top of the curve at
 /// `target_mhz` without hard-locking voltage, so the GPU keeps its power-management
 /// elasticity (the thing a rigid clock-cap / voltage-lock removed → TDR).
-/// Returns the number of points flattened.
+/// Returns the number of points flattened. The transform is computed by the pure
+/// [`plan_vf_ceiling`] so the executed write and the diagnostic preview cannot drift.
 #[cfg(windows)]
 pub fn apply_vf_ceiling(ceiling_mv: u32, target_mhz: u32) -> Result<usize, String> {
     let curve = read_vf_curve_modern();
@@ -531,17 +608,12 @@ pub fn apply_vf_ceiling(ceiling_mv: u32, target_mhz: u32) -> Result<usize, Strin
         return Err("curva V/F vazia (GetStatus não retornou pontos)".into());
     }
     let mut flattened = 0;
-    for (idx, mv, base_mhz) in curve {
-        let off_mhz = if mv >= ceiling_mv {
-            target_mhz as i32 - base_mhz as i32
-        } else {
-            0
-        };
-        let st = vfcurve::set_point(idx, off_mhz * 1000);
+    for entry in plan_vf_ceiling(&curve, ceiling_mv, target_mhz) {
+        let st = vfcurve::set_point(entry.index, entry.desired_offset_mhz * 1000);
         if st != 0 {
-            return Err(format!("set_point({idx}) status {st}"));
+            return Err(format!("set_point({}) status {}", entry.index, st));
         }
-        if off_mhz != 0 {
+        if entry.desired_offset_mhz != 0 {
             flattened += 1;
         }
     }
@@ -619,7 +691,7 @@ pub fn probe() -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::nearest_vf_bin_at_or_above;
+    use super::{nearest_vf_bin_at_or_above, plan_vf_ceiling, VfBinClass};
 
     // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
     fn curve() -> Vec<(usize, u32, u32)> {
@@ -651,5 +723,69 @@ mod tests {
     #[test]
     fn empty_curve_is_none() {
         assert_eq!(nearest_vf_bin_at_or_above(&[], 850), None);
+    }
+
+    // ── plan_vf_ceiling (pure write-plan preview) ────────────────────────────────
+    #[test]
+    fn plan_below_ceiling_bins_are_elastic_zero() {
+        // ceiling 850 mV → the 800 and 837 mV bins are below-ceiling: desired 0, elastic.
+        let plan = plan_vf_ceiling(&curve(), 850, 1770);
+        let below: Vec<_> = plan.iter().filter(|e| e.below_ceiling).collect();
+        assert_eq!(below.len(), 2); // 800, 837 mV
+        for e in below {
+            assert_eq!(e.desired_offset_mhz, 0);
+            assert!(e.desired_offset_is_zero);
+            assert!(!e.in_flatten_set);
+            assert_eq!(e.class, VfBinClass::BelowCeiling);
+        }
+    }
+
+    #[test]
+    fn plan_at_or_above_ceiling_computes_target_minus_base() {
+        // ceiling 850 mV, target 1770 → the 850 (1770) and 1062 (1900) mV bins flatten.
+        let plan = plan_vf_ceiling(&curve(), 850, 1770);
+        let b850 = plan.iter().find(|e| e.voltage_mv == 850).unwrap();
+        let b1062 = plan.iter().find(|e| e.voltage_mv == 1062).unwrap();
+        assert!(b850.in_flatten_set && b1062.in_flatten_set);
+        // 850 mV bin is naturally at target → desired 0 (legit zero), AlreadyAtTarget.
+        assert_eq!(b850.desired_offset_mhz, 0);
+        assert!(b850.desired_offset_is_zero);
+        assert_eq!(b850.class, VfBinClass::AlreadyAtTarget);
+        // 1062 mV bin base 1900 → 1770 - 1900 = -130 (pull-down).
+        assert_eq!(b1062.desired_offset_mhz, -130);
+        assert!(!b1062.desired_offset_is_zero);
+        assert_eq!(b1062.class, VfBinClass::FlattenDown);
+    }
+
+    #[test]
+    fn plan_bin_below_target_raises() {
+        // A flatten-set bin whose base is BELOW target needs a positive offset.
+        let c = vec![(0usize, 900u32, 1700u32)];
+        let plan = plan_vf_ceiling(&c, 900, 1770);
+        assert_eq!(plan[0].desired_offset_mhz, 70);
+        assert_eq!(plan[0].class, VfBinClass::FlattenUp);
+    }
+
+    #[test]
+    fn plan_flatten_count_matches_nonzero_desired() {
+        // The flatten count apply_vf_ceiling reports = bins with a NON-ZERO desired offset.
+        // curve(): at ceiling 837, target 1770 → bins 837(1750,+20), 850(1770,0), 1062(1900,-130).
+        let plan = plan_vf_ceiling(&curve(), 837, 1770);
+        let nonzero = plan.iter().filter(|e| e.desired_offset_mhz != 0).count();
+        // 837 (+20) and 1062 (-130) are non-zero; 850 is a legit zero; 800 is below-ceiling.
+        assert_eq!(nonzero, 2);
+        let flatten_set = plan.iter().filter(|e| e.in_flatten_set).count();
+        assert_eq!(flatten_set, 3); // 837, 850, 1062 mV
+    }
+
+    #[test]
+    fn plan_ceiling_selection_matches_nearest_bin() {
+        // A requested 843 mV snaps to the 850 mV bin; planning at that snapped ceiling
+        // must put exactly the 850 and 1062 mV bins in the flatten set.
+        let (_, snapped) = nearest_vf_bin_at_or_above(&curve(), 843).unwrap();
+        assert_eq!(snapped, 850);
+        let plan = plan_vf_ceiling(&curve(), snapped, 1770);
+        let in_set: Vec<u32> = plan.iter().filter(|e| e.in_flatten_set).map(|e| e.voltage_mv).collect();
+        assert_eq!(in_set, vec![850, 1062]);
     }
 }
