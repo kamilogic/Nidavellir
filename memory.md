@@ -15,7 +15,23 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
-- **F1b Phase 2B.2-c.0 — first-run limiter flags (2026-06-08) — IMPLEMENTED, not pushed**: added
+- **F1b Phase 2B.2-c — FIRST confirmed run (2026-06-11, SAFE) + c.1 verifier fix (IMPLEMENTED, not
+  committed)**: first supervised `build-frontier --confirm --max-targets 1 --max-probes 6
+  --safe-start-cap 1075` ran after a Fable 5 GO audit + clean dry-run. **Safety held end-to-end**
+  (no TDR/reboot; Safe Loop armed/cleared per probe; reset-to-stock on reject + at run end; no
+  persistence; GPU back at stock) but **0 frontier points**: the target=1935 (stock boost top)
+  probe was rejected `LiveMismatch offsets=20/27 plateau=1935..1935 overshoot=0` — flatten-to-top
+  needs zero offset on bins already at target, so the ≥90% presence gate under-counts. **c.1**:
+  narrow stock-equivalent path (`is_stock_equivalent_ceiling`, gpu_verify.rs) — only on
+  LiveMismatch, only for targets within tol of the caller-passed stock top, all offsets readable,
+  no overshoot (even in-tol), all bins in-tol below target, zero-offset bins EXACTLY at target;
+  surfaced as service-internal `LiveCeilingEval.stock_equivalent` (IPC untouched);
+  `verify_applied_curve` passes None (byte-identical); probe logs `verify=StockEquivalentCeiling`.
+  Condition 1 directional (rejects targets above stock top). `cargo check` clean · service
+  **109/109** (+11) · core 46/46. Files: `gpu_verify.rs`,
+  `gpu_power_sweep.rs`. Next: bounded dry-run on rebuilt binary, then re-attempt the same bounded
+  --confirm (user approval). Chain b.1→c.0 IS pushed (6881cd7); c.1 awaits commit approval.
+- **F1b Phase 2B.2-c.0 — first-run limiter flags (2026-06-08) — pushed (6881cd7)**: added
   `build-frontier` flags `--max-targets N` / `--max-probes N` / `--safe-start-cap MV` to bound the
   first supervised run. Pure `FrontierLimits`/`validate_limits`/`apply_frontier_limits`
   (gpu_power_sweep) + `parse_frontier_limits` (main.rs). FAIL CLOSED on absurd values (0 / cap ≤

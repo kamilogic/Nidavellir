@@ -3,7 +3,46 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-08) — F1b Phase 2B.2-c.0: first-run limiter flags (IMPLEMENTED, not pushed)
+## Latest backend checkpoint (2026-06-11) — Phase 2B.2-c: FIRST confirmed run (SAFE, 0 points) + c.1 stock-equivalent verifier fix (IMPLEMENTED, not committed)
+- **Milestone — first supervised hardware run executed.** After a Fable 5 blocker audit (GO) and a
+  clean bounded dry-run (fresh worktree debug build of 6881cd7; `gpu_applied.json` absent; mtimes
+  unchanged), the user approved and we ran
+  `build-frontier --confirm --max-targets 1 --max-probes 6 --safe-start-cap 1075`.
+  **Safety: exit 0, no TDR, no reboot (~10 s)**; startup recovery clean; Safe Loop armed before the
+  VF write and cleared after; `reset_to_stock` fired on the verify reject and again at run end; no
+  profile applied/persisted (`gpu_applied.json` absent; `forge_state`/`gpu_knowledge` mtimes
+  unchanged; `safe_loop.json` re-saved by startup recovery = bookkeeping only); GPU back at stock
+  idle (1% util / 44 °C / 64 W). The full audited safety contract held on real hardware.
+- **Functional: 0 frontier points.** The only probe — target=1935 (the stock cluster boost top),
+  ceiling 1075 mV — was rejected by the verify gate: `verify=LiveMismatch offsets=20/27
+  plateau=1935..1935 overshoot=0`, so the descent stopped before any dwell. Root cause: flatten-to-
+  boost-top needs ZERO offset on the 7 top bins already at 1935 in stock → the ≥90% offset-presence
+  gate under-counts. The frequency evidence (plateau exactly at target, no overshoot) showed the
+  ceiling WAS in effect.
+- **c.1 fix (this checkpoint, code+tests only, NO hardware run yet)**: narrow stock-equivalent
+  acceptance — pure `is_stock_equivalent_ceiling` in `gpu_verify.rs`, consulted ONLY on a
+  `LiveMismatch`, accepting only when: target within tol of the caller-supplied stock boost top;
+  ALL offsets readable; NO bin above target (overshoot rejected even within tol); all bins within
+  tol below target; every zero-offset bin EXACTLY at target (offset 0 ⇒ GetStatus shows stock base;
+  correct flatten writes `target−base`, so only `base==target` explains a missing offset). Carried
+  as service-internal `LiveCeilingEval.stock_equivalent` + `stock_equivalent_bins`;
+  **`CurveVerification` IPC untouched**. `eval_ceiling_evidence`/`classify_live_ceiling` gain
+  `stock_top_mhz: Option<u32>`; `verify_applied_curve` passes `None` (byte-identical);
+  `real_probe_step` passes `Some(seed.stock_boost_max_mhz)`, accepts `VerifiedCurve ||
+  stock_equivalent`, logs the branch as `verify=StockEquivalentCeiling stock_equiv_bins=N`.
+  Safe-Loop/reset/abort flow in the probe unchanged. Condition 1 is DIRECTIONAL (`target ≤ top &&
+  top − target ≤ tol`) — a target above the stock top is an overclock, never stock-equivalent.
+- **Files**: `crates/service/src/gpu_verify.rs`, `crates/service/src/gpu_power_sweep.rs`.
+- **Tests**: `cargo check` clean · service **109/109** (+11: first-run reproduction accepted;
+  plateau-miss / any-overshoot / below-boost-top / zero-offset-not-exact / no-stock-top /
+  unreadable-offset all rejected; normal VerifiedCurve never consults the path; fully-degenerate
+  all-zero-at-target accepted; tol-boundary accept@15 / reject@16 on bin-freq AND target-vs-top;
+  directional above-top reject) · core 46/46.
+- **Next**: re-run the bounded DRY-RUN on the rebuilt binary, then (user approval required) the
+  SAME bounded `--confirm` — expect the 1935-target probe to verify stock-equivalent and dwell
+  (~6 probes, ~120 s). 11D (persisted stock base / exact-offset proof) still deferred.
+
+## Backend checkpoint (2026-06-08) — F1b Phase 2B.2-c.0: first-run limiter flags (pushed, 6881cd7)
 - **Bounded first run.** `build-frontier` gains `--max-targets N`, `--max-probes N`,
   `--safe-start-cap MV` so the first supervised QA validates the pipeline without the full 84-dwell
   plan. Dry-run + confirmed both honor them; defaults preserve the full plan.

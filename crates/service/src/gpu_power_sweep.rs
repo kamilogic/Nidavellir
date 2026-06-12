@@ -1802,6 +1802,8 @@ fn unverified_probe() -> ProbeSample {
 /// game-power dwell, clears the flag, and maps the result. On a dwell CRASH it resets to
 /// stock and sets `abort` so the remaining probes short-circuit (whole run drains safely).
 /// A normal `Unstable`/unverified result only stops THIS clock's descent (not the run).
+/// `stock_top_mhz` (the seeded cluster boost top) enables the narrow stock-equivalent
+/// verification for a boost-top target (Phase 2B.2-c.1) — see `gpu_verify`.
 #[cfg(windows)]
 fn real_probe_step(
     store: &SafeLoopStore,
@@ -1810,6 +1812,7 @@ fn real_probe_step(
     tol_mhz: u32,
     target: u32,
     vbin: u32,
+    stock_top_mhz: u32,
 ) -> ProbeSample {
     use nidavellir_gpu_nvapi as gpu;
     // 1. abort / boundary guards — no hardware.
@@ -1836,15 +1839,26 @@ fn real_probe_step(
     }
     // 5. read-only verify the JUST-applied transient ceiling (shared path) + log 11C diag.
     let after = gpu::read_vf_curve_modern();
-    let eval = crate::gpu_verify::classify_live_ceiling(&after, ceiling_idx, ceiling_mv, target, tol_mhz);
+    let eval = crate::gpu_verify::classify_live_ceiling(
+        &after, ceiling_idx, ceiling_mv, target, tol_mhz, Some(stock_top_mhz),
+    );
+    // Accept the normal offset-presence verdict OR the narrow stock-equivalent path
+    // (a boost-top target whose missing offsets are bins already at target in stock).
+    let verified = eval.state == nidavellir_core::ipc::CurveVerification::VerifiedCurve
+        || eval.stock_equivalent;
+    let verdict = if eval.stock_equivalent {
+        "StockEquivalentCeiling".to_string()
+    } else {
+        format!("{:?}", eval.state)
+    };
     info!(
-        "build-frontier probe: target={target} ceiling_mv={ceiling_mv} verify={:?} \
-         offsets={}/{} plateau={:?}..{:?} overshoot={:?}",
-        eval.state, eval.offset_present, eval.expected_n,
+        "build-frontier probe: target={target} ceiling_mv={ceiling_mv} verify={verdict} \
+         offsets={}/{} stock_equiv_bins={} plateau={:?}..{:?} overshoot={:?}",
+        eval.offset_present, eval.expected_n, eval.stock_equivalent_bins,
         eval.diag.getstatus_plateau_min_mhz, eval.diag.getstatus_plateau_max_mhz,
         eval.diag.max_target_overshoot_mhz
     );
-    if eval.state != nidavellir_core::ipc::CurveVerification::VerifiedCurve {
+    if !verified {
         // The ceiling did not take — don't dwell; stop this clock's descent.
         reset_to_stock();
         let _ = store.clear_boot_flag();
@@ -2039,7 +2053,10 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
                 return unverified_probe();
             }
         }
-        real_probe_step(store, &abort, &descent, FRONTIER_VERIFY_TOL_MHZ, target, vbin)
+        real_probe_step(
+            store, &abort, &descent, FRONTIER_VERIFY_TOL_MHZ, target, vbin,
+            seed.stock_boost_max_mhz,
+        )
     };
     let result = build_frontier(&targets, &descent, &policy, probe);
 

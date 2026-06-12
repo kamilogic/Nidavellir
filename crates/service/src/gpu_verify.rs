@@ -131,6 +131,55 @@ fn compute_curve_diag(target_mhz: u32, anchor_idx: usize, expected: &[PointEvide
     }
 }
 
+/// Narrow stock-equivalent ceiling check (Phase 2B.2-c.1). A flatten whose target equals
+/// the stock boost top legitimately needs ZERO offset on bins whose stock base is already
+/// at the target — the offset-presence ratio then under-counts and `classify_curve` reports
+/// `LiveMismatch` even though the ceiling effect is fully present (first bounded run:
+/// target=1935, offsets 20/27, plateau exactly 1935..1935, overshoot 0).
+///
+/// Accept ONLY when every condition holds (else `(false, 0)` — never a partial rescue):
+/// 1. The caller supplied the observed stock/cluster boost top AND the target is AT or BELOW
+///    it by at most `tol_mhz` (~one boost bin): `target <= top && top - target <= tol`. This
+///    is DIRECTIONAL — a target ABOVE the stock top is an overclock, never stock-equivalent,
+///    and is rejected even within tolerance. Below-boost (by > tol) targets never take this path.
+/// 2. Every expected bin's offset is readable (an unreadable bin explains nothing).
+/// 3. NO bin reads above target — overshoot is rejected even inside `tol_mhz`.
+/// 4. Every offset-carrying bin reads within `tol_mhz` below target (plateau AT target).
+/// 5. Every zero-offset bin reads EXACTLY at target: offset 0 means GetStatus shows the
+///    unmodified stock base, and a correct flatten writes `target - base`, so base==target
+///    is the only stock-equivalent explanation. A zero-offset bin even 15 MHz under target
+///    is an unexplained skip and rejects the whole set.
+///
+/// GetStatus idle noise can only cause a false REJECT (fail closed), never a false accept:
+/// a silently-failed apply leaves below-top bins at their stock base, which violates 4/5.
+/// Returns `(accepted, zero_offset_bins_at_target)`. Pure + testable.
+fn is_stock_equivalent_ceiling(
+    target_mhz: u32,
+    stock_top_mhz: Option<u32>,
+    expected: &[PointEvidence],
+    tol_mhz: u32,
+) -> (bool, u32) {
+    let Some(top) = stock_top_mhz else { return (false, 0) };
+    // Directional: only AT or just BELOW the stock top (never above — that's an overclock).
+    if target_mhz > top || top - target_mhz > tol_mhz || expected.is_empty() {
+        return (false, 0);
+    }
+    let mut stock_bins = 0u32;
+    for e in expected {
+        let Some(offset) = e.offset_khz else { return (false, 0) };
+        if e.freq_mhz > target_mhz || target_mhz - e.freq_mhz > tol_mhz {
+            return (false, 0);
+        }
+        if offset == 0 {
+            if e.freq_mhz != target_mhz {
+                return (false, 0);
+            }
+            stock_bins += 1;
+        }
+    }
+    (true, stock_bins)
+}
+
 /// Bundled result of evaluating a live VF ceiling: the curve verdict (offset-presence gate,
 /// UNCHANGED) plus its 11C diagnostic. Lets the persisted-profile verifier (today) and the
 /// future transient-ceiling probe (Phase 2B.2-b) share ONE classification path.
@@ -142,26 +191,55 @@ pub(crate) struct LiveCeilingEval {
     pub(crate) freq_match: u32,
     pub(crate) expected_n: u32,
     pub(crate) diag: CurveDiag,
+    /// Phase 2B.2-c.1: true ONLY when the normal gate said `LiveMismatch` but the strict
+    /// stock-equivalent boost-top conditions all hold (see [`is_stock_equivalent_ceiling`]).
+    /// Service-internal acceptance for the frontier probe — NOT an IPC state; `state` is
+    /// reported unchanged.
+    pub(crate) stock_equivalent: bool,
+    /// Zero-offset expected bins proven already at target in stock (diagnostic).
+    pub(crate) stock_equivalent_bins: u32,
 }
 
 /// Pure: run the (unchanged) offset-presence `classify_curve` gate + the 11C diagnostic over
 /// an ALREADY-built evidence set. No I/O — this is the unit the Phase 2B.2-a tests target.
+/// `stock_top_mhz` (Phase 2B.2-c.1) enables the narrow stock-equivalent re-evaluation of a
+/// `LiveMismatch` for boost-top targets; pass `None` (the persisted-profile verifier does)
+/// to keep classification byte-identical to the pre-c.1 behavior.
 fn eval_ceiling_evidence(
     target_mhz: u32,
     anchor_idx: usize,
     expected: &[PointEvidence],
     tol_mhz: u32,
+    stock_top_mhz: Option<u32>,
 ) -> LiveCeilingEval {
     let (state, offset_present, freq_match, expected_n) =
         classify_curve(target_mhz, expected, tol_mhz);
     let diag = compute_curve_diag(target_mhz, anchor_idx, expected, tol_mhz);
-    LiveCeilingEval { state, offset_present, freq_match, expected_n, diag }
+    // Narrow stock-equivalent path: ONLY a LiveMismatch is re-evaluated — VerifiedCurve
+    // needs no rescue and VerificationFailed (unreadable/empty evidence) must stay failed.
+    let (stock_equivalent, stock_equivalent_bins) =
+        if state == CurveVerification::LiveMismatch {
+            is_stock_equivalent_ceiling(target_mhz, stock_top_mhz, expected, tol_mhz)
+        } else {
+            (false, 0)
+        };
+    LiveCeilingEval {
+        state,
+        offset_present,
+        freq_match,
+        expected_n,
+        diag,
+        stock_equivalent,
+        stock_equivalent_bins,
+    }
 }
 
 /// Read-only (NVAPI GET-control offset readback): build the live per-point evidence at/above
 /// the ceiling bin, then classify it via [`eval_ceiling_evidence`]. Reusable by the
-/// persisted-profile verifier (today) and the future transient-ceiling probe (Phase 2B.2-b).
-/// NEVER writes / applies / stresses.
+/// persisted-profile verifier (today) and the transient-ceiling probe (Phase 2B.2-b).
+/// `stock_top_mhz`: the observed stock/cluster boost top, enabling the narrow
+/// stock-equivalent path for boost-top targets (Phase 2B.2-c.1) — the persisted-profile
+/// verifier passes `None` (classification unchanged). NEVER writes / applies / stresses.
 #[cfg(windows)]
 pub(crate) fn classify_live_ceiling(
     live: &[(usize, u32, u32)],
@@ -169,6 +247,7 @@ pub(crate) fn classify_live_ceiling(
     ceiling_mv: u32,
     target_mhz: u32,
     tol_mhz: u32,
+    stock_top_mhz: Option<u32>,
 ) -> LiveCeilingEval {
     // PRIMARY evidence: the GET-control offset readback per expected point. GetStatus
     // actual freq is kept only as secondary corroboration (see classify_curve docs).
@@ -182,7 +261,7 @@ pub(crate) fn classify_live_ceiling(
             freq_mhz: *freq,
         })
         .collect();
-    eval_ceiling_evidence(target_mhz, ceiling_idx, &expected, tol_mhz)
+    eval_ceiling_evidence(target_mhz, ceiling_idx, &expected, tol_mhz, stock_top_mhz)
 }
 
 /// Clock tolerance (MHz) for the load-state p5 check: ~two boost bins.
@@ -511,8 +590,10 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
     // Classify the live curve against the deterministic ceiling bin (offset-presence gate)
     // and compute the 11C diagnostic via the shared helper — the same path the future
     // transient-ceiling probe (Phase 2B.2-b) will use.
-    let LiveCeilingEval { state, offset_present, freq_match, expected_n, diag } =
-        classify_live_ceiling(&live, ceiling_idx, ceiling_mv, core.freq_mhz, TOL_MHZ);
+    // `stock_top_mhz = None`: the persisted-profile verifier never uses the narrow
+    // stock-equivalent path — its classification is byte-identical to pre-c.1.
+    let LiveCeilingEval { state, offset_present, freq_match, expected_n, diag, .. } =
+        classify_live_ceiling(&live, ceiling_idx, ceiling_mv, core.freq_mhz, TOL_MHZ, None);
     let message = match state {
         CurveVerification::VerifiedCurve => format!(
             "live curve matches: {offset_present}/{expected_n} plateau points carry the flatten \
@@ -833,7 +914,7 @@ mod tests {
         // All plateau points carry the flatten offset → VerifiedCurve; diag reflects it.
         let expected: Vec<PointEvidence> =
             (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-120_000), 1785)).collect();
-        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ);
+        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ, None);
         assert_eq!(e.state, CurveVerification::VerifiedCurve);
         assert_eq!((e.offset_present, e.expected_n), (10, 10));
         assert_eq!(e.diag.modified_bin_count, 10);
@@ -845,7 +926,7 @@ mod tests {
         // Offsets readable but all zero (reset / never flattened) → LiveMismatch.
         let expected: Vec<PointEvidence> =
             (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(0), 1900)).collect();
-        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ);
+        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ, None);
         assert_eq!(e.state, CurveVerification::LiveMismatch);
         assert_eq!(e.offset_present, 0);
     }
@@ -856,12 +937,12 @@ mod tests {
         let unreadable: Vec<PointEvidence> =
             (0..5).map(|i| evx(60 + i, 850, None, 1785)).collect();
         assert_eq!(
-            eval_ceiling_evidence(1785, 60, &unreadable, TOL_MHZ).state,
+            eval_ceiling_evidence(1785, 60, &unreadable, TOL_MHZ, None).state,
             CurveVerification::VerificationFailed
         );
         // Empty plateau set → VerificationFailed.
         assert_eq!(
-            eval_ceiling_evidence(1785, 60, &[], TOL_MHZ).state,
+            eval_ceiling_evidence(1785, 60, &[], TOL_MHZ, None).state,
             CurveVerification::VerificationFailed
         );
     }
@@ -872,7 +953,7 @@ mod tests {
         // the spread surfaces in `diag`, never in the verdict (offset-presence is the gate).
         let expected: Vec<PointEvidence> =
             (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-100_000), 1830)).collect();
-        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ);
+        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ, None);
         assert_eq!(e.state, CurveVerification::VerifiedCurve);
         assert_eq!(e.diag.max_target_overshoot_mhz, Some(45));
     }
@@ -886,9 +967,177 @@ mod tests {
         let high: Vec<PointEvidence> =
             (0..6).map(|i| evx(60 + i, 1062, Some(-90_000), 1785)).collect();
         assert_eq!(
-            eval_ceiling_evidence(1785, 60, &low, TOL_MHZ).state,
-            eval_ceiling_evidence(1785, 60, &high, TOL_MHZ).state
+            eval_ceiling_evidence(1785, 60, &low, TOL_MHZ, None).state,
+            eval_ceiling_evidence(1785, 60, &high, TOL_MHZ, None).state
         );
+    }
+
+    // ── Phase 2B.2-c.1: stock-equivalent boost-top ceiling (pure) ────────────────
+    /// The first bounded supervised run (2026-06-11): target=1935 (= stock boost top),
+    /// offsets 20/27 present, GetStatus plateau exactly 1935..1935, overshoot 0 — the
+    /// 7 zero-offset bins were top bins already at 1935 in stock.
+    fn boost_top_evidence() -> Vec<PointEvidence> {
+        let mut v: Vec<PointEvidence> = (0..20)
+            .map(|i| evx(38 + i, 1075 + i as u32 * 3, Some(15_000 + i as i32 * 1_000), 1935))
+            .collect();
+        v.extend((0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), 1935)));
+        v
+    }
+
+    #[test]
+    fn stock_equivalent_boost_top_is_accepted() {
+        // Reproduces the rejected first-run probe: normal gate stays LiveMismatch
+        // (20/27 < 90%) but every missing offset is explained by a stock-at-target bin.
+        let e = eval_ceiling_evidence(1935, 38, &boost_top_evidence(), TOL_MHZ, Some(1935));
+        assert_eq!(e.state, CurveVerification::LiveMismatch);
+        assert!(e.stock_equivalent);
+        assert_eq!(e.stock_equivalent_bins, 7);
+        assert_eq!((e.offset_present, e.expected_n), (20, 27));
+    }
+
+    #[test]
+    fn stock_equivalent_rejected_when_plateau_misses_target() {
+        // Zero-offset bins read 1905, not the 1935 target → the missing offsets are
+        // UNexplained (a correct flatten would have written +30 MHz there) → mismatch.
+        let mut v: Vec<PointEvidence> =
+            (0..20).map(|i| evx(38 + i, 1075 + i as u32 * 3, Some(20_000), 1935)).collect();
+        v.extend((0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), 1905)));
+        let e = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935));
+        assert_eq!(e.state, CurveVerification::LiveMismatch);
+        assert!(!e.stock_equivalent);
+    }
+
+    #[test]
+    fn stock_equivalent_rejected_on_any_overshoot() {
+        // One bin reads ABOVE target — even within the GetStatus tolerance → rejected.
+        let mut v = boost_top_evidence();
+        v[5].freq_mhz = 1945; // +10 MHz overshoot, < TOL_MHZ — still not acceptable
+        let e = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935));
+        assert_eq!(e.state, CurveVerification::LiveMismatch);
+        assert!(!e.stock_equivalent);
+    }
+
+    #[test]
+    fn stock_equivalent_rejected_below_boost_top() {
+        // Same weak-offset evidence shape, but the target sits a clock step below the
+        // stock top → the narrow path must NOT apply (the normal gate governs).
+        let mut v: Vec<PointEvidence> =
+            (0..20).map(|i| evx(38 + i, 1075 + i as u32 * 3, Some(20_000), 1875)).collect();
+        v.extend((0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), 1875)));
+        let e = eval_ceiling_evidence(1875, 38, &v, TOL_MHZ, Some(1935));
+        assert_eq!(e.state, CurveVerification::LiveMismatch);
+        assert!(!e.stock_equivalent);
+    }
+
+    #[test]
+    fn stock_equivalent_rejected_when_zero_offset_bin_not_exactly_at_target() {
+        // A zero-offset bin at 1920 (within GetStatus tolerance of 1935) is still NOT
+        // explained: a correct flatten would have written a +15 MHz offset there.
+        let mut v = boost_top_evidence();
+        v[26].freq_mhz = 1920; // a zero-offset bin: within tol, but not exactly at target
+        let e = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935));
+        assert!(!e.stock_equivalent);
+    }
+
+    #[test]
+    fn stock_equivalent_requires_stock_top_and_readable_offsets() {
+        // No stock-top info (the persisted-profile verifier path) → never applies.
+        let e = eval_ceiling_evidence(1935, 38, &boost_top_evidence(), TOL_MHZ, None);
+        assert!(!e.stock_equivalent);
+        // An unreadable offset among the expected bins → never applies (and an
+        // all-unreadable set stays VerificationFailed, which is never re-evaluated).
+        let mut v = boost_top_evidence();
+        v[3].offset_khz = None;
+        let e2 = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935));
+        assert_eq!(e2.state, CurveVerification::LiveMismatch);
+        assert!(!e2.stock_equivalent);
+    }
+
+    #[test]
+    fn stock_equivalent_flag_never_set_on_normal_verified() {
+        // ≥90% offsets present → normal VerifiedCurve; the narrow path is not consulted
+        // even when the target equals the stock top.
+        let v: Vec<PointEvidence> =
+            (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-120_000), 1785)).collect();
+        let e = eval_ceiling_evidence(1785, 60, &v, TOL_MHZ, Some(1785));
+        assert_eq!(e.state, CurveVerification::VerifiedCurve);
+        assert!(!e.stock_equivalent);
+        assert_eq!(e.stock_equivalent_bins, 0);
+    }
+
+    #[test]
+    fn stock_equivalent_fully_degenerate_all_zero_at_target_accepts() {
+        // The maximal-departure case: the ceiling bin snapped high into the stock boost-top
+        // plateau, so EVERY expected bin is already at target in stock → a correct flatten
+        // writes target-base = 0 on all of them. offset_present == 0 → classify_curve says
+        // LiveMismatch, but all bins read EXACTLY at target with readable (zero) offsets, so
+        // the stock-equivalent path accepts. A failed apply here is hardware-IDENTICAL to a
+        // correct flatten (every bin is at target either way), so dwelling is no riskier than
+        // stock. Pins this as INTENDED behavior.
+        let v: Vec<PointEvidence> =
+            (0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), 1935)).collect();
+        let e = eval_ceiling_evidence(1935, 58, &v, TOL_MHZ, Some(1935));
+        assert_eq!(e.state, CurveVerification::LiveMismatch); // normal gate: 0/7 offsets
+        assert_eq!((e.offset_present, e.expected_n), (0, 7));
+        assert!(e.stock_equivalent);
+        assert_eq!(e.stock_equivalent_bins, 7);
+    }
+
+    #[test]
+    fn stock_equivalent_tol_boundary_offset_bin_exactly_15_below_accepts() {
+        // An offset-carrying bin exactly tol (15 MHz) below target is within plateau
+        // tolerance → accepted; 16 below → rejected (condition 4 boundary, accept side).
+        let at_tol: Vec<PointEvidence> = {
+            let mut v: Vec<PointEvidence> =
+                (0..19).map(|i| evx(38 + i, 1075 + i as u32 * 3, Some(20_000), 1935)).collect();
+            v.push(evx(57, 1130, Some(18_000), 1920)); // exactly 15 below target
+            v.extend((0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), 1935)));
+            v
+        };
+        let e = eval_ceiling_evidence(1935, 38, &at_tol, TOL_MHZ, Some(1935));
+        assert!(e.stock_equivalent, "offset bin exactly 15 MHz below target must accept");
+
+        let past_tol: Vec<PointEvidence> = {
+            let mut v = at_tol.clone();
+            v[19].freq_mhz = 1919; // 16 below target → out of tolerance
+            v
+        };
+        let e2 = eval_ceiling_evidence(1935, 38, &past_tol, TOL_MHZ, Some(1935));
+        assert!(!e2.stock_equivalent, "offset bin 16 MHz below target must reject");
+    }
+
+    #[test]
+    fn stock_equivalent_target_tol_boundary_15_below_top_accepts_16_rejects() {
+        // Condition 1 (accept side): a target exactly tol below the stock top enters the
+        // path; 16 below does not. Evidence here is fully valid (all bins at target) so the
+        // only variable under test is the target-vs-top gate.
+        let evidence = |target: u32| -> Vec<PointEvidence> {
+            (0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), target)).collect()
+        };
+        // 1920 == 1935 - 15 → within tol → accepts.
+        let e = eval_ceiling_evidence(1920, 58, &evidence(1920), TOL_MHZ, Some(1935));
+        assert!(e.stock_equivalent, "target 15 MHz below stock top must accept");
+        // 1919 == 1935 - 16 → out of tol → rejects (normal gate governs).
+        let e2 = eval_ceiling_evidence(1919, 58, &evidence(1919), TOL_MHZ, Some(1935));
+        assert!(!e2.stock_equivalent, "target 16 MHz below stock top must reject");
+    }
+
+    #[test]
+    fn stock_equivalent_directional_rejects_target_above_stock_top() {
+        // Directional hardening: a target ABOVE the stock top is an overclock, never
+        // stock-equivalent — rejected even 1 MHz over and even within tol. The frontier
+        // never emits such a target (first-run regime is PowerLimited), but the verifier
+        // must not depend on that.
+        let evidence = |target: u32| -> Vec<PointEvidence> {
+            (0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), target)).collect()
+        };
+        // 1 MHz above the stock top → rejected.
+        let e1 = eval_ceiling_evidence(1936, 58, &evidence(1936), TOL_MHZ, Some(1935));
+        assert!(!e1.stock_equivalent, "target 1 MHz above stock top must reject");
+        // Well above but still within the old symmetric abs_diff window (would have passed
+        // before the directional fix) → still rejected now.
+        let e2 = eval_ceiling_evidence(1945, 58, &evidence(1945), TOL_MHZ, Some(1935));
+        assert!(!e2.stock_equivalent, "target above stock top within tol must still reject");
     }
 
     // ── Patch B: load classification ───────────────────────────────────────────

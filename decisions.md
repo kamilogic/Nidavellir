@@ -2,6 +2,44 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 2B.2-c.1: stock-equivalent ceiling verification for boost-top targets
+- **Trigger** (2026-06-11): the FIRST bounded supervised `build-frontier --confirm` run
+  (`--max-targets 1 --max-probes 6 --safe-start-cap 1075`, Fable-5-audited, user present) completed
+  SAFELY (no TDR/reboot; Safe Loop armed+cleared per probe; reset-to-stock fired; no persistence;
+  GPU back at stock) but produced **0 frontier points**: the only probe (target=1935 = the stock
+  cluster boost top, ceiling 1075 mV) was rejected `LiveMismatch` at `offsets=20/27,
+  plateau=1935..1935, overshoot=0`. Root cause: a flatten whose target equals the stock boost top
+  legitimately needs ZERO offset on bins already at target, so the ≥90% offset-presence gate
+  under-counts — the ceiling effect was present but unprovable by presence alone.
+- **Decision**: add a NARROW stock-equivalent acceptance path, not a weaker global gate. New pure
+  `is_stock_equivalent_ceiling` (`gpu_verify.rs`) consulted ONLY when the unchanged
+  `classify_curve` gate says `LiveMismatch`. Accept only when ALL hold: (1) caller-supplied stock
+  boost top present and target AT or BELOW it by ≤ tol — DIRECTIONAL `target ≤ top && top − target
+  ≤ tol_mhz` (15 MHz); a target ABOVE the stock top is an overclock, rejected even within tol
+  (replaces the original symmetric `abs_diff`); (2) every expected bin's offset readable;
+  (3) NO bin reads above target (overshoot rejected even within tol); (4) every bin within tol
+  below target; (5) every ZERO-offset bin reads EXACTLY at target — offset 0 means GetStatus shows
+  the unmodified stock base and a correct flatten writes `target − base`, so `base == target` is
+  the only valid explanation for a missing offset. Result carried as service-internal
+  `LiveCeilingEval.stock_equivalent` (+`stock_equivalent_bins` diagnostic); **`CurveVerification`
+  (IPC) is untouched** and `state` still reports the normal verdict.
+- **Why it does not weaken safety**: the path demands MORE evidence than the normal gate (per-bin
+  frequency agreement + zero-overshoot + full accounting of every bin), not less; a silently-failed
+  apply leaves below-top bins at their stock base → violates (4)/(5) → rejected; GetStatus idle
+  noise can only cause a false REJECT (fail closed). `VerificationFailed` (unreadable/empty) is
+  never rescued. Below-boost targets with weak offsets stay `LiveMismatch`.
+- **Data flow**: `eval_ceiling_evidence`/`classify_live_ceiling` gain `stock_top_mhz: Option<u32>`.
+  `verify_applied_curve` (VerifyAppliedProfile IPC) passes `None` → classification byte-identical.
+  `real_probe_step` passes `Some(seed.stock_boost_max_mhz)` and accepts `VerifiedCurve ||
+  stock_equivalent`, logging the accepted branch distinctly as `verify=StockEquivalentCeiling`.
+- **Scope**: `gpu_verify.rs` + `gpu_power_sweep.rs` only. No IPC/contract/core/`apps/ui`/Safe-Loop/
+  reset/abort/`gpu_apply`/planning change, no hardware run in this patch. `cargo check` clean;
+  service **109/109** (+11 stock-equivalent tests: the exact first-run reproduction, plateau-miss /
+  any-overshoot / below-boost / zero-offset-not-exact / no-stock-top / unreadable-offset rejects,
+  the fully-degenerate all-zero-at-target accept, tol-boundary accept/reject on both the bin-freq
+  and target-vs-top gates, and the directional above-top reject), core 46/46. **`--confirm` remains
+  gated on explicit user approval; re-run the bounded dry-run first.**
+
 ## F1b Phase 2B.2-c.0: first-run limiter flags for build-frontier
 - **Decision** (2026-06-08): bound the first supervised hardware run so it validates the pipeline
   without the full 84-dwell plan. Added `build-frontier` flags: `--max-targets N` (truncate to the
