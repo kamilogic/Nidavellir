@@ -1814,6 +1814,7 @@ fn real_probe_step(
     vbin: u32,
     stock_top_mhz: u32,
     stock_curve: &[(usize, u32, u32)],
+    static_base: &[(usize, u32, u32)],
 ) -> ProbeSample {
     use nidavellir_gpu_nvapi as gpu;
     // 1. abort / boundary guards — no hardware.
@@ -1839,35 +1840,45 @@ fn real_probe_step(
         return unverified_probe();
     }
     // 5. read-only verify the JUST-applied transient ceiling (shared path) + log 11C diag.
+    // Pass the once-per-run STATIC VF-table base for the NoDownCapNeeded benign-zero rescue.
     let after = gpu::read_vf_curve_modern();
     let eval = crate::gpu_verify::classify_live_ceiling(
-        &after, ceiling_idx, ceiling_mv, target, tol_mhz, Some(stock_top_mhz),
+        &after, ceiling_idx, ceiling_mv, target, tol_mhz, Some(stock_top_mhz), Some(static_base),
     );
-    // Accept the normal offset-presence verdict OR the narrow stock-equivalent path
-    // (a boost-top target whose missing offsets are bins already at target in stock).
+    // Accept the normal offset-presence verdict OR the narrow stock-equivalent path (a boost-top
+    // target whose missing offsets are bins already at target in stock) OR the NoDownCapNeeded
+    // benign-zero rescue (sub-target bins that need no down-cap; static-table-evidence-gated).
     let verified = eval.state == nidavellir_core::ipc::CurveVerification::VerifiedCurve
-        || eval.stock_equivalent;
+        || eval.stock_equivalent
+        || eval.no_down_cap_rescue;
     let verdict = if eval.stock_equivalent {
         "StockEquivalentCeiling".to_string()
+    } else if eval.no_down_cap_rescue {
+        "NoDownCapNeededCeiling".to_string()
     } else {
         format!("{:?}", eval.state)
     };
     info!(
         "build-frontier probe: target={target} ceiling_mv={ceiling_mv} verify={verdict} \
-         offsets={}/{} stock_equiv_bins={} plateau={:?}..{:?} overshoot={:?}",
+         offsets={}/{} stock_equiv_bins={} no_down_cap_needed={} eff_cov={:.3} \
+         plateau={:?}..{:?} overshoot={:?}",
         eval.offset_present, eval.expected_n, eval.stock_equivalent_bins,
+        eval.no_down_cap_needed, eval.effective_coverage,
         eval.diag.getstatus_plateau_min_mhz, eval.diag.getstatus_plateau_max_mhz,
         eval.diag.max_target_overshoot_mhz
     );
     if !verified {
         // Read-only failed-probe diagnostic BEFORE reset (registers still hold the write).
-        // Joins the once-per-run STOCK write-plan with the post-write offset readback to
-        // label legit-zero candidates vs unexplained gaps. Diagnostic ONLY — no verdict change.
-        let diag = crate::gpu_verify::failed_probe_diag_line(stock_curve, ceiling_mv, target, tol_mhz);
+        // Joins the once-per-run STATIC VF-table base with the post-write offset readback to
+        // label NoDownCapNeeded bins vs real gaps. Diagnostic ONLY — no verdict change.
+        let diag = crate::gpu_verify::failed_probe_diag_line(stock_curve, static_base, ceiling_mv, target);
         info!(
             "build-frontier probe DIAG (read-only, no verdict change): target={target} \
-             ceiling_mv={ceiling_mv} ceiling_idx={ceiling_idx} plateau={:?}..{:?} \
+             ceiling_mv={ceiling_mv} ceiling_idx={ceiling_idx} raw_cov={:.3} eff_cov={:.3} \
+             overshoot_veto={} static_base_missing={} plateau={:?}..{:?} \
              overshoot={:?} undershoot={:?} | {diag}",
+            if eval.expected_n > 0 { eval.offset_present as f32 / eval.expected_n as f32 } else { 0.0 },
+            eval.effective_coverage, eval.overshoot_veto, eval.static_base_missing,
             eval.diag.getstatus_plateau_min_mhz, eval.diag.getstatus_plateau_max_mhz,
             eval.diag.max_target_overshoot_mhz, eval.diag.max_target_undershoot_mhz,
         );
@@ -1908,6 +1919,15 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         warn!("build-frontier: VF curve readback returned no points — aborting.");
         return;
     }
+    // Once-per-run STATIC VF-table base (GetStatus vf_tuple_base), index-aligned with `live`.
+    // Feeds ONLY the read-only NoDownCapNeeded benign-zero rescue; empty (driver base
+    // unsupported) → the verifier falls back to strict (no rescue). NOT a hardware write.
+    let static_base = gpu::read_vf_base_curve_modern();
+    info!(
+        "build-frontier: static VF-table base evidence: {} points (NoDownCapNeeded rescue {})",
+        static_base.len(),
+        if static_base.is_empty() { "unavailable → strict" } else { "available" }
+    );
     // SANITY-DOMAIN GUARD (Phase 2B.2-b.3): derive the stock reference ONLY from sane
     // graphics-core VF points — NEVER from the unfiltered global max, which can include
     // non-core / memory-domain / spurious points (a 3060 Ti dry-run produced 7001 MHz /
@@ -2067,7 +2087,7 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         }
         real_probe_step(
             store, &abort, &descent, FRONTIER_VERIFY_TOL_MHZ, target, vbin,
-            seed.stock_boost_max_mhz, &live,
+            seed.stock_boost_max_mhz, &live, &static_base,
         )
     };
     let result = build_frontier(&targets, &descent, &policy, probe);

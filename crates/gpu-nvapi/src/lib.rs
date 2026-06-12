@@ -314,6 +314,39 @@ mod vfcurve {
         Some((s.points[index].freq_khz, s.points[index].voltage_uv))
     }
 
+    /// Read one point's STATIC `vf_tuple_base` (freq_khz, voltage_µV) via GetStatus —
+    /// the deterministic VF-table base, independent of any applied offset and of idle
+    /// boost behavior (unlike the actual freq returned by [`get_status`], which the
+    /// project documents as under-reporting at idle). Same single-bit mask and the SAME
+    /// modern point index as [`get_status`]/`set_point`, so it joins by index with the
+    /// rest of the verifier. Returns `None` if the point is invalid, the API fails, the
+    /// driver reports the base tuple unsupported (`b_base_supported == 0`), or the base
+    /// reads zero.
+    pub fn get_status_base(index: usize) -> Option<(u32, u32)> {
+        if index >= NPTS {
+            return None;
+        }
+        let _ = nvapi::initialize();
+        let p = qi(ID_STATUS)?;
+        let h = handle()?;
+        type F = extern "C" fn(RawGpuHandle, *mut Status) -> i32;
+        let f: F = unsafe { core::mem::transmute(p) };
+        let mut s: Box<Status> = Box::new(unsafe { core::mem::zeroed() });
+        s.version = VER_STATUS;
+        s.mask[index / 32] = 1u32 << (index % 32);
+        if f(h, s.as_mut()) != 0 {
+            return None;
+        }
+        if s.b_base_supported == 0 {
+            return None;
+        }
+        let b = s.points[index].base;
+        if b.freq_khz == 0 {
+            return None;
+        }
+        Some((b.freq_khz, b.voltage_uv))
+    }
+
     /// Diagnostic: GetStatus for sampled points — confirms the struct version and
     /// shows real freq/voltage data (proves the curve is read, not zeroed).
     pub fn dump_status() -> String {
@@ -480,6 +513,26 @@ pub fn read_vf_curve_modern() -> Vec<(usize, u32, u32)> {
     let mut out = Vec::new();
     for i in 0..255 {
         if let Some((f_khz, uv)) = vfcurve::get_status(i) {
+            if uv > 0 {
+                out.push((i, uv / 1000, f_khz / 1000));
+            }
+        }
+    }
+    out
+}
+
+/// Read the STATIC VF-table base curve via GetStatus's `vf_tuple_base` as
+/// `(index, base_voltage_mv, base_freq_mhz)` for every valid point. Index-aligned with
+/// [`read_vf_curve_modern`] (same modern point index). This is the deterministic,
+/// offset-independent and idle-independent stock base the `NoDownCapNeeded` benign-zero
+/// verifier evidence requires — NOT the actual/effective freq, which under-reports at
+/// idle. Empty if the driver does not support the base tuple (then the verifier falls
+/// back to strict behavior).
+#[cfg(windows)]
+pub fn read_vf_base_curve_modern() -> Vec<(usize, u32, u32)> {
+    let mut out = Vec::new();
+    for i in 0..255 {
+        if let Some((f_khz, uv)) = vfcurve::get_status_base(i) {
             if uv > 0 {
                 out.push((i, uv / 1000, f_khz / 1000));
             }

@@ -198,19 +198,90 @@ pub(crate) struct LiveCeilingEval {
     pub(crate) stock_equivalent: bool,
     /// Zero-offset expected bins proven already at target in stock (diagnostic).
     pub(crate) stock_equivalent_bins: u32,
+    /// Phase 2B.2-c.2 (NoDownCapNeeded): zero-offset bins whose STATIC VF-table base is at
+    /// or below target → they need no downward cap to satisfy the ceiling (benign zeros).
+    pub(crate) no_down_cap_needed: u32,
+    /// true ONLY when the normal gate said `LiveMismatch`, the stock-equivalent path did NOT
+    /// rescue it, static-table base evidence is present for EVERY expected bin, no bin
+    /// overshoots target, and effective coverage (non-zero + benign) ≥ 0.90. Build-frontier
+    /// probe acceptance only — NOT an IPC state; `state` is reported unchanged.
+    pub(crate) no_down_cap_rescue: bool,
+    /// Overshoot veto: any expected bin's GetStatus actual freq read ABOVE target. When set,
+    /// the benign-zero rescue is disabled for the whole set (the ceiling is not holding).
+    pub(crate) overshoot_veto: bool,
+    /// Expected bins lacking static-table base evidence. Any > 0 forces strict fallback.
+    pub(crate) static_base_missing: u32,
+    /// (non-zero offset bins + benign zero bins) / expected_n. Diagnostic; gated by 0.90.
+    pub(crate) effective_coverage: f32,
+}
+
+/// Pure NoDownCapNeeded (benign-zero) accounting over the expected set (Phase 2B.2-c.2).
+/// A zero-offset bin needs NO downward cap when its STATIC VF-table base is already at or
+/// below target — flattening would only RAISE it (an overclock the driver clamps), so the
+/// missing offset is benign, not a missing cap. Uses ONLY static-table base evidence
+/// (`static_base_by_idx`, index → base_mhz from `read_vf_base_curve_modern`) — NEVER the
+/// idle GetStatus actual freq — plus a strict overshoot veto. Returns the counts; the
+/// rescue decision lives in [`eval_ceiling_evidence`]. Pure + testable.
+struct NoDownCapEval {
+    /// Exactly-zero-offset bins whose static base ≤ target (no down-cap needed).
+    no_down_cap_needed: u32,
+    /// Any expected bin's GetStatus actual freq read above target → veto the whole rescue.
+    overshoot_veto: bool,
+    /// Expected bins for which no static base was available (index not in the map).
+    static_base_missing: u32,
+    /// Whether any static-base evidence was supplied at all (None → strict everywhere).
+    evidence_present: bool,
+}
+
+fn eval_no_down_cap(
+    target_mhz: u32,
+    expected: &[PointEvidence],
+    static_base_by_idx: Option<&[(usize, u32)]>,
+) -> NoDownCapEval {
+    // Overshoot veto is independent of static evidence: if the ceiling let any expected
+    // bin read above target, the cap is not holding and benign-zero must not rescue.
+    let overshoot_veto = expected.iter().any(|e| e.freq_mhz > target_mhz);
+    let Some(map) = static_base_by_idx else {
+        // No static evidence threaded (e.g. persisted-profile path) → strict: nothing
+        // benign, and every expected bin counts as "missing" so no rescue can fire.
+        return NoDownCapEval {
+            no_down_cap_needed: 0,
+            overshoot_veto,
+            static_base_missing: expected.len() as u32,
+            evidence_present: false,
+        };
+    };
+    let lookup = |idx: usize| map.iter().find(|(i, _)| *i == idx).map(|(_, b)| *b);
+    let mut no_down_cap_needed = 0;
+    let mut static_base_missing = 0;
+    for e in expected {
+        match lookup(e.index) {
+            None => static_base_missing += 1,
+            // Benign zero: offset reads EXACTLY zero AND the static base needs no down-cap.
+            // `<= target` (no +tol) because a static-table base needs no idle tolerance.
+            Some(base) if e.offset_khz == Some(0) && base <= target_mhz => {
+                no_down_cap_needed += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    NoDownCapEval { no_down_cap_needed, overshoot_veto, static_base_missing, evidence_present: true }
 }
 
 /// Pure: run the (unchanged) offset-presence `classify_curve` gate + the 11C diagnostic over
 /// an ALREADY-built evidence set. No I/O — this is the unit the Phase 2B.2-a tests target.
 /// `stock_top_mhz` (Phase 2B.2-c.1) enables the narrow stock-equivalent re-evaluation of a
 /// `LiveMismatch` for boost-top targets; pass `None` (the persisted-profile verifier does)
-/// to keep classification byte-identical to the pre-c.1 behavior.
+/// to keep classification byte-identical to the pre-c.1 behavior. `static_base_by_idx`
+/// (Phase 2B.2-c.2) enables the NoDownCapNeeded benign-zero rescue for the build-frontier
+/// probe; `None` (the persisted-profile verifier) keeps the verdict strict.
 fn eval_ceiling_evidence(
     target_mhz: u32,
     anchor_idx: usize,
     expected: &[PointEvidence],
     tol_mhz: u32,
     stock_top_mhz: Option<u32>,
+    static_base_by_idx: Option<&[(usize, u32)]>,
 ) -> LiveCeilingEval {
     let (state, offset_present, freq_match, expected_n) =
         classify_curve(target_mhz, expected, tol_mhz);
@@ -223,6 +294,22 @@ fn eval_ceiling_evidence(
         } else {
             (false, 0)
         };
+    // NoDownCapNeeded benign-zero rescue (Phase 2B.2-c.2): re-evaluate a LiveMismatch the
+    // stock-equivalent path did not already rescue. Requires COMPLETE static-table evidence
+    // (no missing bin), NO overshoot, and effective coverage ≥ 0.90 — the SAME threshold as
+    // `classify_curve`, applied to (non-zero + benign) bins. Strict everywhere else.
+    let no_down_cap = eval_no_down_cap(target_mhz, expected, static_base_by_idx);
+    let effective_coverage = if expected_n > 0 {
+        (offset_present + no_down_cap.no_down_cap_needed) as f32 / expected_n as f32
+    } else {
+        0.0
+    };
+    let no_down_cap_rescue = state == CurveVerification::LiveMismatch
+        && !stock_equivalent
+        && no_down_cap.evidence_present
+        && no_down_cap.static_base_missing == 0
+        && !no_down_cap.overshoot_veto
+        && effective_coverage >= 0.9;
     LiveCeilingEval {
         state,
         offset_present,
@@ -231,6 +318,11 @@ fn eval_ceiling_evidence(
         diag,
         stock_equivalent,
         stock_equivalent_bins,
+        no_down_cap_needed: no_down_cap.no_down_cap_needed,
+        no_down_cap_rescue,
+        overshoot_veto: no_down_cap.overshoot_veto,
+        static_base_missing: no_down_cap.static_base_missing,
+        effective_coverage,
     }
 }
 
@@ -239,7 +331,11 @@ fn eval_ceiling_evidence(
 /// persisted-profile verifier (today) and the transient-ceiling probe (Phase 2B.2-b).
 /// `stock_top_mhz`: the observed stock/cluster boost top, enabling the narrow
 /// stock-equivalent path for boost-top targets (Phase 2B.2-c.1) — the persisted-profile
-/// verifier passes `None` (classification unchanged). NEVER writes / applies / stresses.
+/// verifier passes `None` (classification unchanged). `static_base`: the once-per-run
+/// STATIC VF-table base curve `(index, voltage_mv, base_freq_mhz)` from
+/// `read_vf_base_curve_modern`, enabling the NoDownCapNeeded benign-zero rescue
+/// (Phase 2B.2-c.2) — the persisted-profile verifier passes `None` (strict). NEVER writes
+/// / applies / stresses.
 #[cfg(windows)]
 pub(crate) fn classify_live_ceiling(
     live: &[(usize, u32, u32)],
@@ -248,6 +344,7 @@ pub(crate) fn classify_live_ceiling(
     target_mhz: u32,
     tol_mhz: u32,
     stock_top_mhz: Option<u32>,
+    static_base: Option<&[(usize, u32, u32)]>,
 ) -> LiveCeilingEval {
     // PRIMARY evidence: the GET-control offset readback per expected point. GetStatus
     // actual freq is kept only as secondary corroboration (see classify_curve docs).
@@ -261,7 +358,17 @@ pub(crate) fn classify_live_ceiling(
             freq_mhz: *freq,
         })
         .collect();
-    eval_ceiling_evidence(target_mhz, ceiling_idx, &expected, tol_mhz, stock_top_mhz)
+    // Reduce the static base curve to an index → base_mhz map for the benign-zero rescue.
+    let static_map: Option<Vec<(usize, u32)>> =
+        static_base.map(|sb| sb.iter().map(|(i, _mv, f)| (*i, *f)).collect());
+    eval_ceiling_evidence(
+        target_mhz,
+        ceiling_idx,
+        &expected,
+        tol_mhz,
+        stock_top_mhz,
+        static_map.as_deref(),
+    )
 }
 
 /// Clock tolerance (MHz) for the load-state p5 check: ~two boost bins.
@@ -592,8 +699,10 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
     // transient-ceiling probe (Phase 2B.2-b) will use.
     // `stock_top_mhz = None`: the persisted-profile verifier never uses the narrow
     // stock-equivalent path — its classification is byte-identical to pre-c.1.
+    // Persisted-profile verification stays STRICT: pass neither stock-top nor static-base
+    // evidence, so neither the stock-equivalent nor the NoDownCapNeeded rescue can apply.
     let LiveCeilingEval { state, offset_present, freq_match, expected_n, diag, .. } =
-        classify_live_ceiling(&live, ceiling_idx, ceiling_mv, core.freq_mhz, TOL_MHZ, None);
+        classify_live_ceiling(&live, ceiling_idx, ceiling_mv, core.freq_mhz, TOL_MHZ, None, None);
     let message = match state {
         CurveVerification::VerifiedCurve => format!(
             "live curve matches: {offset_present}/{expected_n} plateau points carry the flatten \
@@ -730,25 +839,26 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
     }
 }
 
-// ── Legit-zero diagnostic foundation (read-only; NEVER feeds the verdict) ─────────────
-// Joins the PRE-WRITE stock write-plan with the POST-WRITE offset readback so a failed
-// probe can be inspected: are the zero-offset bins legitimately-zero (stock base already
-// at target) or an unexplained gap / reverted high bin? Classification is diagnostic ONLY
-// and is gated on having BOTH the stock write-plan AND the post-write offset — never
-// post-write data alone. It does not change `classify_curve`, the 0.90 threshold, or the
-// StockEquivalentCeiling path.
+// ── NoDownCapNeeded failed-probe diagnostic (read-only; NEVER feeds the verdict) ──────
+// Per-bin view of a failed probe using the SAME static-VF-table evidence and predicate the
+// verifier's benign-zero rescue uses (a zero is benign when the STATIC base ≤ target → no
+// downward cap needed). The GetStatus write-plan (`base`/`want`) is kept ONLY as clamp-
+// behavior context. Classification is diagnostic; it does not change `classify_curve`, the
+// 0.90 threshold, the StockEquivalentCeiling path, or the verdict.
 
 /// Per-bin diagnostic classification for a failed probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinDiagClass {
     /// Post-write offset is non-zero → the flatten is present on this bin.
     Flattened,
-    /// Post-write offset is zero AND the stock write-plan wanted ~zero AND the stock base
-    /// is target-like → a LEGITIMATE-zero candidate (the future fix may count it as covered).
-    LegitZeroCandidate,
-    /// Post-write offset is zero but the stock base is NOT target-like → a real gap: the
-    /// flatten is missing on a bin that should carry a pull-down (skip / revert / contamination).
+    /// Post-write offset is zero AND the STATIC VF-table base ≤ target → no downward cap is
+    /// needed (a benign zero; the verifier may count it as covered).
+    NoDownCapNeeded,
+    /// Post-write offset is zero but the STATIC base is ABOVE target → a real gap: this bin
+    /// should carry a pull-down but does not (skip / revert / driver clamp).
     UnexplainedZero,
+    /// Post-write offset is zero but no static-table base is available → cannot judge benign.
+    StaticBaseMissing,
     /// Post-write offset readback failed → cannot classify.
     Unreadable,
 }
@@ -758,33 +868,32 @@ pub(crate) enum BinDiagClass {
 pub(crate) struct BinDiagRow {
     pub(crate) index: usize,
     pub(crate) voltage_mv: u32,
-    pub(crate) stock_base_mhz: u32,
+    /// Authoritative STATIC VF-table base (the benign-zero evidence). `None` if unavailable.
+    pub(crate) static_base_mhz: Option<u32>,
+    /// GetStatus write-plan base (clamp-behavior context only — NOT used to classify).
+    pub(crate) getstatus_base_mhz: u32,
+    /// GetStatus write-plan desired offset `target - getstatus_base` (clamp context only).
     pub(crate) desired_offset_mhz: i32,
     pub(crate) post_offset_khz: Option<i32>,
     pub(crate) class: BinDiagClass,
 }
 
-/// Classify ONE expected (flatten-set) bin. A zero post-write offset is a legit-zero
-/// candidate ONLY when the stock write-plan also wanted ~zero (`|desired| <= tol`) AND the
-/// stock base reads target-like (`|base - target| <= tol`) — both, never post-write alone.
+/// Classify ONE expected (flatten-set) bin. A zero post-write offset is `NoDownCapNeeded`
+/// ONLY when the STATIC VF-table base is at or below target — never inferred from GetStatus
+/// actual freq or from the write-plan alone.
 fn classify_bin_diag(
-    plan: &nidavellir_gpu_nvapi::VfWritePlanEntry,
+    static_base_mhz: Option<u32>,
     post_offset_khz: Option<i32>,
     target_mhz: u32,
-    tol_mhz: u32,
 ) -> BinDiagClass {
     match post_offset_khz {
         None => BinDiagClass::Unreadable,
         Some(o) if o != 0 => BinDiagClass::Flattened,
-        Some(_) => {
-            let desired_zeroish = plan.desired_offset_mhz.unsigned_abs() <= tol_mhz;
-            let base_targetish = plan.base_mhz.abs_diff(target_mhz) <= tol_mhz;
-            if desired_zeroish && base_targetish {
-                BinDiagClass::LegitZeroCandidate
-            } else {
-                BinDiagClass::UnexplainedZero
-            }
-        }
+        Some(_) => match static_base_mhz {
+            None => BinDiagClass::StaticBaseMissing,
+            Some(b) if b <= target_mhz => BinDiagClass::NoDownCapNeeded,
+            Some(_) => BinDiagClass::UnexplainedZero,
+        },
     }
 }
 
@@ -793,66 +902,66 @@ fn classify_bin_diag(
 pub(crate) struct FailedProbeDiag {
     pub(crate) expected_n: u32,
     pub(crate) non_zero_offsets: u32,
-    pub(crate) zero_offsets: u32,
-    pub(crate) legit_zero_candidates: u32,
+    pub(crate) no_down_cap_needed: u32,
     pub(crate) unexplained_zeros: u32,
+    pub(crate) static_base_missing: u32,
     pub(crate) unreadable: u32,
     pub(crate) first_unexplained_bin: Option<usize>,
     /// Per-bin rows within the `[window_lo_mv, window_hi_mv]` ceiling window, in curve order.
     pub(crate) window: Vec<BinDiagRow>,
 }
 
-/// Pure: join the stock write-plan (flatten-set bins) with the post-write offset readback
-/// and summarize. `post_offsets` maps bin index → post-write offset (kHz, `None` if the
-/// readback failed). Inspects ONLY bins at/above the ceiling. Never mutates classification.
+/// Pure: join the GetStatus write-plan (flatten-set bins, for clamp context), the post-write
+/// offset readback, and the STATIC VF-table base (the authoritative benign-zero evidence),
+/// then summarize. `post_offsets`/`static_base_by_idx` map bin index → value. Inspects ONLY
+/// bins at/above the ceiling. Never mutates classification.
 fn summarize_failed_probe(
     plan: &[nidavellir_gpu_nvapi::VfWritePlanEntry],
     post_offsets: &[(usize, Option<i32>)],
+    static_base_by_idx: &[(usize, u32)],
     target_mhz: u32,
-    tol_mhz: u32,
     window_lo_mv: u32,
     window_hi_mv: u32,
 ) -> FailedProbeDiag {
-    let lookup = |idx: usize| {
-        post_offsets
-            .iter()
-            .find(|(i, _)| *i == idx)
-            .and_then(|(_, o)| *o)
+    let post_lookup = |idx: usize| {
+        post_offsets.iter().find(|(i, _)| *i == idx).and_then(|(_, o)| *o)
+    };
+    let base_lookup = |idx: usize| {
+        static_base_by_idx.iter().find(|(i, _)| *i == idx).map(|(_, b)| *b)
     };
     let mut d = FailedProbeDiag {
         expected_n: 0,
         non_zero_offsets: 0,
-        zero_offsets: 0,
-        legit_zero_candidates: 0,
+        no_down_cap_needed: 0,
         unexplained_zeros: 0,
+        static_base_missing: 0,
         unreadable: 0,
         first_unexplained_bin: None,
         window: Vec::new(),
     };
     for entry in plan.iter().filter(|e| e.in_flatten_set) {
         d.expected_n += 1;
-        let post = lookup(entry.index);
-        let class = classify_bin_diag(entry, post, target_mhz, tol_mhz);
+        let post = post_lookup(entry.index);
+        let sbase = base_lookup(entry.index);
+        let class = classify_bin_diag(sbase, post, target_mhz);
         match class {
             BinDiagClass::Flattened => d.non_zero_offsets += 1,
-            BinDiagClass::LegitZeroCandidate => {
-                d.zero_offsets += 1;
-                d.legit_zero_candidates += 1;
-            }
+            BinDiagClass::NoDownCapNeeded => d.no_down_cap_needed += 1,
             BinDiagClass::UnexplainedZero => {
-                d.zero_offsets += 1;
                 d.unexplained_zeros += 1;
                 if d.first_unexplained_bin.is_none() {
                     d.first_unexplained_bin = Some(entry.index);
                 }
             }
+            BinDiagClass::StaticBaseMissing => d.static_base_missing += 1,
             BinDiagClass::Unreadable => d.unreadable += 1,
         }
         if entry.voltage_mv >= window_lo_mv && entry.voltage_mv <= window_hi_mv {
             d.window.push(BinDiagRow {
                 index: entry.index,
                 voltage_mv: entry.voltage_mv,
-                stock_base_mhz: entry.base_mhz,
+                static_base_mhz: sbase,
+                getstatus_base_mhz: entry.base_mhz,
                 desired_offset_mhz: entry.desired_offset_mhz,
                 post_offset_khz: post,
                 class,
@@ -872,20 +981,25 @@ impl FailedProbeDiag {
                 let post = r
                     .post_offset_khz
                     .map_or_else(|| "none".to_string(), |o| format!("{:+}", o / 1000));
+                let sbase = r
+                    .static_base_mhz
+                    .map_or_else(|| "none".to_string(), |b| b.to_string());
                 format!(
-                    "[{} {}mV base={} want={:+} post={} {:?}]",
-                    r.index, r.voltage_mv, r.stock_base_mhz, r.desired_offset_mhz, post, r.class
+                    "[{} {}mV sbase={} gbase={} want={:+} post={} {:?}]",
+                    r.index, r.voltage_mv, sbase, r.getstatus_base_mhz,
+                    r.desired_offset_mhz, post, r.class
                 )
             })
             .collect();
         format!(
-            "expected={} non_zero={} zero={} legit_zero_candidates={} unexplained_zeros={} \
-             unreadable={} first_unexplained_bin={:?} window(850..950mV)={}",
+            "expected={} non_zero={} no_down_cap_needed={} unexplained_zeros={} \
+             static_base_missing={} unreadable={} first_unexplained_bin={:?} \
+             window(850..950mV)={}",
             self.expected_n,
             self.non_zero_offsets,
-            self.zero_offsets,
-            self.legit_zero_candidates,
+            self.no_down_cap_needed,
             self.unexplained_zeros,
+            self.static_base_missing,
             self.unreadable,
             self.first_unexplained_bin,
             win.join(" ")
@@ -893,24 +1007,28 @@ impl FailedProbeDiag {
     }
 }
 
-/// Read-only failed-probe diagnostic entry point: build the stock write-plan preview, read
-/// back the GET-control offsets for the flatten set (read-only), and return a compact log
-/// line. `stock_curve` is the once-per-run pre-write stock curve (NOT the contaminated
-/// per-probe read). NEVER writes, applies, or changes the verdict.
+/// Read-only failed-probe diagnostic entry point: build the GetStatus write-plan (clamp
+/// context), read back the GET-control offsets for the flatten set (read-only), join the
+/// once-per-run STATIC VF-table base, and return a compact log line. `stock_curve` and
+/// `static_base_curve` are the once-per-run pre-write reads (NOT contaminated per-probe
+/// reads). NEVER writes, applies, or changes the verdict.
 #[cfg(windows)]
 pub(crate) fn failed_probe_diag_line(
     stock_curve: &[(usize, u32, u32)],
+    static_base_curve: &[(usize, u32, u32)],
     ceiling_mv: u32,
     target_mhz: u32,
-    tol_mhz: u32,
 ) -> String {
     let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(stock_curve, ceiling_mv, target_mhz);
+    let static_base_by_idx: Vec<(usize, u32)> =
+        static_base_curve.iter().map(|(i, _mv, f)| (*i, *f)).collect();
     let post_offsets: Vec<(usize, Option<i32>)> = plan
         .iter()
         .filter(|e| e.in_flatten_set)
         .map(|e| (e.index, nidavellir_gpu_nvapi::vf_get_point_khz(e.index)))
         .collect();
-    summarize_failed_probe(&plan, &post_offsets, target_mhz, tol_mhz, 850, 950).fmt_compact()
+    summarize_failed_probe(&plan, &post_offsets, &static_base_by_idx, target_mhz, 850, 950)
+        .fmt_compact()
 }
 
 #[cfg(test)]
@@ -1097,7 +1215,7 @@ mod tests {
         // All plateau points carry the flatten offset → VerifiedCurve; diag reflects it.
         let expected: Vec<PointEvidence> =
             (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-120_000), 1785)).collect();
-        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ, None);
+        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ, None, None);
         assert_eq!(e.state, CurveVerification::VerifiedCurve);
         assert_eq!((e.offset_present, e.expected_n), (10, 10));
         assert_eq!(e.diag.modified_bin_count, 10);
@@ -1109,7 +1227,7 @@ mod tests {
         // Offsets readable but all zero (reset / never flattened) → LiveMismatch.
         let expected: Vec<PointEvidence> =
             (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(0), 1900)).collect();
-        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ, None);
+        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ, None, None);
         assert_eq!(e.state, CurveVerification::LiveMismatch);
         assert_eq!(e.offset_present, 0);
     }
@@ -1120,12 +1238,12 @@ mod tests {
         let unreadable: Vec<PointEvidence> =
             (0..5).map(|i| evx(60 + i, 850, None, 1785)).collect();
         assert_eq!(
-            eval_ceiling_evidence(1785, 60, &unreadable, TOL_MHZ, None).state,
+            eval_ceiling_evidence(1785, 60, &unreadable, TOL_MHZ, None, None).state,
             CurveVerification::VerificationFailed
         );
         // Empty plateau set → VerificationFailed.
         assert_eq!(
-            eval_ceiling_evidence(1785, 60, &[], TOL_MHZ, None).state,
+            eval_ceiling_evidence(1785, 60, &[], TOL_MHZ, None, None).state,
             CurveVerification::VerificationFailed
         );
     }
@@ -1136,7 +1254,7 @@ mod tests {
         // the spread surfaces in `diag`, never in the verdict (offset-presence is the gate).
         let expected: Vec<PointEvidence> =
             (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-100_000), 1830)).collect();
-        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ, None);
+        let e = eval_ceiling_evidence(1785, 60, &expected, TOL_MHZ, None, None);
         assert_eq!(e.state, CurveVerification::VerifiedCurve);
         assert_eq!(e.diag.max_target_overshoot_mhz, Some(45));
     }
@@ -1150,8 +1268,8 @@ mod tests {
         let high: Vec<PointEvidence> =
             (0..6).map(|i| evx(60 + i, 1062, Some(-90_000), 1785)).collect();
         assert_eq!(
-            eval_ceiling_evidence(1785, 60, &low, TOL_MHZ, None).state,
-            eval_ceiling_evidence(1785, 60, &high, TOL_MHZ, None).state
+            eval_ceiling_evidence(1785, 60, &low, TOL_MHZ, None, None).state,
+            eval_ceiling_evidence(1785, 60, &high, TOL_MHZ, None, None).state
         );
     }
 
@@ -1171,7 +1289,7 @@ mod tests {
     fn stock_equivalent_boost_top_is_accepted() {
         // Reproduces the rejected first-run probe: normal gate stays LiveMismatch
         // (20/27 < 90%) but every missing offset is explained by a stock-at-target bin.
-        let e = eval_ceiling_evidence(1935, 38, &boost_top_evidence(), TOL_MHZ, Some(1935));
+        let e = eval_ceiling_evidence(1935, 38, &boost_top_evidence(), TOL_MHZ, Some(1935), None);
         assert_eq!(e.state, CurveVerification::LiveMismatch);
         assert!(e.stock_equivalent);
         assert_eq!(e.stock_equivalent_bins, 7);
@@ -1185,7 +1303,7 @@ mod tests {
         let mut v: Vec<PointEvidence> =
             (0..20).map(|i| evx(38 + i, 1075 + i as u32 * 3, Some(20_000), 1935)).collect();
         v.extend((0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), 1905)));
-        let e = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935));
+        let e = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935), None);
         assert_eq!(e.state, CurveVerification::LiveMismatch);
         assert!(!e.stock_equivalent);
     }
@@ -1195,7 +1313,7 @@ mod tests {
         // One bin reads ABOVE target — even within the GetStatus tolerance → rejected.
         let mut v = boost_top_evidence();
         v[5].freq_mhz = 1945; // +10 MHz overshoot, < TOL_MHZ — still not acceptable
-        let e = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935));
+        let e = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935), None);
         assert_eq!(e.state, CurveVerification::LiveMismatch);
         assert!(!e.stock_equivalent);
     }
@@ -1207,7 +1325,7 @@ mod tests {
         let mut v: Vec<PointEvidence> =
             (0..20).map(|i| evx(38 + i, 1075 + i as u32 * 3, Some(20_000), 1875)).collect();
         v.extend((0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), 1875)));
-        let e = eval_ceiling_evidence(1875, 38, &v, TOL_MHZ, Some(1935));
+        let e = eval_ceiling_evidence(1875, 38, &v, TOL_MHZ, Some(1935), None);
         assert_eq!(e.state, CurveVerification::LiveMismatch);
         assert!(!e.stock_equivalent);
     }
@@ -1218,20 +1336,20 @@ mod tests {
         // explained: a correct flatten would have written a +15 MHz offset there.
         let mut v = boost_top_evidence();
         v[26].freq_mhz = 1920; // a zero-offset bin: within tol, but not exactly at target
-        let e = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935));
+        let e = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935), None);
         assert!(!e.stock_equivalent);
     }
 
     #[test]
     fn stock_equivalent_requires_stock_top_and_readable_offsets() {
         // No stock-top info (the persisted-profile verifier path) → never applies.
-        let e = eval_ceiling_evidence(1935, 38, &boost_top_evidence(), TOL_MHZ, None);
+        let e = eval_ceiling_evidence(1935, 38, &boost_top_evidence(), TOL_MHZ, None, None);
         assert!(!e.stock_equivalent);
         // An unreadable offset among the expected bins → never applies (and an
         // all-unreadable set stays VerificationFailed, which is never re-evaluated).
         let mut v = boost_top_evidence();
         v[3].offset_khz = None;
-        let e2 = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935));
+        let e2 = eval_ceiling_evidence(1935, 38, &v, TOL_MHZ, Some(1935), None);
         assert_eq!(e2.state, CurveVerification::LiveMismatch);
         assert!(!e2.stock_equivalent);
     }
@@ -1242,7 +1360,7 @@ mod tests {
         // even when the target equals the stock top.
         let v: Vec<PointEvidence> =
             (0..10).map(|i| evx(60 + i, 850 + i as u32 * 10, Some(-120_000), 1785)).collect();
-        let e = eval_ceiling_evidence(1785, 60, &v, TOL_MHZ, Some(1785));
+        let e = eval_ceiling_evidence(1785, 60, &v, TOL_MHZ, Some(1785), None);
         assert_eq!(e.state, CurveVerification::VerifiedCurve);
         assert!(!e.stock_equivalent);
         assert_eq!(e.stock_equivalent_bins, 0);
@@ -1259,7 +1377,7 @@ mod tests {
         // stock. Pins this as INTENDED behavior.
         let v: Vec<PointEvidence> =
             (0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), 1935)).collect();
-        let e = eval_ceiling_evidence(1935, 58, &v, TOL_MHZ, Some(1935));
+        let e = eval_ceiling_evidence(1935, 58, &v, TOL_MHZ, Some(1935), None);
         assert_eq!(e.state, CurveVerification::LiveMismatch); // normal gate: 0/7 offsets
         assert_eq!((e.offset_present, e.expected_n), (0, 7));
         assert!(e.stock_equivalent);
@@ -1277,7 +1395,7 @@ mod tests {
             v.extend((0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), 1935)));
             v
         };
-        let e = eval_ceiling_evidence(1935, 38, &at_tol, TOL_MHZ, Some(1935));
+        let e = eval_ceiling_evidence(1935, 38, &at_tol, TOL_MHZ, Some(1935), None);
         assert!(e.stock_equivalent, "offset bin exactly 15 MHz below target must accept");
 
         let past_tol: Vec<PointEvidence> = {
@@ -1285,7 +1403,7 @@ mod tests {
             v[19].freq_mhz = 1919; // 16 below target → out of tolerance
             v
         };
-        let e2 = eval_ceiling_evidence(1935, 38, &past_tol, TOL_MHZ, Some(1935));
+        let e2 = eval_ceiling_evidence(1935, 38, &past_tol, TOL_MHZ, Some(1935), None);
         assert!(!e2.stock_equivalent, "offset bin 16 MHz below target must reject");
     }
 
@@ -1298,10 +1416,10 @@ mod tests {
             (0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), target)).collect()
         };
         // 1920 == 1935 - 15 → within tol → accepts.
-        let e = eval_ceiling_evidence(1920, 58, &evidence(1920), TOL_MHZ, Some(1935));
+        let e = eval_ceiling_evidence(1920, 58, &evidence(1920), TOL_MHZ, Some(1935), None);
         assert!(e.stock_equivalent, "target 15 MHz below stock top must accept");
         // 1919 == 1935 - 16 → out of tol → rejects (normal gate governs).
-        let e2 = eval_ceiling_evidence(1919, 58, &evidence(1919), TOL_MHZ, Some(1935));
+        let e2 = eval_ceiling_evidence(1919, 58, &evidence(1919), TOL_MHZ, Some(1935), None);
         assert!(!e2.stock_equivalent, "target 16 MHz below stock top must reject");
     }
 
@@ -1315,11 +1433,11 @@ mod tests {
             (0..7).map(|i| evx(58 + i, 1136 + i as u32 * 2, Some(0), target)).collect()
         };
         // 1 MHz above the stock top → rejected.
-        let e1 = eval_ceiling_evidence(1936, 58, &evidence(1936), TOL_MHZ, Some(1935));
+        let e1 = eval_ceiling_evidence(1936, 58, &evidence(1936), TOL_MHZ, Some(1935), None);
         assert!(!e1.stock_equivalent, "target 1 MHz above stock top must reject");
         // Well above but still within the old symmetric abs_diff window (would have passed
         // before the directional fix) → still rejected now.
-        let e2 = eval_ceiling_evidence(1945, 58, &evidence(1945), TOL_MHZ, Some(1935));
+        let e2 = eval_ceiling_evidence(1945, 58, &evidence(1945), TOL_MHZ, Some(1935), None);
         assert!(!e2.stock_equivalent, "target above stock top within tol must still reject");
     }
 
@@ -1430,74 +1548,203 @@ mod tests {
         assert_eq!(effective_status(LiveMismatch, NotEvaluated), "live_mismatch");
     }
 
-    // ── Legit-zero diagnostic foundation (pure; never affects the verdict) ────────
+    // ── Phase 2B.2-c.2: NoDownCapNeeded benign-zero verifier rescue (pure) ────────
     #[test]
-    fn diag_labels_legit_zero_but_verdict_unchanged() {
-        // 9 flatten-set bins: 8 carry pull-down offsets, 1 is a legit zero (base==target).
-        // classify_curve verdict: 8/9 = 0.889 < 0.9 → LiveMismatch — UNCHANGED by diagnostics.
-        let target = 1755;
-        let mut evidence: Vec<PointEvidence> =
-            (0..8).map(|i| evx(60 + i, 1000, Some(-100_000), 1830)).collect();
-        evidence.push(evx(68, 900, Some(0), 1755)); // legit zero: already at target
-        let (state, present, _, n) = classify_curve(target, &evidence, TOL_MHZ);
-        assert_eq!(state, CurveVerification::LiveMismatch);
-        assert_eq!((present, n), (8, 9));
+    fn nodowncap_reproduction_passes_via_effective_coverage() {
+        // The 1755/900 shape: raw 49/55 = 0.891 < 0.90 → LiveMismatch. Two zero bins whose
+        // STATIC base ≤ target are benign (no down-cap needed); effective (49+2)/55 = 0.927
+        // ≥ 0.90 with no overshoot and complete static evidence → NoDownCapNeeded rescue.
+        let target: u32 = 1755;
+        let mut expected: Vec<PointEvidence> =
+            (0usize..49).map(|i| evx(i, 1000, Some(-100_000), target)).collect();
+        expected.push(evx(49, 920, Some(0), target)); // benign zero (static == target)
+        expected.push(evx(50, 925, Some(0), target)); // benign zero (static == target)
+        for i in 51usize..55 {
+            expected.push(evx(i, 1010, Some(0), target)); // zeros that are NOT benign (static > target)
+        }
+        let mut sb: Vec<(usize, u32)> = (0usize..49).map(|i| (i, 1830u32)).collect();
+        sb.push((49, target));
+        sb.push((50, target));
+        for i in 51usize..55 {
+            sb.push((i, target + 60));
+        }
+        let e = eval_ceiling_evidence(target, 0, &expected, TOL_MHZ, None, Some(&sb));
+        assert_eq!(e.state, CurveVerification::LiveMismatch); // raw 49/55 still a mismatch
+        assert_eq!((e.offset_present, e.expected_n), (49, 55));
+        assert_eq!(e.no_down_cap_needed, 2); // ONLY the two static ≤ target zeros
+        assert!(!e.overshoot_veto);
+        assert_eq!(e.static_base_missing, 0);
+        assert!(e.no_down_cap_rescue);
+        assert!((e.effective_coverage - 51.0 / 55.0).abs() < 1e-6);
+    }
 
-        // Diagnostic over the stock write-plan: bin 68 is a legit-zero CANDIDATE (label only).
-        let stock: Vec<(usize, u32, u32)> = (60..68)
+    #[test]
+    fn nodowncap_false_accept_guard_static_above_target_not_benign() {
+        // Zeros whose STATIC base is target+60 must NOT count as benign even if a GetStatus
+        // actual freq looked target-like — the gate uses the static table, never the rescue.
+        let target: u32 = 1755;
+        let mut expected: Vec<PointEvidence> =
+            (0usize..8).map(|i| evx(i, 1000, Some(-100_000), target)).collect();
+        expected.push(evx(8, 1010, Some(0), target)); // freq ≤ target (under-reported), but...
+        expected.push(evx(9, 1010, Some(0), target));
+        let mut sb: Vec<(usize, u32)> = (0usize..8).map(|i| (i, 1830u32)).collect();
+        sb.push((8, target + 60)); // STATIC base genuinely above target → needs a down-cap
+        sb.push((9, target + 60));
+        let e = eval_ceiling_evidence(target, 0, &expected, TOL_MHZ, None, Some(&sb));
+        assert_eq!(e.no_down_cap_needed, 0);
+        assert!(!e.no_down_cap_rescue); // effective 8/10 = 0.8 < 0.9
+        assert_eq!(e.state, CurveVerification::LiveMismatch);
+    }
+
+    #[test]
+    fn nodowncap_overshoot_veto_disables_rescue() {
+        // A benign zero exists and effective coverage would reach 1.0, but one expected bin's
+        // GetStatus freq reads above target → veto disables the rescue for the whole set.
+        let target: u32 = 1755;
+        let mut expected: Vec<PointEvidence> =
+            (0usize..7).map(|i| evx(i, 1000, Some(-100_000), target)).collect();
+        expected.push(evx(7, 1000, Some(-100_000), target + 30)); // OVERSHOOT bin
+        expected.push(evx(8, 920, Some(0), target)); // benign zero
+        let mut sb: Vec<(usize, u32)> = (0usize..8).map(|i| (i, 1830u32)).collect();
+        sb.push((8, target));
+        let e = eval_ceiling_evidence(target, 0, &expected, TOL_MHZ, None, Some(&sb));
+        assert!(e.overshoot_veto);
+        assert!(!e.no_down_cap_rescue);
+        assert_eq!(e.state, CurveVerification::LiveMismatch); // raw 8/9 = 0.889
+
+        // The veto only gates the rescue; raw coverage that already passes is unaffected.
+        let raw_pass: Vec<PointEvidence> = (0usize..10)
+            .map(|i| evx(i, 1000, Some(-100_000), if i == 0 { target + 30 } else { target }))
+            .collect();
+        let sb2: Vec<(usize, u32)> = (0usize..10).map(|i| (i, 1830u32)).collect();
+        let e2 = eval_ceiling_evidence(target, 0, &raw_pass, TOL_MHZ, None, Some(&sb2));
+        assert_eq!(e2.state, CurveVerification::VerifiedCurve); // 10/10 raw, overshoot ignored
+    }
+
+    #[test]
+    fn nodowncap_unreadable_offset_not_benign() {
+        // An unreadable (None) offset is never benign even if the static base ≤ target.
+        let target: u32 = 1755;
+        let expected = vec![evx(0, 920, None, target)];
+        let sb = vec![(0usize, target)];
+        let nd = eval_no_down_cap(target, &expected, Some(&sb));
+        assert_eq!(nd.no_down_cap_needed, 0);
+    }
+
+    #[test]
+    fn nodowncap_evidence_unavailable_is_strict() {
+        // No static evidence → strict old behavior: nothing benign, every bin "missing", no rescue.
+        let target: u32 = 1755;
+        let mut expected: Vec<PointEvidence> =
+            (0usize..8).map(|i| evx(i, 1000, Some(-100_000), target)).collect();
+        expected.push(evx(8, 920, Some(0), target));
+        expected.push(evx(9, 925, Some(0), target));
+        let e = eval_ceiling_evidence(target, 0, &expected, TOL_MHZ, None, None);
+        assert!(!e.no_down_cap_rescue);
+        assert_eq!(e.no_down_cap_needed, 0);
+        assert_eq!(e.static_base_missing, e.expected_n);
+        assert_eq!(e.state, CurveVerification::LiveMismatch);
+    }
+
+    #[test]
+    fn nodowncap_partial_static_evidence_forces_strict() {
+        // A single expected bin missing its static base → strict fallback for the whole set.
+        let target: u32 = 1755;
+        let mut expected: Vec<PointEvidence> =
+            (0usize..8).map(|i| evx(i, 1000, Some(-100_000), target)).collect();
+        expected.push(evx(8, 920, Some(0), target)); // would be benign, but its base is missing
+        let sb: Vec<(usize, u32)> = (0usize..8).map(|i| (i, 1830u32)).collect(); // no entry for 8
+        let e = eval_ceiling_evidence(target, 0, &expected, TOL_MHZ, None, Some(&sb));
+        assert!(e.static_base_missing >= 1);
+        assert!(!e.no_down_cap_rescue);
+        assert_eq!(e.state, CurveVerification::LiveMismatch);
+    }
+
+    #[test]
+    fn nodowncap_boundary_target_counts_target_plus_one_does_not() {
+        let target: u32 = 1755;
+        let expected = vec![evx(0, 920, Some(0), target), evx(1, 925, Some(0), target)];
+        let sb = vec![(0usize, target), (1usize, target + 1)];
+        let nd = eval_no_down_cap(target, &expected, Some(&sb));
+        assert_eq!(nd.no_down_cap_needed, 1); // base == target counts; base == target+1 does not
+        assert_eq!(nd.static_base_missing, 0);
+        assert!(!nd.overshoot_veto);
+    }
+
+    #[test]
+    fn nodowncap_high_bin_reverted_zero_not_benign() {
+        // A zero-offset high bin whose static base is well above target must never be benign.
+        let target: u32 = 1755;
+        let expected = vec![evx(0, 1050, Some(0), target)];
+        let sb = vec![(0usize, target + 120)];
+        let nd = eval_no_down_cap(target, &expected, Some(&sb));
+        assert_eq!(nd.no_down_cap_needed, 0);
+    }
+
+    // ── NoDownCapNeeded failed-probe diagnostic (pure; never affects the verdict) ──
+    #[test]
+    fn diag_no_down_cap_needed_labeled_from_static_base() {
+        let target: u32 = 1755;
+        let stock: Vec<(usize, u32, u32)> = (60usize..68)
             .map(|i| (i, 1000u32, 1890u32))
             .chain([(68usize, 900u32, 1755u32)])
             .collect();
         let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(&stock, 900, target);
-        let post: Vec<(usize, Option<i32>)> = (60..68)
+        let post: Vec<(usize, Option<i32>)> = (60usize..68)
             .map(|i| (i, Some(-100_000)))
             .chain([(68usize, Some(0))])
             .collect();
-        let d = summarize_failed_probe(&plan, &post, target, TOL_MHZ, 850, 950);
+        // static base: bins 60-67 above target (capped), bin 68 == target (benign zero).
+        let sb: Vec<(usize, u32)> =
+            (60usize..68).map(|i| (i, 1830u32)).chain([(68usize, target)]).collect();
+        let d = summarize_failed_probe(&plan, &post, &sb, target, 850, 950);
         assert_eq!(d.expected_n, 9);
         assert_eq!(d.non_zero_offsets, 8);
-        assert_eq!(d.legit_zero_candidates, 1);
+        assert_eq!(d.no_down_cap_needed, 1); // bin 68
         assert_eq!(d.unexplained_zeros, 0);
-        assert_eq!(d.first_unexplained_bin, None);
+        assert_eq!(d.static_base_missing, 0);
     }
 
     #[test]
-    fn diag_unexplained_zero_flags_first_bin() {
-        // A zero post-write offset on a bin whose stock base is NOT target-like is a real gap.
-        let target = 1755;
+    fn diag_unexplained_zero_when_static_above_target() {
+        let target: u32 = 1755;
         let stock = vec![(70usize, 1000u32, 1890u32), (71, 1000, 1890)];
         let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(&stock, 900, target);
         let post = vec![(70usize, Some(0)), (71, Some(-100_000))];
-        let d = summarize_failed_probe(&plan, &post, target, TOL_MHZ, 850, 950);
+        let sb = vec![(70usize, target + 60), (71usize, 1830u32)];
+        let d = summarize_failed_probe(&plan, &post, &sb, target, 850, 950);
         assert_eq!(d.unexplained_zeros, 1);
-        assert_eq!(d.first_unexplained_bin, Some(70)); // base 1890 ≠ target, post 0
+        assert_eq!(d.first_unexplained_bin, Some(70)); // static base 1815 > 1755, post 0
         assert_eq!(d.non_zero_offsets, 1);
-        assert_eq!(d.legit_zero_candidates, 0);
+        assert_eq!(d.no_down_cap_needed, 0);
     }
 
     #[test]
-    fn diag_excludes_below_ceiling_and_marks_unreadable() {
-        let target = 1755;
-        // 800 mV bin is below the 900 mV ceiling → excluded from the flatten-set summary.
-        let stock = vec![(80usize, 800u32, 1700u32), (81, 950, 1800)];
+    fn diag_static_base_missing_and_unreadable() {
+        let target: u32 = 1755;
+        let stock = vec![(80usize, 950u32, 1800u32), (81, 950, 1810)];
         let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(&stock, 900, target);
-        let post = vec![(81usize, None)]; // 80 below ceiling; 81 readback failed
-        let d = summarize_failed_probe(&plan, &post, target, TOL_MHZ, 850, 950);
-        assert_eq!(d.expected_n, 1); // only the 950 mV bin is in the flatten set
-        assert_eq!(d.unreadable, 1);
-        assert_eq!(d.non_zero_offsets, 0);
-        assert_eq!(d.legit_zero_candidates, 0);
+        let post = vec![(80usize, Some(0)), (81, None)];
+        let sb: Vec<(usize, u32)> = vec![]; // no static base for either bin
+        let d = summarize_failed_probe(&plan, &post, &sb, target, 850, 950);
+        assert_eq!(d.expected_n, 2);
+        assert_eq!(d.static_base_missing, 1); // bin 80: zero offset, no static base
+        assert_eq!(d.unreadable, 1); // bin 81: offset readback failed
+        assert_eq!(d.no_down_cap_needed, 0);
     }
 
     #[test]
-    fn diag_classify_bin_requires_both_plan_and_post_zero() {
-        let target = 1755;
-        let plan = nidavellir_gpu_nvapi::plan_vf_ceiling(&[(5usize, 900u32, 1755u32)], 900, target);
-        // post non-zero → Flattened regardless of plan.
-        assert_eq!(classify_bin_diag(&plan[0], Some(-30_000), target, TOL_MHZ), BinDiagClass::Flattened);
-        // post zero + plan wants ~zero + base target-like → legit candidate.
-        assert_eq!(classify_bin_diag(&plan[0], Some(0), target, TOL_MHZ), BinDiagClass::LegitZeroCandidate);
-        // post unreadable → Unreadable.
-        assert_eq!(classify_bin_diag(&plan[0], None, target, TOL_MHZ), BinDiagClass::Unreadable);
+    fn diag_classify_bin_uses_static_base() {
+        let target: u32 = 1755;
+        // Non-zero offset → Flattened regardless of static base.
+        assert_eq!(classify_bin_diag(Some(1830), Some(-30_000), target), BinDiagClass::Flattened);
+        // Zero + static base ≤ target → NoDownCapNeeded.
+        assert_eq!(classify_bin_diag(Some(target), Some(0), target), BinDiagClass::NoDownCapNeeded);
+        // Zero + static base > target → UnexplainedZero.
+        assert_eq!(classify_bin_diag(Some(target + 1), Some(0), target), BinDiagClass::UnexplainedZero);
+        // Zero + no static base → StaticBaseMissing.
+        assert_eq!(classify_bin_diag(None, Some(0), target), BinDiagClass::StaticBaseMissing);
+        // Unreadable offset → Unreadable.
+        assert_eq!(classify_bin_diag(Some(target), None, target), BinDiagClass::Unreadable);
     }
 }
