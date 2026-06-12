@@ -1832,12 +1832,38 @@ fn real_probe_step(
         ("gpu_vf_bin_mv", ceiling_mv as i64),
     ]);
     let _ = store.arm_boot_flag(&BootFlag::new(intent, "f1b_frontier"));
-    // 4. apply the elastic VF ceiling.
-    if let Err(e) = gpu::apply_vf_ceiling(ceiling_mv, target) {
-        warn!("build-frontier probe: apply_vf_ceiling({ceiling_mv} mV, {target} MHz) failed: {e}");
-        reset_to_stock();
-        let _ = store.clear_boot_flag();
-        return unverified_probe();
+    // 4. apply the build-frontier MONOTONE-DOWN, static-base-anchored VF ceiling. This writer
+    //    fails closed (Err) if the static base is unavailable/incomplete — it must NEVER fall
+    //    back to the live-anchored apply_vf_ceiling (audit B1). Safe Loop stays armed (above).
+    match gpu::apply_vf_ceiling_monotone(ceiling_mv, target) {
+        Ok(down_caps) => {
+            // Compact diagnostic from a pure preview over the once-per-run static base.
+            let preview = gpu::plan_vf_ceiling_monotone(static_base, ceiling_mv, target);
+            let benign_zeros = preview
+                .iter()
+                .filter(|e| e.in_flatten_set && e.desired_offset_mhz == 0)
+                .count();
+            let predicted_max = preview
+                .iter()
+                .filter(|e| e.in_flatten_set)
+                .map(|e| e.base_mhz as i32 + e.desired_offset_mhz)
+                .max()
+                .unwrap_or(0);
+            info!(
+                "build-frontier probe: write_mode=monotone_static down_caps={down_caps} \
+                 benign_zeros={benign_zeros} static_base_points={} \
+                 monotone_predicted_max={predicted_max} positive_offsets=0 \
+                 ceiling_mv={ceiling_mv} target={target}",
+                static_base.len()
+            );
+        }
+        Err(e) => {
+            // Fail closed (audit B1/B3): reset, clear the armed boot flag, take the safe path.
+            warn!("build-frontier probe: apply_vf_ceiling_monotone({ceiling_mv} mV, {target} MHz) failed closed: {e}");
+            reset_to_stock();
+            let _ = store.clear_boot_flag();
+            return unverified_probe();
+        }
     }
     // 5. read-only verify the JUST-applied transient ceiling (shared path) + log 11C diag.
     // Pass the once-per-run STATIC VF-table base for the NoDownCapNeeded benign-zero rescue.

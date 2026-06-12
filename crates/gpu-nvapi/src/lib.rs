@@ -647,6 +647,49 @@ pub fn plan_vf_ceiling(
         .collect()
 }
 
+/// Pure preview of the build-frontier **monotone-down** VF-ceiling transform, anchored to
+/// the STATIC VF-table base (NOT the idle-depressed live curve `plan_vf_ceiling` uses). For
+/// every point in `static_base_curve` (`(index, voltage_mv, base_freq_mhz)` from
+/// [`read_vf_base_curve_modern`]): below-ceiling bins stay elastic (offset 0); bins at/above
+/// `ceiling_mv` whose static base is ABOVE target are capped DOWN by exactly
+/// `target - static_base` (negative → the driver lands them at target); bins whose static
+/// base is already ≤ target keep offset 0 (NEVER raised). Emits ONLY offsets ≤ 0 — never a
+/// `FlattenUp`. This is the deterministic ceiling the live-anchored planner could not express
+/// (idle GetStatus under-reports vs the static base, so its down-caps were too weak and left
+/// plateau overshoot). Pure + unit-testable; shares the plan shape so writer and diagnostic
+/// cannot drift.
+pub fn plan_vf_ceiling_monotone(
+    static_base_curve: &[(usize, u32, u32)],
+    ceiling_mv: u32,
+    target_mhz: u32,
+) -> Vec<VfWritePlanEntry> {
+    static_base_curve
+        .iter()
+        .map(|&(index, voltage_mv, base_mhz)| {
+            let in_flatten_set = voltage_mv >= ceiling_mv;
+            let (desired_offset_mhz, class) = if !in_flatten_set {
+                (0, VfBinClass::BelowCeiling)
+            } else if base_mhz > target_mhz {
+                // Negative down-cap → effective = static_base + (target - static_base) = target.
+                (target_mhz as i32 - base_mhz as i32, VfBinClass::FlattenDown)
+            } else {
+                // Static base already ≤ target → no down-cap needed; never raise (no FlattenUp).
+                (0, VfBinClass::AlreadyAtTarget)
+            };
+            VfWritePlanEntry {
+                index,
+                voltage_mv,
+                base_mhz,
+                desired_offset_mhz,
+                below_ceiling: !in_flatten_set,
+                in_flatten_set,
+                desired_offset_is_zero: desired_offset_mhz == 0,
+                class,
+            }
+        })
+        .collect()
+}
+
 /// Apply an Afterburner-style **VF ceiling**: flatten every curve point whose
 /// voltage is ≥ `ceiling_mv` to `target_mhz` (via per-point freq offsets), leaving
 /// lower-voltage points untouched (elastic). This caps the top of the curve at
@@ -671,6 +714,46 @@ pub fn apply_vf_ceiling(ceiling_mv: u32, target_mhz: u32) -> Result<usize, Strin
         }
     }
     Ok(flattened)
+}
+
+/// Build-frontier-only **monotone-down** VF-ceiling writer anchored to the STATIC VF-table
+/// base. Unlike [`apply_vf_ceiling`] (offsets derived from the idle-depressed live curve →
+/// can under-cap and leave plateau overshoot), this reads [`read_vf_base_curve_modern`] and
+/// writes the deterministic `target - static_base` down-cap (≤ 0) for every bin at/above
+/// `ceiling_mv` whose static base exceeds target, leaving sub-target and below-ceiling bins
+/// elastic (offset 0). FAILS CLOSED (`Err`) when the static base is unavailable/empty or no
+/// bin sits at/above the ceiling — it NEVER falls back to the live-anchored writer and NEVER
+/// locks voltage. Returns the number of non-zero down-cap writes. Used ONLY by the
+/// build-frontier probe; the persisted-profile path keeps [`apply_vf_ceiling`].
+#[cfg(windows)]
+pub fn apply_vf_ceiling_monotone(ceiling_mv: u32, target_mhz: u32) -> Result<usize, String> {
+    let static_base = read_vf_base_curve_modern();
+    if static_base.is_empty() {
+        return Err("static VF-table base unavailable (read_vf_base_curve_modern empty) — fail closed".into());
+    }
+    let plan = plan_vf_ceiling_monotone(&static_base, ceiling_mv, target_mhz);
+    if !plan.iter().any(|e| e.in_flatten_set) {
+        return Err(format!("no static-base bin at/above ceiling {ceiling_mv} mV — fail closed"));
+    }
+    let mut down_caps = 0;
+    for entry in &plan {
+        // Invariant: the monotone planner must NEVER emit a positive offset. Refuse to write
+        // rather than ever raise a bin.
+        if entry.desired_offset_mhz > 0 {
+            return Err(format!(
+                "monotone plan emitted positive offset {} at idx {} — refusing to write",
+                entry.desired_offset_mhz, entry.index
+            ));
+        }
+        let st = vfcurve::set_point(entry.index, entry.desired_offset_mhz * 1000);
+        if st != 0 {
+            return Err(format!("set_point({}) status {}", entry.index, st));
+        }
+        if entry.desired_offset_mhz != 0 {
+            down_caps += 1;
+        }
+    }
+    Ok(down_caps)
 }
 
 /// Reset the modern V/F curve: zero every valid point's frequency offset.
@@ -744,7 +827,7 @@ pub fn probe() -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{nearest_vf_bin_at_or_above, plan_vf_ceiling, VfBinClass};
+    use super::{nearest_vf_bin_at_or_above, plan_vf_ceiling, plan_vf_ceiling_monotone, VfBinClass};
 
     // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
     fn curve() -> Vec<(usize, u32, u32)> {
@@ -840,5 +923,86 @@ mod tests {
         let plan = plan_vf_ceiling(&curve(), snapped, 1770);
         let in_set: Vec<u32> = plan.iter().filter(|e| e.in_flatten_set).map(|e| e.voltage_mv).collect();
         assert_eq!(in_set, vec![850, 1062]);
+    }
+
+    // ── plan_vf_ceiling_monotone (build-frontier static-base monotone-down) ───────
+    // Static-base curve: (index, voltage_mv, base_freq_mhz). Bins span below/at/above a 900 mV
+    // ceiling; the 1062 mV bin's static base (1845) is the overshoot case from the 1755@900 run.
+    fn base_curve() -> Vec<(usize, u32, u32)> {
+        vec![(0, 800, 1650), (1, 875, 1700), (2, 900, 1740), (3, 975, 1800), (4, 1062, 1845)]
+    }
+
+    #[test]
+    fn monotone_never_emits_positive_offset() {
+        let plan = plan_vf_ceiling_monotone(&base_curve(), 900, 1755);
+        assert!(plan.iter().all(|e| e.desired_offset_mhz <= 0));
+        assert!(plan.iter().all(|e| e.class != VfBinClass::FlattenUp));
+    }
+
+    #[test]
+    fn monotone_high_base_caps_exactly_to_target() {
+        // 1062 mV bin base 1845, target 1755 → offset -90; reconstructed base+offset == target.
+        let plan = plan_vf_ceiling_monotone(&base_curve(), 900, 1755);
+        let b = plan.iter().find(|e| e.voltage_mv == 1062).unwrap();
+        assert_eq!(b.desired_offset_mhz, -90);
+        assert_eq!(b.class, VfBinClass::FlattenDown);
+        assert_eq!(b.base_mhz as i32 + b.desired_offset_mhz, 1755);
+    }
+
+    #[test]
+    fn monotone_sub_target_bin_stays_zero() {
+        // 900 mV bin base 1740 ≤ target 1755 → offset 0, AlreadyAtTarget, never raised.
+        let plan = plan_vf_ceiling_monotone(&base_curve(), 900, 1755);
+        let b = plan.iter().find(|e| e.voltage_mv == 900).unwrap();
+        assert_eq!(b.desired_offset_mhz, 0);
+        assert!(b.in_flatten_set);
+        assert_eq!(b.class, VfBinClass::AlreadyAtTarget);
+    }
+
+    #[test]
+    fn monotone_below_ceiling_is_elastic_zero() {
+        let plan = plan_vf_ceiling_monotone(&base_curve(), 900, 1755);
+        for e in plan.iter().filter(|e| e.voltage_mv < 900) {
+            assert_eq!(e.desired_offset_mhz, 0);
+            assert!(e.below_ceiling && !e.in_flatten_set);
+            assert_eq!(e.class, VfBinClass::BelowCeiling);
+        }
+    }
+
+    #[test]
+    fn monotone_nonzero_bins_are_at_or_above_ceiling() {
+        // Audit B2: every non-zero offset bin's static-base voltage is ≥ ceiling.
+        let plan = plan_vf_ceiling_monotone(&base_curve(), 900, 1755);
+        for e in plan.iter().filter(|e| e.desired_offset_mhz != 0) {
+            assert!(e.voltage_mv >= 900);
+        }
+    }
+
+    #[test]
+    fn monotone_1755_at_900_zero_overshoot() {
+        // Reconstruct the predicted plateau over the flatten set: effective = base + offset.
+        let plan = plan_vf_ceiling_monotone(&base_curve(), 900, 1755);
+        let predicted_max = plan
+            .iter()
+            .filter(|e| e.in_flatten_set)
+            .map(|e| e.base_mhz as i32 + e.desired_offset_mhz)
+            .max()
+            .unwrap();
+        assert_eq!(predicted_max, 1755);
+        assert_eq!((predicted_max - 1755).max(0), 0); // overshoot == 0
+    }
+
+    #[test]
+    fn monotone_empty_curve_is_empty_plan() {
+        // No bins → empty plan → writer maps this to a fail-closed Err (no partial unsafe plan).
+        assert!(plan_vf_ceiling_monotone(&[], 900, 1755).is_empty());
+    }
+
+    #[test]
+    fn monotone_no_bins_above_ceiling_has_no_flatten_set() {
+        // Ceiling above every bin → nothing in the flatten set → writer fails closed.
+        let plan = plan_vf_ceiling_monotone(&base_curve(), 2000, 1755);
+        assert!(plan.iter().all(|e| !e.in_flatten_set));
+        assert!(plan.iter().all(|e| e.desired_offset_mhz == 0));
     }
 }
