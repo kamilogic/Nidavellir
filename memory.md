@@ -15,6 +15,20 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **F1b Phase 2B.2-c — monotone static-base VF writer HARDWARE-VALIDATED (2026-06-12, commit
+  8503182)**: supervised `build-frontier --confirm --max-targets 7 --max-probes 40 --safe-start-cap
+  1075` on a fresh `origin/master` debug build at `8503182`, after a clean bounded dry-run.
+  **Safety held** (exit 0; no TDR/reboot; Safe Loop armed/cleared; `reset_to_stock` ran;
+  `boot_flag.json`/`gpu_applied.json` absent after; `forge_state.json`/`gpu_knowledge.json`/
+  `heartbeat.txt` unchanged; GPU back at stock idle). **Writer confirmed**: all 32 probes
+  `write_mode=monotone_static`, `positive_offsets=0`, `static_base_points=132`. **Primary fix —
+  `1755 @ 900 mV`**: OLD plateau 1755..1845 / `overshoot_veto=true` / `LiveMismatch` → NEW plateau
+  1665..1755 / overshoot=0 / `NoDownCapNeededCeiling` (pass). Run continued to **`1755 @ 875 mV`**
+  and verified (`NoDownCapNeededCeiling`, overshoot=0, plateau 1620..1755, ~19 s dwell, ≈1755 MHz @
+  875 mV ≈179 W). Minor residual: a few non-1755 low-ceiling probes still show single-bin 15 MHz
+  overshoot (not a blocker). FORGE synthesis low confidence (best 0.21) is the unrelated Wilson
+  metric. **Next**: design warm-started voltage-bracket reuse for F1b/Godforge; do NOT mix with
+  persistence/profile apply yet. See `handoff.md` + `decisions.md`.
 - **F1b Phase 2B.2-c — FIRST confirmed run (2026-06-11, SAFE) + c.1 verifier fix (IMPLEMENTED, not
   committed)**: first supervised `build-frontier --confirm --max-targets 1 --max-probes 6
   --safe-start-cap 1075` ran after a Fable 5 GO audit + clean dry-run. **Safety held end-to-end**

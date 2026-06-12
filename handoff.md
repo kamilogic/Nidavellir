@@ -3,7 +3,41 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-11) — Phase 2B.2-c: FIRST confirmed run (SAFE, 0 points) + c.1 stock-equivalent verifier fix (IMPLEMENTED, not committed)
+## Latest backend checkpoint (2026-06-12) — Phase 2B.2-c: monotone static-base VF writer HARDWARE-VALIDATED (commit 8503182)
+- **Milestone — supervised hardware revalidation of the monotone static-base VF ceiling writer.**
+  After a clean bounded dry-run on a fresh `origin/master` debug build at `8503182`
+  (`gpu_applied.json`/`boot_flag.json` absent; state mtimes unchanged), the user approved one
+  confirmed run: `build-frontier --confirm --max-targets 7 --max-probes 40 --safe-start-cap 1075`.
+- **Safety: exit 0, no TDR, no reboot.** Startup recovery clean ("clean boot, nothing to restore");
+  Safe Loop armed for the VF writes and cleared; `reset_to_stock` ran at the end ("GPU restored to
+  stock; no profile applied or persisted"). After the run: `boot_flag.json` absent,
+  `gpu_applied.json` absent; `forge_state.json` / `gpu_knowledge.json` / `heartbeat.txt` unchanged
+  (build-frontier never persists); `safe_loop.json` mtime touched at run start, size unchanged
+  (startup-recovery bookkeeping only). GPU back at stock idle (nvidia-smi ~66 W / 7% util / 200 W
+  limit). The audited safety contract held end-to-end on real hardware.
+- **Functional: monotone writer confirmed working.** Every one of the **32 probes** logged
+  `write_mode=monotone_static` with **`positive_offsets=0`** (static-base-anchored monotone-down
+  offsets only) over `static_base_points=132`.
+- **Primary fixed case — `1755 @ 900 mV` no longer overshoots.**
+  - OLD: raw_cov 0.891, eff_cov 1.000, **`overshoot_veto=true`**, plateau **1755..1845**, result
+    **`LiveMismatch`** (blocked).
+  - NEW: `positive_offsets=0`, eff_cov 1.000, **overshoot=0**, plateau **1665..1755** (max 1755),
+    veto not triggered, result **`NoDownCapNeededCeiling`** (pass). Plateau max dropped 1845 → 1755
+    exactly; overshoot collapsed to 0.
+- **Run continued to `1755 @ 875 mV` and it verified**: `NoDownCapNeededCeiling`, overshoot=0,
+  plateau **1620..1755**, dwelled (~19 s); achieved ≈ **1755 MHz @ 875 mV, ≈179 W**. The `1755`
+  ceiling descent shows overshoot decaying cleanly to 0 from 950 mV down (950/925/900/875 all
+  overshoot=0).
+- **Minor residual (not a blocker for the writer fix)**: a few **non-1755** probes at low ceilings
+  still show a single-bin **15 MHz** overshoot with `overshoot_veto=true` (e.g. 1905@1050, 1875@950,
+  1845@975, 1815@950, 1785@950). All `1755` probes are overshoot=0.
+- **Unrelated note**: FORGE synthesis reported low confidence (best 0.21 < 0.85) → best-effort
+  profiles. This is the single-trial Wilson confidence metric, not a writer/overshoot issue.
+- **Next technical phase**: design **warm-started voltage-bracket reuse** for F1b / Godforge (carry
+  a verified bracket forward across targets to cut probes). **Do NOT mix this with persistence /
+  profile apply yet** — keep build-frontier non-persisting until the bracket-reuse design lands.
+
+## Backend checkpoint (2026-06-11) — Phase 2B.2-c: FIRST confirmed run (SAFE, 0 points) + c.1 stock-equivalent verifier fix (IMPLEMENTED, not committed)
 - **Milestone — first supervised hardware run executed.** After a Fable 5 blocker audit (GO) and a
   clean bounded dry-run (fresh worktree debug build of 6881cd7; `gpu_applied.json` absent; mtimes
   unchanged), the user approved and we ran

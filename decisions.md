@@ -2,6 +2,29 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b Phase 2B.2-c: monotone static-base VF ceiling writer — hardware-validated (commit 8503182)
+- **Validation** (2026-06-12): the monotone static-base VF ceiling writer (`8503182 feat(service):
+  add monotone static-base VF ceiling writer`, on `origin/master`) was confirmed on real hardware by
+  a supervised run `build-frontier --confirm --max-targets 7 --max-probes 40 --safe-start-cap 1075`
+  (fresh debug build at `8503182`; clean bounded dry-run first; user present). This validates the
+  writer behind the b.1 → c.0 → 8b6e105 (legit-zero diagnostics) → 91119e1 (NoDownCapNeeded rescue)
+  → 8503182 chain.
+- **Result**: exit 0; no TDR/reboot; Safe Loop armed+cleared; `reset_to_stock` ran; no persistence
+  (`boot_flag.json`/`gpu_applied.json` absent after; `forge_state.json`/`gpu_knowledge.json`/
+  `heartbeat.txt` unchanged); GPU back at stock idle. All 32 probes used `write_mode=monotone_static`
+  with `positive_offsets=0` (static-base-anchored monotone-down offsets only).
+- **The writer fixes the boost-top overshoot.** Primary case `1755 @ 900 mV`: previously plateau
+  1755..1845 with `overshoot_veto=true` → `LiveMismatch`; now plateau 1665..1755, overshoot=0, veto
+  not triggered → `NoDownCapNeededCeiling` (pass). The run then reached `1755 @ 875 mV` and verified
+  (`NoDownCapNeededCeiling`, overshoot=0, plateau 1620..1755, ~19 s dwell, ≈1755 MHz @ 875 mV
+  ≈179 W). Matches the monotone-writer safety-audit expectation.
+- **Caveats (not blockers)**: a few non-1755 probes at low ceilings still carry a single-bin 15 MHz
+  overshoot (`overshoot_veto=true`); FORGE synthesis reported low confidence (best 0.21, single-trial
+  Wilson) — unrelated to the writer fix. **Next**: design warm-started voltage-bracket reuse for
+  F1b/Godforge; keep build-frontier non-persisting (do not mix with persistence / profile apply yet).
+- **Scope**: docs/continuity only (`handoff.md`, `memory.md`, this file). No code/test/IPC/hardware
+  change in this pass.
+
 ## F1b Phase 2B.2-c.1: stock-equivalent ceiling verification for boost-top targets
 - **Trigger** (2026-06-11): the FIRST bounded supervised `build-frontier --confirm` run
   (`--max-targets 1 --max-probes 6 --safe-start-cap 1075`, Fable-5-audited, user present) completed
