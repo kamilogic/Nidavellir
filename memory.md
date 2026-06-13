@@ -8,6 +8,22 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-06-13) — build-frontier floor is hardware-derived / bin-based (commit f90981d, pushed; NOT hw-validated)
+- `f90981d feat(service): derive build-frontier floor from real VF bins` removes the hardcoded active
+  **875 mV** descent floor. The floor is now the lowest real graphics-core VF bin
+  (`seed.cluster_v_min_mv`); no replacement constant (no 825/800). Descent is **bin-based**: walks real
+  VF/core-cluster bins only, never invents off-curve 25 mV voltages. Warm-start maps its margin to the
+  conservative real bin **≥** the requested target and never starts below the previous
+  `lowest_verified_mv`. `--max-probes` stays the exposure cap. Empty bin domain → fail closed before any
+  hardware write. Dry-run prints the hardware floor + exact bin sequence + bin/dwell counts.
+- Scope: only `crates/service/src/gpu_power_sweep.rs`. **Unchanged**: monotone static-base writer,
+  verifier gates, Safe Loop, `reset_to_stock`, persistence, profile apply. `cargo check` clean; service
+  tests 142 passed.
+- The historical `1755 @ 875` validations remain valid for that point but are no longer an active floor;
+  runs may now go **below 875**. **NOT hardware-validated yet** — first runs must be bounded
+  (`--safe-start-cap`/`--max-probes`), dry-run reviewed before `--confirm`, operator present (descent may
+  reach **below the ~855 mV reboot zone**). See `handoff.md` / `decisions.md` for the suggested dry-run.
+
 ## Current status (2026-06-05)
 - `master`, tag **v0.3.1** (forge-state persistence pushed). Worktree branch
   `claude/vibrant-almeida-dfb6c7`.

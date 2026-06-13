@@ -2,6 +2,31 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Build-frontier floor is now hardware-derived / bin-based — shipped, NOT yet hardware-validated (commit f90981d)
+- **Decision** (2026-06-13): remove the hardcoded active **875 mV** descent floor from `build-frontier`.
+  The lower bound is now **discovered from the GPU's real VF / core-cluster voltage bins** — the lowest
+  real graphics-core bin (`seed.cluster_v_min_mv`), not a fixed constant. `FRONTIER_LOWEST_SAFE_MV` is
+  deleted from active code; no replacement fixed floor (no 825/800).
+- **Bin-based descent**: `FrontierDescent` carries `bins_desc` (real descending VF bins);
+  `derive_descent` builds it from `CoreSeed.cluster_bins_mv`; `descend_target` walks **real bins only**
+  and never invents 25 mV requested voltages outside the curve. Warm-start maps its margin to the
+  **conservative real bin at or above** the requested margin target, and **never starts below the
+  previous `lowest_verified_mv`** (B1). `--max-probes` remains the global exposure cap;
+  `--warm-start-brackets` stays default OFF; no new CLI flag.
+- **Fail-closed**: an empty/underivable bin domain aborts **before any hardware write** (no fallback to
+  a fixed floor on a confirmed run). Dry-run now prints the hardware-derived floor, the exact descent
+  bin sequence, the real bin count, and the worst-case dwell count.
+- **Scope**: only `crates/service/src/gpu_power_sweep.rs`. **Unchanged**: monotone static-base VF
+  writer, verifier gates, Safe Loop, `reset_to_stock`, persistence, profile apply. `cargo check` clean;
+  `cargo test -p nidavellir-service` 142 passed. Pushed to `origin/master`.
+- **Historical validity**: prior `1755 @ 875 mV` validations (NoDownCapNeededCeiling) remain valid for
+  that point; they are **not** an active floor. Future runs may descend **below 875** where real bins
+  exist and `--max-probes` allows.
+- **Operational warning**: **no hardware run of `f90981d` yet.** The descent may now go **below the
+  historical ~855 mV reboot zone**. First real runs MUST be bounded (`--safe-start-cap` / `--max-probes`),
+  the operator present and able to reboot, and the dry-run hardware floor + bin sequence reviewed before
+  any `--confirm`.
+
 ## F1b warm-start voltage-bracket carry-forward — shipped + hardware-validated (commits 23b70c4, 6f2f061)
 - **Decision** (2026-06-13): ship a **generic** warm-start voltage-bracket carry-forward scheduler
   primitive for ordered hardest→easiest core-clock voltage descents, behind an opt-in CLI flag

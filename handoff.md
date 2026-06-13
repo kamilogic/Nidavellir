@@ -3,7 +3,30 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-13) — Warm-start voltage-bracket carry-forward SHIPPED + HARDWARE-VALIDATED (commits 23b70c4, 6f2f061)
+## Latest backend checkpoint (2026-06-13) — Hardware-derived / bin-based build-frontier floor SHIPPED, NOT yet hardware-validated (commit f90981d)
+- **Change** (`f90981d feat(service): derive build-frontier floor from real VF bins`, on `origin/master`):
+  the hardcoded active **875 mV** descent floor is GONE. `build-frontier` now derives the floor from the
+  GPU's real VF / core-cluster voltage bins — `hw_floor_mv = seed.cluster_v_min_mv` (lowest real
+  graphics-core bin). No replacement fixed floor (no 825/800); `FRONTIER_LOWEST_SAFE_MV` deleted.
+- **Bin-based descent**: `FrontierDescent` carries `bins_desc` (real descending bins) built by
+  `derive_descent` from `CoreSeed.cluster_bins_mv`; `descend_target` walks **real bins only** — it does
+  NOT invent 25 mV requested voltages off the curve. Warm-start snaps its margin to the **conservative
+  real bin ≥ the requested margin target** and **never starts below the previous `lowest_verified_mv`**
+  (B1). `--max-probes` remains the exposure cap; `--warm-start-brackets` stays default OFF; no new flag.
+  Empty/underivable bin domain → **fail closed before any hardware write**. Dry-run prints the
+  hardware-derived floor, the exact descent bin sequence, the real bin count, and worst-case dwells.
+- **Scope**: only `crates/service/src/gpu_power_sweep.rs`. **Unchanged**: monotone static-base writer,
+  verifier gates, Safe Loop, `reset_to_stock`, persistence, profile apply. `cargo check` clean;
+  `cargo test -p nidavellir-service` **142 passed**.
+- **Historical note**: the older `1755 @ 875` validations below remain valid for that point but are NO
+  LONGER the active floor; future runs may descend **below 875** where real bins exist + budget allows.
+- **NOT hardware-validated yet.** The descent may now reach **below the historical ~855 mV reboot zone**.
+  **Suggested next operational step (DRY-RUN ONLY, no `--confirm`):**
+  `build-frontier --max-targets 7 --max-probes 70 --safe-start-cap 1075 --warm-start-brackets` → review
+  the hardware-derived floor, exact bin sequence, worst-case dwell count, and whether `--max-probes` is
+  enough. ONLY THEN consider a separate supervised `--confirm` run (operator present + able to reboot).
+
+## Backend checkpoint (2026-06-13) — Warm-start voltage-bracket carry-forward SHIPPED + HARDWARE-VALIDATED (commits 23b70c4, 6f2f061)
 - **Feature** (`23b70c4 feat(service): add warm-start bracket carry-forward`, on `origin/master`):
   a **generic** scheduler primitive (NOT Godforge-specific) for ordered hardest→easiest core-clock
   voltage descents. An easier target reuses the previous harder target's verified + dwell-stable
