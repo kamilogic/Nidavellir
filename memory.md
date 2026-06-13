@@ -8,7 +8,34 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-13) — build-frontier floor is hardware-derived / bin-based (commit f90981d, pushed; NOT hw-validated)
+## Latest (2026-06-13) — FIRST confirmed hardware validation of the bin-based floor (commit f90981d) — PASS (safe)
+- Supervised bounded run, operator present, after a clean dry-run on a fresh debug build (HEAD/origin/master
+  at `c99dbf1`+`f90981d`; `23b70c4`/`8503182` present; `gpu_applied.json`/`boot_flag.json` absent;
+  `safe_loop.json` idle/`safe_mode:false`):
+  `build-frontier --confirm --max-targets 7 --max-probes 34 --safe-start-cap 1075 --warm-start-brackets`.
+  `--max-probes 34` reaches 868 mV (one bin below the old 875 floor) and stops before 862 mV (reboot-zone).
+- **Safety PASS**: exit 0; no TDR/driver-reset/black-screen/reboot/crash. Startup recovery clean; Safe Loop
+  armed→cleared (idle); `reset_to_stock` ran ("GPU restored to stock; no profile applied or persisted").
+  `boot_flag.json`/`gpu_applied.json` absent before+after; `forge_state.json`/`gpu_knowledge.json`/
+  `heartbeat.txt` unchanged; `safe_loop.json` byte-identical (idle, `safe_mode` false, size unchanged),
+  mtime touched at run start only — no new blacklist/crash entry. GPU back at stock idle.
+- **Coverage**: 34 dwells **all on target 1935** (1075→868 mV). Reached 875 + 868 mV; **did not reach 862**
+  (no `ceiling_mv=862`; the 35th scheduler step hit `BudgetExhausted` before write/dwell). 1905/1875/1845/
+  1815/1785/1755 NOT physically characterized (budget spent on the hardest target). Warm-start: B1 1935 from
+  cap, B2 1905 carried 893 mV (868+25). All probes `write_mode=monotone_static`, `positive_offsets=0`,
+  `down_caps=0`, no `overshoot_veto`, all `NoDownCapNeededCeiling`, `eff_cov=1.000`.
+- **Interpretation**: validated safe WRITING/descent of the static ceiling to 868 mV; did NOT prove core
+  stability when RUN at 868 — GPU stayed **power-limited ~198 W**, ceiling **non-binding**. Frontier point
+  1935 → 1839 MHz @ 868 mV vf_bin / 198 W. **PASS for first bin-based floor validation; partial for profile
+  synthesis** (single clock 1800 MHz → FORGE confidence 0.21, profiles collapse). 862/855 reboot-zone
+  blacklist is offset-keyed (different regime from this zero-offset power-limited descent).
+- **Direction**: don't jump to `--max-probes 40`; `--max-probes 35` could deliberately touch 862 for
+  boundary mapping (862 blacklist keyed freq=1755 won't match a 1935 ceiling → Safe Loop is backstop) but
+  won't yield useful profiles. **Primary next: pivot to F1b / multi-clock, and/or make the ceiling BIND
+  (raise power limit) before descending deeper.** No further hardware commands were run. See `handoff.md`
+  + `decisions.md`.
+
+## Bin-based floor shipped (2026-06-13) — build-frontier floor is hardware-derived / bin-based (commit f90981d, pushed)
 - `f90981d feat(service): derive build-frontier floor from real VF bins` removes the hardcoded active
   **875 mV** descent floor. The floor is now the lowest real graphics-core VF bin
   (`seed.cluster_v_min_mv`); no replacement constant (no 825/800). Descent is **bin-based**: walks real
@@ -20,7 +47,8 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   verifier gates, Safe Loop, `reset_to_stock`, persistence, profile apply. `cargo check` clean; service
   tests 142 passed.
 - The historical `1755 @ 875` validations remain valid for that point but are no longer an active floor;
-  runs may now go **below 875**. **NOT hardware-validated yet** — first runs must be bounded
+  runs may now go **below 875**. **First confirmed hardware validation done 2026-06-13 (safe to 868 mV;
+  see the Latest entry above).** First runs must be bounded
   (`--safe-start-cap`/`--max-probes`), dry-run reviewed before `--confirm`, operator present (descent may
   reach **below the ~855 mV reboot zone**). See `handoff.md` / `decisions.md` for the suggested dry-run.
 

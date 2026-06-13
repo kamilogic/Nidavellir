@@ -2,7 +2,46 @@
 
 Durable technical decisions and their rationale. Newest first.
 
-## Build-frontier floor is now hardware-derived / bin-based — shipped, NOT yet hardware-validated (commit f90981d)
+## Build-frontier bin-based floor — FIRST confirmed hardware validation (commit f90981d) — PASS (safe), partial characterization
+- **Validation** (2026-06-13): the hardware-derived / bin-based descent floor (`f90981d`) was confirmed on
+  real hardware by a supervised, bounded run — operator present, after a clean dry-run on a fresh debug
+  build (HEAD/origin/master include `c99dbf1`+`f90981d`; `23b70c4`/`8503182` present;
+  `gpu_applied.json`/`boot_flag.json` absent; `safe_loop.json` idle/`safe_mode:false`):
+  `build-frontier --confirm --max-targets 7 --max-probes 34 --safe-start-cap 1075 --warm-start-brackets`.
+  `--max-probes 34` was chosen so the descent reaches **868 mV** (one real bin below the old 875 mV floor)
+  but stops BEFORE **862 mV** — a historical reboot-zone / blacklisted bin.
+- **Safety: PASS.** Exit 0; no TDR / driver reset / black-screen / reboot / crash. Startup recovery clean;
+  Safe Loop armed → cleared (idle); `reset_to_stock` ran ("GPU restored to stock; no profile applied or
+  persisted"). No persistence: `boot_flag.json`/`gpu_applied.json` absent before AND after;
+  `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt` unchanged; `safe_loop.json` byte-identical
+  (idle, `safe_mode` false, size unchanged) — mtime touched at run start only, **no new blacklist/crash
+  entry**. GPU back at stock idle.
+- **Coverage**: 34 hardware dwells, **all spent on target 1935** (ceilings 1075→868 mV). Reached 875 and
+  868 mV; **did not reach 862 mV** (no `ceiling_mv=862` line — the 35th scheduler step hit
+  `BudgetExhausted` before any write/dwell). Targets 1905/1875/1845/1815/1785/1755 were NOT physically
+  characterized (budget exhausted on the hardest target). Warm-start carry-forward observed (B1: 1935 from
+  cap, `warm_started=false`; B2: 1905 inherited `start_mv=893` = 868 + 25 mV). Every probe
+  `write_mode=monotone_static`, `positive_offsets=0`, `down_caps=0`, no `overshoot_veto`, all
+  `NoDownCapNeededCeiling`, `eff_cov=1.000`.
+- **Key interpretation / limit of the result**: this proves it is **safe to WRITE the static VF ceiling
+  down to 868 mV and descend the bin sequence** — it does **NOT** prove core stability when the core is
+  forced to RUN at 868 mV. The card stayed **power-limited (~198 W)** the whole descent, so the ceiling
+  was **non-binding** (NoDownCapNeededCeiling everywhere; the power-governed operating point sat at/below
+  each ceiling). Frontier point 1935 → **1839 MHz @ 868 mV vf_bin / 198 W**. **PASS for the first
+  bin-based floor validation; partial/insufficient for profile synthesis** (single sustainable clock
+  1800 MHz → FORGE confidence 0.21, profiles collapse identical). The historical 862/855 mV reboot-zone
+  blacklist is offset-keyed (offsets 255/300/330; freq 1755 @ 862) — a DIFFERENT regime from this
+  pure-ceiling, zero-offset, power-limited descent.
+- **Direction**: do NOT jump to `--max-probes 40`. `--max-probes 35` could deliberately touch 862 mV for
+  pure reboot-zone boundary mapping (operator present; the 862 blacklist entry keyed `freq=1755` would not
+  match a 1935-target ceiling → Safe Loop is the backstop, not prevention), but it does not produce useful
+  profiles. **Primary next step: pivot to F1b / multi-clock characterization and/or make the ceiling
+  actually BIND (e.g. raise the power limit) before descending deeper** — deeper ceilings on a
+  power-limited card add reboot-zone exposure for ~zero gain. **No further hardware commands were run.**
+- **Scope**: docs/continuity only (`handoff.md`, `memory.md`, this file). No code/test/IPC/hardware change
+  in this pass.
+
+## Build-frontier floor is hardware-derived / bin-based — shipped (commit f90981d)
 - **Decision** (2026-06-13): remove the hardcoded active **875 mV** descent floor from `build-frontier`.
   The lower bound is now **discovered from the GPU's real VF / core-cluster voltage bins** — the lowest
   real graphics-core bin (`seed.cluster_v_min_mv`), not a fixed constant. `FRONTIER_LOWEST_SAFE_MV` is

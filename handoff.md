@@ -3,7 +3,49 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-13) — Hardware-derived / bin-based build-frontier floor SHIPPED, NOT yet hardware-validated (commit f90981d)
+## Latest backend checkpoint (2026-06-13) — Hardware-derived / bin-based floor FIRST CONFIRMED HARDWARE VALIDATION — PASS (commit f90981d)
+- **Supervised confirmed run** (operator present, after a clean bounded dry-run on a fresh debug build;
+  HEAD/origin/master at `c99dbf1`+`f90981d`; required commits `23b70c4`/`8503182` present;
+  `gpu_applied.json`/`boot_flag.json` absent; `safe_loop.json` idle/`safe_mode:false`):
+  `build-frontier --confirm --max-targets 7 --max-probes 34 --safe-start-cap 1075 --warm-start-brackets`.
+  `--max-probes 34` was chosen so the descent reaches **868 mV** (one real bin below the old 875 mV floor)
+  but stops BEFORE **862 mV** (a historical reboot-zone / blacklisted bin). **Exit 0; no TDR, no driver
+  reset, no black-screen, no reboot, no crash markers.**
+- **Safety state**: startup recovery clean ("clean boot, nothing to restore"); Safe Loop armed at startup
+  and cleared back to **idle**; `reset_to_stock` ran ("GPU restored to stock; no profile applied or
+  persisted"). After: `boot_flag.json`/`gpu_applied.json` **absent** (as before); `forge_state.json`/
+  `gpu_knowledge.json`/`heartbeat.txt` unchanged; `safe_loop.json` **byte-identical** (idle, `safe_mode`
+  false, size unchanged) — mtime touched at run start only, **no new blacklist/crash entry**
+  (`consecutive_crashes` still 1, `crash_log` still `["unrelated"]`). GPU back at stock idle.
+- **Probe budget — 34 hardware dwells, ALL on target 1935** (ceilings 1075→868 mV; benign_zeros 27→60).
+  The per-target `bracket_carry` line logs `probes_used=35` with `stop_reason=BudgetExhausted` — the 35th
+  increment is the scheduler ATTEMPTING the next step (→862 mV) and finding the budget spent; **no
+  `ceiling_mv=862` line exists; 862 mV was never set or dwelled.** Targets 1905/1875/1845/1815/1785/1755
+  were NOT physically characterized this run (budget exhausted on the hardest target; each logged a
+  `probes_used=1` bookkeeping entry, no dwell, "no stable point in safe range — dropped").
+- **Voltage coverage**: reached **875 mV** (probe 33) and **868 mV** (probe 34), both
+  `NoDownCapNeededCeiling`, `eff_cov=1.000`, `overshoot=0`; **did NOT reach 862 mV**. Safety goal met —
+  validated **one real bin below the old 875 mV floor** while **avoiding the historical 862/855 mV
+  reboot-zone bins** on this first bounded run. Warm-start observed: 1935 started from cap 1075
+  (`warm_started=false`); 1905 carried 1935's bracket (`warm_started=true`, `start_mv=893` = 868 + 25 mV).
+- **Writer/verifier**: every probe `write_mode=monotone_static`, `positive_offsets=0`, `down_caps=0`, no
+  `overshoot_veto`, all verified `NoDownCapNeededCeiling`, `eff_cov=1.000`.
+- **IMPORTANT interpretation**: this validated **safe WRITING/descent of the static VF ceiling down to
+  868 mV** — it did NOT prove core stability when actually RUN at 868 mV. The GPU stayed **power-limited
+  (~198 W)** the whole descent, so the ceiling was **non-binding** (the core's power-governed operating
+  point was already at/below each ceiling → no down-cap needed). Frontier point: 1935 target →
+  **1839 MHz @ 868 mV vf_bin, 198 W** (p5 1800). **PASS for the first bin-based floor validation;
+  partial/insufficient for profile synthesis** — FORGE confidence stayed low (best 0.21), single
+  sustainable clock (1800 MHz), so Godforge/Brokkr's/Deep Calm collapsed identical.
+- **Direction**: do NOT jump straight to `--max-probes 40`. `--max-probes 35` would deliberately touch
+  **862 mV** if the goal is pure reboot-zone boundary mapping (operator present; NB the 862 blacklist
+  entry is keyed `freq=1755`, so a 1935-target ceiling at 862 would not match it — Safe Loop is the
+  backstop, not prevention), but that is NOT the best path for useful profiles. **Primary next step: pivot
+  to F1b / multi-clock characterization, and/or a regime that makes the ceiling actually BIND (e.g. raise
+  the power limit) before descending deeper** — since the descent was power-limited, deeper ceilings add
+  reboot-zone exposure for ~zero characterization gain. **No further hardware commands were run.**
+
+## Backend checkpoint (2026-06-13) — Hardware-derived / bin-based build-frontier floor SHIPPED (commit f90981d)
 - **Change** (`f90981d feat(service): derive build-frontier floor from real VF bins`, on `origin/master`):
   the hardcoded active **875 mV** descent floor is GONE. `build-frontier` now derives the floor from the
   GPU's real VF / core-cluster voltage bins — `hw_floor_mv = seed.cluster_v_min_mv` (lowest real
