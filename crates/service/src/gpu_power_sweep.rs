@@ -2212,6 +2212,20 @@ fn real_probe_step(
     s
 }
 
+/// Order the build-frontier log lines for operator output: scheduler/frontier decisions
+/// (`result.log` — bracket carry-forward, warm-start, fallbacks, probes_used) FIRST, then the
+/// profile-synthesis lines (`result.profiles.log`). Any scheduler line that also appears in the
+/// synthesis log is dropped so a shared string is not emitted twice. Pure + testable — does not
+/// touch `build_frontier` or `FrontierBuildResult`.
+#[cfg(windows)]
+fn ordered_frontier_logs<'a>(scheduler: &'a [String], synthesis: &'a [String]) -> Vec<&'a String> {
+    scheduler
+        .iter()
+        .filter(|l| !synthesis.contains(l))
+        .chain(synthesis.iter())
+        .collect()
+}
+
 /// Supervised console entry for the F1b multi-clock frontier. Always prints the plan. WITHOUT
 /// `confirm` it is a read-only DRY-RUN (no Safe Loop arm, no apply, no dwell, no VF write).
 /// WITH `confirm` it runs the real supervised hardware path (transient VF ceilings + game-power
@@ -2447,7 +2461,9 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
     println!("{}", fmt("Godforge   ", &result.profiles.godforge));
     println!("{}", fmt("Brokkr's   ", &result.profiles.brokkrs));
     println!("{}", fmt("Deep Calm  ", &result.profiles.deep_calm));
-    for l in &result.profiles.log {
+    // Surface the scheduler/frontier decision log (bracket carry-forward / warm-start /
+    // fallbacks / probes_used) BEFORE the profile-synthesis log, deduped against it.
+    for l in ordered_frontier_logs(&result.log, &result.profiles.log) {
         info!("build-frontier: {l}");
     }
     info!("build-frontier: done — GPU restored to stock; no profile applied or persisted.");
@@ -3752,6 +3768,44 @@ mod tests {
         let cfg = carry_cfg(true);
         let prev = bracket_with(1815, Some(950), BracketStop::CleanFloor);
         assert_eq!(warm_start_mv(Some(&prev), &cfg), warm_start_mv(Some(&prev), &cfg));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordered_frontier_logs_scheduler_first_and_deduped() {
+        // result.log (scheduler) lines come first; result.profiles.log (synthesis) lines after;
+        // a string present in both is emitted once (kept in the synthesis position).
+        let scheduler = vec![
+            "bracket_carry enabled=true target=1935 ...".to_string(),
+            "shared line".to_string(),
+        ];
+        let synthesis = vec!["shared line".to_string(), "FORGE: Godforge ...".to_string()];
+        let out: Vec<&str> = ordered_frontier_logs(&scheduler, &synthesis)
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            out,
+            vec![
+                "bracket_carry enabled=true target=1935 ...",
+                "shared line",
+                "FORGE: Godforge ...",
+            ]
+        );
+        assert_eq!(out.iter().filter(|s| **s == "shared line").count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordered_frontier_logs_emits_all_scheduler_lines_when_disjoint() {
+        // The common case: the two vectors share nothing → every line is emitted, scheduler first.
+        let scheduler = vec!["bracket A".to_string(), "bracket B".to_string()];
+        let synthesis = vec!["FORGE x".to_string()];
+        let out: Vec<&str> = ordered_frontier_logs(&scheduler, &synthesis)
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(out, vec!["bracket A", "bracket B", "FORGE x"]);
     }
 
     #[cfg(windows)]
