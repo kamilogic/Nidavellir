@@ -3,7 +3,54 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-12) — Phase 2B.2-c: monotone static-base VF writer HARDWARE-VALIDATED (commit 8503182)
+## Latest backend checkpoint (2026-06-13) — Warm-start voltage-bracket carry-forward SHIPPED + HARDWARE-VALIDATED (commits 23b70c4, 6f2f061)
+- **Feature** (`23b70c4 feat(service): add warm-start bracket carry-forward`, on `origin/master`):
+  a **generic** scheduler primitive (NOT Godforge-specific) for ordered hardest→easiest core-clock
+  voltage descents. An easier target reuses the previous harder target's verified + dwell-stable
+  bracket as its descent start (`lowest_verified_mv + 1 step`), skipping dominated high-voltage
+  probes. Opt-in CLI flag **`--warm-start-brackets`, default OFF** — no runtime behavior changes
+  unless the flag is passed. Preserves the monotone static-base VF writer, verifier gates,
+  `overshoot_veto`, Safe Loop, `reset_to_stock`, persistence/profile apply, and the 875 mV floor.
+  Safety constraints B1/B2/B3 (see `decisions.md`).
+- **Hardware validation (2026-06-13) — PASS.** Supervised
+  `build-frontier --confirm --max-targets 7 --max-probes 40 --safe-start-cap 1075 --warm-start-brackets`
+  on a fresh debug build, after a clean bounded dry-run (warm-start shown ENABLED;
+  `gpu_applied.json`/`boot_flag.json` absent; state mtimes unchanged). **Exit 0; no TDR/reboot**;
+  startup recovery clean; Safe Loop armed/cleared per probe; `reset_to_stock` ran ("GPU restored to
+  stock"). After: `boot_flag.json`/`gpu_applied.json` absent; `forge_state.json`/`gpu_knowledge.json`/
+  `heartbeat.txt` unchanged; `safe_loop.json` mtime touched at run start (idle/disarmed, size
+  unchanged); GPU back at stock idle.
+- **Scheduler behavior (33 probes, all 7 targets produced points):**
+  - 1935 (first) started at cap 1075, descended to floor 875 (boost-top NoDownCapNeeded everywhere),
+    `lowest_verified=875`.
+  - **B2 exercised — 1905**: inherited an optimistic 900 mV warm start from 1935's boost-top bracket,
+    failed verify at 900 (`LiveMismatch`, `overshoot_veto=true`) → **fell back ONCE to cap 1075**,
+    re-descended, target preserved (point at 1075). Fallback did not loop and did not fire on a drain.
+  - 1875/1845 collapsed to cap (`lv+step ≥ cap`); 1815/1785/1755 warm-started below cap and skipped
+    1 / 2 / 3 dominated high-V probes respectively.
+  - **Probes: 33** vs **32** baseline (≈ flat raw) but **−5 vs the equivalent from-cap descent (38)**
+    for an identical frontier — net of one B2-fallback probe. Benefit is modest on this RTX 3060 Ti
+    because mid targets stop early on verify-axis residual overshoot regardless of start voltage.
+- **Frontier preserved.** Critical low-V region re-validated exactly: **`1755 @ 900`**
+  `NoDownCapNeededCeiling`, plateau **1665..1755**, overshoot 0, dwell stable; **`1755 @ 875`**
+  `NoDownCapNeededCeiling`, plateau **1620..1755**, overshoot 0, ≈**1755 MHz @ 875 mV, ≈176 W**.
+  Every probe `write_mode=monotone_static`, `positive_offsets=0`. Residual single-bin 15 MHz
+  overshoot on non-1755 targets persists (safe verify-axis early stop, as before). FORGE synthesis
+  low confidence (best 0.21) — unrelated Wilson metric.
+- **B1/B2/B3 held in live logs** (B2 actually exercised). Feature is hardware-validated as **safe
+  behind the opt-in flag**.
+- **Observability follow-up** (`6f2f061 feat(service): surface build-frontier scheduler logs`):
+  log-only. `run_build_frontier` previously emitted only `result.profiles.log`; now emits the
+  scheduler/frontier `result.log` (bracket carry / warm-start / fallback / probes_used) FIRST, then
+  the synthesis log, deduping shared lines (pure `ordered_frontier_logs` helper + 2 unit tests). No
+  tuning behavior changed. Closes the validation finding that bracket telemetry existed but was
+  invisible in CLI output.
+- **Keep `--warm-start-brackets` default OFF** until more runs justify flipping it. **Next** (later,
+  optional): 1–2 more warm-start runs; a benign-zero-only (NoDownCapNeeded) bracket-seeding refinement
+  so a boost-top bracket doesn't mis-seed the next sub-boost target (the 1905 B2 case); broader
+  frontier/profile confidence work. **Do NOT mix with profile persistence yet.**
+
+## Backend checkpoint (2026-06-12) — Phase 2B.2-c: monotone static-base VF writer HARDWARE-VALIDATED (commit 8503182)
 - **Milestone — supervised hardware revalidation of the monotone static-base VF ceiling writer.**
   After a clean bounded dry-run on a fresh `origin/master` debug build at `8503182`
   (`gpu_applied.json`/`boot_flag.json` absent; state mtimes unchanged), the user approved one

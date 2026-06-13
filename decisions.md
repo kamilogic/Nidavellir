@@ -2,6 +2,49 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b warm-start voltage-bracket carry-forward — shipped + hardware-validated (commits 23b70c4, 6f2f061)
+- **Decision** (2026-06-13): ship a **generic** warm-start voltage-bracket carry-forward scheduler
+  primitive for ordered hardest→easiest core-clock voltage descents, behind an opt-in CLI flag
+  **`--warm-start-brackets` (default OFF)**. An easier target reuses the previous harder target's
+  verified + dwell-stable bracket as its descent start (`lowest_verified_mv + 1 step`), skipping
+  dominated high-voltage probes. NOT Godforge-specific; first adopter is build-frontier/F1b. Commit
+  `23b70c4 feat(service): add warm-start bracket carry-forward` on `origin/master`.
+- **Safety constraints (verified by unit tests AND live logs):**
+  - **B1** — seed only from a verified (`VerifiedCurve`/`StockEquivalentCeiling`/
+    `NoDownCapNeededCeiling`) AND dwell-stable bin; never from verify-only-unstable, unverified,
+    crash/abort, or budget drain; never start below the previous `lowest_verified_mv`.
+  - **B2** — the verifier/ceiling axis is NOT monotone in clock: a warm-started first probe that
+    fails apply/verify falls back ONCE to `safe_start_cap` and descends normally; never on
+    drain/crash/abort; never recurses; the target is not dropped.
+  - **B3** — every target gets ≥1 verified-or-fallback-exhausted probe; never dropped solely because
+    the inherited warm-start probe failed verify/apply.
+- **Hardware validation (2026-06-13) — PASS.**
+  `build-frontier --confirm --max-targets 7 --max-probes 40 --safe-start-cap 1075 --warm-start-brackets`:
+  exit 0; no TDR/reboot; Safe Loop armed/cleared; `reset_to_stock` ran; no persistence
+  (`boot_flag.json`/`gpu_applied.json` absent after; `forge_state.json`/`gpu_knowledge.json`/
+  `heartbeat.txt` unchanged); GPU back at stock idle. **33 probes**, all 7 targets produced points.
+  **B2 exercised**: 1905 inherited an optimistic 900 mV start from 1935's boost-top NoDownCapNeeded
+  bracket, failed verify (`LiveMismatch`, `overshoot_veto=true`), fell back once to cap 1075, target
+  preserved. Frontier preserved — `1755 @ 900` (`NoDownCapNeededCeiling`, plateau 1665..1755,
+  overshoot 0) and `1755 @ 875` (`NoDownCapNeededCeiling`, plateau 1620..1755, overshoot 0,
+  ≈1755 MHz @ 875 mV ≈176 W) re-validated; every probe `write_mode=monotone_static`,
+  `positive_offsets=0`. Residual non-1755 single-bin 15 MHz overshoot persists (safe verify-axis
+  early stop); FORGE low confidence (0.21) unrelated.
+- **Efficiency**: 33 probes vs 32 baseline (≈ flat) but **−5 vs the equivalent from-cap descent (38)**
+  for an identical frontier (net of one B2-fallback probe). Modest on this RTX 3060 Ti because mid
+  targets stop early on verify-axis residual overshoot regardless of start voltage. **Keep default
+  OFF** until more runs justify flipping it.
+- **Observability follow-up** (`6f2f061 feat(service): surface build-frontier scheduler logs`):
+  log-only — `run_build_frontier` now emits the scheduler `result.log` (bracket carry / warm-start /
+  fallback / probes_used) before the synthesis `result.profiles.log`, deduping shared lines (pure
+  `ordered_frontier_logs` helper + 2 unit tests). No tuning behavior changed. Closes the validation
+  finding that bracket telemetry existed but was invisible in CLI output.
+- **Next (later, optional)**: 1–2 more warm-start runs; benign-zero-only (NoDownCapNeeded)
+  bracket-seeding refinement (so a boost-top bracket doesn't mis-seed the next sub-boost target — the
+  1905 case); broader frontier/profile confidence work. **Do NOT mix with profile persistence yet.**
+- **Scope**: docs/continuity in this pass (`handoff.md`, `memory.md`, this file). Code already
+  shipped/pushed in `23b70c4` + `6f2f061`.
+
 ## F1b Phase 2B.2-c: monotone static-base VF ceiling writer — hardware-validated (commit 8503182)
 - **Validation** (2026-06-12): the monotone static-base VF ceiling writer (`8503182 feat(service):
   add monotone static-base VF ceiling writer`, on `origin/master`) was confirmed on real hardware by

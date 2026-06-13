@@ -15,6 +15,23 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   Review 1 (persistence/startup) **done** → forge-state persistence shipped (below).
   Applied-Curve-Verification review **done** (investigation; see handoff).
   Review 2 (Sensor Quality Audit) **done** (investigation; key decision below).
+- **F1b warm-start voltage-bracket carry-forward — SHIPPED + HARDWARE-VALIDATED (2026-06-13, commits
+  23b70c4, 6f2f061)**: generic ordered-descent scheduler primitive (NOT Godforge-specific) behind
+  opt-in **`--warm-start-brackets` (default OFF)** — an easier target reuses the previous harder
+  target's verified + dwell-stable bracket (`lowest_verified_mv + 1 step`), skipping dominated
+  high-V probes. Preserves monotone writer / verifier gates / `overshoot_veto` / Safe Loop /
+  `reset_to_stock` / persistence / 875 mV floor. **Validation PASS**: supervised
+  `build-frontier --confirm --max-targets 7 --max-probes 40 --safe-start-cap 1075 --warm-start-brackets`
+  — exit 0; no TDR/reboot; Safe Loop clean; `reset_to_stock` ran; `boot_flag.json`/`gpu_applied.json`
+  absent after; `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt` unchanged; GPU stock idle.
+  **33 probes**, all 7 targets produced points; **B1/B2/B3 held, B2 exercised** (1905 failed verify at
+  warm-start 900 mV → fell back once to cap 1075, target preserved). **−5 probes vs from-cap (38)** for
+  an identical frontier (32 baseline ≈ flat); modest on RTX 3060 Ti (mid targets stop early on
+  verify-axis residual overshoot). `1755 @ 900`/`@ 875` re-validated (`NoDownCapNeededCeiling`,
+  overshoot 0, plateau 1665..1755 / 1620..1755, ≈1755 MHz @ 875 mV ≈176 W); `write_mode=monotone_static`,
+  `positive_offsets=0`. Follow-up `6f2f061` surfaces scheduler `result.log` before `result.profiles.log`
+  (log-only, deduped). **Keep default OFF**; next (later): more runs, benign-zero-only seeding
+  refinement, broader confidence work; do NOT mix with persistence. See `handoff.md` + `decisions.md`.
 - **F1b Phase 2B.2-c — monotone static-base VF writer HARDWARE-VALIDATED (2026-06-12, commit
   8503182)**: supervised `build-frontier --confirm --max-targets 7 --max-probes 40 --safe-start-cap
   1075` on a fresh `origin/master` debug build at `8503182`, after a clean bounded dry-run.
