@@ -112,6 +112,11 @@ fn parse_frontier_limits(args: &[OsString]) -> Result<gpu_power_sweep::FrontierL
                     Some(v.parse().map_err(|_| format!("--safe-start-cap: invalid number '{v}'"))?);
                 i += 2;
             }
+            // Opt-in warm-start voltage-bracket carry-forward (no value; default OFF).
+            "--warm-start-brackets" => {
+                limits.warm_start_brackets = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -178,6 +183,19 @@ mod cli_tests {
     fn parse_limits_defaults_when_absent() {
         let l = super::parse_frontier_limits(&os(&["build-frontier"])).unwrap();
         assert_eq!(l, crate::gpu_power_sweep::FrontierLimits::default());
+        assert!(!l.warm_start_brackets); // opt-in: default OFF
+    }
+
+    #[test]
+    fn parse_warm_start_brackets_flag_opt_in() {
+        // Absent → off; present → on. Existing flags unaffected.
+        assert!(!super::parse_frontier_limits(&os(&["build-frontier"])).unwrap().warm_start_brackets);
+        let l = super::parse_frontier_limits(&os(&[
+            "build-frontier", "--warm-start-brackets", "--max-targets", "3",
+        ]))
+        .unwrap();
+        assert!(l.warm_start_brackets);
+        assert_eq!(l.max_targets, Some(3));
     }
 
     #[test]
