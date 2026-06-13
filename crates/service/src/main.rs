@@ -85,9 +85,10 @@ fn has_confirm_flag(args: &[OsString]) -> bool {
     args.iter().any(|a| a.to_string_lossy() == "--confirm")
 }
 
-/// Parse the first-run limiter flags (`--max-targets N`, `--max-probes N`, `--safe-start-cap MV`).
-/// Syntax-only: missing/non-numeric values FAIL CLOSED (`Err`). Semantic checks (0 values,
-/// cap vs crash floor) happen in `gpu_power_sweep::run_build_frontier`. Pure (unit-testable).
+/// Parse the first-run limiter flags (`--max-targets N`, `--max-probes N`,
+/// `--max-probes-per-target N`, `--safe-start-cap MV`). Syntax-only: missing/non-numeric values
+/// FAIL CLOSED (`Err`). Semantic checks (0 values, cap vs crash floor) happen in
+/// `gpu_power_sweep::run_build_frontier`. Pure (unit-testable).
 fn parse_frontier_limits(args: &[OsString]) -> Result<gpu_power_sweep::FrontierLimits, String> {
     let strs: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     let mut limits = gpu_power_sweep::FrontierLimits::default();
@@ -104,6 +105,15 @@ fn parse_frontier_limits(args: &[OsString]) -> Result<gpu_power_sweep::FrontierL
                 let v = strs.get(i + 1).ok_or_else(|| "--max-probes needs a value".to_string())?;
                 limits.max_probes =
                     Some(v.parse().map_err(|_| format!("--max-probes: invalid number '{v}'"))?);
+                i += 2;
+            }
+            "--max-probes-per-target" => {
+                let v = strs
+                    .get(i + 1)
+                    .ok_or_else(|| "--max-probes-per-target needs a value".to_string())?;
+                limits.max_probes_per_target = Some(
+                    v.parse().map_err(|_| format!("--max-probes-per-target: invalid number '{v}'"))?,
+                );
                 i += 2;
             }
             "--safe-start-cap" => {
@@ -203,6 +213,24 @@ mod cli_tests {
         assert!(super::parse_frontier_limits(&os(&["build-frontier", "--max-targets", "abc"])).is_err());
         assert!(super::parse_frontier_limits(&os(&["build-frontier", "--max-probes"])).is_err());
         assert!(super::parse_frontier_limits(&os(&["build-frontier", "--safe-start-cap", "x"])).is_err());
+    }
+
+    #[test]
+    fn parse_max_probes_per_target_flag() {
+        // Present → parsed; absent → None; missing/non-numeric value → error.
+        let l = super::parse_frontier_limits(&os(&[
+            "build-frontier", "--max-targets", "7", "--max-probes", "14", "--max-probes-per-target", "2",
+        ]))
+        .unwrap();
+        assert_eq!(l.max_probes_per_target, Some(2));
+        assert_eq!(l.max_targets, Some(7));
+        assert_eq!(l.max_probes, Some(14));
+        assert_eq!(
+            super::parse_frontier_limits(&os(&["build-frontier"])).unwrap().max_probes_per_target,
+            None
+        );
+        assert!(super::parse_frontier_limits(&os(&["build-frontier", "--max-probes-per-target"])).is_err());
+        assert!(super::parse_frontier_limits(&os(&["build-frontier", "--max-probes-per-target", "x"])).is_err());
     }
 }
 

@@ -1390,6 +1390,11 @@ fn measured_to_probe(m: &Measured, curve_verified: bool, confidence: f64) -> Pro
 enum BracketStop {
     /// Reached the floor with the last probe still verified + stable.
     CleanFloor,
+    /// Hit the per-target depth bound (`--max-probes-per-target`) with the last probe still verified
+    /// + stable — a CLEAN, intentional stop (descended N bins by choice, no failure). Distinct from
+    /// `BudgetExhausted` (global drain, non-evidence): a `PerTargetCap` bracket IS carry-forward
+    /// eligible when it recorded a `lowest_verified_mv`.
+    PerTargetCap,
     /// Dwell instability (curve verified, but the dwell was not Stable) below the verified band.
     SoftUnstable,
     /// Ceiling did not verify/apply (LiveMismatch / overshoot_veto / monotone writer fail-closed).
@@ -1539,6 +1544,7 @@ fn descend_target(
     target: u32,
     start_mv: u32,
     descent: &FrontierDescent,
+    max_per_target: Option<u32>,
     probe: &impl Fn(u32, u32) -> ProbeSample,
 ) -> (TargetBracket, Option<(PowerSweepPoint, f64)>) {
     let mut bracket = TargetBracket {
@@ -1574,6 +1580,17 @@ fn descend_target(
         return (bracket, deepest); // empty bin domain — caller fails closed before any hardware
     };
     for &v in descent.bins_desc.iter().filter(|&&b| b <= start_bin) {
+        // Per-target depth cap: stop CLEANLY once N probes have run for this target, BEFORE probing
+        // the next (deeper) bin. This arm is only reached when the prior N probes were all
+        // verified + stable — any failure / drain / crash breaks earlier with its own stop reason
+        // and takes precedence — so `PerTargetCap` is genuinely clean (carry-forward eligible when a
+        // verified floor was recorded). No effect when `None` (legacy full descent).
+        if let Some(n) = max_per_target {
+            if bracket.probes_used >= n {
+                bracket.stop_reason = BracketStop::PerTargetCap;
+                break;
+            }
+        }
         let s = probe(target, v);
         bracket.probes_used += 1;
         // Drain / hard-failure first: these stop the descent and are NOT verify failures.
@@ -1621,6 +1638,12 @@ fn descend_target(
 /// ONCE to the cap and descends normally; it is never dropped, and the fallback never fires on a
 /// drain (budget/abort) or a crash. Outer loop allows a partial frontier, then synthesizes. Pure —
 /// the closure is the only seam to (future) hardware. Never runs stress / writes the VF curve.
+///
+/// `max_per_target` (`--max-probes-per-target`) bounds each target's descent depth so one target
+/// cannot drain the whole global budget (the F1b multi-clock coverage fix). It is passed to BOTH
+/// the normal and the B2-fallback descents. NOTE: with warm-start ON, a B2 fallback re-descends
+/// from the cap, so a single target may run up to two capped descent attempts (≤ 2·N probes); this
+/// is acceptable because warm-start is opt-in and the global `--max-probes` cap still bounds the run.
 #[cfg(windows)]
 #[allow(dead_code)] // wired to the real measurement closure in Phase 2B
 fn build_frontier(
@@ -1628,6 +1651,7 @@ fn build_frontier(
     descent: &FrontierDescent,
     policy: &ForgePolicy,
     carry: &BracketCarryConfig,
+    max_per_target: Option<u32>,
     probe: impl Fn(u32, u32) -> ProbeSample,
 ) -> FrontierBuildResult {
     let mut paired: Vec<(PowerSweepPoint, f64)> = Vec::new();
@@ -1636,7 +1660,8 @@ fn build_frontier(
 
     for &target in candidate_clocks {
         let decision = warm_start_mv(prev.as_ref(), carry);
-        let (mut bracket, mut point) = descend_target(target, decision.start_mv, descent, &probe);
+        let (mut bracket, mut point) =
+            descend_target(target, decision.start_mv, descent, max_per_target, &probe);
         bracket.warm_started = decision.warm_started;
         bracket.bracket_source_target = decision.source_target;
         bracket.bracket_reuse_start_mv = decision.warm_started.then_some(decision.start_mv);
@@ -1654,7 +1679,8 @@ fn build_frontier(
                 decision.start_mv, carry.safe_start_cap_mv
             ));
             let warm_probes = bracket.probes_used;
-            let (mut fb, fb_point) = descend_target(target, carry.safe_start_cap_mv, descent, &probe);
+            let (mut fb, fb_point) =
+                descend_target(target, carry.safe_start_cap_mv, descent, max_per_target, &probe);
             fb.bracket_source_target = decision.source_target;
             fb.fell_back_to_cap = true;
             fb.probes_used = fb.probes_used.saturating_add(warm_probes);
@@ -1749,22 +1775,38 @@ struct FrontierPlan {
     /// exact sequence before `--confirm`.
     descent_bins: Vec<u32>,
     bins_per_descent: u32,
+    /// Per-target depth bound in effect (`--max-probes-per-target`), or `None` for full descent.
+    max_probes_per_target: Option<u32>,
+    /// Bins each target actually descends this run = `min(bins_per_descent, max_probes_per_target)`.
+    /// Equals `bins_per_descent` when no per-target cap is set.
+    effective_bins_per_descent: u32,
     est_dwell_count: u32,
     est_wall_secs: u64,
     safety_notice: String,
 }
 
 /// Compute the dry-run plan from candidate `targets` + a `FrontierDescent`. `est_dwell_count`
-/// is the WORST case (every target descends every bin with no early stop); real runs stop
-/// earlier on first instability. Pure + testable.
+/// is the WORST case (every target descends its effective bin budget with no early stop); real runs
+/// stop earlier on first instability. `max_per_target` (`--max-probes-per-target`) caps the bins one
+/// target descends, so the worst case becomes `targets × min(bins, cap)` instead of `targets ×
+/// bins`. The GLOBAL `--max-probes` cap is applied by the caller (it bounds the run-wide total).
+/// Pure + testable.
 #[cfg(windows)]
 #[allow(dead_code)] // surfaced by the dry-run path in Phase 2B.2-b
-fn plan_frontier(targets: Vec<u32>, descent: &FrontierDescent, dwell_ms: u64) -> FrontierPlan {
+fn plan_frontier(
+    targets: Vec<u32>,
+    descent: &FrontierDescent,
+    dwell_ms: u64,
+    max_per_target: Option<u32>,
+) -> FrontierPlan {
     let step = descent.voltage_step_mv.max(1);
     // Worst case = every target descends every REAL bin (no early stop). Bin-based: the count is
     // the number of actual VF bins in range, not a step-grid span.
     let bins_per_descent = descent.bins_desc.len() as u32;
-    let est_dwell_count = targets.len() as u32 * bins_per_descent;
+    // Per-target cap only ever REDUCES the bins a target descends (never widens exposure).
+    let effective_bins_per_descent =
+        max_per_target.map_or(bins_per_descent, |n| bins_per_descent.min(n));
+    let est_dwell_count = targets.len() as u32 * effective_bins_per_descent;
     let est_wall_secs = est_dwell_count as u64 * (dwell_ms + PROBE_OVERHEAD_MS) / 1000;
     FrontierPlan {
         targets,
@@ -1773,6 +1815,8 @@ fn plan_frontier(targets: Vec<u32>, descent: &FrontierDescent, dwell_ms: u64) ->
         voltage_step_mv: step,
         descent_bins: descent.bins_desc.clone(),
         bins_per_descent,
+        max_probes_per_target: max_per_target,
+        effective_bins_per_descent,
         est_dwell_count,
         est_wall_secs,
         safety_notice: "SUPERVISED ONLY: applies transient VF ceilings and runs game-power \
@@ -1844,6 +1888,12 @@ const MIN_CORE_CLUSTER_POINTS: usize = 8;
 pub struct FrontierLimits {
     pub max_targets: Option<usize>,
     pub max_probes: Option<u32>,
+    /// Per-target depth bound (`--max-probes-per-target`): the max hardware probes ONE target's
+    /// descent may spend before stopping cleanly (before probing the next bin). `None` preserves
+    /// the legacy depth-first descent. It can only REDUCE / redistribute exposure — the global
+    /// `max_probes` stays the hard cap. Prevents one power-limited target from draining the whole
+    /// budget so F1b collects multi-clock coverage. Default `None`.
+    pub max_probes_per_target: Option<u32>,
     pub safe_start_cap_mv: Option<u32>,
     /// Opt-in (`--warm-start-brackets`): warm-start voltage-bracket carry-forward. Default `false`
     /// → legacy behavior (every target starts at the cap). First adopter: build-frontier / F1b.
@@ -1858,6 +1908,9 @@ fn validate_limits(l: &FrontierLimits, lowest_safe_mv: u32) -> Result<(), String
     }
     if l.max_probes == Some(0) {
         return Err("--max-probes must be >= 1".into());
+    }
+    if l.max_probes_per_target == Some(0) {
+        return Err("--max-probes-per-target must be >= 1".into());
     }
     if let Some(cap) = l.safe_start_cap_mv {
         if cap <= lowest_safe_mv {
@@ -2385,7 +2438,7 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         warn!("build-frontier: no real VF bin ≤ {safe_start_mv} mV — failing closed (no hardware floor)");
         return;
     }
-    let plan = plan_frontier(targets.clone(), &descent, DWELL_MS);
+    let plan = plan_frontier(targets.clone(), &descent, DWELL_MS, limits.max_probes_per_target);
     // Effective dwell budget after --max-probes (the run hard-stops at this many probes).
     let capped_dwells = limits
         .max_probes
@@ -2421,8 +2474,19 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         hw_floor_mv
     );
     println!(
-        "limits             : max_targets={:?} max_probes={:?} safe_start_cap={:?}",
-        limits.max_targets, limits.max_probes, limits.safe_start_cap_mv
+        "limits             : max_targets={:?} max_probes={:?} max_probes_per_target={:?} safe_start_cap={:?}",
+        limits.max_targets, limits.max_probes, limits.max_probes_per_target, limits.safe_start_cap_mv
+    );
+    println!(
+        "scheduler mode     : {}",
+        if limits.max_probes_per_target.is_some() {
+            "coverage-bounded (per-target depth cap — reach multiple clocks before deepening one)"
+        } else {
+            "depth-first (full descent per target until floor / failure / global budget)"
+        }
+    );
+    println!(
+        "budget semantics   : global --max-probes is the hard cap; per-target cap only limits depth per target"
     );
     println!(
         "warm-start         : {} (margin {} step(s) = {} mV; first/hard-failed targets start at cap)",
@@ -2440,6 +2504,29 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         plan.bins_per_descent, plan.safe_start_mv, plan.lowest_safe_mv
     );
     println!("descent bins (mV)  : {:?}", plan.descent_bins);
+    let first_pass: Vec<u32> = plan
+        .descent_bins
+        .iter()
+        .copied()
+        .take(plan.effective_bins_per_descent as usize)
+        .collect();
+    println!(
+        "first-pass bins(mV): {:?} ({} bin(s)/target — shallowest first under the per-target cap)",
+        first_pass, plan.effective_bins_per_descent
+    );
+    if let Some(mp) = limits.max_probes {
+        let eff = plan.effective_bins_per_descent.max(1);
+        // ceil(mp / eff) targets get at least one probe before the global budget drains.
+        let reachable = mp.div_ceil(eff).min(plan.targets.len() as u32);
+        let skipped = plan.targets.len() as u32 - reachable;
+        println!(
+            "global-cap reach   : {} of {} target(s) reachable under --max-probes {} ({} skipped)",
+            reachable,
+            plan.targets.len(),
+            mp,
+            skipped
+        );
+    }
     println!(
         "worst-case dwells  : {} (~{} s, no early stop){}",
         capped_dwells,
@@ -2511,7 +2598,14 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         limits.warm_start_brackets,
         FRONTIER_WARM_START_MARGIN_STEPS,
     );
-    let result = build_frontier(&targets, &descent, &policy, &carry, probe);
+    let result = build_frontier(
+        &targets,
+        &descent,
+        &policy,
+        &carry,
+        limits.max_probes_per_target,
+        probe,
+    );
 
     // ALWAYS restore stock after the run (success, partial, or abort). No profile is applied.
     reset_to_stock();
@@ -3316,7 +3410,7 @@ mod tests {
     #[test]
     fn plan_frontier_estimates_dwells_and_time() {
         let d = step_descent(1000, 25, 900);
-        let plan = plan_frontier(vec![1830, 1800, 1770], &d, 15_000);
+        let plan = plan_frontier(vec![1830, 1800, 1770], &d, 15_000, None);
         assert_eq!(plan.bins_per_descent, 5); // (1000-900)/25 + 1
         assert_eq!(plan.est_dwell_count, 15); // 3 targets × 5 bins (worst case, no early stop)
         assert_eq!(plan.est_wall_secs, 300); // 15 × (15000 + 5000) / 1000
@@ -3334,7 +3428,7 @@ mod tests {
     #[test]
     fn plan_frontier_counts_real_irregular_bins() {
         let d = derive_descent(&IRREGULAR_BINS, 1062, 25);
-        let plan = plan_frontier(vec![1830, 1800], &d, 15_000);
+        let plan = plan_frontier(vec![1830, 1800], &d, 15_000, None);
         assert_eq!(plan.bins_per_descent, 7); // the REAL bin count, not a step-grid span
         assert_eq!(plan.descent_bins, vec![1062, 975, 900, 850, 812, 700, 606]);
         assert!(plan.descent_bins.iter().all(|v| IRREGULAR_BINS.contains(v)));
@@ -3351,7 +3445,7 @@ mod tests {
             probed.borrow_mut().push(vbin);
             stable_sample(target, 180.0, 0.95) // stable everywhere → descend to the hardware floor
         };
-        let r = build_frontier(&[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         let seq = probed.borrow().clone();
         // Every probed voltage is a REAL curve bin — never an invented step-grid voltage.
         assert!(seq.iter().all(|v| IRREGULAR_BINS.contains(v)), "probed only real bins: {seq:?}");
@@ -3380,7 +3474,7 @@ mod tests {
                 stable_sample(target, 175.0, 0.95)
             }
         };
-        let r = build_frontier(&[1830u32, 1800], &d, &ForgePolicy::balanced(), &carry, probe);
+        let r = build_frontier(&[1830u32, 1800], &d, &ForgePolicy::balanced(), &carry, None, probe);
         let first_b = b_first.borrow().expect("B was probed");
         assert_eq!(first_b, 900, "warm start snaps the 875 margin target UP to the real 900 bin");
         assert!(IRREGULAR_BINS.contains(&first_b), "start bin is a real curve bin");
@@ -3401,7 +3495,7 @@ mod tests {
             if vbin >= 850 { stable_sample(target, 180.0, 0.95) } else { unstable_sample() }
         };
         let r = build_frontier(
-            &[1830u32, 1800], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe,
+            &[1830u32, 1800], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe,
         );
         // Disabled carry → every target starts at the cap = the TOP real bin (1062), no warm-start.
         assert_eq!(*b_first.borrow(), Some(1062));
@@ -3426,7 +3520,7 @@ mod tests {
             stable_sample(target, 180.0, 0.95)
         };
         let _ = build_frontier(
-            &[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe,
+            &[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe,
         );
         assert_eq!(executed.load(SeqCst), max); // exactly the budget over the bin domain
     }
@@ -3602,6 +3696,9 @@ mod tests {
         let floor = 700u32; // a hardware-derived floor (validate_limits is floor-agnostic)
         assert!(validate_limits(&FrontierLimits { max_targets: Some(0), ..Default::default() }, floor).is_err());
         assert!(validate_limits(&FrontierLimits { max_probes: Some(0), ..Default::default() }, floor).is_err());
+        // per-target cap of 0 → invalid; >= 1 → ok.
+        assert!(validate_limits(&FrontierLimits { max_probes_per_target: Some(0), ..Default::default() }, floor).is_err());
+        assert!(validate_limits(&FrontierLimits { max_probes_per_target: Some(2), ..Default::default() }, floor).is_ok());
         // cap at or below the crash floor → invalid.
         assert!(validate_limits(&FrontierLimits { safe_start_cap_mv: Some(floor), ..Default::default() }, floor).is_err());
         assert!(validate_limits(&FrontierLimits { safe_start_cap_mv: Some(floor - 1), ..Default::default() }, floor).is_err());
@@ -3655,7 +3752,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 800);
-        let _ = build_frontier(&[1935, 1905, 1875], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let _ = build_frontier(&[1935, 1905, 1875], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         assert_eq!(executed.load(SeqCst), max); // exactly 3 real probes ran before the cap
     }
 
@@ -3708,7 +3805,7 @@ mod tests {
             unstable_sample()
         };
         let d = step_descent(1000, 25, 900);
-        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         // 1830: 1000/975/950 stable (3) + 925 abort (1) = 4 calls; 1800 & 1770: 1 call each.
         assert_eq!(calls.load(SeqCst), 6);
         assert_eq!(r.frontier.len(), 1);
@@ -3736,7 +3833,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         assert_eq!(r.frontier.len(), 5);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
         assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 1815);
@@ -3764,7 +3861,7 @@ mod tests {
             }
         };
         let d = step_descent(1100, 25, 800);
-        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         assert_eq!(r.frontier.len(), 6);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 2880, "Godforge = highest clock");
         assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 2860, "Brokkr's = max R within 98% floor");
@@ -3783,7 +3880,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(900), "deepest stable bin kept");
         assert!(r.frontier[0].stable);
@@ -3805,7 +3902,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 950);
-        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         assert!(min_probed.get() >= 950, "never probe below the known-unsafe floor");
         assert!(r.frontier[0].vf_table_voltage_mv.unwrap() >= 950);
     }
@@ -3822,7 +3919,7 @@ mod tests {
             s
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         assert_eq!(r.frontier.len(), 1, "unverified clock rejected");
         assert_eq!(r.frontier[0].clock_mhz, 1770);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1770);
@@ -3847,7 +3944,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[1830u32, 1815, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&[1830u32, 1815, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         assert_eq!(r.frontier.len(), 2, "partial frontier (1815 dropped)");
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
         assert!(r.profiles.deep_calm.is_some());
@@ -3865,7 +3962,7 @@ mod tests {
             }
         };
         let d = step_descent(950, 25, 700);
-        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         assert!(r.profiles.godforge.is_some());
         assert!(r.profiles.brokkrs.is_some());
         assert!(r.profiles.deep_calm.is_some());
@@ -3877,7 +3974,7 @@ mod tests {
     fn sim_no_valid_points_returns_safe_failure() {
         let probe = |_t: u32, _v: u32| unstable_sample(); // nothing ever stable
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
         assert!(r.frontier.is_empty());
         assert!(r.profiles.godforge.is_none());
         assert!(r.profiles.brokkrs.is_none());
@@ -4041,14 +4138,14 @@ mod tests {
             *off_calls.borrow_mut() += 1;
             if v >= 925 { stable_sample(t, 180.0, 0.95) } else { unstable_sample() }
         };
-        let off = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), off_probe);
+        let off = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, off_probe);
 
         let on_calls = RefCell::new(0u32);
         let on_probe = |t: u32, v: u32| {
             *on_calls.borrow_mut() += 1;
             if v >= 925 { stable_sample(t, 180.0, 0.95) } else { unstable_sample() }
         };
-        let on = build_frontier(&targets, &d, &ForgePolicy::balanced(), &carry_cfg(true), on_probe);
+        let on = build_frontier(&targets, &d, &ForgePolicy::balanced(), &carry_cfg(true), None, on_probe);
 
         // Identical frontier (same deepest verified bin per target), but fewer probes.
         let off_bins: Vec<_> = off.frontier.iter().map(|p| p.vf_table_voltage_mv).collect();
@@ -4074,7 +4171,7 @@ mod tests {
             _ => if vbin >= 1000 { stable_sample(1785, 175.0, 0.95) } else { unverified_probe() },
         };
         let d = step_descent(1075, 25, 875);
-        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), probe);
+        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, probe);
         assert_eq!(r.frontier.len(), 2); // 1785 recovered via fallback, not dropped
         let t1785 = r.frontier.iter().find(|p| p.target_clock_mhz == Some(1785)).expect("1785 present");
         assert_eq!(t1785.vf_table_voltage_mv, Some(1000));
@@ -4099,7 +4196,7 @@ mod tests {
             if vbin >= 925 { stable_sample(1785, 175.0, 0.95) } else { unstable_sample() }
         };
         let d = step_descent(1075, 25, 875);
-        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), probe);
+        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, probe);
         assert_eq!(*first_vbin_1785.borrow(), Some(1075)); // started at the cap, no warm-start
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].target_clock_mhz, Some(1785));
@@ -4132,7 +4229,7 @@ mod tests {
             stable_sample(1785, 175.0, 0.95)
         };
         let d = step_descent(1075, 25, 875);
-        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), probe);
+        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, probe);
         assert_eq!(*first_vbin_1785.borrow(), Some(1075)); // not seeded from the crashed target
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].target_clock_mhz, Some(1815));
@@ -4156,8 +4253,123 @@ mod tests {
             if vbin >= 925 { stable_sample(target, 180.0, 0.95) } else { unstable_sample() }
         };
         let d = step_descent(1075, 25, 875);
-        let _ = build_frontier(&[1815u32, 1785, 1755], &d, &ForgePolicy::balanced(), &carry_cfg(true), probe);
+        let _ = build_frontier(&[1815u32, 1785, 1755], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, probe);
         assert_eq!(executed.load(SeqCst), max); // exactly the budget, no fallback burst beyond it
+    }
+
+    // ── F1b Option B: per-target probe cap (--max-probes-per-target) ──────────────────
+    #[cfg(windows)]
+    #[test]
+    fn per_target_cap_none_preserves_full_descent() {
+        use std::cell::RefCell;
+        // No cap → identical probe sequence to the legacy full descent (down to the floor).
+        let d = step_descent(1075, 25, 875); // 9 bins
+        let probed = RefCell::new(Vec::<u32>::new());
+        let probe = |target: u32, vbin: u32| {
+            probed.borrow_mut().push(vbin);
+            stable_sample(target, 180.0, 0.95)
+        };
+        let r = build_frontier(
+            &[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe,
+        );
+        assert_eq!(probed.borrow().len(), 9, "no cap → descend every bin");
+        assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(875)); // reached the hardware floor
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn per_target_cap_covers_all_targets_before_deepening() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        // 7 targets, per-target cap 2, no global drain → each target gets EXACTLY 2 shallow probes
+        // and a point; none is dropped. Regression for "all probes spent on one target".
+        let d = step_descent(1075, 25, 875); // bins 1075,1050,...,875
+        let targets = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        let executed = AtomicU32::new(0);
+        let probe = |target: u32, _vbin: u32| {
+            executed.fetch_add(1, SeqCst);
+            stable_sample(target, 180.0, 0.95)
+        };
+        let r = build_frontier(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), Some(2), probe,
+        );
+        assert_eq!(executed.load(SeqCst), 14, "7 targets × 2 probes");
+        assert_eq!(r.frontier.len(), 7, "every target characterized — none dropped");
+        // Each target stops at its 2nd (deepest probed) bin = 1050.
+        assert!(r.frontier.iter().all(|p| p.vf_table_voltage_mv == Some(1050)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn per_target_cap_global_max_probes_still_hard() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        // Per-target cap 2 with a GLOBAL --max-probes of 5 (modeled in the probe closure, as the real
+        // run does): exactly 5 real probes run; later targets drain. The per-target cap can only
+        // reduce/redistribute exposure — it never raises the global ceiling.
+        let d = step_descent(1075, 25, 875);
+        let targets = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        let calls = AtomicU32::new(0);
+        let executed = AtomicU32::new(0);
+        let max = 5u32;
+        let probe = |target: u32, _vbin: u32| {
+            if calls.fetch_add(1, SeqCst) >= max {
+                return budget_sample();
+            }
+            executed.fetch_add(1, SeqCst);
+            stable_sample(target, 180.0, 0.95)
+        };
+        let _ = build_frontier(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), Some(2), probe,
+        );
+        assert_eq!(executed.load(SeqCst), max, "global --max-probes stays the hard cap");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn per_target_cap_stop_is_clean_and_carry_eligible() {
+        // A descent stopped by the per-target cap (still verified+stable) is NOT a hard failure and —
+        // having a verified floor — IS eligible to warm-start the next target (unlike a global drain).
+        let prev = bracket_with(1815, Some(950), BracketStop::PerTargetCap);
+        assert!(!prev.is_hard_failed());
+        let d = warm_start_mv(Some(&prev), &carry_cfg(true));
+        assert!(d.warm_started, "clean per-target-cap bracket seeds the next target");
+        assert_eq!(d.start_mv, 975); // 950 + one 25 mV step
+        assert_eq!(d.source_target, Some(1815));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn per_target_cap_records_stop_reason_and_never_probes_bin_n_plus_1() {
+        use std::cell::RefCell;
+        // Direct descend_target check: cap 2 over an all-stable descent stops with PerTargetCap and a
+        // verified floor at the 2nd bin, having probed EXACTLY 2 bins (never bin N+1).
+        let d = step_descent(1075, 25, 875);
+        let probed = RefCell::new(Vec::<u32>::new());
+        let probe = |target: u32, vbin: u32| {
+            probed.borrow_mut().push(vbin);
+            stable_sample(target, 180.0, 0.95)
+        };
+        let (bracket, point) = descend_target(1935, 1075, &d, Some(2), &probe);
+        assert_eq!(bracket.stop_reason, BracketStop::PerTargetCap);
+        assert_eq!(bracket.probes_used, 2);
+        assert_eq!(*probed.borrow(), vec![1075u32, 1050]); // bin N+1 (1025) never probed
+        assert_eq!(bracket.lowest_verified_mv, Some(1050));
+        assert_eq!(point.unwrap().0.vf_table_voltage_mv, Some(1050));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plan_frontier_reports_per_target_cap_and_reduced_dwells() {
+        let d = step_descent(1075, 25, 875); // 9 bins
+        let targets = vec![1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        let plan = plan_frontier(targets, &d, 15_000, Some(2));
+        assert_eq!(plan.bins_per_descent, 9); // full descent depth unchanged
+        assert_eq!(plan.max_probes_per_target, Some(2));
+        assert_eq!(plan.effective_bins_per_descent, 2);
+        assert_eq!(plan.est_dwell_count, 14); // 7 targets × 2 (was 7 × 9 = 63 uncapped)
+        // No cap → effective equals the full descent.
+        let plan_full = plan_frontier(vec![1935u32, 1905], &d, 15_000, None);
+        assert_eq!(plan_full.effective_bins_per_descent, 9);
+        assert_eq!(plan_full.est_dwell_count, 18);
     }
 
     #[cfg(windows)]
