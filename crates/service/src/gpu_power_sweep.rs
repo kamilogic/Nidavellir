@@ -1272,12 +1272,19 @@ struct ProbeSample {
     crashed: bool,
 }
 
-/// Voltage-bin descent config for a target clock. The descent never probes below
-/// `lowest_safe_mv` (the known-crash floor from Forge Knowledge — a config input here).
+/// Voltage-bin descent config for a target clock. The descent walks `bins_desc` — the GPU's REAL
+/// VF-table voltage bins in [`lowest_safe_mv`..=`safe_start_mv`], strictly descending — so it only
+/// ever probes voltages that exist in the curve. `lowest_safe_mv` (= `bins_desc.last()`) is the
+/// HARDWARE-DERIVED floor: the lowest real graphics-core VF bin. `safe_start_mv` (= the highest
+/// included bin, ≤ any `--safe-start-cap`) is the descent start. `voltage_step_mv` is the nominal
+/// spacing used only for the warm-start re-anchor margin, never as the descent grid.
 #[cfg(windows)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 struct FrontierDescent {
+    /// Real VF-table voltage bins to probe, strictly descending (cap → hardware floor). Every entry
+    /// is a voltage present in the live curve; the descent never invents a non-bin voltage.
+    bins_desc: Vec<u32>,
     safe_start_mv: u32,
     voltage_step_mv: u32,
     lowest_safe_mv: u32,
@@ -1548,8 +1555,25 @@ fn descend_target(
         probes_used: 0,
     };
     let mut deepest: Option<(PowerSweepPoint, f64)> = None;
-    let mut v = start_mv;
-    while v >= descent.lowest_safe_mv {
+    // Bin-based descent. Snap the requested start voltage UP to the lowest real bin ≥ `start_mv`
+    // (the CONSERVATIVE re-anchor — same `nearest_vf_bin_at_or_above` direction the hardware apply
+    // uses), then walk strictly down through every lower real bin to the hardware floor
+    // (`bins_desc.last()`). Because `start_mv ≥ prev.lowest_verified_mv` (itself a real bin) and the
+    // start bin is ≥ `start_mv`, the descent never starts below the previous verified floor (B1).
+    // When the margin target lands between two bins it re-anchors at the higher (safer) one; an
+    // exact-bin `start_mv` (e.g. the cap, or the legacy step grid) resolves to itself. No invented
+    // voltages — only real curve bins are ever probed.
+    let Some(start_bin) = descent
+        .bins_desc
+        .iter()
+        .copied()
+        .filter(|&b| b >= start_mv)
+        .min()
+        .or_else(|| descent.bins_desc.first().copied())
+    else {
+        return (bracket, deepest); // empty bin domain — caller fails closed before any hardware
+    };
+    for &v in descent.bins_desc.iter().filter(|&&b| b <= start_bin) {
         let s = probe(target, v);
         bracket.probes_used += 1;
         // Drain / hard-failure first: these stop the descent and are NOT verify failures.
@@ -1575,10 +1599,7 @@ fn descend_target(
                 // B1: a verified floor is recorded ONLY from a verified + dwell-Stable bin.
                 deepest = Some((probe_to_point(target, v, &s), s.confidence));
                 bracket.lowest_verified_mv = Some(v);
-                if v < descent.voltage_step_mv {
-                    break;
-                }
-                v -= descent.voltage_step_mv;
+                // Continue to the next lower real bin (loop ends at the hardware floor).
             }
             ProbeOutcome::Unstable => {
                 bracket.stop_reason = BracketStop::SoftUnstable;
@@ -1686,16 +1707,28 @@ fn build_frontier(
 #[allow(dead_code)] // used by `plan_frontier` (wired into the dry-run in Phase 2B.2-b)
 const PROBE_OVERHEAD_MS: u64 = 5_000;
 
-/// Derive a `FrontierDescent` from the live VF-curve bin voltages + the operator-confirmed
-/// crash floor. `safe_start_mv` = the highest real bin (top of the curve), clamped to be ≥
-/// the floor; the descent never goes below `lowest_safe_mv`. Pure + testable (the caller
-/// reads the bins from `read_vf_curve_modern` in Phase 2B.2-b). No hardware here.
+/// Derive a BIN-BASED `FrontierDescent` from the GPU's real graphics-core VF voltage bins.
+/// `core_bins_mv` are the actual stock-curve core voltages (the seeded cluster's bins); `cap_mv`
+/// is the effective descent start (the cluster top, lowered by any `--safe-start-cap`). The
+/// descent keeps only real bins in `[floor..=cap]`, strictly descending, where the HARDWARE-DERIVED
+/// floor = the lowest real core bin (`bins_desc.last()`). The lower bound is discovered from the
+/// curve, never a hardcoded voltage; `step_mv` is retained only as the warm-start re-anchor margin
+/// unit + dry-run label. An empty result (no real bin ≤ cap) signals the caller to FAIL CLOSED —
+/// the supervised run must not descend an invented grid. Pure + testable; no hardware here.
 #[cfg(windows)]
 #[allow(dead_code)] // wired into the dry-run / supervised run in Phase 2B.2-b
-fn derive_descent(curve_bins_mv: &[u32], lowest_safe_mv: u32, step_mv: u32) -> FrontierDescent {
-    let top = curve_bins_mv.iter().copied().max().unwrap_or(lowest_safe_mv);
+fn derive_descent(core_bins_mv: &[u32], cap_mv: u32, step_mv: u32) -> FrontierDescent {
+    let mut bins: Vec<u32> = core_bins_mv.iter().copied().filter(|&v| v <= cap_mv).collect();
+    bins.sort_unstable();
+    bins.dedup();
+    // Hardware-derived floor + start: the lowest / highest real bin within the cap. Degenerate
+    // (no bin ≤ cap) → empty `bins_desc`, floor = start = cap, and the caller fails closed.
+    let lowest_safe_mv = bins.first().copied().unwrap_or(cap_mv);
+    let safe_start_mv = bins.last().copied().unwrap_or(cap_mv);
+    bins.reverse(); // strictly descending: cap → hardware floor
     FrontierDescent {
-        safe_start_mv: top.max(lowest_safe_mv),
+        bins_desc: bins,
+        safe_start_mv,
         voltage_step_mv: step_mv.max(1),
         lowest_safe_mv,
     }
@@ -1711,6 +1744,10 @@ struct FrontierPlan {
     safe_start_mv: u32,
     lowest_safe_mv: u32,
     voltage_step_mv: u32,
+    /// The real VF-table voltage bins the descent will probe (cap → hardware floor, descending).
+    /// Every entry exists in the live curve; surfaced in the dry-run so the operator reviews the
+    /// exact sequence before `--confirm`.
+    descent_bins: Vec<u32>,
     bins_per_descent: u32,
     est_dwell_count: u32,
     est_wall_secs: u64,
@@ -1724,8 +1761,9 @@ struct FrontierPlan {
 #[allow(dead_code)] // surfaced by the dry-run path in Phase 2B.2-b
 fn plan_frontier(targets: Vec<u32>, descent: &FrontierDescent, dwell_ms: u64) -> FrontierPlan {
     let step = descent.voltage_step_mv.max(1);
-    let span = descent.safe_start_mv.saturating_sub(descent.lowest_safe_mv);
-    let bins_per_descent = span / step + 1;
+    // Worst case = every target descends every REAL bin (no early stop). Bin-based: the count is
+    // the number of actual VF bins in range, not a step-grid span.
+    let bins_per_descent = descent.bins_desc.len() as u32;
     let est_dwell_count = targets.len() as u32 * bins_per_descent;
     let est_wall_secs = est_dwell_count as u64 * (dwell_ms + PROBE_OVERHEAD_MS) / 1000;
     FrontierPlan {
@@ -1733,6 +1771,7 @@ fn plan_frontier(targets: Vec<u32>, descent: &FrontierDescent, dwell_ms: u64) ->
         safe_start_mv: descent.safe_start_mv,
         lowest_safe_mv: descent.lowest_safe_mv,
         voltage_step_mv: step,
+        descent_bins: descent.bins_desc.clone(),
         bins_per_descent,
         est_dwell_count,
         est_wall_secs,
@@ -1754,10 +1793,13 @@ const FRONTIER_VERIFY_TOL_MHZ: u32 = 15;
 /// falls back to best-effort/V1; it matures across runs (V3). No knowledge writes here.
 #[cfg(windows)]
 const FRONTIER_PROBE_CONFIDENCE: f64 = 0.21;
-/// Crash floor (mV) — NEVER probe below this. Conservatively ABOVE the ~855 mV known hard-reboot.
-#[cfg(windows)]
-const FRONTIER_LOWEST_SAFE_MV: u32 = 875;
-/// Coarse voltage descent step (mV) for the first supervised run (fewer dwells = less exposure).
+/// Nominal voltage spacing (mV). Used ONLY for the warm-start re-anchor margin and the dry-run
+/// label — NOT as the descent grid. The descent is BIN-BASED: it walks the GPU's real VF-table
+/// voltage bins (see [`derive_descent`]), so it never requests a voltage that is not a real,
+/// writable bin. The lower bound is the HARDWARE-DERIVED floor (the lowest real graphics-core VF
+/// bin from the seeded cluster), not a hardcoded voltage: discovery descends naturally until the
+/// floor bin, a verifier/dwell failure, or a TDR/crash/abort, whichever comes first. The per-probe
+/// Safe Loop + verifier + reset remain the safety net (the old artificial 875 mV floor did not).
 #[cfg(windows)]
 const FRONTIER_VOLT_STEP_MV: u32 = 25;
 /// Upward safety margin (in voltage steps) added when an easier target reuses a harder target's
@@ -1897,6 +1939,9 @@ struct CoreCluster {
     f_min_mhz: u32,
     f_max_mhz: u32,
     point_count: usize,
+    /// Unique core VF voltages in the chosen cluster, ascending. These are the real, writable bins
+    /// the bin-based descent walks; `v_min_mv` (= `bins_mv.first()`) is the hardware-derived floor.
+    bins_mv: Vec<u32>,
 }
 
 /// Select the actual stock core VF cluster from already-sane points: sort by voltage, split
@@ -1929,12 +1974,17 @@ fn select_core_cluster(sane: &[(usize, u32, u32)]) -> Result<CoreCluster, String
             MIN_CORE_CLUSTER_POINTS
         ));
     }
+    // Unique voltages, ascending (the chosen run is already sorted by voltage) — the real bins the
+    // bin-based descent will walk.
+    let mut bins_mv: Vec<u32> = chosen.iter().map(|(_, mv, _)| *mv).collect();
+    bins_mv.dedup();
     Ok(CoreCluster {
         v_min_mv: chosen.first().unwrap().1,
         v_max_mv: chosen.last().unwrap().1,
         f_min_mhz: chosen.iter().map(|(_, _, f)| *f).min().unwrap(),
         f_max_mhz: chosen.iter().map(|(_, _, f)| *f).max().unwrap(),
         point_count: chosen.len(),
+        bins_mv,
     })
 }
 
@@ -1956,6 +2006,9 @@ struct CoreSeed {
     cluster_v_max_mv: u32,
     cluster_f_min_mhz: u32,
     cluster_f_max_mhz: u32,
+    /// The selected core cluster's real VF voltages, ascending. The bin-based descent walks these;
+    /// `cluster_v_min_mv` (= first) is the hardware-derived voltage floor (no hardcoded bound).
+    cluster_bins_mv: Vec<u32>,
     outliers_above_count: usize,
     warnings: Vec<String>,
 }
@@ -2033,6 +2086,7 @@ fn derive_core_seed(curve: &[(usize, u32, u32)]) -> Result<CoreSeed, String> {
         cluster_v_max_mv: cluster.v_max_mv,
         cluster_f_min_mhz: cluster.f_min_mhz,
         cluster_f_max_mhz: cluster.f_max_mhz,
+        cluster_bins_mv: cluster.bins_mv,
         outliers_above_count,
         warnings,
     })
@@ -2286,8 +2340,13 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         regime_raw
     };
 
-    // Validate first-run limiter flags (fail closed on absurd values).
-    if let Err(e) = validate_limits(&limits, FRONTIER_LOWEST_SAFE_MV) {
+    // HARDWARE-DERIVED voltage floor: the lowest real graphics-core VF bin from the seeded
+    // cluster (NOT a hardcoded value). Discovery descends naturally to this bin; the per-probe
+    // verifier/dwell/Safe-Loop stop it earlier on any failure. `derive_core_seed` already failed
+    // closed above if no sane core cluster exists, so this floor is always a real, writable bin.
+    let hw_floor_mv = seed.cluster_v_min_mv;
+    // Validate first-run limiter flags against the derived floor (fail closed on absurd values).
+    if let Err(e) = validate_limits(&limits, hw_floor_mv) {
         println!("=== build-frontier ABORTED (invalid limits) ===");
         println!("{e}");
         warn!("build-frontier: {e}");
@@ -2300,9 +2359,10 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         FRONTIER_CLOCK_STEP_MHZ,
         FRONTIER_FLOOR_FRAC,
     );
-    // Apply first-run limiters: --max-targets truncation + --safe-start-cap.
+    // Apply first-run limiters: --max-targets truncation + --safe-start-cap (never below the
+    // hardware floor).
     let (targets, safe_start_mv) =
-        apply_frontier_limits(raw_targets, seed.safe_start_mv, FRONTIER_LOWEST_SAFE_MV, &limits);
+        apply_frontier_limits(raw_targets, seed.safe_start_mv, hw_floor_mv, &limits);
     // Defensive: a sane seed cannot produce an out-of-range target, but fail closed if it ever does.
     if targets.iter().any(|&t| t > CORE_FREQ_HARD_MAX_MHZ) {
         println!("=== build-frontier ABORTED (fail-closed) ===");
@@ -2310,11 +2370,21 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         warn!("build-frontier: candidate target > {CORE_FREQ_HARD_MAX_MHZ} MHz — failing closed");
         return;
     }
-    let descent = FrontierDescent {
-        safe_start_mv,
-        voltage_step_mv: FRONTIER_VOLT_STEP_MV,
-        lowest_safe_mv: FRONTIER_LOWEST_SAFE_MV,
-    };
+    // BIN-BASED descent over the real core VF bins in [hardware floor..=safe_start]. The floor is
+    // discovered from the curve; the sequence contains only real, writable bins.
+    let descent = derive_descent(&seed.cluster_bins_mv, safe_start_mv, FRONTIER_VOLT_STEP_MV);
+    if descent.bins_desc.is_empty() {
+        // FAIL CLOSED (constraint 5): no real VF bin at or below the descent start means the
+        // hardware floor could not be addressed — never fall back to an invented voltage grid.
+        println!("=== build-frontier ABORTED (fail-closed: no VF bins in descent range) ===");
+        println!(
+            "no real core VF bin at or below the descent start {safe_start_mv} mV \
+             (cluster bins {:?}) — cannot derive a hardware floor; aborting.",
+            seed.cluster_bins_mv
+        );
+        warn!("build-frontier: no real VF bin ≤ {safe_start_mv} mV — failing closed (no hardware floor)");
+        return;
+    }
     let plan = plan_frontier(targets.clone(), &descent, DWELL_MS);
     // Effective dwell budget after --max-probes (the run hard-stops at this many probes).
     let capped_dwells = limits
@@ -2346,6 +2416,11 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
     );
     println!("safe_start source  : stock core cluster top ({} mV)", seed.safe_start_mv);
     println!(
+        "hardware floor     : {} mV (lowest real core VF bin; descent never goes below it — \
+         discovered, not hardcoded)",
+        hw_floor_mv
+    );
+    println!(
         "limits             : max_targets={:?} max_probes={:?} safe_start_cap={:?}",
         limits.max_targets, limits.max_probes, limits.safe_start_cap_mv
     );
@@ -2361,9 +2436,10 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
     );
     println!("targets (MHz)      : {:?}", plan.targets);
     println!(
-        "voltage descent    : {} mV -> {} mV, step {} mV  ({} bins/descent)",
-        plan.safe_start_mv, plan.lowest_safe_mv, plan.voltage_step_mv, plan.bins_per_descent
+        "voltage descent    : bin-based, {} real VF bins {} mV -> {} mV (hardware floor)",
+        plan.bins_per_descent, plan.safe_start_mv, plan.lowest_safe_mv
     );
+    println!("descent bins (mV)  : {:?}", plan.descent_bins);
     println!(
         "worst-case dwells  : {} (~{} s, no early stop){}",
         capped_dwells,
@@ -3219,26 +3295,140 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn derive_descent_from_curve_bins() {
-        let bins = [800u32, 837, 850, 1062];
-        let d = derive_descent(&bins, 820, 25);
-        assert_eq!(d.safe_start_mv, 1062); // top of the live curve
-        assert_eq!(d.lowest_safe_mv, 820); // operator-confirmed crash floor
-        assert_eq!(d.voltage_step_mv, 25);
-        // Empty bins → safe_start clamps to the floor (degenerate but safe).
-        assert_eq!(derive_descent(&[], 900, 25).safe_start_mv, 900);
+    fn derive_descent_uses_real_bins_and_derived_floor() {
+        // Bin-based: the descent walks ONLY real curve bins in [floor..=cap]; the floor is the
+        // LOWEST real bin (discovered from the curve), never a hardcoded value; a bin above the cap
+        // is excluded.
+        let bins = [606u32, 700, 837, 850, 1062, 1075];
+        let d = derive_descent(&bins, 1062, 25);
+        assert_eq!(d.safe_start_mv, 1062); // highest real bin ≤ cap (1075 excluded by the cap)
+        assert_eq!(d.lowest_safe_mv, 606); // DERIVED hardware floor = lowest real bin, not 875
+        assert_eq!(d.bins_desc, vec![1062, 850, 837, 700, 606]); // descending real bins only
+        assert_eq!(d.voltage_step_mv, 25); // nominal margin unit, not a descent grid
+        // Every descent voltage is an actual curve bin — never an invented step-grid voltage.
+        assert!(d.bins_desc.iter().all(|v| bins.contains(v)));
+        // Degenerate (no real bin ≤ cap) → empty descent so the caller FAILS CLOSED; no invented
+        // floor is fabricated.
+        assert!(derive_descent(&bins, 500, 25).bins_desc.is_empty());
     }
 
     #[cfg(windows)]
     #[test]
     fn plan_frontier_estimates_dwells_and_time() {
-        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 900 };
+        let d = step_descent(1000, 25, 900);
         let plan = plan_frontier(vec![1830, 1800, 1770], &d, 15_000);
         assert_eq!(plan.bins_per_descent, 5); // (1000-900)/25 + 1
         assert_eq!(plan.est_dwell_count, 15); // 3 targets × 5 bins (worst case, no early stop)
         assert_eq!(plan.est_wall_secs, 300); // 15 × (15000 + 5000) / 1000
         assert_eq!(plan.targets.len(), 3);
         assert!(plan.safety_notice.contains("SUPERVISED"));
+    }
+
+    // ── Bin-based descent over REAL (irregular-spaced) VF bins ───────────────────
+    /// A hardware-like core curve whose voltage bins are NOT on a 25 mV grid — the case the
+    /// bin-based descent exists for (a step grid would invent voltages between these).
+    #[cfg(windows)]
+    const IRREGULAR_BINS: [u32; 7] = [606, 700, 812, 850, 900, 975, 1062];
+
+    #[cfg(windows)]
+    #[test]
+    fn plan_frontier_counts_real_irregular_bins() {
+        let d = derive_descent(&IRREGULAR_BINS, 1062, 25);
+        let plan = plan_frontier(vec![1830, 1800], &d, 15_000);
+        assert_eq!(plan.bins_per_descent, 7); // the REAL bin count, not a step-grid span
+        assert_eq!(plan.descent_bins, vec![1062, 975, 900, 850, 812, 700, 606]);
+        assert!(plan.descent_bins.iter().all(|v| IRREGULAR_BINS.contains(v)));
+        assert_eq!(plan.est_dwell_count, 14); // 2 targets × 7 real bins (worst case)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_frontier_descends_only_real_bins_to_floor() {
+        use std::cell::RefCell;
+        let d = derive_descent(&IRREGULAR_BINS, 1062, 25);
+        let probed = RefCell::new(Vec::<u32>::new());
+        let probe = |target: u32, vbin: u32| {
+            probed.borrow_mut().push(vbin);
+            stable_sample(target, 180.0, 0.95) // stable everywhere → descend to the hardware floor
+        };
+        let r = build_frontier(&[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
+        let seq = probed.borrow().clone();
+        // Every probed voltage is a REAL curve bin — never an invented step-grid voltage.
+        assert!(seq.iter().all(|v| IRREGULAR_BINS.contains(v)), "probed only real bins: {seq:?}");
+        // The probe sequence is exactly the real descending bin domain, ending at the floor bin.
+        assert_eq!(seq, vec![1062, 975, 900, 850, 812, 700, 606]);
+        assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(606), "deepest stable = hardware floor bin");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn warm_start_snaps_margin_up_to_real_bin_never_below_lv() {
+        use std::cell::RefCell;
+        // Target A floors at a real bin (850). The warm-start margin target for B (850 + 25 = 875)
+        // is NOT a bin → it must snap UP to the conservative real bin ≥ 875 (i.e. 900), never below
+        // A's verified floor (B1), and never to an invented voltage.
+        let d = derive_descent(&IRREGULAR_BINS, 1062, 25); // [1062,975,900,850,812,700,606]
+        let carry = BracketCarryConfig::from_descent(&d, true, 1); // margin = 1 step = 25 mV
+        let b_first = RefCell::new(None);
+        let probe = |target: u32, vbin: u32| {
+            if target == 1830 {
+                if vbin >= 850 { stable_sample(1830, 180.0, 0.95) } else { unstable_sample() }
+            } else {
+                if b_first.borrow().is_none() {
+                    *b_first.borrow_mut() = Some(vbin);
+                }
+                stable_sample(target, 175.0, 0.95)
+            }
+        };
+        let r = build_frontier(&[1830u32, 1800], &d, &ForgePolicy::balanced(), &carry, probe);
+        let first_b = b_first.borrow().expect("B was probed");
+        assert_eq!(first_b, 900, "warm start snaps the 875 margin target UP to the real 900 bin");
+        assert!(IRREGULAR_BINS.contains(&first_b), "start bin is a real curve bin");
+        assert!(first_b >= 850, "B1: never starts below A's verified floor (850)");
+        assert_eq!(r.frontier.len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn warm_start_disabled_starts_at_top_real_bin_over_real_domain() {
+        use std::cell::RefCell;
+        let d = derive_descent(&IRREGULAR_BINS, 1062, 25);
+        let b_first = RefCell::new(None);
+        let probe = |target: u32, vbin: u32| {
+            if target == 1800 && b_first.borrow().is_none() {
+                *b_first.borrow_mut() = Some(vbin);
+            }
+            if vbin >= 850 { stable_sample(target, 180.0, 0.95) } else { unstable_sample() }
+        };
+        let r = build_frontier(
+            &[1830u32, 1800], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe,
+        );
+        // Disabled carry → every target starts at the cap = the TOP real bin (1062), no warm-start.
+        assert_eq!(*b_first.borrow(), Some(1062));
+        assert_eq!(r.frontier.len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn max_probes_caps_irregular_bin_descent() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        // The global --max-probes cap still bounds total executions over the (deeper) real bin
+        // domain — bin-based descent does not widen exposure past the budget.
+        let d = derive_descent(&IRREGULAR_BINS, 1062, 25);
+        let calls = AtomicU32::new(0);
+        let executed = AtomicU32::new(0);
+        let max = 4u32;
+        let probe = |target: u32, _vbin: u32| {
+            if calls.fetch_add(1, SeqCst) >= max {
+                return budget_sample();
+            }
+            executed.fetch_add(1, SeqCst);
+            stable_sample(target, 180.0, 0.95)
+        };
+        let _ = build_frontier(
+            &[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe,
+        );
+        assert_eq!(executed.load(SeqCst), max); // exactly the budget over the bin domain
     }
 
     // ── Phase 2B.2-b.3/b.4: core sanity filter + stock core VF cluster (pure) ─────
@@ -3253,6 +3443,25 @@ mod tests {
             i += 1;
         }
         out
+    }
+
+    /// Test-only `FrontierDescent` whose bin domain is a legacy step grid
+    /// `{safe_start, safe_start-step, …, floor}` (the floors used in these tests are on-grid), so
+    /// the bin-based scheduler walks the exact vbin sequence the old step descent did. Real runs
+    /// build `bins_desc` from actual VF bins via `derive_descent`.
+    #[cfg(windows)]
+    fn step_descent(safe_start_mv: u32, step: u32, floor: u32) -> FrontierDescent {
+        let step = step.max(1);
+        let mut bins_desc = Vec::new();
+        let mut v = safe_start_mv;
+        while v >= floor {
+            bins_desc.push(v);
+            if v < floor + step {
+                break;
+            }
+            v -= step;
+        }
+        FrontierDescent { bins_desc, safe_start_mv, voltage_step_mv: step, lowest_safe_mv: floor }
     }
 
     #[cfg(windows)]
@@ -3346,6 +3555,17 @@ mod tests {
         assert_eq!(seed.cluster_f_max_mhz, 1775);
         assert!(seed.cluster_point_count >= MIN_CORE_CLUSTER_POINTS);
         assert_eq!((seed.raw_count, seed.retained_count), (16, 16));
+        // The seed exposes the cluster's real voltage bins (ascending) — the bin-based descent
+        // domain. The HARDWARE FLOOR is the lowest of these, never a hardcoded value.
+        assert_eq!(seed.cluster_bins_mv.first().copied(), Some(seed.cluster_v_min_mv));
+        assert_eq!(seed.cluster_bins_mv.last().copied(), Some(seed.cluster_v_max_mv));
+        assert_eq!(seed.cluster_bins_mv.first(), Some(&700)); // discovered floor, not 875
+        assert!(seed.cluster_bins_mv.windows(2).all(|w| w[0] < w[1])); // strictly ascending, unique
+        // Feeding the seed bins into the descent yields a real-bin sequence down to that floor.
+        let d = derive_descent(&seed.cluster_bins_mv, seed.safe_start_mv, FRONTIER_VOLT_STEP_MV);
+        assert_eq!(d.lowest_safe_mv, 700);
+        assert_eq!(d.safe_start_mv, 1075);
+        assert!(d.bins_desc.iter().all(|v| seed.cluster_bins_mv.contains(v)));
     }
 
     #[cfg(windows)]
@@ -3379,7 +3599,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn validate_limits_fails_closed_on_absurd() {
-        let floor = FRONTIER_LOWEST_SAFE_MV; // 875
+        let floor = 700u32; // a hardware-derived floor (validate_limits is floor-agnostic)
         assert!(validate_limits(&FrontierLimits { max_targets: Some(0), ..Default::default() }, floor).is_err());
         assert!(validate_limits(&FrontierLimits { max_probes: Some(0), ..Default::default() }, floor).is_err());
         // cap at or below the crash floor → invalid.
@@ -3434,7 +3654,7 @@ mod tests {
                 unstable_sample()
             }
         };
-        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 800 };
+        let d = step_descent(1000, 25, 800);
         let _ = build_frontier(&[1935, 1905, 1875], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         assert_eq!(executed.load(SeqCst), max); // exactly 3 real probes ran before the cap
     }
@@ -3487,7 +3707,7 @@ mod tests {
             }
             unstable_sample()
         };
-        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 900 };
+        let d = step_descent(1000, 25, 900);
         let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         // 1830: 1000/975/950 stable (3) + 925 abort (1) = 4 calls; 1800 & 1770: 1 call each.
         assert_eq!(calls.load(SeqCst), 6);
@@ -3515,7 +3735,7 @@ mod tests {
                 unstable_sample()
             }
         };
-        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let d = step_descent(1000, 25, 700);
         let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         assert_eq!(r.frontier.len(), 5);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
@@ -3543,7 +3763,7 @@ mod tests {
                 unstable_sample()
             }
         };
-        let d = FrontierDescent { safe_start_mv: 1100, voltage_step_mv: 25, lowest_safe_mv: 800 };
+        let d = step_descent(1100, 25, 800);
         let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         assert_eq!(r.frontier.len(), 6);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 2880, "Godforge = highest clock");
@@ -3562,7 +3782,7 @@ mod tests {
                 unstable_sample()
             }
         };
-        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let d = step_descent(1000, 25, 700);
         let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(900), "deepest stable bin kept");
@@ -3584,7 +3804,7 @@ mod tests {
                 unstable_sample()
             }
         };
-        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 950 };
+        let d = step_descent(1000, 25, 950);
         let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         assert!(min_probed.get() >= 950, "never probe below the known-unsafe floor");
         assert!(r.frontier[0].vf_table_voltage_mv.unwrap() >= 950);
@@ -3601,7 +3821,7 @@ mod tests {
             }
             s
         };
-        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let d = step_descent(1000, 25, 700);
         let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         assert_eq!(r.frontier.len(), 1, "unverified clock rejected");
         assert_eq!(r.frontier[0].clock_mhz, 1770);
@@ -3626,7 +3846,7 @@ mod tests {
                 unstable_sample()
             }
         };
-        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let d = step_descent(1000, 25, 700);
         let r = build_frontier(&[1830u32, 1815, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         assert_eq!(r.frontier.len(), 2, "partial frontier (1815 dropped)");
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
@@ -3644,7 +3864,7 @@ mod tests {
                 unstable_sample()
             }
         };
-        let d = FrontierDescent { safe_start_mv: 950, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let d = step_descent(950, 25, 700);
         let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         assert!(r.profiles.godforge.is_some());
         assert!(r.profiles.brokkrs.is_some());
@@ -3656,7 +3876,7 @@ mod tests {
     #[test]
     fn sim_no_valid_points_returns_safe_failure() {
         let probe = |_t: u32, _v: u32| unstable_sample(); // nothing ever stable
-        let d = FrontierDescent { safe_start_mv: 1000, voltage_step_mv: 25, lowest_safe_mv: 700 };
+        let d = step_descent(1000, 25, 700);
         let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), probe);
         assert!(r.frontier.is_empty());
         assert!(r.profiles.godforge.is_none());
@@ -3813,7 +4033,7 @@ mod tests {
     fn build_frontier_warm_start_matches_frontier_with_fewer_probes() {
         use std::cell::RefCell;
         let targets = [1815u32, 1785, 1755];
-        let d = FrontierDescent { safe_start_mv: 1075, voltage_step_mv: 25, lowest_safe_mv: 875 };
+        let d = step_descent(1075, 25, 875);
         // Monotone synthetic: every target is verified+stable at/above 925 mV, unstable below.
 
         let off_calls = RefCell::new(0u32);
@@ -3853,7 +4073,7 @@ mod tests {
             1815 => if vbin >= 925 { stable_sample(1815, 180.0, 0.95) } else { unstable_sample() },
             _ => if vbin >= 1000 { stable_sample(1785, 175.0, 0.95) } else { unverified_probe() },
         };
-        let d = FrontierDescent { safe_start_mv: 1075, voltage_step_mv: 25, lowest_safe_mv: 875 };
+        let d = step_descent(1075, 25, 875);
         let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), probe);
         assert_eq!(r.frontier.len(), 2); // 1785 recovered via fallback, not dropped
         let t1785 = r.frontier.iter().find(|p| p.target_clock_mhz == Some(1785)).expect("1785 present");
@@ -3878,7 +4098,7 @@ mod tests {
             }
             if vbin >= 925 { stable_sample(1785, 175.0, 0.95) } else { unstable_sample() }
         };
-        let d = FrontierDescent { safe_start_mv: 1075, voltage_step_mv: 25, lowest_safe_mv: 875 };
+        let d = step_descent(1075, 25, 875);
         let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), probe);
         assert_eq!(*first_vbin_1785.borrow(), Some(1075)); // started at the cap, no warm-start
         assert_eq!(r.frontier.len(), 1);
@@ -3911,7 +4131,7 @@ mod tests {
             }
             stable_sample(1785, 175.0, 0.95)
         };
-        let d = FrontierDescent { safe_start_mv: 1075, voltage_step_mv: 25, lowest_safe_mv: 875 };
+        let d = step_descent(1075, 25, 875);
         let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), probe);
         assert_eq!(*first_vbin_1785.borrow(), Some(1075)); // not seeded from the crashed target
         assert_eq!(r.frontier.len(), 1);
@@ -3935,7 +4155,7 @@ mod tests {
             executed.fetch_add(1, SeqCst);
             if vbin >= 925 { stable_sample(target, 180.0, 0.95) } else { unstable_sample() }
         };
-        let d = FrontierDescent { safe_start_mv: 1075, voltage_step_mv: 25, lowest_safe_mv: 875 };
+        let d = step_descent(1075, 25, 875);
         let _ = build_frontier(&[1815u32, 1785, 1755], &d, &ForgePolicy::balanced(), &carry_cfg(true), probe);
         assert_eq!(executed.load(SeqCst), max); // exactly the budget, no fallback burst beyond it
     }
