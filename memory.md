@@ -8,7 +8,34 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-13) — FIRST confirmed hardware validation of the bin-based floor (commit f90981d) — PASS (safe)
+## Latest (2026-06-13) — FIRST confirmed hardware validation of F1b `--max-probes-per-target` (commit 5248758) — coverage PASS, profile PARTIAL
+- Supervised run, operator present, after a clean confirming dry-run (no plan drift; HEAD/origin/master
+  `5248758`; `47f39be`/`f90981d`/`8503182` present; `gpu_applied.json`/`boot_flag.json` absent;
+  `safe_loop.json` idle/`safe_mode:false`):
+  `build-frontier --confirm --max-targets 7 --max-probes 14 --max-probes-per-target 2 --safe-start-cap 1075`
+  — **warm-start OFF**. Exit 0; ~4 min; no TDR/driver-reset/black-screen/reboot/crash.
+- **Safety PASS**: Safe Loop armed→cleared **per probe** (idle); `reset_to_stock` ran ("GPU restored to stock;
+  no profile applied or persisted"). `boot_flag.json`/`gpu_applied.json` absent before+after;
+  `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt` unchanged (no forge-state persistence, no knowledge
+  write); `safe_loop.json` content/size unchanged (idle, `safe_mode` false), mtime touched only — **no new
+  blacklist/crash entry**. GPU back at stock idle.
+- **Coverage PASS (the fix works)**: **13 dwells across all 7 targets** (vs prior 34-on-1935 depth-first). 6
+  targets stopped via **`PerTargetCap`** (`probes_used=2`, bins **1075 + 1068 mV**); global `--max-probes 14`
+  **not exhausted** (13 used) — the cap stopped one target from eating the whole budget. **1905 dropped** at
+  probe 1 (`LiveMismatch`, `overshoot_veto=true`, `eff_cov=0.963` — conservative verifier reject; neighbors
+  passed). All probes `write_mode=monotone_static`, `positive_offsets=0`; `NoDownCapNeededCeiling` (1935) +
+  `VerifiedCurve` (1875–1755). No writer/verifier/Safe-Loop/reset/persistence regression. Shallow only
+  (1075/1068 mV); did **not** touch 875/868/862/856/850.
+- **Profile PARTIAL**: achieved clocks clustered **1832–1867 MHz**, power **194–199 W**; lower targets not
+  distinct; Godforge/Brokkr/Deep Calm collapsed to **1860 MHz / 194 W**; FORGE confidence 0.21. **Shallow
+  near-stock coverage (1075/1068 mV) is non-binding on this hard power-capped 3060 Ti** — the ceiling does
+  not govern the achieved clock at that high-voltage band; the cap solved budget *distribution*, not binding.
+- **Direction — bind-seeking F1b**: don't repeat the flags / use cap 3 / enable warm-start / jump to
+  power-limit/clock-lock changes next. Per target: descend while stable-but-non-binding, stop when it BINDS /
+  fails verifier/dwell / hits a cap. Goal = first useful (binding) point per target, not deepest voltage. No
+  further hardware commands were run. See `handoff.md` + `decisions.md`.
+
+## (2026-06-13) — FIRST confirmed hardware validation of the bin-based floor (commit f90981d) — PASS (safe)
 - Supervised bounded run, operator present, after a clean dry-run on a fresh debug build (HEAD/origin/master
   at `c99dbf1`+`f90981d`; `23b70c4`/`8503182` present; `gpu_applied.json`/`boot_flag.json` absent;
   `safe_loop.json` idle/`safe_mode:false`):

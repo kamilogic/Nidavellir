@@ -3,7 +3,46 @@
 How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
 `2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-13) — Hardware-derived / bin-based floor FIRST CONFIRMED HARDWARE VALIDATION — PASS (commit f90981d)
+## Latest backend checkpoint (2026-06-13) — F1b `--max-probes-per-target` FIRST CONFIRMED HARDWARE VALIDATION — coverage PASS / profile PARTIAL (commit 5248758)
+- **Supervised confirmed run** (operator present, after a clean confirming dry-run that showed no plan drift;
+  HEAD/origin/master at `5248758`; required commits `47f39be`/`f90981d`/`8503182` present;
+  `gpu_applied.json`/`boot_flag.json` absent; `safe_loop.json` idle/`safe_mode:false`):
+  `build-frontier --confirm --max-targets 7 --max-probes 14 --max-probes-per-target 2 --safe-start-cap 1075`
+  — **warm-start OFF**. **Exit 0; ~4 min; no TDR, no driver reset, no black-screen, no reboot, no crash markers.**
+- **Safety state**: startup recovery clean; Safe Loop armed/cleared **per probe**, ended **idle/disarmed**;
+  `reset_to_stock` ran ("GPU restored to stock; no profile applied or persisted"). After:
+  `boot_flag.json`/`gpu_applied.json` **absent**; `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt`
+  unchanged (no forge-state persistence, no knowledge write); `safe_loop.json` content/size **unchanged**
+  (idle, `safe_mode` false) — mtime touched only, **no new blacklist/crash entry**. GPU back at stock idle.
+- **Coverage — PASS (the fix works)**: **13 hardware dwells spread across all 7 targets** (not depth-first on
+  one). 6 targets stopped cleanly via **`PerTargetCap`** (`probes_used=2` each, bins **1075 + 1068 mV**);
+  global `--max-probes 14` was **not exhausted** (13 used). The per-target cap successfully prevented one
+  target from consuming the whole budget — the exact fix vs the prior 34-on-1935 depth-first run.
+- **Target 1905 dropped** after its 1st probe: ceiling 1075 mV → **`LiveMismatch`**, **`overshoot_veto=true`**,
+  `eff_cov=0.963`, 1 unexplained zero — a conservative verifier rejection (neighbors 1935 `NoDownCapNeeded`
+  and 1875 `VerifiedCurve` passed), not a hardware fault. **6/7 produced frontier points.**
+- **Writer/verifier**: every probe `write_mode=monotone_static`, `positive_offsets=0`; verdicts
+  `NoDownCapNeededCeiling` (1935) + `VerifiedCurve` (1875–1755). No VF persistence; no Safe Loop / reset /
+  verifier / writer regression. Voltage band shallow only — **1075 and 1068 mV**; did **not** touch
+  875/868/862/856/850 mV (the cap-2 stop holds at the top two bins).
+- **Profile goal — PARTIAL**: lower targets did **not** produce distinct clock/power. Achieved clocks
+  clustered **1832–1867 MHz**, power **194–199 W**; the live plateau stayed ~1890 MHz with `overshoot`
+  growing 1875:+30 → 1755:+135 → the near-stock flatten does not govern the achieved clock.
+  Godforge/Brokkr's/Deep Calm collapsed to one point (**1860 MHz / 194 W**, target 1755); FORGE confidence
+  stayed low (best 0.21, single-trial → best-effort synthesis).
+- **Key conclusion**: **shallow near-stock coverage at 1075/1068 mV is non-binding on this hard power-capped
+  RTX 3060 Ti** — the ceiling does not materially govern the achieved clock at that high-voltage band.
+  `--max-probes-per-target` **solved budget distribution, not binding/differentiation**.
+- **Direction (next design = bind-seeking F1b)**: do NOT repeat the same flags; do NOT use per-target cap 3
+  next; do NOT enable warm-start next; do NOT jump straight to power-limit/clock-lock changes. Instead, per
+  target: **keep descending while the point is stable but non-binding, and stop when it actually BINDS** (the
+  ceiling materially governs the clock), fails the verifier/dwell, or hits the global/per-target cap — the
+  goal is the **first useful (binding) point per target**, not the deepest voltage. **No further hardware
+  commands were run.**
+- **Scope**: docs/continuity only (`handoff.md`, `decisions.md`, `memory.md`). No code/test/IPC/hardware
+  change in this pass.
+
+## Backend checkpoint (2026-06-13) — Hardware-derived / bin-based floor FIRST CONFIRMED HARDWARE VALIDATION — PASS (commit f90981d)
 - **Supervised confirmed run** (operator present, after a clean bounded dry-run on a fresh debug build;
   HEAD/origin/master at `c99dbf1`+`f90981d`; required commits `23b70c4`/`8503182` present;
   `gpu_applied.json`/`boot_flag.json` absent; `safe_loop.json` idle/`safe_mode:false`):

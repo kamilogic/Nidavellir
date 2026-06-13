@@ -2,6 +2,43 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b `--max-probes-per-target` — FIRST confirmed hardware validation (commit 5248758) — coverage PASS, profile PARTIAL
+- **Validation** (2026-06-13): the per-target probe cap (`5248758 feat(service): add per-target probe cap to
+  build-frontier`) was confirmed on real hardware by a supervised run — operator present, after a clean
+  confirming dry-run with no plan drift (HEAD/origin/master `5248758`; `47f39be`/`f90981d`/`8503182` present;
+  `gpu_applied.json`/`boot_flag.json` absent; `safe_loop.json` idle/`safe_mode:false`):
+  `build-frontier --confirm --max-targets 7 --max-probes 14 --max-probes-per-target 2 --safe-start-cap 1075`
+  — **warm-start OFF**.
+- **Safety: PASS.** Exit 0; ~4 min; no TDR / driver reset / black-screen / reboot / crash. Startup recovery
+  clean; Safe Loop armed→cleared **per probe** (idle); `reset_to_stock` ran. No persistence:
+  `boot_flag.json`/`gpu_applied.json` absent before AND after; `forge_state.json`/`gpu_knowledge.json`/
+  `heartbeat.txt` unchanged; `safe_loop.json` content/size unchanged (idle, `safe_mode` false), mtime touched
+  only, **no new blacklist/crash entry**. GPU back at stock idle.
+- **Coverage: PASS (the fix works).** 13 dwells across **all 7 targets** (vs the prior 34-on-1935 depth-first
+  run). 6 targets stopped via **`PerTargetCap`** (`probes_used=2`, bins 1075 + 1068 mV); global
+  `--max-probes 14` **not exhausted** (13 used). The cap prevented one target from draining the budget — the
+  precise goal of Option B.
+- **1905 dropped** at probe 1: `LiveMismatch`, `overshoot_veto=true`, `eff_cov=0.963` — conservative verifier
+  rejection (neighbors 1935 `NoDownCapNeeded` and 1875 `VerifiedCurve` passed), not a fault. Every probe
+  `write_mode=monotone_static`, `positive_offsets=0`; verdicts `NoDownCapNeededCeiling` (1935) +
+  `VerifiedCurve` (1875–1755). No writer/verifier/Safe-Loop/reset/persistence regression. Shallow band only
+  (1075/1068 mV); did not touch 875/868/862/856/850.
+- **Profile goal: PARTIAL.** Achieved clocks clustered **1832–1867 MHz**, power **194–199 W**; lower targets
+  did not yield distinct clock/power. Live plateau ~1890 MHz, `overshoot` grew 1875:+30 → 1755:+135 → the
+  near-stock flatten does not govern the achieved clock. Godforge/Brokkr's/Deep Calm collapsed to
+  **1860 MHz / 194 W** (target 1755); FORGE confidence 0.21 (single-trial → best-effort).
+- **Key conclusion**: **shallow near-stock coverage at 1075/1068 mV is non-binding on this hard power-capped
+  RTX 3060 Ti.** `--max-probes-per-target` solved budget *distribution*, not *binding/differentiation*. The
+  collapse cause is the power-limited / non-binding-ceiling regime (consistent with the prior bin-based-floor
+  run), not the scheduler.
+- **Direction — bind-seeking F1b (next design):** do NOT repeat these flags, do NOT bump the per-target cap to
+  3, do NOT enable warm-start, do NOT jump to power-limit/clock-lock changes as the immediate next step.
+  Instead, per target: **continue descending while the point is stable but non-binding; stop when it actually
+  BINDS, fails the verifier/dwell, or hits the global/per-target cap.** Goal = first useful (binding) point
+  per target, not deepest voltage. **No further hardware commands were run.**
+- **Scope**: docs/continuity only (`handoff.md`, `memory.md`, this file). No code/test/IPC/hardware change in
+  this pass.
+
 ## Build-frontier bin-based floor — FIRST confirmed hardware validation (commit f90981d) — PASS (safe), partial characterization
 - **Validation** (2026-06-13): the hardware-derived / bin-based descent floor (`f90981d`) was confirmed on
   real hardware by a supervised, bounded run — operator present, after a clean dry-run on a fresh debug
