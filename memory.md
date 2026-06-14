@@ -8,6 +8,35 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-06-14) — bind-seeking F1b v1 IMPLEMENTED + pushed (commit 08f745e), NOT yet hardware-validated
+- **Commit `08f745e feat(service): add opt-in bind-seeking to build-frontier`**, pushed to `origin/master`
+  (HEAD = origin/master = `08f745e`). Scope: `crates/service/src/gpu_power_sweep.rs` +
+  `crates/service/src/main.rs` only. Builds the bind-seeking direction from the `5248758` run.
+- **Feature**: opt-in CLI flag **`--bind-seeking`** + `FrontierLimits.bind_seeking`, **default OFF** (absent =
+  current behavior byte-for-byte). Per target the descent stops at the first verified+stable **binding** point
+  instead of walking a fixed bin count, so targets can differentiate (vs the prior 1832–1867 MHz / 194–199 W
+  collapse).
+- **Binding v1 (Clock + regime)** — pure `classify_binding`: verified + stable AND either
+  `sustained - target <= BIND_OVERSHOOT_MHZ (30)` (sustained = p5 else avg) OR `power_capped_frac <=
+  BIND_CAP_FRAC (0.5)`. **Power-drop is intentionally NOT a v1 stop-condition** (no top-power reference
+  tracking; telemetry/log later, not binding logic now).
+- **Scheduler**: new `BracketStop::BoundBinding` — clean (`is_hard_failed()==false`), carry-forward eligible
+  with a `lowest_verified_mv`. Binding checked only on a verified+stable sample, after the failure arms.
+  Precedence preserved: crash → aborted → global budget drained → verifier-failure/unverified →
+  dwell-unstable/silent-error → **binding** → per-target cap / floor.
+- **Invariants**: `--max-probes` = hard global cap; `--max-probes-per-target` = per-target attempt/depth cap
+  (bind-seeking may stop earlier); **warm-start default OFF**. Unchanged: monotone static-base writer, verifier
+  gates, Safe Loop, `reset_to_stock`, hardware-derived floor, persistence/profile apply. No
+  power-limit/clock-lock changes.
+- **Validation (no hardware)**: `cargo check -p nidavellir-service` clean; `cargo test -p nidavellir-service`
+  **165 passed / 0 failed**. Dry-run only (no `--confirm`): `--max-targets 7 --max-probes 21
+  --max-probes-per-target 3 --safe-start-cap 1075 --bind-seeking` → exit 0; `bind-seeking: ENABLED`, thresholds
+  + caveat, warm-start OFF, no Safe Loop arm / apply / dwell / VF write.
+- **Hardware validation NOT yet done for `08f745e`.** Next (separate, operator-present): clean confirming
+  dry-run, then `build-frontier --confirm --max-targets 7 --max-probes 21 --max-probes-per-target 3
+  --safe-start-cap 1075 --bind-seeking`. No hardware commands run in the implementation or docs pass. See
+  `handoff.md` + `decisions.md`.
+
 ## Latest (2026-06-13) — FIRST confirmed hardware validation of F1b `--max-probes-per-target` (commit 5248758) — coverage PASS, profile PARTIAL
 - Supervised run, operator present, after a clean confirming dry-run (no plan drift; HEAD/origin/master
   `5248758`; `47f39be`/`f90981d`/`8503182` present; `gpu_applied.json`/`boot_flag.json` absent;

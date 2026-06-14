@@ -1,7 +1,39 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-04, `master` (clean, latest commit
-`2f785cb`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+How to pick this up cold. State as of 2026-06-14, `master` (clean, latest commit
+`08f745e`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## Latest backend checkpoint (2026-06-14) — bind-seeking F1b v1 IMPLEMENTED + PUSHED, NOT yet hardware-validated (commit 08f745e)
+- **Commit `08f745e feat(service): add opt-in bind-seeking to build-frontier`** — pushed to `origin/master`
+  (HEAD = origin/master = `08f745e`). Scope: `crates/service/src/gpu_power_sweep.rs` +
+  `crates/service/src/main.rs` ONLY. This builds the bind-seeking direction set after the `5248758` run.
+- **Feature**: new opt-in CLI flag **`--bind-seeking`** + `FrontierLimits.bind_seeking` (default **OFF** —
+  absence reproduces current behavior byte-for-byte). Per target, the descent stops at the first verified +
+  dwell-stable **binding** point instead of walking a fixed number of bins, so each target can contribute a
+  distinguishable point (vs the 1832–1867 MHz / 194–199 W collapse in the `5248758` run).
+- **Binding signal v1 (Clock + regime)** — pure `classify_binding`: a verified + stable probe binds iff EITHER
+  `sustained - target <= BIND_OVERSHOOT_MHZ (30)` (sustained = p5 if present, else avg) OR
+  `power_capped_frac <= BIND_CAP_FRAC (0.5)` (card no longer power-pinned).
+- **Power-drop deliberately NOT a v1 stop-condition**: no top-power reference tracking. May become
+  telemetry/log later — never a binding/stop rule in v1.
+- **Scheduler**: adds `BracketStop::BoundBinding` — a CLEAN stop (`is_hard_failed()==false`), carry-forward
+  eligible when it recorded a `lowest_verified_mv`. Binding is checked ONLY on a verified+stable sample, AFTER
+  the failure arms. **Precedence preserved**: crash/hard-failure → aborted → global budget drained →
+  verifier-failure/unverified → dwell-unstable/silent-error → **then binding** → then per-target cap / floor.
+- **Interactions**: `--max-probes` stays the hard global cap; `--max-probes-per-target` stays the per-target
+  attempt/depth cap; bind-seeking may stop EARLIER than the per-target cap; **warm-start stays default OFF**.
+- **Safety boundaries UNCHANGED**: monotone static-base writer, verifier gates, Safe Loop, `reset_to_stock`,
+  hardware-derived floor, persistence/profile apply — none modified. No power-limit / clock-lock changes.
+- **Validation before commit (no hardware)**: `cargo check -p nidavellir-service` clean; `cargo test -p
+  nidavellir-service` **165 passed / 0 failed** (incl. classifier 30/0.50 boundaries, the full failure
+  precedence, BoundBinding carry-forward, and dry-run reporting). **Dry-run only** (no `--confirm`):
+  `build-frontier --max-targets 7 --max-probes 21 --max-probes-per-target 3 --safe-start-cap 1075 --bind-seeking`
+  → exit 0; printed `bind-seeking: ENABLED`, thresholds (`clock_overshoot <= 30 MHz OR power_capped_frac
+  <= 0.50`), the live-metrics caveat, warm-start OFF; **no Safe Loop arm / apply / dwell / VF write**.
+- **Hardware validation: NOT yet run for `08f745e`.** Next step (separate, operator-present, NOT this task): a
+  clean confirming dry-run, then the supervised confirmed run
+  `build-frontier --confirm --max-targets 7 --max-probes 21 --max-probes-per-target 3 --safe-start-cap 1075 --bind-seeking`.
+- **Scope of this entry**: docs/continuity only. No code/test/hardware commands run in the docs pass.
 
 ## Latest backend checkpoint (2026-06-13) — F1b `--max-probes-per-target` FIRST CONFIRMED HARDWARE VALIDATION — coverage PASS / profile PARTIAL (commit 5248758)
 - **Supervised confirmed run** (operator present, after a clean confirming dry-run that showed no plan drift;

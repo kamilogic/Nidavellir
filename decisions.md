@@ -2,6 +2,39 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## bind-seeking F1b v1 — IMPLEMENTED + pushed (commit 08f745e), NOT yet hardware-validated
+- **Decision (2026-06-14)**: implement the bind-seeking direction from the `5248758` run as an **opt-in,
+  default-OFF** scheduler mode. Commit `08f745e feat(service): add opt-in bind-seeking to build-frontier`,
+  pushed to `origin/master`. Scope: `crates/service/src/gpu_power_sweep.rs` + `crates/service/src/main.rs`.
+- **Why**: `--max-probes-per-target` (`5248758`) fixed budget *distribution* but not *binding/differentiation*
+  — shallow near-stock bins (1075/1068 mV) are non-binding on the power-capped 3060 Ti, so profiles collapsed
+  to one point. Walking a fixed bin count cannot tell a useful (binding) point from a non-binding one. The
+  fix: per target, **keep descending while stable but non-binding; stop at the first BINDING point**.
+- **Binding signal v1 — Clock + regime** (`classify_binding`, pure): a verified + dwell-stable probe binds iff
+  EITHER `sustained - target <= BIND_OVERSHOOT_MHZ (30)` (sustained = p5 else avg) OR `power_capped_frac <=
+  BIND_CAP_FRAC (0.5)`. Constants `BIND_OVERSHOOT_MHZ=30`, `BIND_CAP_FRAC=0.5`.
+- **Rejected for v1 — power-drop stop-condition**: deliberately excluded; it needs top-power reference
+  tracking and adds state/risk. Clock + regime is sufficient and self-contained. Power-drop may be logged as
+  telemetry later, but is NOT a stop rule in v1. (Alternatives considered earlier: log-only classifier — too
+  weak; redefining the per-target cap — overloads validated semantics; power-limit/clock-lock — out of scope.)
+- **Scheduler**: new `BracketStop::BoundBinding` — CLEAN (`is_hard_failed()==false`), carry-forward eligible
+  when it has a `lowest_verified_mv`. Binding is evaluated ONLY on a verified+stable sample, AFTER every
+  failure arm, so precedence is unchanged: crash/hard-failure → aborted → global budget drained →
+  verifier-failure/unverified → dwell-unstable/silent-error → **binding** → per-target cap / floor.
+- **Interactions / invariants**: `--max-probes` remains the hard global cap; `--max-probes-per-target` remains
+  the per-target attempt/depth cap (bind-seeking can stop earlier); **warm-start remains default OFF**. Safety
+  boundaries unchanged: monotone static-base writer, verifier gates, Safe Loop, `reset_to_stock`,
+  hardware-derived floor, persistence/profile apply — none touched.
+- **Validation (no hardware)**: `cargo check -p nidavellir-service` clean; `cargo test -p nidavellir-service`
+  **165 passed / 0 failed** (classifier boundaries, failure precedence, BoundBinding carry-forward, dry-run
+  reporting). Dry-run only (no `--confirm`): `--max-targets 7 --max-probes 21 --max-probes-per-target 3
+  --safe-start-cap 1075 --bind-seeking` → exit 0, `bind-seeking: ENABLED`, thresholds + caveat printed,
+  warm-start OFF, no Safe Loop arm / apply / dwell / VF write.
+- **Hardware validation: NOT yet done for `08f745e`.** Next step (separate, operator-present): clean
+  confirming dry-run, then `build-frontier --confirm --max-targets 7 --max-probes 21 --max-probes-per-target 3
+  --safe-start-cap 1075 --bind-seeking`. **No hardware commands were run in this implementation or docs pass.**
+- **Scope of this entry**: docs/continuity only (`handoff.md`, `memory.md`, this file).
+
 ## F1b `--max-probes-per-target` — FIRST confirmed hardware validation (commit 5248758) — coverage PASS, profile PARTIAL
 - **Validation** (2026-06-13): the per-target probe cap (`5248758 feat(service): add per-target probe cap to
   build-frontier`) was confirmed on real hardware by a supervised run — operator present, after a clean
