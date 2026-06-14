@@ -1395,6 +1395,13 @@ enum BracketStop {
     /// `BudgetExhausted` (global drain, non-evidence): a `PerTargetCap` bracket IS carry-forward
     /// eligible when it recorded a `lowest_verified_mv`.
     PerTargetCap,
+    /// Bind-seeking (`--bind-seeking`) found the first verified + dwell-stable BINDING point
+    /// (sustained clock near target, OR the card left the power-limited regime) and stopped the
+    /// target here — a CLEAN, intentional stop, typically earlier than the per-target cap. Carry-
+    /// forward eligible (it records a `lowest_verified_mv`); `is_hard_failed()` is false. Distinct
+    /// from `PerTargetCap` (depth bound), `CleanFloor` (hardware floor), and `BudgetExhausted`
+    /// (global drain).
+    BoundBinding,
     /// Dwell instability (curve verified, but the dwell was not Stable) below the verified band.
     SoftUnstable,
     /// Ceiling did not verify/apply (LiveMismatch / overshoot_veto / monotone writer fail-closed).
@@ -1532,12 +1539,111 @@ fn warm_start_mv(prev: Option<&TargetBracket>, cfg: &BracketCarryConfig) -> Warm
     }
 }
 
+// ── F1b bind-seeking v1: stop a target at the first USEFUL verified+stable point ──────────
+// A "binding" probe is one where the requested target meaningfully shapes the achieved
+// operating point — either the sustained clock has come down near the target (clock binding)
+// or the card is no longer pinned at the power cap (regime binding). On a hard power-capped
+// card the shallow near-stock bins are NON-binding (the elastic VF ceiling sits above the
+// operating voltage and does nothing), so a fixed-depth descent collapses every target into one
+// (clock, power) cluster. Bind-seeking keeps descending until the first binding point so each
+// target contributes a DISTINGUISHABLE point. v1 uses the approved Clock + regime signal ONLY —
+// NO power-drop stop (power-drop may be logged as telemetry later, never a v1 stopping rule).
+
+/// Sustained-clock overshoot (MHz, sustained − target) at or below which a probe counts as
+/// clock-binding (~one target step / two boost bins).
+#[cfg(windows)]
+const BIND_OVERSHOOT_MHZ: i32 = 30;
+/// Power-cap fraction at or below which a probe counts as regime-binding (the card is no longer
+/// power-pinned, so the ceiling/voltage — not power — is the binding constraint). Mirrors the
+/// `near_power` threshold used by `classify_regime`.
+#[cfg(windows)]
+const BIND_CAP_FRAC: f32 = 0.5;
+
+/// Bind-seeking thresholds (v1). Held in a struct so the classifier is a pure function the tests
+/// can drive with explicit values; the live run always uses `v1()`.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BindThresholds {
+    /// Max sustained-clock overshoot (sustained − target, MHz) for clock binding.
+    overshoot_mhz: i32,
+    /// Max power-cap fraction for regime binding.
+    cap_frac: f32,
+}
+
+#[cfg(windows)]
+impl BindThresholds {
+    fn v1() -> Self {
+        Self { overshoot_mhz: BIND_OVERSHOOT_MHZ, cap_frac: BIND_CAP_FRAC }
+    }
+}
+
+/// Pure v1 binding classifier (Clock + regime). Returns true ONLY for a verified + dwell-stable
+/// probe — never a drain / crash / abort / unverified / unstable one — that ALSO satisfies either:
+///   • clock binding — sustained clock (p5 if present, else avg) is within `overshoot_mhz` MHz
+///     above the target (the ceiling brought the achieved clock down near target), or
+///   • regime binding — `power_capped_frac <= cap_frac` (the card left the power-limited regime).
+/// A missing / zero sustained clock is an invalid metric → not binding. No power-drop rule in v1.
+/// Pure + testable; no hardware, no scheduler state.
+#[cfg(windows)]
+fn classify_binding(target_mhz: u32, s: &ProbeSample, t: &BindThresholds) -> bool {
+    // Only a verified + dwell-stable probe can bind. The drain/crash/abort guards are belt-and-
+    // suspenders (such samples are already Unstable/unverified) but make the precondition explicit.
+    if !s.curve_verified
+        || s.outcome != ProbeOutcome::Stable
+        || s.crashed
+        || s.aborted
+        || s.budget_drained
+    {
+        return false;
+    }
+    // Sustained clock = p5 (dip-aware) when present, else the mean. A zero/absent clock is an
+    // invalid metric — never claim binding from it.
+    let sustained = s.p5_clock_mhz.unwrap_or(s.avg_clock_mhz);
+    if sustained == 0 {
+        return false;
+    }
+    let clock_binding = sustained as i32 - target_mhz as i32 <= t.overshoot_mhz;
+    let regime_binding = s.power_capped_frac <= t.cap_frac;
+    clock_binding || regime_binding
+}
+
+/// Dry-run reporting lines for bind-seeking (pure, so the dry-run output is unit-testable without
+/// hardware). OFF → a single "off" line that does NOT imply binding logic is active. ON → the mode
+/// line plus the v1 thresholds and the live-metrics caveat. The live dry-run prints these verbatim.
+#[cfg(windows)]
+fn bind_seeking_plan_lines(bind_seeking: bool) -> Vec<String> {
+    let mut out = vec![format!(
+        "bind-seeking       : {}",
+        if bind_seeking {
+            "ENABLED — stop a target at the first verified+stable binding point (Clock + regime, v1)"
+        } else {
+            "off — descend by depth only (per-target cap / floor / failure)"
+        }
+    )];
+    if bind_seeking {
+        out.push(format!(
+            "binding thresholds : clock_overshoot <= {} MHz  OR  power_capped_frac <= {:.2}",
+            BIND_OVERSHOOT_MHZ, BIND_CAP_FRAC
+        ));
+        out.push(
+            "binding note       : actual bind stop depends on live verified+dwell metrics — \
+             not promised before hardware runs"
+                .to_string(),
+        );
+    }
+    out
+}
+
 /// Run ONE target's voltage descent from `start_mv` and capture its bracket. Mirrors the legacy
 /// inner loop exactly (same probe sequence, same deepest-stable selection); additionally records
 /// the verified floor, first failure below it, and the stop reason. The drain/crash signals on
 /// `ProbeSample` are checked BEFORE the verify/outcome arms so a budget/abort/crash stop is never
-/// mistaken for a plain verify failure (only the latter is B2-fallback-eligible). Pure — the
-/// `probe` closure is the only seam to hardware.
+/// mistaken for a plain verify failure (only the latter is B2-fallback-eligible). When
+/// `bind_seeking` is set, a verified + dwell-stable probe that is the first BINDING point stops the
+/// descent CLEANLY here (`BracketStop::BoundBinding`), earlier than the per-target cap — checked
+/// only after the failure/drain arms, so a failure always takes precedence. `bind_seeking=false`
+/// reproduces the legacy descent byte-for-byte. Pure — the `probe` closure is the only seam to
+/// hardware.
 #[cfg(windows)]
 #[allow(dead_code)] // wired to the real measurement closure in Phase 2B
 fn descend_target(
@@ -1545,6 +1651,7 @@ fn descend_target(
     start_mv: u32,
     descent: &FrontierDescent,
     max_per_target: Option<u32>,
+    bind_seeking: bool,
     probe: &impl Fn(u32, u32) -> ProbeSample,
 ) -> (TargetBracket, Option<(PowerSweepPoint, f64)>) {
     let mut bracket = TargetBracket {
@@ -1616,7 +1723,16 @@ fn descend_target(
                 // B1: a verified floor is recorded ONLY from a verified + dwell-Stable bin.
                 deepest = Some((probe_to_point(target, v, &s), s.confidence));
                 bracket.lowest_verified_mv = Some(v);
-                // Continue to the next lower real bin (loop ends at the hardware floor).
+                // Bind-seeking (opt-in): if this verified + dwell-stable probe is the first USEFUL
+                // binding point (sustained clock near target, OR the card left the power-limited
+                // regime), stop the target CLEANLY here — earlier than the per-target cap / floor —
+                // keeping THIS point. Reached only after the crash/abort/budget/unverified/unstable
+                // arms above, so a failure always takes precedence over binding. No-op when off.
+                if bind_seeking && classify_binding(target, &s, &BindThresholds::v1()) {
+                    bracket.stop_reason = BracketStop::BoundBinding;
+                    break;
+                }
+                // Otherwise continue to the next lower real bin (loop ends at the hardware floor).
             }
             ProbeOutcome::Unstable => {
                 bracket.stop_reason = BracketStop::SoftUnstable;
@@ -1641,7 +1757,9 @@ fn descend_target(
 ///
 /// `max_per_target` (`--max-probes-per-target`) bounds each target's descent depth so one target
 /// cannot drain the whole global budget (the F1b multi-clock coverage fix). It is passed to BOTH
-/// the normal and the B2-fallback descents. NOTE: with warm-start ON, a B2 fallback re-descends
+/// the normal and the B2-fallback descents. `bind_seeking` (`--bind-seeking`, opt-in) lets a target
+/// stop at the first verified+stable BINDING point (earlier than the cap); `false` preserves the
+/// legacy depth-bounded descent. It too is passed to both the normal and B2-fallback descents. NOTE: with warm-start ON, a B2 fallback re-descends
 /// from the cap, so a single target may run up to two capped descent attempts (≤ 2·N probes); this
 /// is acceptable because warm-start is opt-in and the global `--max-probes` cap still bounds the run.
 #[cfg(windows)]
@@ -1652,6 +1770,7 @@ fn build_frontier(
     policy: &ForgePolicy,
     carry: &BracketCarryConfig,
     max_per_target: Option<u32>,
+    bind_seeking: bool,
     probe: impl Fn(u32, u32) -> ProbeSample,
 ) -> FrontierBuildResult {
     let mut paired: Vec<(PowerSweepPoint, f64)> = Vec::new();
@@ -1661,7 +1780,7 @@ fn build_frontier(
     for &target in candidate_clocks {
         let decision = warm_start_mv(prev.as_ref(), carry);
         let (mut bracket, mut point) =
-            descend_target(target, decision.start_mv, descent, max_per_target, &probe);
+            descend_target(target, decision.start_mv, descent, max_per_target, bind_seeking, &probe);
         bracket.warm_started = decision.warm_started;
         bracket.bracket_source_target = decision.source_target;
         bracket.bracket_reuse_start_mv = decision.warm_started.then_some(decision.start_mv);
@@ -1680,7 +1799,7 @@ fn build_frontier(
             ));
             let warm_probes = bracket.probes_used;
             let (mut fb, fb_point) =
-                descend_target(target, carry.safe_start_cap_mv, descent, max_per_target, &probe);
+                descend_target(target, carry.safe_start_cap_mv, descent, max_per_target, bind_seeking, &probe);
             fb.bracket_source_target = decision.source_target;
             fb.fell_back_to_cap = true;
             fb.probes_used = fb.probes_used.saturating_add(warm_probes);
@@ -1898,6 +2017,12 @@ pub struct FrontierLimits {
     /// Opt-in (`--warm-start-brackets`): warm-start voltage-bracket carry-forward. Default `false`
     /// → legacy behavior (every target starts at the cap). First adopter: build-frontier / F1b.
     pub warm_start_brackets: bool,
+    /// Opt-in (`--bind-seeking`): F1b bind-seeking v1. When set, each target's descent stops at the
+    /// first verified + dwell-stable BINDING point (sustained clock near target OR the card left the
+    /// power-limited regime) instead of walking a fixed number of bins. Default `false` preserves
+    /// the current per-target-cap / depth-first behavior exactly. The global `max_probes` and the
+    /// per-target cap remain the bounding limits; binding can only stop a target EARLIER.
+    pub bind_seeking: bool,
 }
 
 /// Semantic validation of the limiter flags — FAIL CLOSED on absurd values. Pure + testable.
@@ -2498,6 +2623,9 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         FRONTIER_WARM_START_MARGIN_STEPS,
         FRONTIER_WARM_START_MARGIN_STEPS * FRONTIER_VOLT_STEP_MV
     );
+    for line in bind_seeking_plan_lines(limits.bind_seeking) {
+        println!("{line}");
+    }
     println!("targets (MHz)      : {:?}", plan.targets);
     println!(
         "voltage descent    : bin-based, {} real VF bins {} mV -> {} mV (hardware floor)",
@@ -2556,13 +2684,13 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         "build-frontier PLAN: raw={} sane={} rejected={} rej_max_freq={:?} rej_max_mv={:?} \
          cluster_pts={} cluster_v={}..{} cluster_f={}..{} outliers_above={} boost~{} targets={:?} \
          {}..{} mV step {} bins/descent={} est_dwells={} est_wall_s={} regime_raw={:?} \
-         regime_used={:?} confirm={}",
+         regime_used={:?} bind_seeking={} confirm={}",
         seed.raw_count, seed.retained_count, seed.rejected_count, seed.rejected_max_freq_mhz,
         seed.rejected_max_voltage_mv, seed.cluster_point_count, seed.cluster_v_min_mv,
         seed.cluster_v_max_mv, seed.cluster_f_min_mhz, seed.cluster_f_max_mhz,
         seed.outliers_above_count, seed.stock_boost_max_mhz, plan.targets, plan.safe_start_mv,
         plan.lowest_safe_mv, plan.voltage_step_mv, plan.bins_per_descent, capped_dwells,
-        capped_secs, regime_raw, regime, confirm
+        capped_secs, regime_raw, regime, limits.bind_seeking, confirm
     );
 
     if !confirm {
@@ -2604,6 +2732,7 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         &policy,
         &carry,
         limits.max_probes_per_target,
+        limits.bind_seeking,
         probe,
     );
 
@@ -3445,7 +3574,7 @@ mod tests {
             probed.borrow_mut().push(vbin);
             stable_sample(target, 180.0, 0.95) // stable everywhere → descend to the hardware floor
         };
-        let r = build_frontier(&[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         let seq = probed.borrow().clone();
         // Every probed voltage is a REAL curve bin — never an invented step-grid voltage.
         assert!(seq.iter().all(|v| IRREGULAR_BINS.contains(v)), "probed only real bins: {seq:?}");
@@ -3474,7 +3603,7 @@ mod tests {
                 stable_sample(target, 175.0, 0.95)
             }
         };
-        let r = build_frontier(&[1830u32, 1800], &d, &ForgePolicy::balanced(), &carry, None, probe);
+        let r = build_frontier(&[1830u32, 1800], &d, &ForgePolicy::balanced(), &carry, None, false, probe);
         let first_b = b_first.borrow().expect("B was probed");
         assert_eq!(first_b, 900, "warm start snaps the 875 margin target UP to the real 900 bin");
         assert!(IRREGULAR_BINS.contains(&first_b), "start bin is a real curve bin");
@@ -3495,7 +3624,7 @@ mod tests {
             if vbin >= 850 { stable_sample(target, 180.0, 0.95) } else { unstable_sample() }
         };
         let r = build_frontier(
-            &[1830u32, 1800], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe,
+            &[1830u32, 1800], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
         );
         // Disabled carry → every target starts at the cap = the TOP real bin (1062), no warm-start.
         assert_eq!(*b_first.borrow(), Some(1062));
@@ -3520,7 +3649,7 @@ mod tests {
             stable_sample(target, 180.0, 0.95)
         };
         let _ = build_frontier(
-            &[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe,
+            &[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
         );
         assert_eq!(executed.load(SeqCst), max); // exactly the budget over the bin domain
     }
@@ -3752,7 +3881,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 800);
-        let _ = build_frontier(&[1935, 1905, 1875], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let _ = build_frontier(&[1935, 1905, 1875], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         assert_eq!(executed.load(SeqCst), max); // exactly 3 real probes ran before the cap
     }
 
@@ -3805,7 +3934,7 @@ mod tests {
             unstable_sample()
         };
         let d = step_descent(1000, 25, 900);
-        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         // 1830: 1000/975/950 stable (3) + 925 abort (1) = 4 calls; 1800 & 1770: 1 call each.
         assert_eq!(calls.load(SeqCst), 6);
         assert_eq!(r.frontier.len(), 1);
@@ -3833,7 +3962,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         assert_eq!(r.frontier.len(), 5);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
         assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 1815);
@@ -3861,7 +3990,7 @@ mod tests {
             }
         };
         let d = step_descent(1100, 25, 800);
-        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         assert_eq!(r.frontier.len(), 6);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 2880, "Godforge = highest clock");
         assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 2860, "Brokkr's = max R within 98% floor");
@@ -3880,7 +4009,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(900), "deepest stable bin kept");
         assert!(r.frontier[0].stable);
@@ -3902,7 +4031,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 950);
-        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         assert!(min_probed.get() >= 950, "never probe below the known-unsafe floor");
         assert!(r.frontier[0].vf_table_voltage_mv.unwrap() >= 950);
     }
@@ -3919,7 +4048,7 @@ mod tests {
             s
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         assert_eq!(r.frontier.len(), 1, "unverified clock rejected");
         assert_eq!(r.frontier[0].clock_mhz, 1770);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1770);
@@ -3944,7 +4073,7 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[1830u32, 1815, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&[1830u32, 1815, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         assert_eq!(r.frontier.len(), 2, "partial frontier (1815 dropped)");
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
         assert!(r.profiles.deep_calm.is_some());
@@ -3962,7 +4091,7 @@ mod tests {
             }
         };
         let d = step_descent(950, 25, 700);
-        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         assert!(r.profiles.godforge.is_some());
         assert!(r.profiles.brokkrs.is_some());
         assert!(r.profiles.deep_calm.is_some());
@@ -3974,7 +4103,7 @@ mod tests {
     fn sim_no_valid_points_returns_safe_failure() {
         let probe = |_t: u32, _v: u32| unstable_sample(); // nothing ever stable
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe);
+        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
         assert!(r.frontier.is_empty());
         assert!(r.profiles.godforge.is_none());
         assert!(r.profiles.brokkrs.is_none());
@@ -4138,14 +4267,14 @@ mod tests {
             *off_calls.borrow_mut() += 1;
             if v >= 925 { stable_sample(t, 180.0, 0.95) } else { unstable_sample() }
         };
-        let off = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, off_probe);
+        let off = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, off_probe);
 
         let on_calls = RefCell::new(0u32);
         let on_probe = |t: u32, v: u32| {
             *on_calls.borrow_mut() += 1;
             if v >= 925 { stable_sample(t, 180.0, 0.95) } else { unstable_sample() }
         };
-        let on = build_frontier(&targets, &d, &ForgePolicy::balanced(), &carry_cfg(true), None, on_probe);
+        let on = build_frontier(&targets, &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, on_probe);
 
         // Identical frontier (same deepest verified bin per target), but fewer probes.
         let off_bins: Vec<_> = off.frontier.iter().map(|p| p.vf_table_voltage_mv).collect();
@@ -4171,7 +4300,7 @@ mod tests {
             _ => if vbin >= 1000 { stable_sample(1785, 175.0, 0.95) } else { unverified_probe() },
         };
         let d = step_descent(1075, 25, 875);
-        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, probe);
+        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe);
         assert_eq!(r.frontier.len(), 2); // 1785 recovered via fallback, not dropped
         let t1785 = r.frontier.iter().find(|p| p.target_clock_mhz == Some(1785)).expect("1785 present");
         assert_eq!(t1785.vf_table_voltage_mv, Some(1000));
@@ -4196,7 +4325,7 @@ mod tests {
             if vbin >= 925 { stable_sample(1785, 175.0, 0.95) } else { unstable_sample() }
         };
         let d = step_descent(1075, 25, 875);
-        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, probe);
+        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe);
         assert_eq!(*first_vbin_1785.borrow(), Some(1075)); // started at the cap, no warm-start
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].target_clock_mhz, Some(1785));
@@ -4229,7 +4358,7 @@ mod tests {
             stable_sample(1785, 175.0, 0.95)
         };
         let d = step_descent(1075, 25, 875);
-        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, probe);
+        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe);
         assert_eq!(*first_vbin_1785.borrow(), Some(1075)); // not seeded from the crashed target
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].target_clock_mhz, Some(1815));
@@ -4253,7 +4382,7 @@ mod tests {
             if vbin >= 925 { stable_sample(target, 180.0, 0.95) } else { unstable_sample() }
         };
         let d = step_descent(1075, 25, 875);
-        let _ = build_frontier(&[1815u32, 1785, 1755], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, probe);
+        let _ = build_frontier(&[1815u32, 1785, 1755], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe);
         assert_eq!(executed.load(SeqCst), max); // exactly the budget, no fallback burst beyond it
     }
 
@@ -4270,7 +4399,7 @@ mod tests {
             stable_sample(target, 180.0, 0.95)
         };
         let r = build_frontier(
-            &[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, probe,
+            &[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
         );
         assert_eq!(probed.borrow().len(), 9, "no cap → descend every bin");
         assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(875)); // reached the hardware floor
@@ -4290,7 +4419,7 @@ mod tests {
             stable_sample(target, 180.0, 0.95)
         };
         let r = build_frontier(
-            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), Some(2), probe,
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), Some(2), false, probe,
         );
         assert_eq!(executed.load(SeqCst), 14, "7 targets × 2 probes");
         assert_eq!(r.frontier.len(), 7, "every target characterized — none dropped");
@@ -4318,7 +4447,7 @@ mod tests {
             stable_sample(target, 180.0, 0.95)
         };
         let _ = build_frontier(
-            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), Some(2), probe,
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), Some(2), false, probe,
         );
         assert_eq!(executed.load(SeqCst), max, "global --max-probes stays the hard cap");
     }
@@ -4348,12 +4477,221 @@ mod tests {
             probed.borrow_mut().push(vbin);
             stable_sample(target, 180.0, 0.95)
         };
-        let (bracket, point) = descend_target(1935, 1075, &d, Some(2), &probe);
+        let (bracket, point) = descend_target(1935, 1075, &d, Some(2), false, &probe);
         assert_eq!(bracket.stop_reason, BracketStop::PerTargetCap);
         assert_eq!(bracket.probes_used, 2);
         assert_eq!(*probed.borrow(), vec![1075u32, 1050]); // bin N+1 (1025) never probed
         assert_eq!(bracket.lowest_verified_mv, Some(1050));
         assert_eq!(point.unwrap().0.vf_table_voltage_mv, Some(1050));
+    }
+
+    // ── F1b bind-seeking v1 (Clock + regime) ─────────────────────────────────────────────────
+    /// A verified + dwell-stable probe with an EXACT sustained clock (p5) and cap fraction so the
+    /// classifier inputs are unambiguous (the generic `stable_sample` hardcodes cap_frac = 0).
+    #[cfg(windows)]
+    fn bind_sample(sustained_mhz: u32, cap_frac: f32) -> ProbeSample {
+        let mut s = stable_sample(sustained_mhz, 180.0, 0.95);
+        s.p5_clock_mhz = Some(sustained_mhz);
+        s.avg_clock_mhz = sustained_mhz;
+        s.power_capped_frac = cap_frac;
+        s
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_binding_clock_overshoot_boundary() {
+        let t = BindThresholds::v1();
+        // Overshoot EXACTLY +30 MHz while still power-pinned (cap_frac > 0.5) → clock rule binds.
+        assert!(classify_binding(1800, &bind_sample(1830, 0.9), &t), "overshoot 30 binds (clock rule)");
+        // Overshoot +31 MHz and still power-pinned → neither rule → not binding.
+        assert!(!classify_binding(1800, &bind_sample(1831, 0.9), &t), "overshoot 31 does not bind when power-pinned");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_binding_regime_boundary() {
+        let t = BindThresholds::v1();
+        // Large overshoot (+100) turns the clock rule OFF, isolating the regime rule on cap_frac.
+        assert!(classify_binding(1800, &bind_sample(1900, 0.50), &t), "cap_frac 0.50 binds (regime rule)");
+        assert!(!classify_binding(1800, &bind_sample(1900, 0.51), &t), "cap_frac 0.51 with big overshoot does not bind");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_binding_rejects_unverified_unstable_and_drains() {
+        let t = BindThresholds::v1();
+        // Metrics would bind, but an unverified curve never binds.
+        let mut unverified = bind_sample(1800, 0.0);
+        unverified.curve_verified = false;
+        assert!(!classify_binding(1800, &unverified, &t), "unverified never binds");
+        // An unstable dwell (outcome Unstable, no p5) never binds.
+        assert!(!classify_binding(1800, &unstable_sample(), &t), "unstable never binds");
+        // Drain/crash/abort flags never bind even when the clock/power metrics look binding.
+        let mut drained = bind_sample(1800, 0.0);
+        drained.budget_drained = true;
+        assert!(!classify_binding(1800, &drained, &t), "budget-drained never binds");
+        let mut crashed = bind_sample(1800, 0.0);
+        crashed.crashed = true;
+        assert!(!classify_binding(1800, &crashed, &t), "crashed never binds");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_seeking_off_descends_full_depth_even_when_binding() {
+        // Every probe WOULD bind (sustained=target → clock-binding; cap 0 → regime-binding), but
+        // bind-seeking OFF must descend the full depth to the floor exactly like today.
+        let d = step_descent(1075, 25, 875); // 9 bins
+        let probe = |target: u32, _v: u32| bind_sample(target, 0.0);
+        let (bracket, point) = descend_target(1830, 1075, &d, None, false, &probe);
+        assert_eq!(bracket.stop_reason, BracketStop::CleanFloor);
+        assert_eq!(bracket.lowest_verified_mv, Some(875));
+        assert_eq!(point.unwrap().0.vf_table_voltage_mv, Some(875));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_seeking_stops_at_first_binding_point() {
+        use std::cell::RefCell;
+        // Shallow bins NON-binding (overshoot +100, power-pinned); the ceiling binds at vbin <= 1000.
+        let d = step_descent(1075, 25, 875); // bins 1075,1050,1025,1000,...
+        let probed = RefCell::new(Vec::<u32>::new());
+        let probe = |target: u32, vbin: u32| {
+            probed.borrow_mut().push(vbin);
+            if vbin <= 1000 { bind_sample(target, 0.2) } else { bind_sample(target + 100, 0.9) }
+        };
+        let (bracket, point) = descend_target(1800, 1075, &d, None, true, &probe);
+        assert_eq!(bracket.stop_reason, BracketStop::BoundBinding);
+        assert_eq!(*probed.borrow(), vec![1075u32, 1050, 1025, 1000]); // stopped at the first binding bin
+        assert_eq!(bracket.lowest_verified_mv, Some(1000));
+        assert_eq!(point.unwrap().0.vf_table_voltage_mv, Some(1000));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_seeking_continues_through_nonbinding_until_cap() {
+        // Always non-binding → bind-seeking keeps descending; the per-target cap still stops it.
+        let d = step_descent(1075, 25, 875);
+        let probe = |target: u32, _v: u32| bind_sample(target + 100, 0.9);
+        let (bracket, _point) = descend_target(1800, 1075, &d, Some(3), true, &probe);
+        assert_eq!(bracket.stop_reason, BracketStop::PerTargetCap, "no binding → cap still stops");
+        assert_eq!(bracket.probes_used, 3, "descended past the first bin through non-binding probes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_seeking_no_binding_reaches_clean_floor() {
+        // Never binds, no cap → descends every bin to the hardware floor (CleanFloor).
+        let d = step_descent(1075, 25, 875); // 9 bins
+        let probe = |target: u32, _v: u32| bind_sample(target + 100, 0.9);
+        let (bracket, _p) = descend_target(1800, 1075, &d, None, true, &probe);
+        assert_eq!(bracket.stop_reason, BracketStop::CleanFloor);
+        assert_eq!(bracket.lowest_verified_mv, Some(875));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_seeking_verifier_failure_precedes_binding() {
+        // First bin unverified → SoftUnverified before any binding evaluation; no point recorded.
+        let d = step_descent(1075, 25, 875);
+        let probe =
+            |target: u32, vbin: u32| if vbin == 1075 { unverified_probe() } else { bind_sample(target, 0.0) };
+        let (bracket, point) = descend_target(1800, 1075, &d, None, true, &probe);
+        assert_eq!(bracket.stop_reason, BracketStop::SoftUnverified);
+        assert!(point.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_seeking_instability_precedes_binding() {
+        // A verified-but-unstable dwell stops SoftUnstable before binding logic (binding is only
+        // evaluated on the Stable arm).
+        let d = step_descent(1075, 25, 875);
+        let probe =
+            |target: u32, vbin: u32| if vbin == 1075 { unstable_sample() } else { bind_sample(target, 0.0) };
+        let (bracket, _p) = descend_target(1800, 1075, &d, None, true, &probe);
+        assert_eq!(bracket.stop_reason, BracketStop::SoftUnstable);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_seeking_crash_and_abort_precede_binding() {
+        let d = step_descent(1075, 25, 875);
+        let crash =
+            |target: u32, vbin: u32| if vbin == 1075 { crashed_sample() } else { bind_sample(target, 0.0) };
+        let (b1, _) = descend_target(1800, 1075, &d, None, true, &crash);
+        assert_eq!(b1.stop_reason, BracketStop::HardFailure);
+        assert!(b1.is_hard_failed());
+        let abort =
+            |target: u32, vbin: u32| if vbin == 1075 { aborted_sample() } else { bind_sample(target, 0.0) };
+        let (b2, _) = descend_target(1800, 1075, &d, None, true, &abort);
+        assert_eq!(b2.stop_reason, BracketStop::Aborted);
+        assert!(b2.is_hard_failed());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_seeking_budget_drain_precedes_binding() {
+        // A global --max-probes drain stops BudgetExhausted before binding logic (and is NOT a finding).
+        let d = step_descent(1075, 25, 875);
+        let probe =
+            |target: u32, vbin: u32| if vbin == 1075 { budget_sample() } else { bind_sample(target, 0.0) };
+        let (bracket, _p) = descend_target(1800, 1075, &d, None, true, &probe);
+        assert_eq!(bracket.stop_reason, BracketStop::BudgetExhausted);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bound_binding_is_clean_and_carry_eligible() {
+        // BoundBinding is NOT a hard failure and — having a verified floor — seeds the next target
+        // when warm-start is enabled (same carry-forward path as a clean PerTargetCap).
+        let prev = bracket_with(1815, Some(950), BracketStop::BoundBinding);
+        assert!(!prev.is_hard_failed());
+        let d = warm_start_mv(Some(&prev), &carry_cfg(true));
+        assert!(d.warm_started, "a clean BoundBinding bracket seeds the next target");
+        assert_eq!(d.start_mv, 975); // 950 + one 25 mV step
+        assert_eq!(d.source_target, Some(1815));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_frontier_bind_seeking_off_matches_legacy_depth() {
+        // Whole-pipeline default: bind-seeking OFF descends to the floor even when every probe binds.
+        let d = step_descent(1075, 25, 875); // 9 bins
+        let probe = |target: u32, _v: u32| bind_sample(target, 0.0);
+        let r = build_frontier(
+            &[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
+        assert_eq!(r.frontier.len(), 1);
+        assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(875)); // reached the hardware floor
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_frontier_bind_seeking_stops_each_target_early() {
+        // Whole-pipeline bind-seeking: every target binds at the shallowest bin → each stops there.
+        let d = step_descent(1075, 25, 875);
+        let probe = |target: u32, _v: u32| bind_sample(target, 0.2);
+        let r = build_frontier(
+            &[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, true, probe,
+        );
+        assert_eq!(r.frontier.len(), 3);
+        assert!(r.frontier.iter().all(|p| p.vf_table_voltage_mv == Some(1075)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bind_seeking_plan_lines_reports_mode_and_thresholds() {
+        // OFF → one line, no binding logic implied, no thresholds.
+        let off = bind_seeking_plan_lines(false);
+        assert_eq!(off.len(), 1);
+        assert!(off[0].contains("off"));
+        assert!(!off.iter().any(|l| l.contains("clock_overshoot")));
+        // ON → mode + thresholds + live-metrics caveat.
+        let on = bind_seeking_plan_lines(true);
+        assert!(on.iter().any(|l| l.contains("ENABLED")));
+        assert!(on.iter().any(|l| l.contains("clock_overshoot <= 30 MHz")));
+        assert!(on.iter().any(|l| l.contains("power_capped_frac <= 0.50")));
+        assert!(on.iter().any(|l| l.contains("depends on live")));
     }
 
     #[cfg(windows)]

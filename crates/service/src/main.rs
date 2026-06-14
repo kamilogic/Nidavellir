@@ -127,6 +127,12 @@ fn parse_frontier_limits(args: &[OsString]) -> Result<gpu_power_sweep::FrontierL
                 limits.warm_start_brackets = true;
                 i += 1;
             }
+            // Opt-in F1b bind-seeking v1 (no value; default OFF): stop a target at the first
+            // verified+stable binding point instead of walking a fixed number of bins.
+            "--bind-seeking" => {
+                limits.bind_seeking = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -194,6 +200,21 @@ mod cli_tests {
         let l = super::parse_frontier_limits(&os(&["build-frontier"])).unwrap();
         assert_eq!(l, crate::gpu_power_sweep::FrontierLimits::default());
         assert!(!l.warm_start_brackets); // opt-in: default OFF
+        assert!(!l.bind_seeking); // opt-in: default OFF
+    }
+
+    #[test]
+    fn parse_bind_seeking_flag_opt_in() {
+        // Absent → off; present → on. No value; other flags unaffected; warm-start stays off.
+        assert!(!super::parse_frontier_limits(&os(&["build-frontier"])).unwrap().bind_seeking);
+        let l = super::parse_frontier_limits(&os(&[
+            "build-frontier", "--bind-seeking", "--max-targets", "7", "--max-probes-per-target", "3",
+        ]))
+        .unwrap();
+        assert!(l.bind_seeking);
+        assert!(!l.warm_start_brackets); // bind-seeking does NOT enable warm-start
+        assert_eq!(l.max_targets, Some(7));
+        assert_eq!(l.max_probes_per_target, Some(3));
     }
 
     #[test]
