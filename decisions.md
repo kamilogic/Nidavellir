@@ -2,6 +2,49 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b power-bound collapse classification — FIRST confirmed hardware validation (commit 0996769, 2026-06-15) — PASS
+- **Validation (2026-06-15)**: one supervised confirmed run of `0996769` (docs `4880153`), operator present;
+  worktree HEAD = `origin/master` = `4880153`, tree clean. Fresh worktree-local binary (built after `0996769`,
+  not the stale main-repo target). Confirming dry-run gate passed first (regime-only wording, threshold
+  `power_capped_frac <= 0.50`, clock arm retired, warm-start OFF, no-op safety line). Command:
+  `build-frontier --confirm --max-targets 7 --max-probes 21 --max-probes-per-target 3 --safe-start-cap 1075
+  --bind-seeking`. **Exit 0; ~5.7 min.**
+- **Safety: PASS.** No TDR / crash / driver reset / black-screen / reboot. `reset_to_stock` ran ("GPU restored
+  to stock; no profile applied or persisted"); GPU back at stock/idle. After: `gpu_applied.json` /
+  `boot_flag.json` absent; `safe_loop.json` stayed idle/disarmed (`safe_mode:false`, no new crash/blacklist
+  entry; only mtime touched by startup recovery); `forge_state.json` / `gpu_knowledge.json` / `heartbeat.txt`
+  byte-unchanged; working tree clean. Every probe `write_mode=monotone_static`, `positive_offsets=0`; no
+  overshoot veto.
+- **Run mechanics**: 19 probes / 17 measured dwells; global `--max-probes 21` not exhausted; **6 of 7 targets
+  characterized**. Target **1920 dropped** on a benign verifier `LiveMismatch` at the start bin (verifier path
+  worked, no crash, run-variance — not patch-related); target **1890** hit a later `LiveMismatch` and kept its
+  deepest verified bin. Targets descended to 1062/1068 mV. All dwells **PowerLimited**, `power_capped_frac=1.000`,
+  ~199 W, clocks ~1784–1825 MHz.
+- **Algorithm/reporting honesty: PASS.** No `BoundBinding` wording, no `reason=Clock` anywhere. **Clock-arm
+  retirement validated**: probes whose avg clock sat within 30 MHz of target (e.g. 1800 @ 1068 → avg 1812;
+  1830 @ 1062 → avg 1814) would have FALSE-bound under the retired v2 Clock arm — they correctly did **not**
+  bind and descended to `PerTargetCap`. **`LeftPowerRegime` validated negatively**: evaluated on every eligible
+  probe, correctly returned `bound=false reason=None`, and **no** target stopped by `LeftPowerRegime` (none had
+  `power_capped_frac <= 0.50`). **`PowerBound`/`PowerBoundCollapse` validated positively**: all 6 retained
+  points marked `[power-bound]`; output reported `6 power-bound / 0 useful`; explicit diagnostic
+  *"power-bound collapse — cannot build a differentiated VF frontier under this workload/regime"*; frontier
+  classes = `POWER-BOUND COLLAPSE (best-effort, NOT a differentiated VF frontier)`. Synthesis collapsed
+  Godforge / Brokkr's / Deep Calm to the SAME best-effort point (1815 MHz / 199 W, R=0.00), confidence stayed
+  0.21, all explicitly flagged not-differentiated — **no fake differentiated frontier presented.**
+- **Verdict: PASS** (safety/mechanics PASS, reporting honesty PASS). The physical frontier is still not useful
+  under this workload/regime because the RTX 3060 Ti is pinned at the ~199 W power cap — which the tool now
+  reports honestly instead of fabricating profiles.
+- **Caveats**: `LeftPowerRegime` was validated **negatively only** (it did not false-fire under pcf=1.000); a
+  positive `LeftPowerRegime` stop still needs a workload/target regime where pcf drops ≤ 0.50. The 1920
+  `LiveMismatch` is benign run-variance, not patch-related. No useful frontier diversity appeared.
+- **Decision / next direction**: **accept the patch behavior; keep hardware BLOCKED for this same
+  configuration.** Do NOT repeat the same confirmed run; do NOT increase the per-target cap as the next step;
+  do NOT tune power limit / TDP / clock lock yet. The next move is a **design decision**, one of: (a) a workload
+  that does not saturate the ~199 W cap; (b) candidate-target generation below the observed power-bound plateau;
+  or (c) a dedicated design pass for how Nidavellir should present "cannot differentiate under this
+  workload/regime."
+- **Scope**: docs/continuity only. One dry-run + one confirmed run; no code/test change; no further hardware.
+
 ## F1b power-bound collapse classification — IMPLEMENTED (commit 0996769, 2026-06-15) — pure, no hardware
 - **Decision (2026-06-15)**: implement the first post-audit simplification (the SIMPLIFY direction recorded
   below). Commit `0996769 fix(service): classify power-bound frontier collapse`. Scope:

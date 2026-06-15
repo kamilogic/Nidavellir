@@ -8,7 +8,30 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-15) — F1b power-bound collapse classification IMPLEMENTED (commit 0996769) — pure, no hardware
+## Latest (2026-06-15) — F1b power-bound collapse classification FIRST CONFIRMED HARDWARE VALIDATION (commit 0996769) — PASS
+- **One supervised confirmed run** validating `0996769` (docs `4880153`); HEAD = origin/master = `4880153`,
+  tree clean; fresh worktree binary. Dry-run gate passed first. `build-frontier --confirm --max-targets 7
+  --max-probes 21 --max-probes-per-target 3 --safe-start-cap 1075 --bind-seeking`. **Exit 0; ~5.7 min.**
+- **Safety PASS**: no TDR/crash/reset/reboot; `reset_to_stock` ran; GPU back at stock/idle. After:
+  `gpu_applied.json`/`boot_flag.json` absent; `safe_loop.json` idle/disarmed (mtime-only change);
+  `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt` unchanged; tree clean. Every probe
+  `write_mode=monotone_static`, `positive_offsets=0`; no overshoot veto.
+- **Mechanics**: 19 probes / 17 dwells; `--max-probes 21` not exhausted; 6/7 targets characterized (1920 dropped
+  on benign verifier `LiveMismatch`, run-variance; 1890 later LiveMismatch kept deepest verified). All dwells
+  PowerLimited, `power_capped_frac=1.000`, ~199 W, ~1784–1825 MHz.
+- **Reporting honesty PASS**: no `BoundBinding`, no `reason=Clock`. **Clock-arm retirement validated** (probes
+  that would false-bind under v2 avg-clock did NOT bind → `PerTargetCap`). **`LeftPowerRegime` validated
+  negatively** (no false-fire; no target had pcf ≤ 0.50 so none stopped by it). **`PowerBound`/collapse positive**:
+  6 `[power-bound]` / 0 useful; explicit *"power-bound collapse — cannot build a differentiated VF frontier under
+  this workload/regime"*; Godforge/Brokkr's/Deep Calm collapsed to one best-effort point (1815 MHz/199 W, R=0.00,
+  conf 0.21), flagged not-differentiated — no fake frontier.
+- **Verdict PASS** (safety + honesty). Frontier still not useful: card pinned at ~199 W cap, now reported
+  honestly. **Caveat**: `LeftPowerRegime` validated negatively only (positive stop needs pcf ≤ 0.50). **Next**:
+  accept patch; **keep hardware BLOCKED for this config**; don't repeat the run / bump per-target cap / touch
+  power-limit yet. Design decision next: non-cap-saturating workload, targets below the power-bound plateau, or a
+  "cannot differentiate" presentation pass. See `decisions.md` + `handoff.md`.
+
+## (2026-06-15) — F1b power-bound collapse classification IMPLEMENTED (commit 0996769) — pure, no hardware
 - **Commit `0996769 fix(service): classify power-bound frontier collapse`** (pushed to `origin/master`). Scope:
   `crates/service/src/gpu_power_sweep.rs` ONLY. The SIMPLIFY patch from the audit below. No hardware.
 - **Retired bind-seeking's Clock arm** → `classify_binding` regime-only: bind (stop early) ONLY on leaving the

@@ -3,7 +3,38 @@
 How to pick this up cold. State as of 2026-06-15, `master` (clean, latest commit
 `bf02971`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-15) — F1b power-bound collapse classification IMPLEMENTED (commit 0996769) — pure, no hardware
+## Latest backend checkpoint (2026-06-15) — F1b power-bound collapse classification FIRST CONFIRMED HARDWARE VALIDATION (commit 0996769) — PASS
+- **One supervised confirmed run** (operator present) validating `0996769`; HEAD = `origin/master` = `4880153`,
+  tree clean; fresh worktree-local binary (built after `0996769`, not the stale main-repo target). Confirming
+  dry-run gate passed first. Command: `build-frontier --confirm --max-targets 7 --max-probes 21
+  --max-probes-per-target 3 --safe-start-cap 1075 --bind-seeking`. **Exit 0; ~5.7 min.**
+- **Safety PASS**: no TDR / crash / driver reset / black-screen / reboot; `reset_to_stock` ran; GPU back at
+  stock/idle. After: `gpu_applied.json` / `boot_flag.json` absent; `safe_loop.json` idle/disarmed
+  (`safe_mode:false`, no new crash/blacklist entry, mtime touched by startup recovery only); `forge_state.json`
+  / `gpu_knowledge.json` / `heartbeat.txt` byte-unchanged; tree clean. Every probe `write_mode=monotone_static`,
+  `positive_offsets=0`; no overshoot veto.
+- **Mechanics**: 19 probes / 17 dwells; `--max-probes 21` not exhausted; **6 of 7 targets characterized**. 1920
+  dropped on a benign verifier `LiveMismatch` at the start bin (verifier worked, no crash, run-variance); 1890
+  hit a later `LiveMismatch`, kept its deepest verified bin. Descended to 1062/1068 mV. All dwells PowerLimited,
+  `power_capped_frac=1.000`, ~199 W, ~1784–1825 MHz.
+- **Reporting honesty PASS**: no `BoundBinding`, no `reason=Clock`. **Clock arm retirement validated** — probes
+  with avg clock within 30 MHz of target (which would FALSE-bind under v2) correctly did NOT bind, descended to
+  `PerTargetCap`. **`LeftPowerRegime` validated negatively** — evaluated each eligible probe, `bound=false
+  reason=None`, no target stopped by it (none had pcf ≤ 0.50). **`PowerBound`/`PowerBoundCollapse` validated
+  positively** — 6 points `[power-bound]`; reported `6 power-bound / 0 useful`; explicit *"power-bound collapse
+  — cannot build a differentiated VF frontier under this workload/regime"*; frontier classes = `POWER-BOUND
+  COLLAPSE (best-effort, NOT a differentiated VF frontier)`. Godforge/Brokkr's/Deep Calm collapsed to one
+  best-effort point (1815 MHz / 199 W, R=0.00), confidence 0.21, all flagged not-differentiated — no fake
+  frontier.
+- **Verdict PASS** (safety + reporting honesty). Physical frontier still not useful here: the card is pinned at
+  the ~199 W cap, now reported honestly. **Caveats**: `LeftPowerRegime` validated negatively only (a positive
+  stop needs pcf ≤ 0.50, which this regime never produces); 1920 LiveMismatch is benign run-variance.
+- **Direction**: accept the patch; **keep hardware BLOCKED for this same config**; do NOT repeat the run, do NOT
+  bump the per-target cap, do NOT tune power-limit/TDP/clock-lock yet. Next is a design decision: a workload that
+  doesn't saturate the ~199 W cap, candidate targets below the power-bound plateau, or a design pass for
+  presenting "cannot differentiate under this workload/regime." Detail in `decisions.md` (top entry).
+
+## Backend checkpoint (2026-06-15) — F1b power-bound collapse classification IMPLEMENTED (commit 0996769) — pure, no hardware
 - **Commit `0996769 fix(service): classify power-bound frontier collapse`** (pushed to `origin/master` with
   the docs entry). Scope: `crates/service/src/gpu_power_sweep.rs` ONLY. Implements the SIMPLIFY patch from the
   audit below. No hardware, no `--confirm`, no dry-run.
