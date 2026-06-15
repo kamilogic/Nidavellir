@@ -1098,7 +1098,56 @@ struct ForgeProfiles {
     godforge: Option<PowerSweepPoint>,
     brokkrs: Option<PowerSweepPoint>,
     deep_calm: Option<PowerSweepPoint>,
+    /// Frontier points excluded from differentiation because they were power-bound
+    /// (`power_capped_frac >= POWER_BOUND_FRAC`) — valid raw brackets, but no clock-frontier value.
+    power_bound_excluded: usize,
+    /// True when fewer than `MIN_USEFUL_FRONTIER_POINTS` useful (non-power-bound) points remained:
+    /// the returned profiles are a FLAGGED best-effort over the full frontier, NOT a differentiated
+    /// VF frontier. The operator must not read them as a real clock frontier.
+    power_bound_collapse: bool,
     log: Vec<String>,
+}
+
+/// A dwell is **power-bound** when it stayed pinned at the power cap for at least this fraction of
+/// its samples: the achieved clock was set by the cap, not the voltage descent, so the point carries
+/// no clock-frontier information. From the F1b algorithm audit (`decisions.md`): `POWER_BOUND_FRAC`.
+#[cfg(windows)]
+const POWER_BOUND_FRAC: f32 = 0.95;
+
+/// Fewer than this many useful (non-power-bound) points means the frontier cannot be differentiated
+/// on clock — synthesis falls back to a flagged best-effort instead of inventing differentiation.
+#[cfg(windows)]
+const MIN_USEFUL_FRONTIER_POINTS: usize = 2;
+
+/// True iff `f` is a VALID power-cap fraction at or above the power-bound threshold. A missing /
+/// invalid fraction (NaN / <0 / >1) is NOT treated as power-bound: an unknown cap state must never
+/// silently mark a point as a power-bound plateau. Pure (reuses `valid_cap_frac`).
+#[cfg(windows)]
+fn is_power_bound_frac(f: f32) -> bool {
+    valid_cap_frac(f).map_or(false, |v| v >= POWER_BOUND_FRAC)
+}
+
+/// True iff a (stable, verified) frontier point is power-bound — its dwell stayed at the power cap.
+#[cfg(windows)]
+fn is_power_bound_point(p: &PowerSweepPoint) -> bool {
+    is_power_bound_frac(p.power_capped_frac)
+}
+
+/// The frontier points that carry real clock-frontier information (NOT power-bound). Pure.
+#[cfg(windows)]
+fn useful_frontier_points(frontier: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, f64)> {
+    frontier.iter().copied().filter(|(p, _)| !is_power_bound_point(p)).collect()
+}
+
+/// True iff the frontier is non-empty, has at least one power-bound point, AND fewer than
+/// `MIN_USEFUL_FRONTIER_POINTS` useful (non-power-bound) points — i.e. (nearly) every sample was
+/// power-capped, so no differentiated VF frontier can be built. Detects the jittery power-bound
+/// plateau (e.g. 1798/1811/1819 MHz @ pcf≈1.0) that exact-distinct-clock checks miss. Pure + testable.
+#[cfg(windows)]
+fn frontier_power_bound_collapse(frontier: &[(PowerSweepPoint, f64)]) -> bool {
+    !frontier.is_empty()
+        && frontier.iter().any(|(p, _)| is_power_bound_point(p))
+        && useful_frontier_points(frontier).len() < MIN_USEFUL_FRONTIER_POINTS
 }
 
 /// Synthesize the three forge profiles from a (multi-clock) power frontier — each entry
@@ -1123,26 +1172,59 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
     use std::cmp::Ordering as Ord;
     let mut log = Vec::new();
 
+    // ── Power-bound classification (F1b audit) ──────────────────────────────────────────────────
+    // A power-bound point (`power_capped_frac >= POWER_BOUND_FRAC`) is a VALID raw voltage bracket
+    // but carries NO clock-frontier information — the cap, not the descent, set its clock. Such
+    // points are EXCLUDED from differentiated profile selection. When fewer than two useful
+    // (non-power-bound) points remain, the frontier is power-bound-collapsed: we keep the full
+    // frontier only as a FLAGGED best-effort and never present a jittery saturated plateau as a
+    // differentiated VF frontier. With NO power-bound points this is a no-op: `working == frontier`,
+    // so the legacy (non-power-bound) path is byte-for-byte unchanged.
+    let useful = useful_frontier_points(frontier);
+    let power_bound_excluded = frontier.len() - useful.len();
+    let power_bound_collapse = frontier_power_bound_collapse(frontier);
+    let working: Vec<(PowerSweepPoint, f64)> = if power_bound_excluded == 0 {
+        frontier.to_vec()
+    } else if power_bound_collapse {
+        log.push(format!(
+            "FORGE: power-bound collapse — cannot build a differentiated VF frontier under this \
+             workload/regime ({power_bound_excluded}/{} point(s) power-capped >= {:.2}, {} useful) \
+             — best-effort only, not differentiated",
+            frontier.len(), POWER_BOUND_FRAC, useful.len()
+        ));
+        frontier.to_vec()
+    } else {
+        log.push(format!(
+            "FORGE: excluded {power_bound_excluded} power-bound point(s) (power_capped_frac >= {:.2}) \
+             from differentiation — synthesizing from {} useful point(s)",
+            POWER_BOUND_FRAC, useful.len()
+        ));
+        useful
+    };
+
     // Confidence gate (reuses V2): trust only well-tested points; else best-effort.
     let pool: Vec<(PowerSweepPoint, f64)> = {
-        let trusted: Vec<(PowerSweepPoint, f64)> = frontier
+        let trusted: Vec<(PowerSweepPoint, f64)> = working
             .iter()
             .copied()
             .filter(|(_, c)| *c >= policy.confidence_threshold)
             .collect();
         if trusted.is_empty() {
-            let best = frontier.iter().map(|(_, c)| *c).fold(0.0_f64, f64::max);
+            let best = working.iter().map(|(_, c)| *c).fold(0.0_f64, f64::max);
             log.push(format!(
                 "FORGE: no point met confidence ≥ {:.2} (best {best:.2}) — best-effort synthesis",
                 policy.confidence_threshold
             ));
-            frontier.to_vec()
+            working.clone()
         } else {
             trusted
         }
     };
     if pool.is_empty() {
-        return ForgeProfiles { godforge: None, brokkrs: None, deep_calm: None, log };
+        return ForgeProfiles {
+            godforge: None, brokkrs: None, deep_calm: None,
+            power_bound_excluded, power_bound_collapse, log,
+        };
     }
 
     // Sustained clock = p5 when available (dip-aware), else average (legacy fallback).
@@ -1216,6 +1298,8 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
         godforge: Some(godforge.0),
         brokkrs: Some(brokkrs.0),
         deep_calm: Some(deep_calm.0),
+        power_bound_excluded,
+        power_bound_collapse,
         log,
     }
 }
@@ -1395,13 +1479,15 @@ enum BracketStop {
     /// `BudgetExhausted` (global drain, non-evidence): a `PerTargetCap` bracket IS carry-forward
     /// eligible when it recorded a `lowest_verified_mv`.
     PerTargetCap,
-    /// Bind-seeking (`--bind-seeking`) found the first verified + dwell-stable BINDING point
-    /// (sustained clock near target, OR the card left the power-limited regime) and stopped the
+    /// Bind-seeking (`--bind-seeking`) found the first verified + dwell-stable point where the card
+    /// has LEFT the power-limited regime (`power_capped_frac <= BIND_CAP_FRAC`) and stopped the
     /// target here — a CLEAN, intentional stop, typically earlier than the per-target cap. Carry-
     /// forward eligible (it records a `lowest_verified_mv`); `is_hard_failed()` is false. Distinct
     /// from `PerTargetCap` (depth bound), `CleanFloor` (hardware floor), and `BudgetExhausted`
-    /// (global drain).
-    BoundBinding,
+    /// (global drain). NOTE (F1b audit): the old clock-near-target stop arm was RETIRED — on a
+    /// power-bound card it false-binds (the cap, not the descent, sets the clock), so leaving the
+    /// power regime is now the only early-stop signal.
+    LeftPowerRegime,
     /// Dwell instability (curve verified, but the dwell was not Stable) below the verified band.
     SoftUnstable,
     /// Ceiling did not verify/apply (LiveMismatch / overshoot_veto / monotone writer fail-closed).
@@ -1539,45 +1625,39 @@ fn warm_start_mv(prev: Option<&TargetBracket>, cfg: &BracketCarryConfig) -> Warm
     }
 }
 
-// ── F1b bind-seeking v2: stop a target at the first ELIGIBLE useful verified+stable point ──
-// A "binding" probe is one where the requested target meaningfully shapes the achieved
-// operating point — either the average clock has come down near the target (clock binding)
-// or the card is no longer pinned at the power cap (regime binding). On a hard power-capped
-// card the shallow near-stock bins are NON-binding (the elastic VF ceiling sits above the
-// operating voltage and does nothing), so a fixed-depth descent collapses every target into one
-// (clock, power) cluster. Bind-seeking keeps descending until the first binding point so each
-// target contributes a DISTINGUISHABLE point. v2 hardens v1 after the first hardware run: the
-// start bin is NEVER bind-eligible (a target must descend ≥1 real VF bin first), and the clock
-// rule keys off the AVERAGE/achieved clock, not p5. Clock + regime signal ONLY — NO power-drop
-// stop (power-drop may be logged as telemetry later, never a stopping rule).
+// ── F1b bind-seeking (regime-only): stop a target at the first ELIGIBLE point that has LEFT the
+//    power-limited regime ──────────────────────────────────────────────────────────────────────
+// A target "binds" when the card is no longer pinned at the power cap (`power_capped_frac <=
+// BIND_CAP_FRAC`): the ceiling/voltage — not power — is now the binding constraint, so this is a
+// real, distinguishable VF point. Bind-seeking keeps descending while still power-pinned and stops
+// at the first point that leaves the regime. The start bin is NEVER bind-eligible (a target must
+// descend ≥1 real VF bin first). The old clock-near-target arm was RETIRED after the first hardware
+// run (F1b audit): on a power-bound card the cap, not the descent, sets the achieved clock, so an
+// avg-clock-near-target reading FALSE-binds. Power-bound samples are now CLASSIFIED, not bound (see
+// `is_power_bound_point` / `synthesize_forge_profiles`). Regime signal ONLY — no clock or power-drop
+// stop rule.
 
-/// Average/achieved-clock overshoot (MHz, avg − target) at or below which a probe counts as
-/// clock-binding (~one target step / two boost bins). v2: keyed off the AVERAGE clock, not p5.
-#[cfg(windows)]
-const BIND_OVERSHOOT_MHZ: i32 = 30;
 /// Power-cap fraction at or below which a probe counts as regime-binding (the card is no longer
 /// power-pinned, so the ceiling/voltage — not power — is the binding constraint). Mirrors the
 /// `near_power` threshold used by `classify_regime`.
 #[cfg(windows)]
 const BIND_CAP_FRAC: f32 = 0.5;
 
-/// Bind-seeking thresholds (v2). Held in a struct so the classifier is a pure function the tests
-/// can drive with explicit values; the live run always uses `v2()`.
+/// Bind-seeking thresholds (regime-only). Held in a struct so the classifier is a pure function the
+/// tests can drive with explicit values; the live run always uses `v2()`.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct BindThresholds {
-    /// Max average-clock overshoot (avg − target, MHz) for clock binding.
-    overshoot_mhz: i32,
-    /// Max power-cap fraction for regime binding.
+    /// Max power-cap fraction for regime binding (`power_capped_frac <= cap_frac` ⇒ left the regime).
     cap_frac: f32,
 }
 
 #[cfg(windows)]
 impl BindThresholds {
-    /// v2 thresholds. Same numeric limits as v1 (30 MHz / 0.5) — the v2 strictness lives in the
-    /// classifier (start-bin ineligibility + average-clock metric), not in the thresholds.
+    /// Live thresholds. The clock arm was retired (F1b audit); only the regime threshold remains.
+    /// Kept named `v2()` for call-site stability (`classify_binding` + tests).
     fn v2() -> Self {
-        Self { overshoot_mhz: BIND_OVERSHOOT_MHZ, cap_frac: BIND_CAP_FRAC }
+        Self { cap_frac: BIND_CAP_FRAC }
     }
 }
 
@@ -1587,9 +1667,7 @@ impl BindThresholds {
 enum BindReason {
     /// Did not bind.
     None,
-    /// Average/achieved clock came down within `overshoot_mhz` of the target.
-    Clock,
-    /// Card left the power-limited regime (`power_capped_frac <= cap_frac`).
+    /// Card left the power-limited regime (`power_capped_frac <= cap_frac`) — the only stop arm.
     Regime,
 }
 
@@ -1601,13 +1679,13 @@ struct BindDecision {
     /// Bind eligibility: false on a descent's first/start bin (a target must descend ≥1 real VF bin
     /// before it may bind). A non-eligible probe never binds, whatever its metrics.
     eligible: bool,
-    /// Final decision: stop this target here as a clean `BoundBinding`.
+    /// Final decision: stop this target here as a clean `LeftPowerRegime`.
     bound: bool,
     /// Which rule fired (or `None`).
     reason: BindReason,
-    /// Average/achieved clock used by the v2 clock rule (0 = invalid → no clock binding).
+    /// Average/achieved clock — reporting/telemetry only (the clock stop arm was retired).
     avg_clock_mhz: u32,
-    /// Dip-aware sustained clock — reporting/synthesis only in v2, never the clock stop signal.
+    /// Dip-aware sustained clock — reporting/synthesis only, never a stop signal.
     p5_clock_mhz: Option<u32>,
     /// Power-cap fraction IF valid (finite, in [0,1]); `None` when missing/invalid → no regime binding.
     power_capped_frac: Option<f32>,
@@ -1629,19 +1707,19 @@ fn bind_eligible(probes_before: u32, cur_bin_mv: u32, start_bin_mv: u32) -> bool
     probes_before >= 1 && cur_bin_mv != start_bin_mv
 }
 
-/// Pure v2 binding classifier. Stricter than v1 in two ways:
-///   1. ELIGIBILITY — the start bin is never binding (`eligible=false` → never bound), so a target
-///      must descend ≥1 real VF bin before it can stop on a binding point.
-///   2. CLOCK METRIC — the clock rule uses the AVERAGE/achieved clock (not p5/sustained): the card
-///      counts as clock-binding only when `avg_clock_mhz − target <= overshoot_mhz`. A zero/absent
-///      avg is an invalid metric → no clock binding. p5 stays available for reporting only.
-/// Regime binding keeps its threshold (`power_capped_frac <= cap_frac`) but fails closed when the
-/// fraction is missing/invalid. Only a verified + dwell-stable, non-drain/crash/abort probe can bind
-/// at all. Returns the full decision (with the metrics used) for telemetry. No power-drop rule.
-/// Pure + testable; no hardware, no scheduler state.
+/// Pure binding classifier (regime-only, post-audit). A target binds — stops its descent CLEANLY as
+/// `LeftPowerRegime` — only when ALL of:
+///   1. ELIGIBILITY — not the start bin (`eligible`); a target must descend ≥1 real VF bin first.
+///   2. SAMPLE — a verified + dwell-stable, non-drain/crash/abort probe.
+///   3. REGIME — a VALID `power_capped_frac <= cap_frac` (the card left the power-limited regime);
+///      a missing/invalid fraction fails closed (no bind).
+/// The old clock-near-target arm was RETIRED (F1b audit): on a power-bound card it false-binds
+/// because the cap, not the voltage descent, set the achieved clock. `avg_clock_mhz` / `p5_clock_mhz`
+/// remain in the decision for telemetry only. Returns the full decision (with the metrics used) for
+/// logging. Pure + testable; no hardware, no scheduler state.
 #[cfg(windows)]
 fn classify_binding(
-    target_mhz: u32,
+    _target_mhz: u32,
     s: &ProbeSample,
     t: &BindThresholds,
     eligible: bool,
@@ -1658,20 +1736,12 @@ fn classify_binding(
         && !s.aborted
         && !s.budget_drained;
 
-    // v2 clock rule: AVERAGE/achieved clock within `overshoot_mhz` above target. Zero/absent → no.
-    let clock_binding =
-        avg_clock_mhz != 0 && (avg_clock_mhz as i32 - target_mhz as i32) <= t.overshoot_mhz;
-    // v2 regime rule: a VALID cap fraction at or below the threshold (missing/invalid → no).
+    // Regime rule (the ONLY stop arm): a VALID cap fraction at or below the threshold means the card
+    // has left the power-limited regime. Missing/invalid → fail closed (no regime bind).
     let regime_binding = matches!(power_capped_frac, Some(f) if f <= t.cap_frac);
 
-    let (bound, reason) = if eligible && sample_bindable {
-        if clock_binding {
-            (true, BindReason::Clock)
-        } else if regime_binding {
-            (true, BindReason::Regime)
-        } else {
-            (false, BindReason::None)
-        }
+    let (bound, reason) = if eligible && sample_bindable && regime_binding {
+        (true, BindReason::Regime)
     } else {
         (false, BindReason::None)
     };
@@ -1687,15 +1757,15 @@ fn bind_seeking_plan_lines(bind_seeking: bool) -> Vec<String> {
     let mut out = vec![format!(
         "bind-seeking       : {}",
         if bind_seeking {
-            "ENABLED — stop a target at the first ELIGIBLE verified+stable binding point past the start bin (avg-clock + regime, v2)"
+            "ENABLED — stop a target at the first ELIGIBLE verified+stable point that LEFT the power-limited regime, past the start bin (regime-only; clock arm retired)"
         } else {
             "off — descend by depth only (per-target cap / floor / failure)"
         }
     )];
     if bind_seeking {
         out.push(format!(
-            "binding thresholds : avg_clock_overshoot <= {} MHz  OR  power_capped_frac <= {:.2}",
-            BIND_OVERSHOOT_MHZ, BIND_CAP_FRAC
+            "binding threshold  : power_capped_frac <= {:.2} (card left the power-limited regime — only stop arm)",
+            BIND_CAP_FRAC
         ));
         out.push(
             "binding eligibility: start bin is NOT bind-eligible — a target must descend ≥1 real VF \
@@ -1716,9 +1786,9 @@ fn bind_seeking_plan_lines(bind_seeking: bool) -> Vec<String> {
 /// the verified floor, first failure below it, and the stop reason. The drain/crash signals on
 /// `ProbeSample` are checked BEFORE the verify/outcome arms so a budget/abort/crash stop is never
 /// mistaken for a plain verify failure (only the latter is B2-fallback-eligible). When
-/// `bind_seeking` is set, a verified + dwell-stable probe that is the first BINDING point stops the
-/// descent CLEANLY here (`BracketStop::BoundBinding`), earlier than the per-target cap — checked
-/// only after the failure/drain arms, so a failure always takes precedence. `bind_seeking=false`
+/// `bind_seeking` is set, a verified + dwell-stable probe that is the first to LEAVE the power-limited
+/// regime stops the descent CLEANLY here (`BracketStop::LeftPowerRegime`), earlier than the per-target
+/// cap — checked only after the failure/drain arms, so a failure always takes precedence. `bind_seeking=false`
 /// reproduces the legacy descent byte-for-byte. The `probe` closure is the only seam to hardware;
 /// when `bind_seeking` is on, each verified+stable probe additionally emits a `tracing` bind-seeking
 /// telemetry line (eligibility + rule + metrics) — return values stay deterministic and testable.
@@ -1801,13 +1871,13 @@ fn descend_target(
                 // B1: a verified floor is recorded ONLY from a verified + dwell-Stable bin.
                 deepest = Some((probe_to_point(target, v, &s), s.confidence));
                 bracket.lowest_verified_mv = Some(v);
-                // Bind-seeking (opt-in), v2: a target must descend ≥1 real VF bin before it may bind
-                // (the start bin is never eligible), and the clock rule keys off the AVERAGE clock.
-                // If this verified + dwell-stable probe is the first ELIGIBLE binding point (avg clock
-                // near target, OR the card left the power-limited regime), stop the target CLEANLY
-                // here — earlier than the per-target cap / floor — keeping THIS point. Reached only
-                // after the crash/abort/budget/unverified/unstable arms above, so a failure always
-                // takes precedence over binding. No-op when off.
+                // Bind-seeking (opt-in), regime-only: a target must descend ≥1 real VF bin before it
+                // may bind (the start bin is never eligible). If this verified + dwell-stable probe is
+                // the first ELIGIBLE point that has LEFT the power-limited regime (power_capped_frac <=
+                // BIND_CAP_FRAC), stop the target CLEANLY here — earlier than the per-target cap / floor
+                // — keeping THIS point. The old clock-near-target arm was retired (it false-binds on a
+                // power-bound card). Reached only after the crash/abort/budget/unverified/unstable arms
+                // above, so a failure always takes precedence over binding. No-op when off.
                 if bind_seeking {
                     // `probes_used` was incremented above, so `- 1` is this probe's predecessors.
                     let eligible = bind_eligible(bracket.probes_used - 1, v, start_bin);
@@ -1824,7 +1894,7 @@ fn descend_target(
                             .unwrap_or_else(|| "n/a".to_string()),
                     );
                     if decision.bound {
-                        bracket.stop_reason = BracketStop::BoundBinding;
+                        bracket.stop_reason = BracketStop::LeftPowerRegime;
                         break;
                     }
                 }
@@ -2842,10 +2912,25 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
     println!("=== build-frontier RESULT ({} frontier points) ===", result.frontier.len());
     for p in &result.frontier {
         println!(
-            "  target={:?} achieved={} MHz  vf_bin={:?} mV  power={:.0} W  p5={:?}",
-            p.target_clock_mhz, p.clock_mhz, p.vf_table_voltage_mv, p.power_w, p.p5_clock_mhz
+            "  target={:?} achieved={} MHz  vf_bin={:?} mV  power={:.0} W  p5={:?}  pcf={:.3}{}",
+            p.target_clock_mhz, p.clock_mhz, p.vf_table_voltage_mv, p.power_w, p.p5_clock_mhz,
+            p.power_capped_frac,
+            if is_power_bound_point(p) { "  [power-bound]" } else { "" }
         );
     }
+    // Frontier classification (F1b audit): how many points carry real clock-frontier information
+    // vs. power-bound plateau points, and whether synthesis differentiated or collapsed.
+    let pb = result.profiles.power_bound_excluded;
+    let useful = result.frontier.len().saturating_sub(pb);
+    println!(
+        "frontier classes   : {useful} useful / {pb} power-bound (pcf >= {:.2}) — synthesis {}",
+        POWER_BOUND_FRAC,
+        if result.profiles.power_bound_collapse {
+            "POWER-BOUND COLLAPSE (best-effort, NOT a differentiated VF frontier)"
+        } else {
+            "differentiated"
+        }
+    );
     let fmt = |label: &str, pt: &Option<PowerSweepPoint>| match pt {
         Some(p) => format!(
             "{label}: target={:?} achieved={} MHz @ vf_bin {:?} mV, {:.0} W",
@@ -3377,6 +3462,105 @@ mod tests {
         ];
         let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
         assert_eq!(p.deep_calm.unwrap().clock_mhz, 1850, "below 90% floor excluded despite best MHz/W");
+    }
+
+    // ── F1b power-bound collapse classification (audit patch) ───────────────────────────────────
+    /// A stable frontier point pinned at the power cap (`power_capped_frac = pcf`).
+    #[cfg(windows)]
+    fn pb_fp(clock_mhz: u32, power_w: f32, pcf: f32) -> PowerSweepPoint {
+        let mut p = fp(clock_mhz, power_w);
+        p.power_capped_frac = pcf;
+        p
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn power_bound_frac_threshold_and_invalid() {
+        assert!(is_power_bound_frac(POWER_BOUND_FRAC), "exactly at the threshold is power-bound");
+        assert!(is_power_bound_frac(1.0), "fully capped is power-bound");
+        assert!(!is_power_bound_frac(0.94), "just below the threshold is not power-bound");
+        assert!(!is_power_bound_frac(0.0), "uncapped is not power-bound");
+        // Missing / invalid fraction must NOT be marked power-bound (an unknown cap state is not a
+        // plateau): fail open for classification (it fails CLOSED for regime binding, tested elsewhere).
+        for bad in [f32::NAN, -0.1, 1.5] {
+            assert!(!is_power_bound_frac(bad), "invalid pcf {bad} is not power-bound");
+        }
+        assert!(is_power_bound_point(&pb_fp(1800, 199.0, 1.0)));
+        assert!(!is_power_bound_point(&fp(1800, 150.0))); // fp() sets pcf = 0.0
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn frontier_all_power_bound_is_collapse() {
+        // The exact hardware failure mode: jittery clocks (1798/1811/1819) all pinned at pcf 1.0.
+        // Exact-distinct-clock detection sees 3 "distinct" clocks; pcf saturation catches the collapse.
+        let collapsed = vec![
+            (pb_fp(1819, 199.0, 1.0), 0.21),
+            (pb_fp(1811, 199.0, 1.0), 0.21),
+            (pb_fp(1798, 199.0, 1.0), 0.21),
+        ];
+        assert!(frontier_power_bound_collapse(&collapsed), "all-power-bound jittery plateau = collapse");
+        // A frontier with >= 2 useful points is NOT a collapse, even with a power-bound point present.
+        let mixed = vec![
+            (pb_fp(1850, 199.0, 1.0), 0.95),
+            (fp(1830, 180.0), 0.95),
+            (fp(1740, 150.0), 0.95),
+        ];
+        assert!(!frontier_power_bound_collapse(&mixed));
+        // No power-bound points at all → never a power-bound collapse.
+        assert!(!frontier_power_bound_collapse(&[(fp(1830, 180.0), 0.95)]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn synthesis_flags_power_bound_collapse_and_does_not_differentiate() {
+        // All points power-bound → synthesis must NOT present a differentiated frontier. It returns a
+        // flagged best-effort (still Some, never empty) and logs the explicit collapse diagnostic.
+        let frontier = vec![
+            (pb_fp(1819, 199.0, 1.0), 0.21),
+            (pb_fp(1811, 199.0, 1.0), 0.21),
+            (pb_fp(1798, 199.0, 1.0), 0.21),
+        ];
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        assert!(p.power_bound_collapse, "all-power-bound frontier flagged as collapse");
+        assert_eq!(p.power_bound_excluded, 3, "all three points are power-bound");
+        assert!(p.godforge.is_some(), "best-effort still returns a point (never empty)");
+        assert!(p.log.iter().any(|l| l.contains("power-bound collapse")),
+            "emits the explicit power-bound collapse diagnostic");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn synthesis_excludes_power_bound_points_from_differentiation() {
+        // Mixed frontier: a HIGH-clock power-bound plateau point (1850 @ pcf 1.0) plus >= 2 useful
+        // points. The power-bound point must be EXCLUDED, so Godforge = the highest USEFUL clock
+        // (1830), never the saturated 1850 plateau.
+        let frontier = vec![
+            (pb_fp(1850, 199.0, 1.0), 0.95), // power-bound, highest raw clock — must be excluded
+            (fp(1830, 180.0), 0.95),
+            (fp(1815, 170.0), 0.95),
+            (fp(1740, 150.0), 0.95),
+        ];
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        assert!(!p.power_bound_collapse, "two+ useful points → not a collapse");
+        assert_eq!(p.power_bound_excluded, 1);
+        assert_eq!(p.godforge.unwrap().clock_mhz, 1830,
+            "Godforge is the highest USEFUL clock, not the power-bound 1850 plateau");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn synthesis_without_power_bound_points_is_unchanged() {
+        // Regression: no power-bound points → excluded = 0, collapse = false, identical selection.
+        let frontier = vec![
+            (fp(1830, 200.0), 0.95),
+            (fp(1815, 181.0), 0.95),
+            (fp(1740, 158.0), 0.95),
+        ];
+        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        assert_eq!(p.power_bound_excluded, 0);
+        assert!(!p.power_bound_collapse);
+        assert_eq!(p.godforge.unwrap().clock_mhz, 1830);
     }
 
     #[cfg(windows)]
@@ -4581,10 +4765,10 @@ mod tests {
         assert_eq!(point.unwrap().0.vf_table_voltage_mv, Some(1050));
     }
 
-    // ── F1b bind-seeking v2 (eligibility + average-clock + regime) ─────────────────────────────
-    /// A verified + dwell-stable probe with EXACT avg/p5 clock (both set to `avg_mhz`) and cap
-    /// fraction so the classifier inputs are unambiguous (the generic `stable_sample` hardcodes
-    /// cap_frac = 0). v2 keys the clock rule off the AVERAGE clock.
+    // ── F1b bind-seeking (regime-only: eligibility + left-power-regime) ─────────────────────────
+    /// A verified + dwell-stable probe with EXACT avg/p5 clock (both set to `avg_mhz`) and a given
+    /// power-cap fraction so the classifier inputs are unambiguous (the generic `stable_sample`
+    /// hardcodes cap_frac = 0). The clock arm is retired; `cap_frac` drives the only (regime) rule.
     #[cfg(windows)]
     fn bind_sample(avg_mhz: u32, cap_frac: f32) -> ProbeSample {
         let mut s = stable_sample(avg_mhz, 180.0, 0.95);
@@ -4594,73 +4778,54 @@ mod tests {
         s
     }
 
-    /// Like `bind_sample` but with split avg vs p5 — to prove v2 keys the clock rule off the AVERAGE.
     #[cfg(windows)]
-    fn bind_sample_split(avg_mhz: u32, p5_mhz: u32, cap_frac: f32) -> ProbeSample {
-        let mut s = bind_sample(avg_mhz, cap_frac);
-        s.p5_clock_mhz = Some(p5_mhz);
-        s
+    #[test]
+    fn classify_binding_start_bin_never_binds() {
+        let t = BindThresholds::v2();
+        // A sample that WOULD regime-bind (left the power regime, cap 0.3) must NOT bind on the start
+        // bin (not eligible) — the start-bin guard is retained. It binds at the 2nd (eligible) bin.
+        assert!(!classify_binding(1800, &bind_sample(1800, 0.3), &t, false).bound,
+            "start bin is never binding even when the regime metric matches");
+        let d = classify_binding(1800, &bind_sample(1800, 0.3), &t, true);
+        assert!(d.bound && d.reason == BindReason::Regime, "second bin binds on the regime rule");
     }
 
     #[cfg(windows)]
     #[test]
-    fn classify_binding_start_bin_never_binds_even_when_clock_matches() {
+    fn classify_binding_clock_near_target_does_not_bind_when_power_bound() {
+        // CORE post-audit guarantee: the clock-near-target arm is RETIRED, so a probe whose average
+        // clock sits exactly AT the target never binds while the card is power-bound/pinned. Saturated
+        // pcf (1.0), near-saturated (0.95/0.9), and merely-pinned (0.6) all fail the regime rule.
         let t = BindThresholds::v2();
-        // Metrics that WOULD bind on the clock rule (avg == target) must NOT bind when not eligible
-        // (the start bin). This is the core v2 fix for the degenerate single-bin frontier.
-        assert!(!classify_binding(1800, &bind_sample(1800, 0.9), &t, false).bound,
-            "start bin is never binding even when the clock metric matches");
-        // ...and the SECOND bin (eligible) DOES bind when avg is within target + 30.
-        let d = classify_binding(1800, &bind_sample(1800, 0.9), &t, true);
-        assert!(d.bound && d.reason == BindReason::Clock, "second bin binds on the clock rule");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn classify_binding_clock_overshoot_boundary_uses_average() {
-        let t = BindThresholds::v2();
-        // Eligible, AVERAGE overshoot EXACTLY +30 MHz while power-pinned (cap > 0.5) → clock binds.
-        let d = classify_binding(1800, &bind_sample(1830, 0.9), &t, true);
-        assert!(d.bound && d.reason == BindReason::Clock, "avg overshoot 30 binds (clock rule)");
-        // Average overshoot +31 MHz and still power-pinned → neither rule → not binding.
-        assert!(!classify_binding(1800, &bind_sample(1831, 0.9), &t, true).bound,
-            "avg overshoot 31 does not bind when power-pinned");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn classify_binding_uses_average_not_p5_clock() {
-        let t = BindThresholds::v2();
-        // p5 within threshold (1820) but AVERAGE above it (1900) → v2 clock rule must NOT bind, and
-        // with the card power-pinned (cap 0.9) there is no regime binding either.
-        assert!(!classify_binding(1800, &bind_sample_split(1900, 1820, 0.9), &t, true).bound,
-            "p5 within but avg above → no clock binding (v2 keys off avg)");
-        // AVERAGE within threshold binds on the clock rule regardless of p5 being far above.
-        let d = classify_binding(1800, &bind_sample_split(1820, 1900, 0.9), &t, true);
-        assert!(d.bound && d.reason == BindReason::Clock, "avg within target+30 binds on clock rule");
+        for pcf in [1.0_f32, 0.95, 0.9, 0.6] {
+            let d = classify_binding(1800, &bind_sample(1800, pcf), &t, true);
+            assert!(!d.bound,
+                "avg-clock at target must NOT bind when power-bound/pinned (pcf {pcf}) — clock arm retired");
+            assert_eq!(d.reason, BindReason::None);
+        }
     }
 
     #[cfg(windows)]
     #[test]
     fn classify_binding_regime_only_after_eligibility() {
         let t = BindThresholds::v2();
-        // Large overshoot (+100) turns the clock rule OFF, isolating the regime rule on cap_frac.
-        // cap_frac == 0.50 regime-binds — but ONLY when eligible (never on the start bin).
+        // The regime rule is the only stop arm. cap_frac == 0.50 regime-binds — but ONLY when
+        // eligible (never on the start bin); the clock metric is irrelevant (arm retired).
         assert!(!classify_binding(1800, &bind_sample(1900, 0.50), &t, false).bound,
             "cap_frac 0.50 does NOT bind on the start bin (not eligible)");
         let d = classify_binding(1800, &bind_sample(1900, 0.50), &t, true);
         assert!(d.bound && d.reason == BindReason::Regime, "cap_frac 0.50 binds (regime) when eligible");
-        // cap_frac == 0.51 with a big overshoot never binds, even eligible.
-        assert!(!classify_binding(1800, &bind_sample(1900, 0.51), &t, true).bound,
-            "cap_frac 0.51 with big overshoot does not bind");
+        // cap_frac == 0.51 (still power-pinned) never binds, even eligible, whatever the clock.
+        assert!(!classify_binding(1800, &bind_sample(1810, 0.51), &t, true).bound,
+            "cap_frac 0.51 (still power-pinned) does not bind");
     }
 
     #[cfg(windows)]
     #[test]
     fn classify_binding_invalid_cap_frac_fails_closed_on_regime() {
         let t = BindThresholds::v2();
-        // Big overshoot (clock rule off) + an invalid cap fraction (NaN / out of range) → no regime
-        // binding (fail closed), so the probe does not bind even when eligible.
+        // An invalid cap fraction (NaN / out of range) → no regime binding (fail closed), so the probe
+        // does not bind even when eligible.
         for bad in [f32::NAN, -0.1, 1.5] {
             let d = classify_binding(1800, &bind_sample(1900, bad), &t, true);
             assert!(!d.bound, "invalid power_capped_frac {bad} must not regime-bind");
@@ -4672,7 +4837,8 @@ mod tests {
     #[test]
     fn classify_binding_rejects_unverified_unstable_and_drains() {
         let t = BindThresholds::v2();
-        // Eligible metrics would bind (avg == target), but an unverified curve never binds.
+        // Eligible + regime metrics would bind (cap 0.0 ⇒ left the power regime), but an unverified
+        // curve never binds.
         let mut unverified = bind_sample(1800, 0.0);
         unverified.curve_verified = false;
         assert!(!classify_binding(1800, &unverified, &t, true).bound, "unverified never binds");
@@ -4693,8 +4859,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn bind_seeking_off_descends_full_depth_even_when_binding() {
-        // Every probe WOULD bind (sustained=target → clock-binding; cap 0 → regime-binding), but
-        // bind-seeking OFF must descend the full depth to the floor exactly like today.
+        // Every probe WOULD regime-bind (cap 0 ⇒ left the power regime), but bind-seeking OFF must
+        // descend the full depth to the floor exactly like today.
         let d = step_descent(1075, 25, 875); // 9 bins
         let probe = |target: u32, _v: u32| bind_sample(target, 0.0);
         let (bracket, point) = descend_target(1830, 1075, &d, None, false, &probe);
@@ -4707,7 +4873,8 @@ mod tests {
     #[test]
     fn bind_seeking_stops_at_first_binding_point() {
         use std::cell::RefCell;
-        // Shallow bins NON-binding (overshoot +100, power-pinned); the ceiling binds at vbin <= 1000.
+        // Shallow bins still power-pinned (cap 0.9 → no regime bind); the card leaves the power regime
+        // (cap 0.2) at vbin <= 1000, where bind-seeking stops.
         let d = step_descent(1075, 25, 875); // bins 1075,1050,1025,1000,...
         let probed = RefCell::new(Vec::<u32>::new());
         let probe = |target: u32, vbin: u32| {
@@ -4715,7 +4882,7 @@ mod tests {
             if vbin <= 1000 { bind_sample(target, 0.2) } else { bind_sample(target + 100, 0.9) }
         };
         let (bracket, point) = descend_target(1800, 1075, &d, None, true, &probe);
-        assert_eq!(bracket.stop_reason, BracketStop::BoundBinding);
+        assert_eq!(bracket.stop_reason, BracketStop::LeftPowerRegime);
         assert_eq!(*probed.borrow(), vec![1075u32, 1050, 1025, 1000]); // stopped at the first binding bin
         assert_eq!(bracket.lowest_verified_mv, Some(1000));
         assert_eq!(point.unwrap().0.vf_table_voltage_mv, Some(1000));
@@ -4725,17 +4892,17 @@ mod tests {
     #[test]
     fn bind_seeking_skips_start_bin_and_binds_at_second() {
         use std::cell::RefCell;
-        // Every bin WOULD bind on the clock rule (avg == target). v2 must NOT stop at the start bin;
-        // it descends one real bin and binds at the 2nd probed bin (the first eligible one). This is
-        // the regression guard for the v1 degenerate single-bin frontier.
+        // Every bin WOULD regime-bind (cap 0.2 ⇒ left the power regime). The guard must NOT stop at the
+        // start bin; it descends one real bin and binds at the 2nd probed bin (the first eligible one).
+        // This is the regression guard for the v1 degenerate single-bin frontier.
         let d = step_descent(1075, 25, 875); // bins 1075, 1050, 1025, ...
         let probed = RefCell::new(Vec::<u32>::new());
         let probe = |target: u32, vbin: u32| {
             probed.borrow_mut().push(vbin);
-            bind_sample(target, 0.2) // avg == target → clock-binding at every bin
+            bind_sample(target, 0.2) // cap 0.2 ⇒ regime-binding at every (eligible) bin
         };
         let (bracket, point) = descend_target(1800, 1075, &d, None, true, &probe);
-        assert_eq!(bracket.stop_reason, BracketStop::BoundBinding);
+        assert_eq!(bracket.stop_reason, BracketStop::LeftPowerRegime);
         assert_eq!(*probed.borrow(), vec![1075u32, 1050], "start bin skipped; binds at the 2nd bin");
         assert_eq!(bracket.lowest_verified_mv, Some(1050));
         assert_eq!(point.unwrap().0.vf_table_voltage_mv, Some(1050));
@@ -4816,13 +4983,13 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn bound_binding_is_clean_and_carry_eligible() {
-        // BoundBinding is NOT a hard failure and — having a verified floor — seeds the next target
+    fn left_power_regime_is_clean_and_carry_eligible() {
+        // LeftPowerRegime is NOT a hard failure and — having a verified floor — seeds the next target
         // when warm-start is enabled (same carry-forward path as a clean PerTargetCap).
-        let prev = bracket_with(1815, Some(950), BracketStop::BoundBinding);
+        let prev = bracket_with(1815, Some(950), BracketStop::LeftPowerRegime);
         assert!(!prev.is_hard_failed());
         let d = warm_start_mv(Some(&prev), &carry_cfg(true));
-        assert!(d.warm_started, "a clean BoundBinding bracket seeds the next target");
+        assert!(d.warm_started, "a clean LeftPowerRegime bracket seeds the next target");
         assert_eq!(d.start_mv, 975); // 950 + one 25 mV step
         assert_eq!(d.source_target, Some(1815));
     }
@@ -4864,12 +5031,14 @@ mod tests {
         assert_eq!(off.len(), 1);
         assert!(off[0].contains("off"));
         assert!(!off.iter().any(|l| l.contains("clock_overshoot")));
-        // ON → mode + v2 thresholds + start-bin eligibility caveat + live-metrics caveat.
+        // ON → regime-only mode + the single regime threshold + start-bin eligibility + live caveat.
         let on = bind_seeking_plan_lines(true);
         assert!(on.iter().any(|l| l.contains("ENABLED")));
-        assert!(on.iter().any(|l| l.contains("avg_clock_overshoot <= 30 MHz")));
+        assert!(on.iter().any(|l| l.contains("regime-only")));
         assert!(on.iter().any(|l| l.contains("power_capped_frac <= 0.50")));
-        // v2: the dry-run must state the start bin is not bind-eligible.
+        // The clock arm is retired — the dry-run must NOT advertise a clock-overshoot threshold.
+        assert!(!on.iter().any(|l| l.contains("avg_clock_overshoot")));
+        // The dry-run must state the start bin is not bind-eligible.
         assert!(on.iter().any(|l| l.contains("NOT bind-eligible")));
         assert!(on.iter().any(|l| l.contains("depends on live")));
     }
