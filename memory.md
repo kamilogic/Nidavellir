@@ -8,7 +8,27 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-15) — build-frontier / F1b algorithm audit — verdict SIMPLIFY (read-only, pre-implementation)
+## Latest (2026-06-15) — F1b power-bound collapse classification IMPLEMENTED (commit 0996769) — pure, no hardware
+- **Commit `0996769 fix(service): classify power-bound frontier collapse`** (pushed to `origin/master`). Scope:
+  `crates/service/src/gpu_power_sweep.rs` ONLY. The SIMPLIFY patch from the audit below. No hardware.
+- **Retired bind-seeking's Clock arm** → `classify_binding` regime-only: bind (stop early) ONLY on leaving the
+  power-limited regime (`power_capped_frac <= 0.50`). Removed `BIND_OVERSHOOT_MHZ` / `overshoot_mhz` /
+  `BindReason::Clock`; start-bin guard kept. Renamed `BracketStop::BoundBinding → LeftPowerRegime`.
+- **Power-bound classification** (`POWER_BOUND_FRAC = 0.95`, pure helpers `is_power_bound_frac/_point`,
+  `useful_frontier_points`, `frontier_power_bound_collapse`): a pcf-saturated stable dwell is a valid raw
+  bracket but NOT useful clock-frontier diversity; invalid/missing pcf → not power-bound (fail open), still
+  fail-closed for regime binding.
+- **Collapse-aware synthesis**: `synthesize_forge_profiles` excludes power-bound points; < 2 useful → flagged
+  best-effort + "power-bound collapse — cannot build a differentiated VF frontier…" (new
+  `ForgeProfiles.power_bound_excluded` / `power_bound_collapse`). Catches jittery ~1798–1819 MHz @ pcf 1.0 that
+  exact-distinct-clock missed. No power-bound points → legacy path unchanged. RESULT prints per-point pcf +
+  `frontier classes` summary.
+- **Unchanged safety surfaces**: writer, verifier, Safe Loop, reset_to_stock, floor/cluster, per-target cap,
+  warm-start default OFF, persistence/knowledge, power-limit/clock-lock. `cargo check` clean; `cargo test`
+  **173 passed**. **Hardware STILL BLOCKED** (pure patch; review new diagnostics in a dry-run before any run).
+  See `handoff.md` + `decisions.md`.
+
+## (2026-06-15) — build-frontier / F1b algorithm audit — verdict SIMPLIFY (read-only, pre-implementation)
 - **Read-only audit** of `crates/service/src/gpu_power_sweep.rs` + continuity docs. **No code/tests/hardware/
   `--confirm`/VF-write/stress/power-sweep** run. Recorded BEFORE implementation to set the next patch's north
   star. Full rationale: `decisions.md` (top) + `handoff.md` (Latest backend checkpoint).

@@ -3,7 +3,33 @@
 How to pick this up cold. State as of 2026-06-15, `master` (clean, latest commit
 `bf02971`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-15) — build-frontier / F1b algorithm audit — verdict SIMPLIFY (read-only, pre-implementation)
+## Latest backend checkpoint (2026-06-15) — F1b power-bound collapse classification IMPLEMENTED (commit 0996769) — pure, no hardware
+- **Commit `0996769 fix(service): classify power-bound frontier collapse`** (pushed to `origin/master` with
+  the docs entry). Scope: `crates/service/src/gpu_power_sweep.rs` ONLY. Implements the SIMPLIFY patch from the
+  audit below. No hardware, no `--confirm`, no dry-run.
+- **Retired bind-seeking's Clock arm** — `classify_binding` is regime-only: a target binds (stops early) ONLY
+  when it LEFT the power-limited regime (`power_capped_frac <= 0.50`). Removed `BIND_OVERSHOOT_MHZ`,
+  `BindThresholds.overshoot_mhz`, `BindReason::Clock`; start-bin eligibility guard kept. Renamed
+  `BracketStop::BoundBinding → LeftPowerRegime`.
+- **Power-bound classification** (`POWER_BOUND_FRAC = 0.95`): pure `is_power_bound_frac` / `is_power_bound_point`
+  / `useful_frontier_points` / `frontier_power_bound_collapse`. A pcf-saturated stable dwell = VALID raw
+  bracket, NOT useful clock-frontier diversity. Invalid/missing pcf → not power-bound (fail open for
+  classification), still fail-CLOSED for regime binding.
+- **Collapse-aware synthesis**: `synthesize_forge_profiles` excludes power-bound points; < 2 useful → FLAGGED
+  best-effort + diagnostic *"power-bound collapse — cannot build a differentiated VF frontier under this
+  workload/regime"* (new `ForgeProfiles.power_bound_excluded` / `power_bound_collapse`). Catches the jittery
+  ~1798–1819 MHz @ pcf 1.0 plateau the exact-distinct-clock check missed. NO power-bound points → legacy path
+  byte-for-byte unchanged. RESULT output now prints per-point `pcf` + a `frontier classes` summary.
+- **Safety surfaces UNCHANGED** (diff audited — no protected symbol added/removed): monotone writer, verifier
+  gates, Safe Loop, `reset_to_stock`, floor/cluster derivation, per-target cap, warm-start default OFF,
+  persistence/knowledge writes, power-limit/clock-lock.
+- **Validation (no hardware)**: `cargo check -p nidavellir-service` clean; `cargo test -p nidavellir-service`
+  **173 passed / 0 failed** (was 169: +5 power-bound tests, +2 regime tests, −3 retired clock tests).
+- **Hardware STILL BLOCKED**: pure code/test patch. Next confirmed run only AFTER reviewing the new
+  classification/reporting in a fresh dry-run; the same-config rerun remains not recommended. Full detail in
+  `decisions.md` (top entry).
+
+## Backend checkpoint (2026-06-15) — build-frontier / F1b algorithm audit — verdict SIMPLIFY (read-only, pre-implementation)
 - **Read-only audit only.** Inspected `crates/service/src/gpu_power_sweep.rs` + continuity docs. **No code edit,
   no tests, no `build-frontier`, no `--confirm`, no hardware, no VF write, no stress, no power sweep** were run.
   This entry records the audit conclusion BEFORE implementation so the next patch has a clear north star.

@@ -2,6 +2,40 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b power-bound collapse classification — IMPLEMENTED (commit 0996769, 2026-06-15) — pure, no hardware
+- **Decision (2026-06-15)**: implement the first post-audit simplification (the SIMPLIFY direction recorded
+  below). Commit `0996769 fix(service): classify power-bound frontier collapse`. Scope:
+  `crates/service/src/gpu_power_sweep.rs` ONLY. Pure change — no hardware, no `--confirm`, no dry-run.
+- **What changed**:
+  - **Retired bind-seeking's Clock arm.** `classify_binding` is now regime-only: a target binds (stops early)
+    ONLY when it has LEFT the power-limited regime (valid `power_capped_frac <= BIND_CAP_FRAC = 0.50`). The
+    clock-near-target arm false-binds on a power-bound card (the cap, not the descent, sets the achieved
+    clock). Removed `BIND_OVERSHOOT_MHZ`, `BindThresholds.overshoot_mhz`, `BindReason::Clock`; the start-bin
+    eligibility guard is retained.
+  - **Renamed `BracketStop::BoundBinding` → `LeftPowerRegime`** — the early stop now has one honest meaning.
+  - **First-class power-bound classification** (`POWER_BOUND_FRAC = 0.95`): pure `is_power_bound_frac` /
+    `is_power_bound_point` / `useful_frontier_points` / `frontier_power_bound_collapse`. A stable, verified,
+    pcf-saturated dwell is a VALID raw bracket but NOT a useful clock-frontier point. Missing/invalid pcf is
+    NOT marked power-bound (fail open for classification) yet still fails CLOSED for regime binding.
+  - **Collapse-aware synthesis**: `synthesize_forge_profiles` excludes power-bound points from differentiated
+    selection; with < 2 useful (non-power-bound) points it returns a FLAGGED best-effort and logs
+    *"power-bound collapse — cannot build a differentiated VF frontier under this workload/regime"* (new
+    `ForgeProfiles.power_bound_excluded` / `power_bound_collapse`). Keys on pcf saturation, so the jittery
+    ~1798–1819 MHz @ pcf 1.0 plateau is caught where exact-distinct-clock detection missed it. With NO
+    power-bound points the legacy path is byte-for-byte unchanged.
+  - **Reporting**: `run_build_frontier` RESULT now prints per-point `pcf` (+ a `[power-bound]` tag) and a
+    `frontier classes : N useful / M power-bound — synthesis differentiated|POWER-BOUND COLLAPSE` summary.
+- **Unchanged safety surfaces** (diff audited — no protected symbol added/removed): monotone static-base
+  writer, verifier gates, Safe Loop, `reset_to_stock`, hardware-derived floor / cluster selection, per-target
+  cap, warm-start default OFF, profile persistence / knowledge writes, power-limit / clock-lock.
+- **Validation (no hardware)**: `cargo check -p nidavellir-service` clean; `cargo test -p nidavellir-service`
+  **173 passed / 0 failed** (new: power-bound threshold + invalid; all-power-bound collapse incl. jittery
+  1798/1811/1819; collapse flagged + best-effort; mixed frontier synthesizes from useful; legacy path
+  unchanged; clock-near-target does NOT bind under saturation; regime binds at pcf ≤ 0.50; invalid pcf fails
+  closed). No dry-run / `--confirm` / hardware.
+- **Hardware: STILL BLOCKED.** Pure code/test patch. A confirmed run is justified only AFTER reviewing the new
+  classification/reporting behavior in a fresh dry-run; the same-config rerun remains not recommended.
+
 ## build-frontier / F1b algorithm audit — verdict SIMPLIFY (2026-06-15, read-only, pre-implementation)
 - **Decision**: record the conclusion of a read-only algorithm audit of the F1b build-frontier curve
   exploration BEFORE writing any code, so the next patch has a clear north star. **No code, no tests, no
