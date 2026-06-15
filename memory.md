@@ -8,7 +8,40 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-15) — bind-seeking F1b v2 strictness IMPLEMENTED + pushed (commit bf02971), NOT yet hardware-validated
+## Latest (2026-06-15) — FIRST confirmed hardware validation of bind-seeking F1b v2 strictness (commit bf02971) — mechanism PASS, frontier PARTIAL
+- Supervised confirmed run (operator present) validating `bf02971`; docs at `3b8774c`
+  (HEAD/origin/master = `3b8774c`, tree clean). A **fresh worktree binary was built first** — the
+  worktree-local `target/debug/nidavellir-service.exe` was absent and the only existing binary was stale
+  (main-repo, built 2026-06-07, predating bind-seeking): `cargo build -p nidavellir-service` → worktree
+  binary created after the build; stale main-repo binary NOT used; tree stayed clean.
+- **Dry-run gate passed** (no `--confirm`): bind-seeking ENABLED; v2 start-bin-not-eligible note; thresholds
+  `avg_clock_overshoot <= 30 MHz` + `power_capped_frac <= 0.50`; coverage-bounded scheduler;
+  `max_probes=Some(21)`; `max_probes_per_target=Some(3)`; targets `[1935,1905,1875,1845,1815,1785,1755]`;
+  first-pass bins `[1075,1068,1062]`; warm-start OFF; no applied-profile / Safe Loop warning; dry-run no-op
+  line. Confirmed: `build-frontier --confirm --max-targets 7 --max-probes 21 --max-probes-per-target 3
+  --safe-start-cap 1075 --bind-seeking`.
+- **Safety PASS**: exit 0; no TDR/driver-reset/black-screen/reboot/crash; `reset_to_stock` ran; GPU back at
+  stock idle. After: `boot_flag.json`/`gpu_applied.json` absent; `forge_state.json`/`gpu_knowledge.json`/
+  `heartbeat.txt` unchanged; `safe_loop.json` idle (`safe_mode:false`), size unchanged, mtime touched by
+  startup recovery only.
+- **Probe**: 15 dwells; all 7 targets characterized; 6 via **`BoundBinding`** (1935/1905/1875/1845/1815/1785),
+  1 via **`PerTargetCap`** (1755); none dropped; `--max-probes 21` not exhausted (15/21); no `overshoot_veto`;
+  all probes `write_mode=monotone_static`, `positive_offsets=0`.
+- **v2 mechanism PASS (start-bin guard)**: every 1075 mV start bin `eligible=false/bound=false`; all 7
+  descended to 1068, 1755 to 1062; earliest bind only after a real descent (6 bound at 1068, `reason=Clock`);
+  bind telemetry present (eligible/bound/reason/avg_clock_mhz/p5_clock_mhz/power_capped_frac); regime arm never
+  fired (pcf=1.000).
+- **Frontier PARTIAL (did NOT de-collapse)**: all dwells PowerLimited, `power_capped_frac=1.000` throughout
+  (~199 W flat); clocks clustered **~1798–1819 MHz**; confidence stayed **0.21**; Godforge/Brokkr/Deep Calm
+  collapsed to ~1800 MHz/199 W. v2 fixed the **procedural** start-bin bug; the remaining collapse is
+  **power/regime**, not scheduler depth and not the per-target cap.
+- **Direction**: don't repeat the run; don't bump the per-target cap as the immediate next step; don't jump to
+  risky power-limit/clock-lock changes. Next design (analysis first): **regime-aware binding**, distinguish
+  `Clock` from `PowerLimitedPlateau`/`PowerBoundCollapse`, veto `Clock` binding when pcf is saturated ~1.0,
+  add collapse diagnostics + power-headroom/power-drop telemetry. **Stop for analysis before any further
+  confirmed run.** See `handoff.md` + `decisions.md`.
+
+## (2026-06-15) — bind-seeking F1b v2 strictness IMPLEMENTED + pushed (commit bf02971) — hardware-validated (see entry above)
 - **Commit `bf02971 fix(service): tighten bind-seeking stop criteria`**, pushed to `origin/master`
   (HEAD = origin/master = `bf02971`). Scope: `crates/service/src/gpu_power_sweep.rs` only.
 - **Why**: v1's first supervised hardware run was safety/mechanics **PASS** but semantic **PARTIAL** — v1
@@ -24,9 +57,9 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   persistence/apply, hardware-floor derivation, warm-start default OFF.
 - **Validation (no hardware)**: `cargo check` clean; `cargo test -p nidavellir-service` **169 passed**;
   dry-run only passed; no hardware boundary crossed.
-- **Hardware validation NOT yet run for `bf02971`** → next: separate dry-run + supervised confirmed run
-  (proposed `--confirm --max-targets 7 --max-probes 21 --max-probes-per-target 3 --safe-start-cap 1075
-  --bind-seeking`; do not auto-run).
+- **Hardware-validated 2026-06-15** (see the FIRST confirmed hardware validation entry above) via
+  `build-frontier --confirm --max-targets 7 --max-probes 21 --max-probes-per-target 3 --safe-start-cap 1075
+  --bind-seeking` — mechanism PASS (start-bin guard), frontier PARTIAL (still power-limited / collapsed).
 
 ## 2026-06-14 — bind-seeking F1b v1 IMPLEMENTED + pushed (commit 08f745e), hardware-validated PARTIAL → superseded by v2
 - **Commit `08f745e feat(service): add opt-in bind-seeking to build-frontier`**, pushed to `origin/master`
