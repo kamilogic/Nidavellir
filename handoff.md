@@ -1,9 +1,40 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-14, `master` (clean, latest commit
-`08f745e`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+How to pick this up cold. State as of 2026-06-15, `master` (clean, latest commit
+`bf02971`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-14) — bind-seeking F1b v1 IMPLEMENTED + PUSHED, NOT yet hardware-validated (commit 08f745e)
+## Latest backend checkpoint (2026-06-15) — bind-seeking F1b v2 strictness IMPLEMENTED + PUSHED, NOT yet hardware-validated (commit bf02971)
+- **Commit `bf02971 fix(service): tighten bind-seeking stop criteria`** — pushed to `origin/master`
+  (HEAD = origin/master = `bf02971`). Scope: `crates/service/src/gpu_power_sweep.rs` ONLY (no other file).
+- **Why**: the v1 supervised hardware run (`--bind-seeking`, this session) was **safety/mechanics PASS but
+  semantic PARTIAL** — v1 allowed `BoundBinding` on the **first/start bin at 1075 mV**, so every viable target
+  stopped immediately with no descent; the frontier stayed degenerate/single-bin (all ~1075 mV / ~199 W) and
+  Forge synthesis confidence stayed low (~0.21).
+- **v2 changes** (`classify_binding` now returns `BindDecision` and takes an `eligible` flag):
+  - **Start bin is NOT bind-eligible** — a target must descend ≥1 real VF bin before `BoundBinding` can fire;
+    earliest bind = the **2nd probed real VF bin** (`bind_eligible(probes_before, cur_bin, start_bin)`).
+  - **Clock binding uses the AVERAGE/achieved clock** (`avg_clock_mhz - target <= 30`), not p5/sustained;
+    p5 remains telemetry/reporting only; zero/absent avg fails closed (no clock binding).
+  - **Regime arm unchanged** (`power_capped_frac <= 0.5`) but **invalid/missing cap_frac fails closed**
+    (NaN / <0 / >1 → no regime binding, via `valid_cap_frac`).
+  - **Bind telemetry** added (live run, per verified+stable probe): `eligible`, `bound`, `reason`
+    (`BindReason::None/Clock/Regime`), `avg_clock_mhz`, `p5_clock_mhz`, `power_capped_frac`.
+  - **Dry-run** prints the new `binding eligibility: start bin is NOT bind-eligible …` caveat + v2 threshold
+    wording (`avg_clock_overshoot <= 30 MHz`).
+- **Stop precedence PRESERVED**: crash → abort → budget drain → verifier failure → dwell instability →
+  **binding** → per-target cap → floor (only the binding arm is now gated by eligibility).
+- **Safety boundaries UNCHANGED**: monotone static-base writer, verifier gates, Safe Loop, `reset_to_stock`,
+  persistence/profile apply, hardware-floor derivation; **warm-start default remains OFF**.
+- **Validation before commit (no hardware)**: `cargo check -p nidavellir-service` clean; `cargo test -p
+  nidavellir-service` **169 passed / 0 failed** (new: start-bin-not-eligible, avg-not-p5, invalid-cap-frac
+  fail-closed, skips-start→binds-at-second). **Dry-run only** (no `--confirm`) passed:
+  `build-frontier --max-targets 7 --max-probes 21 --max-probes-per-target 3 --safe-start-cap 1075 --bind-seeking`.
+  No hardware boundary crossed.
+- **Hardware validation: NOT run yet for `bf02971`.** Next step: a separate dry-run + supervised confirmed run.
+  Proposed shape (DO NOT auto-run): `build-frontier --confirm --max-targets 7 --max-probes 21
+  --max-probes-per-target 3 --safe-start-cap 1075 --bind-seeking`.
+
+## Backend checkpoint (2026-06-14) — bind-seeking F1b v1 IMPLEMENTED + PUSHED, hardware-validated PARTIAL → superseded by v2 (commit 08f745e)
 - **Commit `08f745e feat(service): add opt-in bind-seeking to build-frontier`** — pushed to `origin/master`
   (HEAD = origin/master = `08f745e`). Scope: `crates/service/src/gpu_power_sweep.rs` +
   `crates/service/src/main.rs` ONLY. This builds the bind-seeking direction set after the `5248758` run.

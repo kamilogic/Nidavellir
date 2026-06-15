@@ -2,7 +2,38 @@
 
 Durable technical decisions and their rationale. Newest first.
 
-## bind-seeking F1b v1 — IMPLEMENTED + pushed (commit 08f745e), NOT yet hardware-validated
+## bind-seeking F1b v2 strictness — IMPLEMENTED + pushed (commit bf02971), NOT yet hardware-validated
+- **Decision (2026-06-15)**: tighten bind-seeking after its first supervised hardware run. Commit
+  `bf02971 fix(service): tighten bind-seeking stop criteria`, pushed to `origin/master`. Scope:
+  `crates/service/src/gpu_power_sweep.rs` only.
+- **Why**: the v1 run was **safety/mechanics PASS but semantic PARTIAL** — v1 allowed `BoundBinding` on the
+  first/start bin (1075 mV), so every viable target stopped immediately, no descent happened, and the frontier
+  stayed degenerate (single-bin, ~1075 mV / ~199 W; Forge confidence ~0.21). The binding test was too
+  permissive, and the p5/sustained clock signal could call a target "binding" while the average/achieved clock
+  was still materially above target.
+- **What changed**:
+  - **Eligibility**: the start bin is never bind-eligible; a target must descend ≥1 real VF bin first
+    (earliest bind = 2nd probed bin). `classify_binding` now takes an `eligible` flag and returns a
+    `BindDecision`; eligibility computed by `bind_eligible(probes_before, cur_bin, start_bin)`.
+  - **Clock metric**: clock binding keys off the AVERAGE/achieved clock (`avg - target <= 30`), not
+    p5/sustained; p5 stays telemetry/reporting; absent/zero avg fails closed.
+  - **Regime arm**: `power_capped_frac <= 0.5` kept; invalid/missing cap_frac fails closed (`valid_cap_frac`:
+    NaN / <0 / >1 → no regime binding).
+  - **Telemetry**: new `BindReason` + `BindDecision`; per-probe live log of eligible / bound / reason /
+    avg_clock_mhz / p5_clock_mhz / power_capped_frac; dry-run reports the start-bin-not-eligible caveat.
+- **Rejected/deferred (unchanged from v1)**: power-drop stop-condition still NOT a stopping rule; no
+  power-limit / clock-lock changes; per-target cap semantics untouched.
+- **Precedence preserved**: crash → abort → budget drain → verifier failure → dwell instability → binding →
+  per-target cap → floor (only the binding arm is now gated by eligibility).
+- **Safety unchanged**: monotone static-base writer, verifier gates, Safe Loop, `reset_to_stock`,
+  persistence/profile apply, hardware-floor derivation, warm-start default OFF.
+- **Validation (no hardware)**: `cargo check -p nidavellir-service` clean; `cargo test -p nidavellir-service`
+  169 passed; dry-run only passed (`--max-targets 7 --max-probes 21 --max-probes-per-target 3
+  --safe-start-cap 1075 --bind-seeking`); no hardware boundary crossed.
+- **Status**: hardware validation NOT yet run for `bf02971`. Next: separate dry-run + supervised confirmed run
+  (proposed `--confirm` shape recorded in `handoff.md`); do not auto-run.
+
+## bind-seeking F1b v1 — IMPLEMENTED + pushed (commit 08f745e), hardware-validated PARTIAL → superseded by v2
 - **Decision (2026-06-14)**: implement the bind-seeking direction from the `5248758` run as an **opt-in,
   default-OFF** scheduler mode. Commit `08f745e feat(service): add opt-in bind-seeking to build-frontier`,
   pushed to `origin/master`. Scope: `crates/service/src/gpu_power_sweep.rs` + `crates/service/src/main.rs`.

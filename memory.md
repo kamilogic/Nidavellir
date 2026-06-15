@@ -8,7 +8,27 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-14) — bind-seeking F1b v1 IMPLEMENTED + pushed (commit 08f745e), NOT yet hardware-validated
+## Latest (2026-06-15) — bind-seeking F1b v2 strictness IMPLEMENTED + pushed (commit bf02971), NOT yet hardware-validated
+- **Commit `bf02971 fix(service): tighten bind-seeking stop criteria`**, pushed to `origin/master`
+  (HEAD = origin/master = `bf02971`). Scope: `crates/service/src/gpu_power_sweep.rs` only.
+- **Why**: v1's first supervised hardware run was safety/mechanics **PASS** but semantic **PARTIAL** — v1
+  bound on the **first/start bin (1075 mV)**, so every viable target stopped immediately, no descent occurred,
+  frontier stayed degenerate (single-bin ~1075 mV / ~199 W, Forge confidence ~0.21).
+- **v2**: start bin NOT bind-eligible (earliest bind = 2nd probed real VF bin); clock binding uses the
+  **average/achieved clock** (`avg - target <= 30`), not p5/sustained (p5 = telemetry only); regime arm
+  `power_capped_frac <= 0.5` kept but **invalid/missing cap_frac fails closed**. New `BindReason`/`BindDecision`
+  + per-probe bind telemetry (eligible / bound / reason / avg_clock_mhz / p5_clock_mhz / power_capped_frac);
+  dry-run reports the start-bin-not-eligible caveat.
+- **Precedence preserved**: crash → abort → budget drain → verifier failure → dwell instability → binding →
+  per-target cap → floor. **Safety unchanged**: monotone writer, verifier gates, Safe Loop, `reset_to_stock`,
+  persistence/apply, hardware-floor derivation, warm-start default OFF.
+- **Validation (no hardware)**: `cargo check` clean; `cargo test -p nidavellir-service` **169 passed**;
+  dry-run only passed; no hardware boundary crossed.
+- **Hardware validation NOT yet run for `bf02971`** → next: separate dry-run + supervised confirmed run
+  (proposed `--confirm --max-targets 7 --max-probes 21 --max-probes-per-target 3 --safe-start-cap 1075
+  --bind-seeking`; do not auto-run).
+
+## 2026-06-14 — bind-seeking F1b v1 IMPLEMENTED + pushed (commit 08f745e), hardware-validated PARTIAL → superseded by v2
 - **Commit `08f745e feat(service): add opt-in bind-seeking to build-frontier`**, pushed to `origin/master`
   (HEAD = origin/master = `08f745e`). Scope: `crates/service/src/gpu_power_sweep.rs` +
   `crates/service/src/main.rs` only. Builds the bind-seeking direction from the `5248758` run.
