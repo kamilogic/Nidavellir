@@ -8,7 +8,33 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-15) — FIRST confirmed hardware validation of bind-seeking F1b v2 strictness (commit bf02971) — mechanism PASS, frontier PARTIAL
+## Latest (2026-06-15) — build-frontier / F1b algorithm audit — verdict SIMPLIFY (read-only, pre-implementation)
+- **Read-only audit** of `crates/service/src/gpu_power_sweep.rs` + continuity docs. **No code/tests/hardware/
+  `--confirm`/VF-write/stress/power-sweep** run. Recorded BEFORE implementation to set the next patch's north
+  star. Full rationale: `decisions.md` (top) + `handoff.md` (Latest backend checkpoint).
+- **Verdict: SIMPLIFY CURRENT DIRECTION** — not a redesign, not a full rollback. Don't run more hardware before
+  the next pure/pure-ish patch; don't keep adding bind-seeking complexity. The discovery → descent → synthesis
+  skeleton is still valid; the drift is concentrated in **bind-seeking / `BoundBinding`** semantics.
+- **Bind-seeking conclusion**: `BoundBinding` is the wrong combined abstraction — a **bad Clock arm**
+  (false-binds under power cap) + a **useful Regime arm** (`pcf <= 0.5`). The v2 start-bin guard was useful +
+  validated but did NOT fix physical frontier collapse: the confirmed v2 run (`bf02971`) stayed power-limited
+  (`power_capped_frac=1.000`, ~199 W, ~1798–1819 MHz, confidence 0.21, profiles collapsed). ⇒ remaining issue =
+  **regime/power-bound collapse, not scheduler depth or per-target probe count.**
+- **Decision**: retire/neutralize the Clock arm; keep the regime signal as **`LeftPowerRegime`**; add a
+  first-class **`PowerBound`/`PowerBoundCollapse`** classification; strengthen `synthesize_forge_profiles` to
+  detect the pcf-saturated plateau (today it keys on exact-distinct clocks, so jittery ~1800 MHz reads as
+  "differentiated" and the warning never fires) and emit *"power-bound collapse — cannot build a differentiated
+  VF frontier under this workload/regime."* Power-limited samples = valid bracket, **not** useful clock-frontier
+  diversity; raw synthesis input but filtered out of differentiated selection; primary collapse signal.
+- **KEEP (load-bearing)**: hardware-derived floor; cluster selection / sane-core filtering; real-bin descent;
+  per-target cap; typed hard/soft stops; confidence gate + best-effort fallback; monotone writer; verifier
+  gates; Safe Loop; `reset_to_stock`; no persistence during build-frontier.
+- **Non-goals / hardware**: pure-ish patch in `gpu_power_sweep.rs` + synthetic-sample tests only; no hardware
+  run, no power-limit/TDP/clock-lock changes, no target-gen redesign yet, no warm-start/per-target-cap/safety
+  changes, no version bump. **Hardware BLOCKED** until the classification + collapse report land and a fresh
+  dry-run shows them.
+
+## (2026-06-15) — FIRST confirmed hardware validation of bind-seeking F1b v2 strictness (commit bf02971) — mechanism PASS, frontier PARTIAL
 - Supervised confirmed run (operator present) validating `bf02971`; docs at `3b8774c`
   (HEAD/origin/master = `3b8774c`, tree clean). A **fresh worktree binary was built first** — the
   worktree-local `target/debug/nidavellir-service.exe` was absent and the only existing binary was stale

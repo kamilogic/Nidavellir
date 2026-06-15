@@ -2,6 +2,75 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## build-frontier / F1b algorithm audit — verdict SIMPLIFY (2026-06-15, read-only, pre-implementation)
+- **Decision**: record the conclusion of a read-only algorithm audit of the F1b build-frontier curve
+  exploration BEFORE writing any code, so the next patch has a clear north star. **No code, no tests, no
+  hardware, no `--confirm` were run** for this audit — inspection of `crates/service/src/gpu_power_sweep.rs`
+  and the continuity docs only. Verdict: **SIMPLIFY CURRENT DIRECTION** (not a redesign, not a full rollback).
+- **North star reaffirmed** (the intended simple dwell-descent the code should keep implementing):
+  1. find the relevant max core clock / top sustainable target;
+  2. start at the max safe voltage / safe VF ceiling;
+  3. dwell trying to hold the target core clock;
+  4. descend the real VF voltage bins while sustainable;
+  5. stop each target on an **explicit stop reason** — unstable, verifier failure, crash/abort/budget drain,
+     voltage floor, per-target cap, **or power-bound regime/collapse**;
+  6. move to the next lower target; 7. build a real stable frontier;
+  8. synthesize Godforge / Brokkr's Best / Deep Calm **only from meaningful (non-power-bound) frontier data**.
+- **The skeleton is still valid.** Discovery → descent → synthesis matches the north star. The drift is
+  concentrated in **bind-seeking / `BoundBinding`** semantics.
+- **Load-bearing — KEEP (do not touch)**: hardware-derived floor; cluster selection / sane-core VF filtering
+  (`derive_core_seed`, `select_core_cluster`, `sane_core_points`); real-bin descent (`derive_descent`,
+  `descend_target`); per-target probe cap; the typed hard/soft stops (`SoftUnverified`/`SoftUnstable`/
+  `HardFailure`/`Aborted`/`BudgetExhausted`/`CleanFloor`/`PerTargetCap` — they gate B2 fallback, carry-forward
+  eligibility, and abort); the confidence gate + best-effort fallback structure in `synthesize_forge_profiles`;
+  monotone static-base writer; verifier gates; Safe Loop; `reset_to_stock`; no profile persistence/knowledge
+  write during build-frontier.
+- **Conclusion on bind-seeking**: `BoundBinding` is the **wrong combined abstraction**. It mixes (a) a **bad
+  Clock arm** that *false-binds* under power cap — on a power-pinned card the cap, not the voltage descent,
+  sets the achieved clock, so "avg clock within 30 MHz of target" is an illusion — with (b) a **useful Regime
+  arm** (`power_capped_frac <= 0.5`) that legitimately indicates the card left power-limited behavior. The v2
+  start-bin guard was useful and validated (it killed the v1 start-bin false bind) but it did **not** solve the
+  physical frontier collapse.
+- **Evidence (confirmed v2 hardware run, commit `bf02971`, 2026-06-15)**: all dwells stayed power-limited —
+  `power_capped_frac=1.000`, ~199 W flat, achieved clocks ~1798–1819 MHz, synthesis confidence 0.21, profiles
+  collapsed to one ~1800 MHz / 199 W point. The Clock arm bound (`reason=Clock`); the Regime arm never fired
+  (pcf saturated). Therefore the remaining issue is **regime / power-bound collapse, not scheduler depth and
+  not per-target probe count** (1755 descended deeper to 1062 mV and still produced ~1811 MHz / 199 W).
+- **Decisions to act on (next patch)**:
+  - Stop treating a `Clock` bind as sufficient evidence of useful VF-bound behavior when `power_capped_frac`
+    is saturated; **retire or neutralize bind-seeking's Clock arm** (vetoing it under pcf saturation is the
+    minimal step; deleting it — and with it `bind_eligible`, the overshoot threshold, and the v1/v2 split — is
+    the simpler/cleaner one).
+  - **Keep the useful regime signal**, reclassified as something honest like **`LeftPowerRegime`** (a clean,
+    informative early stop: the descent reached a voltage where the card is no longer power-pinned — a real VF
+    point).
+  - Add a first-class **`PowerBound` / `PowerLimitedPlateau` / `PowerBoundCollapse`** classification (north-star
+    stop 5e, currently unnamed).
+  - **Strengthen `synthesize_forge_profiles`**: power-bound samples are **valid raw brackets but NOT useful
+    clock-frontier diversity**. Today the collapse detector keys on exact-distinct clocks, so a jittery
+    ~1798–1819 MHz plateau reads as ~6 "distinct" clocks and the warning never fires — synthesis silently emits
+    a falsely-differentiated frontier even with bind-seeking OFF. Re-key collapse detection on **pcf
+    saturation** and emit an explicit diagnostic: *"power-bound collapse — cannot build a differentiated VF
+    frontier under this workload/regime."*
+- **Power-limited sample treatment**: valid bracket = **yes**; useful clock-frontier point = **no** when
+  `power_capped_frac` is saturated; synthesis = **raw input yes, but excluded from differentiated profile
+  selection**; collapse diagnostic = **yes, the primary signal**. Mark, don't discard (the point already
+  carries `power_capped_frac`, and it remains a valid warm-start seed).
+- **Next safest patch (pure / mostly pure, `crates/service/src/gpu_power_sweep.rs`)**: add/rename the stop
+  classifications (`VoltageFloor`, `DepthCap`, `LeftPowerRegime`, `Unstable`, `VerifyFailed`, `Crashed`,
+  `Aborted`, `BudgetDrained`, `PowerBound`/`PowerBoundCollapse`); strengthen `synthesize_forge_profiles`
+  (detect the pcf-saturated plateau, don't treat jittery ~1800 MHz clocks as a real differentiated frontier,
+  emit the explicit diagnostic); add unit tests over synthetic samples; **do not touch the hardware-writing
+  path.** Optionally add read-only power-headroom telemetry.
+- **Explicit non-goals**: no confirmed hardware run; no power-limit/TDP changes; no clock-lock changes; no
+  target-generation redesign yet; no warm-start default change; no per-target cap change; no Safe Loop / reset
+  / writer / verifier changes; no profile persistence / knowledge write change; no version bump.
+- **Hardware**: **blocked** until the power-bound classification + collapse report land and a fresh dry-run
+  shows the new diagnostics. Re-running the proven-uninformative config is not justified. See `handoff.md`
+  (continuity) and `memory.md` (index).
+- **Scope of this entry**: docs/continuity only (`decisions.md`, `handoff.md`, `memory.md`). No code/test/
+  hardware command was run.
+
 ## bind-seeking F1b v2 strictness — FIRST confirmed hardware validation (commit bf02971) — mechanism PASS, frontier PARTIAL
 - **Validation (2026-06-15)**: `bf02971 fix(service): tighten bind-seeking stop criteria` was confirmed on
   real hardware by a supervised run — operator present; docs at `3b8774c` (HEAD/origin/master = `3b8774c`,
