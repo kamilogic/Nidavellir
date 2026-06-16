@@ -8,7 +8,25 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-15) — F1c power-bound knee-seeking two-phase prototype IMPLEMENTED (commit 0ef4e68) — pure, no hardware
+## Latest (2026-06-16) — F1c follow-up: Phase B continues BELOW Phase-A floor (commit 9f35ec0) — pure, no hardware
+- **What**: budget-efficiency fix for F1c Phase B (dry-run-review finding). Phase B now CONTINUES below the
+  deepest bin Phase A already explored for the focused target, instead of re-probing the inert top bins.
+  File: `crates/service/src/gpu_power_sweep.rs` only. Pure: no hardware, no `--confirm`.
+- **Why**: fine VF curve (~6–7 mV/bin) — `0ef4e68` Phase B re-started from the cap, so `--phase-b-probes 12`
+  reached only ~1006 mV (re-covered 1075/1068/1062), ~75 mV above the ~930 mV knee. Now each probe is a new,
+  deeper bin.
+- **How**: pure helpers `phase_a_deepest_bin` (focus target's deepest retained Phase-A bin) +
+  `phase_b_start_below` (highest real bin strictly below it) → Phase-B start. Fallbacks: no Phase-A history
+  → safe-start cap; Phase A at the floor → Phase B skipped cleanly. Dry-run plan gains a `knee start` line.
+- **Unchanged**: Phase A, `descend_phase_b`, synthesis, safety chain (writer/verifier/Safe Loop/
+  reset_to_stock/floor/cluster/persistence/power-limit/clock-lock); opt-in / default OFF; global
+  `--max-probes` master cap.
+- **Validation**: `cargo check` clean; `cargo test -p nidavellir-service` **195 / 0** (5 new). No hardware.
+- **Hardware STILL BLOCKED**. Next: NEW dry-run-only review of the improved plan. Budget sizing still the
+  operator's call (~20+ Phase-B probes to cross a ~930 mV knee from a ~1062 mV floor); default budget
+  unchanged (12). Detail in `decisions.md` / `handoff.md` (top entries).
+
+## Checkpoint (2026-06-15) — F1c power-bound knee-seeking two-phase prototype IMPLEMENTED (commit 0ef4e68) — pure, no hardware
 - **What landed**: OPT-IN (default OFF) two-phase power-bound knee-seeking for `build-frontier` — the
   design-audit direction `NEED DEEPER POWER-BOUND DESCENT`. Files: `crates/service/src/gpu_power_sweep.rs`
   + `crates/service/src/main.rs` (2 CLI flags). Pure: no hardware, no `--confirm`, no dry-run, no VF write.

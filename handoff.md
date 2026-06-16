@@ -1,9 +1,31 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-15, `master` (clean, latest commit
-`0ef4e68`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+How to pick this up cold. State as of 2026-06-16, `master` (clean, latest commit
+`9f35ec0`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-15) — F1c power-bound knee-seeking two-phase prototype IMPLEMENTED (commit 0ef4e68) — pure, no hardware
+## Latest backend checkpoint (2026-06-16) — F1c follow-up: Phase B continues BELOW Phase-A floor (commit 9f35ec0) — pure, no hardware
+- **What landed**: a budget-efficiency fix for F1c Phase B, acting on the dry-run-only review finding.
+  Phase B now CONTINUES below the deepest bin Phase A already explored for the focused target instead of
+  re-probing the inert top bins. Files: `crates/service/src/gpu_power_sweep.rs` only (no `main.rs` / no new
+  flag). Pure: no hardware, no `--confirm`.
+- **Why**: on this card's fine VF curve (~6–7 mV/bin), the `0ef4e68` Phase B re-started from the cap, so
+  `--phase-b-probes 12` reached only ~1006 mV — re-covering Phase A's 1075/1068/1062 and stopping ~75 mV
+  above the ~930 mV knee. Now each Phase-B probe lands on a new, deeper bin.
+- **How**: two pure helpers in the orchestrator — `phase_a_deepest_bin` (focus target's deepest retained
+  Phase-A bin) + `phase_b_start_below` (highest real bin strictly below it). Fallbacks: no Phase-A history
+  for the target → safe-start cap; Phase A already at the floor → Phase B skipped cleanly. Dry-run plan adds
+  a `knee start` line.
+- **Unchanged**: Phase A, `descend_phase_b`, synthesis, safety chain (writer/verifier/Safe Loop/
+  `reset_to_stock`/floor/cluster/persistence/power-limit/clock-lock); opt-in / default OFF; global
+  `--max-probes` master cap.
+- **Validation**: `cargo check` clean (0 warnings); `cargo test -p nidavellir-service` **195 passed / 0
+  failed** (5 new). No hardware.
+- **Hardware STILL BLOCKED**. Next: a NEW dry-run-only review confirming the improved plan (`knee start`
+  line, deeper reach). Budget sizing remains the operator's call (~20+ Phase-B probes to cross a ~930 mV
+  knee from a ~1062 mV Phase-A floor); this patch makes each probe count, default budget unchanged (12).
+  Non-goals unchanged. Detail in `decisions.md` (top entry).
+
+## Backend checkpoint (2026-06-15) — F1c power-bound knee-seeking two-phase prototype IMPLEMENTED (commit 0ef4e68) — pure, no hardware
 - **What landed**: an OPT-IN (default OFF) two-phase knee-seeking mode for `build-frontier`, the
   design-audit direction `NEED DEEPER POWER-BOUND DESCENT`. Phase A = the existing single-pass descent
   (byte-for-byte unchanged when OFF; extracted into `run_target_descents`). Phase B (only after a Phase-A

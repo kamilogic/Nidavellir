@@ -2,6 +2,34 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1c follow-up — Phase B continues BELOW Phase-A floor (commit 9f35ec0, 2026-06-16) — pure, no hardware
+- **Decision (2026-06-16)**: act on the dry-run-only review finding. The `0ef4e68` Phase B re-started from
+  the cap, so on this card's fine-grained VF curve (~6–7 mV/bin) `--phase-b-probes 12` reached only
+  ~1006 mV — it re-probed the inert top bins Phase A already covered (1075/1068/1062) and stopped ~75 mV
+  ABOVE the estimated ~930 mV knee. Commit `9f35ec0 fix(service): start power-bound phase b below phase a
+  bins`. Scope: `crates/service/src/gpu_power_sweep.rs` (+ in-file tests). Pure — no hardware.
+- **What changed**: Phase B now CONTINUES below the deepest bin Phase A retained for the focused target.
+  Two pure helpers — `phase_a_deepest_bin(frontier, target)` (the target's deepest retained Phase-A VF bin;
+  in the collapse trigger every Phase-A probe is stable so this equals the deepest probed) and
+  `phase_b_start_below(descent, floor)` (the highest REAL bin strictly below it) — pick the Phase-B start so
+  every probe lands on a new, deeper real bin. Fallbacks: no retained Phase-A point for the target (not
+  probed / dropped) → safe-start cap; Phase A already at the hardware floor → Phase B skipped cleanly (no
+  deeper bin, no unbounded behavior). Dry-run plan adds a `knee start` line.
+- **Unchanged**: Phase A, `descend_phase_b` (its contract is unchanged — only the start voltage the
+  orchestrator passes it changed), `synthesize_forge_profiles`, the whole safety chain (monotone writer,
+  verifier, Safe Loop, `reset_to_stock`, floor/cluster, persistence, power-limit/TDP/clock-lock). Feature
+  stays opt-in / default OFF; global `--max-probes` remains the master cap; no new CLI flag.
+- **Validation (no hardware)**: `cargo check -p nidavellir-service` clean (0 warnings); `cargo test`
+  **195 passed / 0 failed** (5 new: `phase_a_deepest_bin`, `phase_b_start_below`, start-below-floor
+  integration with probe instrumentation, no-history safe-start fallback, floor-reached clean skip; existing
+  collapse test updated — knee now at index 3 since the inert top bins are skipped).
+- **Hardware: STILL BLOCKED.** Next step is a NEW dry-run-only review confirming the improved plan output
+  (the `knee start` line + a deeper effective reach), before any confirmed validation. Note: budget SIZING
+  is still the operator's call — with ~6–7 mV bins, crossing a ~930 mV knee from a ~1062 mV Phase-A floor
+  needs ~20+ Phase-B probes; this patch makes each probe count, it does not change the default budget (12).
+- **Non-goals (unchanged)**: no power-limit/TDP, no clock-lock, no safety-chain change, no persistence/apply,
+  no same-config confirmed rerun.
+
 ## F1c power-bound knee-seeking — two-phase prototype IMPLEMENTED (commit 0ef4e68, 2026-06-15) — pure, no hardware
 - **Decision (2026-06-15)**: implement the design-audit direction `NEED DEEPER POWER-BOUND DESCENT` as an
   OPT-IN two-phase knee-seeking prototype. Commit `0ef4e68 feat(service): add power-bound knee-seeking
