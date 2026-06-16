@@ -1252,6 +1252,29 @@ fn detect_power_bound_knee(trajectory: &[(PowerSweepPoint, f64)]) -> Option<usiz
     None
 }
 
+/// The deepest (lowest-mV) VF bin Phase A retained a stable frontier point at for `target` — the
+/// bottom of what Phase A already covered for it. `None` when Phase A kept no point for it (target not
+/// probed, or dropped without a stable bin). In the power-bound-collapse case that gates Phase B every
+/// Phase-A probe was stable, so this is the deepest bin Phase A actually probed for that target. Pure.
+#[cfg(windows)]
+fn phase_a_deepest_bin(frontier: &[(PowerSweepPoint, f64)], target: u32) -> Option<u32> {
+    frontier
+        .iter()
+        .filter(|(p, _)| p.target_clock_mhz == Some(target))
+        .filter_map(|(p, _)| p.vf_table_voltage_mv)
+        .min()
+}
+
+/// The Phase-B descent start when CONTINUING below Phase A: the highest real VF bin STRICTLY below
+/// `phase_a_floor_mv`, so Phase B descends only new, deeper bins instead of re-probing the inert top
+/// bins Phase A already covered (the budget-efficiency fix on fine-grained VF curves). `None` when no
+/// lower real bin exists (Phase A already reached the hardware floor) — nothing deeper for Phase B to
+/// do. Only real curve bins are ever returned. Pure + testable; no hardware.
+#[cfg(windows)]
+fn phase_b_start_below(descent: &FrontierDescent, phase_a_floor_mv: u32) -> Option<u32> {
+    descent.bins_desc.iter().copied().filter(|&b| b < phase_a_floor_mv).max()
+}
+
 /// Synthesize the three forge profiles from a (multi-clock) power frontier — each entry
 /// a measured operating point plus its accumulated stability confidence (Wilson LB):
 /// - **Godforge**  = highest SUSTAINED clock (performance); ties → lowest power.
@@ -1909,6 +1932,9 @@ fn phase_b_plan_lines(knee_seeking: bool, budget: u32) -> Vec<String> {
         "knee budget        : global --max-probes stays the MASTER cap; --phase-b-probes only bounds \
          the focused descent depth"
             .to_string(),
+        "knee start         : Phase B CONTINUES below the focus target's deepest Phase-A bin (skips \
+         already-probed top bins; the budget is spent on new, deeper bins)"
+            .to_string(),
         "knee note          : Phase B is supervised hardware like Phase A — descends LOWER voltages \
          only; same verifier / Safe Loop / reset / hardware-floor envelope; no profile applied"
             .to_string(),
@@ -2353,7 +2379,39 @@ fn build_frontier_two_phase(
          (plateau ~{plateau_clock} MHz, budget {budget} probe(s))"
     ));
 
-    let traj = descend_phase_b(focus_target, carry.safe_start_cap_mv, descent, budget, &probe);
+    // Budget efficiency (F1c follow-up): CONTINUE the focused descent BELOW the deepest bin Phase A
+    // already explored for this target, rather than re-probing the inert top bins. On fine-grained VF
+    // curves this spends every Phase-B probe on new, deeper bins. No retained Phase-A point for the
+    // target (not probed / dropped) → fall back to the cap; Phase A already at the floor → nothing
+    // deeper, so Phase B returns cleanly.
+    let phase_b_start_mv = match phase_a_deepest_bin(&paired_a, focus_target) {
+        Some(floor) => match phase_b_start_below(descent, floor) {
+            Some(below) => {
+                log.push(format!(
+                    "PHASE-B: focus {focus_target} MHz explored to {floor} mV in Phase A → start Phase B \
+                     below, at {below} mV (skip already-probed bins)"
+                ));
+                below
+            }
+            None => {
+                log.push(format!(
+                    "PHASE-B: skipped — focus {focus_target} MHz already reached the hardware floor \
+                     ({floor} mV) in Phase A; no deeper real bin"
+                ));
+                return phase_a_only(paired_a, profiles_a, log);
+            }
+        },
+        None => {
+            log.push(format!(
+                "PHASE-B: focus {focus_target} MHz has no retained Phase-A point → start at \
+                 safe_start_cap {} mV (fallback)",
+                carry.safe_start_cap_mv
+            ));
+            carry.safe_start_cap_mv
+        }
+    };
+
+    let traj = descend_phase_b(focus_target, phase_b_start_mv, descent, budget, &probe);
     let knee_index = detect_power_bound_knee(&traj.points);
     for l in &traj.log {
         log.push(l.clone());
@@ -5368,7 +5426,8 @@ mod tests {
     fn two_phase_collapse_triggers_deep_descent_and_differentiates() {
         // The headline case. Phase A (shallow cap 3) only sees the inert top bins (1075/1050/1025 @
         // pcf 1.0) → power-bound collapse, exactly like the validated hardware run. Phase B (budget 12)
-        // descends the focused target PAST the knee → the merged frontier differentiates honestly.
+        // CONTINUES below Phase A's deepest bin (1025) — starting at 1000 — and descends PAST the knee →
+        // the merged frontier differentiates honestly.
         let d = step_descent(1075, 25, 800);
         let targets = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
         let two = build_frontier_two_phase(
@@ -5378,7 +5437,9 @@ mod tests {
         assert!(two.phase_b_ran, "collapse must trigger Phase B");
         assert_eq!(two.plateau_clock, Some(1810), "plateau = median power-bound clock");
         assert_eq!(two.focus_target, Some(1815), "lowest candidate >= plateau");
-        assert_eq!(two.knee_index, Some(6), "knee detected mid-descent");
+        // Phase B starts at 1000 (below Phase A's 1025 floor): trajectory 1000/975/950 (saturated) then
+        // 925 off-cap → knee at index 3 (vs index 6 if it had restarted from the 1075 cap).
+        assert_eq!(two.knee_index, Some(3), "knee detected after the skipped Phase-A bins");
         assert!(!two.result.profiles.power_bound_collapse, "deep descent de-collapsed the frontier");
         assert_eq!(
             two.result.profiles.godforge.map(|p| p.clock_mhz),
@@ -5387,6 +5448,105 @@ mod tests {
         );
         let useful = two.result.frontier.iter().filter(|p| !is_power_bound_point(p)).count();
         assert!(useful >= 2, "merged frontier carries the below-knee useful tail (got {useful})");
+    }
+
+    // ── F1c follow-up: Phase B continues below Phase A's explored floor (budget efficiency) ─────────
+    #[cfg(windows)]
+    #[test]
+    fn phase_a_deepest_bin_finds_focus_floor() {
+        // One retained point per target; its applied VF bin is the deepest Phase-A bin for that target.
+        let frontier = vec![
+            (probe_to_point(1935, 1025, &pb_sample(1810, 199.0, 1.0)), 0.21),
+            (probe_to_point(1815, 1025, &pb_sample(1810, 199.0, 1.0)), 0.21),
+        ];
+        assert_eq!(phase_a_deepest_bin(&frontier, 1815), Some(1025));
+        assert_eq!(phase_a_deepest_bin(&frontier, 1755), None, "target with no retained point");
+        assert_eq!(phase_a_deepest_bin(&[], 1815), None, "empty frontier");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_start_below_returns_next_lower_real_bin() {
+        let d = step_descent(1075, 25, 875); // bins 1075,1050,1025,1000,975,950,925,900,875
+        assert_eq!(phase_b_start_below(&d, 1025), Some(1000), "highest real bin strictly below 1025");
+        assert_eq!(phase_b_start_below(&d, 1000), Some(975));
+        assert_eq!(phase_b_start_below(&d, 875), None, "no real bin below the hardware floor");
+        assert_eq!(phase_b_start_below(&d, 1010), Some(1000), "a between-bins floor re-anchors to 1000");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_phase_phase_b_starts_below_phase_a_floor() {
+        use std::cell::RefCell;
+        // Instrument the probe to record every (target, bin). Phase A (cap 3) probes the focus target at
+        // 1075/1050/1025; Phase B must CONTINUE at 1000 and below — never re-probing the top bins.
+        let d = step_descent(1075, 25, 800);
+        let targets = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        let probed: RefCell<Vec<(u32, u32)>> = RefCell::new(Vec::new());
+        let probe = |t: u32, v: u32| {
+            probed.borrow_mut().push((t, v));
+            knee_probe(t, v)
+        };
+        let two = build_frontier_two_phase(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d),
+            Some(3), false, Some(12), probe,
+        );
+        assert!(two.phase_b_ran);
+        assert_eq!(two.focus_target, Some(1815));
+        let focus_bins: Vec<u32> =
+            probed.borrow().iter().filter(|(t, _)| *t == 1815).map(|(_, v)| *v).collect();
+        assert_eq!(
+            focus_bins,
+            vec![1075, 1050, 1025, 1000, 975, 950, 925, 900, 875, 850],
+            "Phase A probes 1075/1050/1025; Phase B continues at 1000↓ — no re-probe of the top bins",
+        );
+        let mut uniq = focus_bins.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), focus_bins.len(), "no Phase-A bin re-probed by Phase B");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_phase_phase_b_no_phase_a_history_uses_safe_start_fallback() {
+        // The focus target is UNSTABLE in Phase A (dropped, no retained point); the other targets are
+        // power-bound stable → collapse with a plateau, and the dropped target is the lowest candidate
+        // ≥ plateau. With no Phase-A history for it, Phase B falls back to the safe-start cap.
+        let d = step_descent(1075, 25, 800);
+        let targets = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        let probe = |t: u32, _v: u32| {
+            if t == 1815 { unstable_sample() } else { pb_sample(1810, 199.0, 1.0) }
+        };
+        let two = build_frontier_two_phase(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d),
+            Some(3), false, Some(12), probe,
+        );
+        assert_eq!(two.focus_target, Some(1815));
+        assert!(two.phase_b_ran, "Phase B still runs, from the fallback start");
+        assert!(
+            two.result.log.iter().any(|l| l.contains("no retained Phase-A point") && l.contains("fallback")),
+            "logs the safe-start fallback",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_phase_phase_b_skipped_when_phase_a_reached_floor() {
+        // Phase A FULL descent (no per-target cap) over an all-power-bound card: the focus target
+        // reaches the hardware floor in Phase A, so there is no deeper bin → Phase B is skipped cleanly
+        // and the honest collapse is preserved (no unbounded behavior).
+        let d = step_descent(1075, 25, 1000); // tiny: bins 1075,1050,1025,1000 (floor 1000)
+        let targets = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        let two = build_frontier_two_phase(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d),
+            None, false, Some(12), |_t: u32, _v: u32| pb_sample(1810, 199.0, 1.0),
+        );
+        assert!(!two.phase_b_ran, "no deeper bin below Phase A's floor → Phase B skipped");
+        assert!(two.result.profiles.power_bound_collapse, "honest collapse preserved");
+        assert!(
+            two.result.log.iter().any(|l| l.contains("already reached the hardware floor")),
+            "logs the no-deeper-bin skip",
+        );
     }
 
     #[cfg(windows)]
@@ -5467,6 +5627,7 @@ mod tests {
         assert!(on.iter().any(|l| l.contains("ENABLED")));
         assert!(on.iter().any(|l| l.contains("budget 12")));
         assert!(on.iter().any(|l| l.contains("--max-probes stays the MASTER cap")));
+        assert!(on.iter().any(|l| l.contains("CONTINUES below the focus target's deepest Phase-A bin")));
         assert!(on.iter().any(|l| l.contains("no profile applied")));
     }
 
