@@ -1,9 +1,30 @@
 # Nidavellir — Session Handoff
 
 How to pick this up cold. State as of 2026-06-16, `master` (clean, latest commit
-`9f35ec0`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+`8667bf0`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-16) — F1c follow-up: Phase B continues BELOW Phase-A floor (commit 9f35ec0) — pure, no hardware
+## Latest backend checkpoint (2026-06-16) — F1c follow-up: Phase B captures a bounded below-knee TAIL (commit 8667bf0) — pure, no hardware
+- **Why**: the FIRST confirmed knee-seeking run (2026-06-16, PASS-PARTIAL) found the real knee at **~1025 mV**
+  (Phase B started 1056 mV below the 1062 Phase-A floor, descended to 1025 where **pcf dropped 1.000→0.437 in
+  one 6 mV bin** — a steep knee). But Phase B stopped at that FIRST off-cap point → only **1** useful point →
+  synthesis correctly still reported `POWER-BOUND COLLAPSE`. Stop policy, not budget, was the limiter.
+- **What landed**: `descend_phase_b` now captures a BOUNDED below-knee tail. After the knee crossing (first
+  `pcf < POWER_BOUND_FRAC` point) it keeps descending until `PHASE_B_MIN_USEFUL_POINTS` (=2) useful off-cap
+  points OR `PHASE_B_POST_KNEE_TAIL_BINS` (=3) post-knee bins, then stops cleanly as new
+  `BracketStop::KneeTailComplete`. ≥ 2 useful → existing synthesis differentiates; 1 → honest collapse.
+- **Safety precedence preserved**: crash / abort / global drain / verifier failure / instability are checked
+  BEFORE the tail and stop immediately; floor / `--phase-b-probes` / global `--max-probes` still bound it.
+- **Confirmed-run safety (PASS)**: exit 0, no TDR/crash/reboot, `reset_to_stock` ran, no persist/apply
+  (`gpu_applied.json`/`boot_flag.json` absent; state files byte-identical), monotone writer `positive_offsets=0`.
+- **Unchanged**: Phase A, synthesis, bind-seeking, safety chain (writer/verifier/Safe Loop/reset_to_stock/
+  floor/cluster/persistence/power-limit/clock-lock); opt-in / default OFF; no new CLI flag.
+- **Files**: `crates/service/src/gpu_power_sweep.rs` only (BracketStop variant + 2 consts + `descend_phase_b`
+  tail loop + dry-run plan line + tests).
+- **Validation**: `cargo check` clean (0 warnings); `cargo test -p nidavellir-service` **203 / 0** (8 new).
+- **Hardware STILL BLOCKED**. Next: NEW dry-run-only review of the bounded-tail plan output, before any
+  further confirmed run. Non-goals unchanged. Detail in `decisions.md` (top entry).
+
+## Backend checkpoint (2026-06-16) — F1c follow-up: Phase B continues BELOW Phase-A floor (commit 9f35ec0) — pure, no hardware
 - **What landed**: a budget-efficiency fix for F1c Phase B, acting on the dry-run-only review finding.
   Phase B now CONTINUES below the deepest bin Phase A already explored for the focused target instead of
   re-probing the inert top bins. Files: `crates/service/src/gpu_power_sweep.rs` only (no `main.rs` / no new

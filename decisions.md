@@ -2,6 +2,40 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1c follow-up — Phase B captures a bounded below-knee TAIL (commit 8667bf0, 2026-06-16) — pure, no hardware
+- **Driver: FIRST confirmed knee-seeking hardware run (2026-06-16) — verdict PASS-PARTIAL.** Command
+  `build-frontier --confirm --max-targets 7 --max-probes 45 --max-probes-per-target 3 --safe-start-cap 1075
+  --bind-seeking --power-bound-knee-seeking --phase-b-probes 24`. Exit 0; no TDR/crash/reboot; `reset_to_stock`
+  ran; `gpu_applied.json`/`boot_flag.json` absent; state files byte-identical (safe_loop.json mtime-only);
+  monotone writer, `positive_offsets=0` throughout. Phase A collapsed (7 pts pcf 1.0, ~199 W); plateau 1785;
+  Phase B focus 1785, **started at 1056 mV (below the 1062 Phase-A floor — skipped 1075/1068/1062)**, descended
+  1056→1025, and at **1025 mV pcf dropped 1.000→0.437** (a STEEP knee, crossing 0.95 and 0.50 in one 6 mV bin)
+  → `LeftPowerRegime` fired. **Real knee ≈ 1025 mV** (~100 mV higher than the ~930 mV estimate; budget was NOT
+  the limiter — reached in 6 bins).
+- **Problem found:** Phase B stopped at the FIRST off-cap point, so only **1** useful point was captured →
+  synthesis still (correctly) reported `POWER-BOUND COLLAPSE`, Godforge/Brokkr's/Deep Calm best-effort/not
+  differentiated. The **stop policy**, not the budget, was the limiter.
+- **Decision (2026-06-16):** change `descend_phase_b` to capture a BOUNDED below-knee tail. After the knee
+  crossing (first `pcf < POWER_BOUND_FRAC` point — the synthesis off-cap definition), keep descending until
+  `PHASE_B_MIN_USEFUL_POINTS` (= `MIN_USEFUL_FRONTIER_POINTS` = 2) useful off-cap points OR
+  `PHASE_B_POST_KNEE_TAIL_BINS` (= 3) post-knee bins, then stop cleanly as new
+  `BracketStop::KneeTailComplete`. With ≥ 2 useful points the existing synthesis differentiates; with 1 it
+  keeps the honest collapse. Replaces the old first-off-cap (`pcf ≤ BIND_CAP_FRAC`) `LeftPowerRegime` stop in
+  Phase B (bind-seeking's `LeftPowerRegime` is unchanged).
+- **Safety precedence PRESERVED:** crash / abort / global drain / verifier failure / instability are checked
+  BEFORE the tail logic and stop immediately — the tail never descends through an unverified or unstable
+  probe; hardware floor / `--phase-b-probes` / global `--max-probes` still bound it.
+- **Unchanged:** Phase A, synthesis, bind-seeking, and the whole safety chain (monotone writer, verifier
+  gates, Safe Loop, `reset_to_stock`, floor/cluster selection, persistence/knowledge writes, power-limit/TDP/
+  clock-lock). Opt-in / default OFF; no new CLI flag. Dry-run plan states the bounded-tail policy.
+- **Validation (no hardware):** `cargo check -p nidavellir-service` clean (0 warnings); `cargo test`
+  **203 passed / 0 failed** (8 new: steep-knee captures a tail not one point; stop-at-enough-useful;
+  post-knee-bin bound; verifier-fail / instability / `--phase-b-probes` / global-`--max-probes` / floor each
+  stop the tail; 3 updated). No dry-run / `--confirm` / hardware.
+- **Hardware: STILL BLOCKED.** Next is a NEW dry-run-only review confirming the bounded-tail plan output,
+  before any further confirmed run. Non-goals unchanged: no power-limit/TDP, no clock-lock, no safety-chain
+  change, no persistence/apply, no same-config rerun.
+
 ## F1c follow-up — Phase B continues BELOW Phase-A floor (commit 9f35ec0, 2026-06-16) — pure, no hardware
 - **Decision (2026-06-16)**: act on the dry-run-only review finding. The `0ef4e68` Phase B re-started from
   the cap, so on this card's fine-grained VF curve (~6–7 mV/bin) `--phase-b-probes 12` reached only

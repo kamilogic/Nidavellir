@@ -8,7 +8,26 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-16) — F1c follow-up: Phase B continues BELOW Phase-A floor (commit 9f35ec0) — pure, no hardware
+## Latest (2026-06-16) — F1c follow-up: Phase B captures a bounded below-knee TAIL (commit 8667bf0) — pure, no hardware
+- **Driver**: FIRST confirmed knee-seeking run (2026-06-16) = **PASS-PARTIAL**. Found the real knee at
+  **~1025 mV** (Phase B started 1056 mV, below the 1062 Phase-A floor; pcf dropped **1.000→0.437 in one 6 mV
+  bin** — steep knee). Safety PASS (exit 0, no TDR/crash/reboot, reset_to_stock ran, no persist/apply, state
+  byte-identical, monotone writer positive_offsets=0). But Phase B stopped at the FIRST off-cap point → only
+  **1** useful point → synthesis correctly still `POWER-BOUND COLLAPSE`. Stop policy, not budget, was the limit.
+- **What landed**: `descend_phase_b` now captures a BOUNDED below-knee tail. After the knee crossing (first
+  `pcf < POWER_BOUND_FRAC` point) it keeps descending until `PHASE_B_MIN_USEFUL_POINTS` (=2) useful off-cap
+  points OR `PHASE_B_POST_KNEE_TAIL_BINS` (=3) post-knee bins, then stops cleanly as new
+  `BracketStop::KneeTailComplete`. ≥2 useful → existing synthesis differentiates; 1 → honest collapse.
+- **Safety precedence preserved**: crash/abort/global-drain/verifier-fail/instability are checked BEFORE the
+  tail and stop immediately; floor / `--phase-b-probes` / global `--max-probes` still bound it.
+- **Unchanged**: Phase A, synthesis, bind-seeking, safety chain (writer/verifier/Safe Loop/reset_to_stock/
+  floor/cluster/persistence/power-limit/clock-lock); opt-in / default OFF; no new CLI flag. File:
+  `crates/service/src/gpu_power_sweep.rs` only.
+- **Validation**: `cargo check` clean; `cargo test -p nidavellir-service` **203 / 0** (8 new). No hardware.
+- **Hardware STILL BLOCKED**. Next: NEW dry-run-only review of the bounded-tail plan. Detail in
+  `decisions.md` / `handoff.md` (top entries).
+
+## Checkpoint (2026-06-16) — F1c follow-up: Phase B continues BELOW Phase-A floor (commit 9f35ec0) — pure, no hardware
 - **What**: budget-efficiency fix for F1c Phase B (dry-run-review finding). Phase B now CONTINUES below the
   deepest bin Phase A already explored for the focused target, instead of re-probing the inert top bins.
   File: `crates/service/src/gpu_power_sweep.rs` only. Pure: no hardware, no `--confirm`.
