@@ -8,7 +8,36 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-15) — F1b power-bound collapse classification FIRST CONFIRMED HARDWARE VALIDATION (commit 0996769) — PASS
+## Latest (2026-06-15) — F1c power-bound knee-seeking two-phase prototype IMPLEMENTED (commit 0ef4e68) — pure, no hardware
+- **What landed**: OPT-IN (default OFF) two-phase power-bound knee-seeking for `build-frontier` — the
+  design-audit direction `NEED DEEPER POWER-BOUND DESCENT`. Files: `crates/service/src/gpu_power_sweep.rs`
+  + `crates/service/src/main.rs` (2 CLI flags). Pure: no hardware, no `--confirm`, no dry-run, no VF write.
+- **Why shallow collapse ≠ terminal**: the validated `0996769` run only walked the top ~13 mV (bins
+  `1075/1068/1062`), ~130 mV above the card's ~930 mV operating voltage, so the VF ceiling was INERT and
+  pcf stayed 1.000 — honest diagnostic for a SHALLOW descent, not proof no frontier exists.
+- **Phase A** = the existing broad/shallow single-pass descent, extracted VERBATIM into
+  `run_target_descents` → byte-for-byte unchanged when OFF. **Phase B** runs ONLY after a Phase-A
+  power-bound collapse AND the opt-in is set: `detect_plateau_clock` (median power-bound clock) →
+  `select_phase_b_target` (lowest candidate ≥ plateau) → `descend_phase_b` (deep descent on ONE focused
+  target through real VF bins, bounded budget, full trajectory) → `detect_power_bound_knee` (first pcf
+  crossing below 0.95). Merge + re-synthesize via existing `synthesize_forge_profiles`.
+- **Knee mental model**: above-knee `pcf ≥ 0.95` (ceiling inert — keep descending); knee = first pcf drop
+  < 0.95; clean deep stop at `pcf ≤ 0.50`; below-knee tail → Brokkr's/Deep Calm; Godforge = highest
+  sustained off-cap clock (knee region), NOT highest requested clock. No knee ⇒ honest `PowerBoundCollapse`
+  preserved.
+- **Flags**: `--power-bound-knee-seeking` (default OFF) + `--phase-b-probes N` (default None → 12).
+  Global `--max-probes` stays the MASTER cap; Phase-B budget only bounds the focused descent depth;
+  `--phase-b-probes 0` fails closed.
+- **Safety surfaces UNCHANGED**: VF (monotone static-base) writer, verifier gates, Safe Loop,
+  `reset_to_stock` (runs after every build, both paths), floor/cluster derivation, per-target cap,
+  warm-start default OFF, persistence/knowledge writes, power-limit/TDP/clock-lock.
+- **Validation**: `cargo check -p nidavellir-service` clean (0 warnings); `cargo test -p
+  nidavellir-service` **190 passed / 0 failed** (17 new). No hardware run.
+- **Hardware STILL BLOCKED.** Next: SEPARATE dry-run-only review of the new opt-in `--power-bound-knee-seeking`
+  plan output (no `--confirm`); no confirmed run until that review; no same-config rerun. Detail in
+  `decisions.md` / `handoff.md` (top entries).
+
+## Checkpoint (2026-06-15) — F1b power-bound collapse classification FIRST CONFIRMED HARDWARE VALIDATION (commit 0996769) — PASS
 - **One supervised confirmed run** validating `0996769` (docs `4880153`); HEAD = origin/master = `4880153`,
   tree clean; fresh worktree binary. Dry-run gate passed first. `build-frontier --confirm --max-targets 7
   --max-probes 21 --max-probes-per-target 3 --safe-start-cap 1075 --bind-seeking`. **Exit 0; ~5.7 min.**

@@ -1,9 +1,37 @@
 # Nidavellir — Session Handoff
 
 How to pick this up cold. State as of 2026-06-15, `master` (clean, latest commit
-`bf02971`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+`0ef4e68`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-15) — F1b power-bound collapse classification FIRST CONFIRMED HARDWARE VALIDATION (commit 0996769) — PASS
+## Latest backend checkpoint (2026-06-15) — F1c power-bound knee-seeking two-phase prototype IMPLEMENTED (commit 0ef4e68) — pure, no hardware
+- **What landed**: an OPT-IN (default OFF) two-phase knee-seeking mode for `build-frontier`, the
+  design-audit direction `NEED DEEPER POWER-BOUND DESCENT`. Phase A = the existing single-pass descent
+  (byte-for-byte unchanged when OFF; extracted into `run_target_descents`). Phase B (only after a Phase-A
+  power-bound collapse) detects the plateau (median power-bound clock), picks the lowest candidate target
+  ≥ plateau, and descends THAT target deeper to cross the knee, then merges + re-synthesizes via the
+  existing `synthesize_forge_profiles`. New CLI flags `--power-bound-knee-seeking` + `--phase-b-probes N`
+  (default None → 12). Global `--max-probes` stays the master cap.
+- **Why**: the validated `0996769` collapse only walked the top ~13 mV (bins `1075/1068/1062`), ~130 mV
+  above the card's operating voltage, so the VF ceiling was inert and pcf stayed 1.000 — an honest
+  diagnostic for a SHALLOW descent, not proof no frontier exists. Detail in `decisions.md` (top entry).
+- **Knee model**: above the knee `pcf >= 0.95` (ceiling inert — keep descending); knee = first pcf drop
+  below 0.95; clean deep stop at `pcf <= 0.50`; below-knee tail feeds Brokkr's / Deep Calm; Godforge =
+  highest sustained off-cap clock (the knee region), NOT the highest requested clock. No knee ⇒ the honest
+  `PowerBoundCollapse` is preserved.
+- **Files**: `crates/service/src/gpu_power_sweep.rs` (helpers + `descend_phase_b` +
+  `build_frontier_two_phase` + `FrontierLimits` fields + `validate_limits` + dry-run plan lines + wiring +
+  tests); `crates/service/src/main.rs` (2 CLI flags + parse test).
+- **Safety surfaces UNCHANGED** (diff audited): monotone writer, verifier gates, Safe Loop, `reset_to_stock`
+  (runs after every build, both paths), floor/cluster derivation, per-target cap, warm-start default OFF,
+  persistence/knowledge writes, power-limit / TDP / clock-lock.
+- **Validation**: `cargo check` clean (0 warnings); `cargo test -p nidavellir-service` **190 passed / 0
+  failed** (17 new). No dry-run / `--confirm` / hardware.
+- **Hardware STILL BLOCKED**. Next: a SEPARATE dry-run-only review of the Phase-B plan output (no
+  `--confirm`). A later confirmed run must be a bounded knee-seeking shape (one focused target descended
+  deep past ~930 mV), NOT a same-config rerun. Non-goals unchanged: no power-limit/TDP, no clock-lock, no
+  persistence/apply, no safety-chain change.
+
+## Backend checkpoint (2026-06-15) — F1b power-bound collapse classification FIRST CONFIRMED HARDWARE VALIDATION (commit 0996769) — PASS
 - **One supervised confirmed run** (operator present) validating `0996769`; HEAD = `origin/master` = `4880153`,
   tree clean; fresh worktree-local binary (built after `0996769`, not the stale main-repo target). Confirming
   dry-run gate passed first. Command: `build-frontier --confirm --max-targets 7 --max-probes 21

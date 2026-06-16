@@ -2,6 +2,53 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1c power-bound knee-seeking — two-phase prototype IMPLEMENTED (commit 0ef4e68, 2026-06-15) — pure, no hardware
+- **Decision (2026-06-15)**: implement the design-audit direction `NEED DEEPER POWER-BOUND DESCENT` as an
+  OPT-IN two-phase knee-seeking prototype. Commit `0ef4e68 feat(service): add power-bound knee-seeking
+  phase`. Scope: `crates/service/src/gpu_power_sweep.rs` (+ in-file tests) and two CLI flags in
+  `main.rs`. Pure change — no hardware, no `--confirm`, no dry-run, no VF write.
+- **Why the shallow collapse was NOT terminal proof**: the validated `0996769` run walked only the top
+  ~13 mV (first-pass bins `[1075, 1068, 1062]` under `--safe-start-cap 1075 --max-probes-per-target 3`) —
+  ~130 mV ABOVE the card's real operating voltage (~1810 MHz draws ~930 mV). `apply_vf_ceiling_monotone`
+  only caps bins at voltage ≥ ceiling_mv, so a 1062–1075 mV ceiling was physically INERT (clock pinned at
+  the cap regardless of target/bin: 1800@1068→1812, 1830@1062→1814). pcf stayed 1.000 because the descent
+  never reached the knee, NOT because no frontier exists. (The prior "not scheduler depth / not per-target
+  cap — 1755 went deeper to 1062" reading mistook 1062 mV — the 3rd bin — for "deep"; it is ~100 mV above
+  the knee.)
+- **What landed (opt-in, default OFF)**:
+  - **Phase A** = the existing single-pass `build_frontier` descent — extracted VERBATIM into
+    `run_target_descents` so the single-pass path is byte-for-byte unchanged (proven by the unchanged
+    `build_frontier` / per-target-cap / warm-start / bind-seeking tests).
+  - **Phase B** (only after a Phase-A power-bound collapse): `detect_plateau_clock` (median power-bound
+    clock), `select_phase_b_target` (lowest candidate ≥ plateau), `descend_phase_b` (deep descent on ONE
+    focused target, recording the FULL trajectory, descending THROUGH the knee and stopping cleanly at
+    `pcf ≤ BIND_CAP_FRAC` / budget / floor / failure), `detect_power_bound_knee` (first pcf crossing below
+    `POWER_BOUND_FRAC`). Merge Phase A + Phase B and re-synthesize via the EXISTING
+    `synthesize_forge_profiles`: a crossed knee differentiates (Godforge = highest sustained off-cap clock);
+    no knee preserves the honest `PowerBoundCollapse`.
+  - **Flags**: `--power-bound-knee-seeking` (valueless, default OFF) + `--phase-b-probes N` (default None →
+    `FRONTIER_PHASE_B_PROBES = 12`). Global `--max-probes` stays the MASTER cap; `--phase-b-probes` only
+    bounds the focused descent depth; `--phase-b-probes 0` fails closed. Dry-run plan prints the mode.
+- **Profile semantics (prototype)**: Godforge becomes the knee region (highest sustained off-cap clock),
+  NOT the highest requested clock; Brokkr's / Deep Calm come from the below-knee tail via the existing
+  policy. Full profile-policy refinement (knee-margin, multi-target tails) is deferred — documented in
+  comments/tests, not overfit here.
+- **Unchanged safety surfaces** (diff audited — no protected symbol modified): monotone static-base writer,
+  verifier gates, Safe Loop, `reset_to_stock` (still runs after every build, both paths), hardware-derived
+  floor / cluster selection, per-target cap, warm-start default OFF, profile persistence / knowledge writes,
+  power-limit / TDP / clock-lock.
+- **Validation (no hardware)**: `cargo check -p nidavellir-service` clean (0 warnings); `cargo test -p
+  nidavellir-service` **190 passed / 0 failed** (new F1c: plateau median, target selection + fallback, knee
+  transition/detection, Phase-B crosses-knee/budget-bounded/stays-saturated, two-phase OFF==single-pass,
+  collapse→differentiates, no-knee→honest-collapse, differentiated-skips-Phase-B, global-cap bounds both
+  phases, `--phase-b-probes` fail-closed, plan lines, CLI parse). No dry-run / `--confirm` / hardware.
+- **Hardware: STILL BLOCKED.** Next step is a SEPARATE dry-run-only review of the new Phase-B plan output
+  (no `--confirm`). A confirmed run is justified only after that review and must be a bounded knee-seeking
+  shape (one focused target descended deep past ~930 mV), NOT a same-config rerun of the known collapse.
+- **Non-goals (unchanged)**: no power-limit / TDP change; no clock-lock; no safety-chain removal; no
+  profile persistence/apply; no same-config confirmed rerun; no broad adaptive target regeneration yet.
+- **Scope**: code + tests in `gpu_power_sweep.rs`, CLI flags in `main.rs`. No version bump.
+
 ## F1b power-bound collapse classification — FIRST confirmed hardware validation (commit 0996769, 2026-06-15) — PASS
 - **Validation (2026-06-15)**: one supervised confirmed run of `0996769` (docs `4880153`), operator present;
   worktree HEAD = `origin/master` = `4880153`, tree clean. Fresh worktree-local binary (built after `0996769`,
