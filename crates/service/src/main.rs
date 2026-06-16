@@ -133,6 +133,20 @@ fn parse_frontier_limits(args: &[OsString]) -> Result<gpu_power_sweep::FrontierL
                 limits.bind_seeking = true;
                 i += 1;
             }
+            // Opt-in F1c power-bound knee-seeking (no value; default OFF): after a Phase-A power-bound
+            // collapse, run a focused Phase-B deep descent to find the VF knee.
+            "--power-bound-knee-seeking" => {
+                limits.power_bound_knee_seeking = true;
+                i += 1;
+            }
+            // Phase-B deep-descent budget (value; default None → built-in default when knee-seeking
+            // is on). Only bounds the focused descent depth; the global --max-probes stays the cap.
+            "--phase-b-probes" => {
+                let v = strs.get(i + 1).ok_or_else(|| "--phase-b-probes needs a value".to_string())?;
+                limits.phase_b_probes =
+                    Some(v.parse().map_err(|_| format!("--phase-b-probes: invalid number '{v}'"))?);
+                i += 2;
+            }
             _ => i += 1,
         }
     }
@@ -215,6 +229,26 @@ mod cli_tests {
         assert!(!l.warm_start_brackets); // bind-seeking does NOT enable warm-start
         assert_eq!(l.max_targets, Some(7));
         assert_eq!(l.max_probes_per_target, Some(3));
+    }
+
+    #[test]
+    fn parse_power_bound_knee_seeking_flags_opt_in() {
+        // Both default OFF/None; the flag is valueless, --phase-b-probes takes a number.
+        let def = super::parse_frontier_limits(&os(&["build-frontier"])).unwrap();
+        assert!(!def.power_bound_knee_seeking);
+        assert_eq!(def.phase_b_probes, None);
+        let l = super::parse_frontier_limits(&os(&[
+            "build-frontier", "--power-bound-knee-seeking", "--phase-b-probes", "12",
+            "--max-probes-per-target", "3",
+        ]))
+        .unwrap();
+        assert!(l.power_bound_knee_seeking);
+        assert_eq!(l.phase_b_probes, Some(12));
+        assert_eq!(l.max_probes_per_target, Some(3)); // Phase A cap unaffected
+        assert!(!l.bind_seeking); // independent of bind-seeking
+        // Missing / non-numeric value fails closed.
+        assert!(super::parse_frontier_limits(&os(&["build-frontier", "--phase-b-probes"])).is_err());
+        assert!(super::parse_frontier_limits(&os(&["build-frontier", "--phase-b-probes", "x"])).is_err());
     }
 
     #[test]

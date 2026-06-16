@@ -1150,6 +1150,108 @@ fn frontier_power_bound_collapse(frontier: &[(PowerSweepPoint, f64)]) -> bool {
         && useful_frontier_points(frontier).len() < MIN_USEFUL_FRONTIER_POINTS
 }
 
+// ── F1c: two-phase power-bound knee-seeking (pure helpers) ───────────────────────────────────────
+// Design audit (`decisions.md`, 2026-06-15): a Phase-A `PowerBoundCollapse` is an HONEST diagnostic
+// for a SHALLOW descent, NOT proof that no VF frontier exists. The validated collapse run only walked
+// the top ~13 mV (bins 1075/1068/1062) — ~130 mV ABOVE the card's real operating voltage — so the VF
+// ceiling never bit (`apply_vf_ceiling_monotone` only caps bins at voltage ≥ ceiling_mv) and every
+// dwell stayed pcf-saturated. A power-bound descent has three voltage regions: ABOVE the knee (ceiling
+// inert, pcf≈1.0, clock pinned by the power cap — no frontier info); AT the knee (the lowest ceiling
+// that still sustains the power-limited clock — candidate Godforge); BELOW the knee (ceiling controls
+// clock/power, pcf drops — the useful Brokkr's / Deep Calm efficiency tail). These pure helpers let an
+// OPT-IN Phase B aim a focused deeper descent at the knee. No hardware, no scheduler state.
+
+/// Minimum power-bound points before `detect_plateau_clock` will report a plateau — a single
+/// saturated dwell is not a plateau. Mirrors `MIN_USEFUL_FRONTIER_POINTS` on the saturated side.
+#[cfg(windows)]
+const MIN_PLATEAU_POINTS: usize = 2;
+
+/// Robust representative of the power-limited plateau clock: the MEDIAN sustained clock among the
+/// power-bound points. Median (not exact-distinct) is robust to the jittery saturated plateau
+/// (e.g. 1798/1811/1819 MHz @ pcf≈1.0 — which exact-distinct detection mis-reads as 3 real clocks).
+/// `None` unless at least `MIN_PLATEAU_POINTS` power-bound points with a positive clock exist: without
+/// a real plateau there is nothing for a focused Phase-B descent to aim at. Pure + testable.
+#[cfg(windows)]
+fn detect_plateau_clock(frontier: &[(PowerSweepPoint, f64)]) -> Option<u32> {
+    let mut clocks: Vec<u32> = frontier
+        .iter()
+        .filter(|(p, _)| is_power_bound_point(p))
+        .map(|(p, _)| p.p5_clock_mhz.unwrap_or(p.clock_mhz))
+        .filter(|&c| c > 0)
+        .collect();
+    if clocks.len() < MIN_PLATEAU_POINTS {
+        return None;
+    }
+    clocks.sort_unstable();
+    Some(clocks[clocks.len() / 2])
+}
+
+/// Pick the focused Phase-B target for a detected `plateau_clock`: the LOWEST candidate clock still
+/// ≥ the plateau, so the clock cap never binds BELOW the plateau — we want the VOLTAGE ceiling, not the
+/// target, to be the binding constraint as the descent crosses the knee — without wasting effort on
+/// clearly-unreachable higher targets. If no candidate reaches the plateau, fall back to the nearest
+/// candidate. Pure + testable; no hardware.
+#[cfg(windows)]
+fn select_phase_b_target(candidates: &[u32], plateau_clock: u32) -> Option<u32> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|&c| c >= plateau_clock)
+        .min()
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .min_by_key(|&c| (c as i64 - plateau_clock as i64).abs())
+        })
+}
+
+/// One step of a descending-voltage trajectory, classified purely from the power-cap fraction.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KneeTransition {
+    /// Still power-bound (`pcf >= POWER_BOUND_FRAC`): the ceiling has not bitten — keep descending.
+    AboveKnee,
+    /// Just crossed the knee: the previous point was power-bound (or absent) and this one LEFT
+    /// saturation (`pcf < POWER_BOUND_FRAC`). The first below-knee point.
+    KneeCrossed,
+    /// Both the previous and current points are off the plateau: the below-knee efficiency tail.
+    BelowKneeTail,
+}
+
+/// Classify one descending step from the previous/current power-cap fraction. A missing/invalid
+/// previous pcf is treated as "above the knee" (a descent starts saturated), so the FIRST off-cap
+/// point reads as `KneeCrossed`. Reuses the shared `is_power_bound_frac` threshold so the knee and the
+/// synthesis power-bound exclusion always agree. Pure + testable.
+#[cfg(windows)]
+fn classify_knee_transition(prev_pcf: Option<f32>, cur_pcf: f32) -> KneeTransition {
+    let cur_bound = is_power_bound_frac(cur_pcf);
+    let prev_bound = prev_pcf.map_or(true, is_power_bound_frac);
+    if cur_bound {
+        KneeTransition::AboveKnee
+    } else if prev_bound {
+        KneeTransition::KneeCrossed
+    } else {
+        KneeTransition::BelowKneeTail
+    }
+}
+
+/// Find the knee in a descending-voltage trajectory: the index of the FIRST point that LEAVES power-
+/// cap saturation (`KneeCrossed`). `None` means the descent stayed power-bound throughout — no knee was
+/// reached (too shallow / still above the operating voltage), so synthesis must NOT differentiate and
+/// the honest `PowerBoundCollapse` stands. Pure + testable; no hardware.
+#[cfg(windows)]
+fn detect_power_bound_knee(trajectory: &[(PowerSweepPoint, f64)]) -> Option<usize> {
+    let mut prev_pcf: Option<f32> = None;
+    for (i, (p, _)) in trajectory.iter().enumerate() {
+        if classify_knee_transition(prev_pcf, p.power_capped_frac) == KneeTransition::KneeCrossed {
+            return Some(i);
+        }
+        prev_pcf = Some(p.power_capped_frac);
+    }
+    None
+}
+
 /// Synthesize the three forge profiles from a (multi-clock) power frontier — each entry
 /// a measured operating point plus its accumulated stability confidence (Wilson LB):
 /// - **Godforge**  = highest SUSTAINED clock (performance); ties → lowest power.
@@ -1781,6 +1883,38 @@ fn bind_seeking_plan_lines(bind_seeking: bool) -> Vec<String> {
     out
 }
 
+/// Dry-run reporting lines for F1c power-bound knee-seeking (pure → unit-testable without hardware).
+/// OFF → a single line that does NOT imply a Phase B runs. ON → the mode line, the plateau/knee
+/// thresholds, the bounded deep budget, and the same-safety-envelope caveat (Phase B is supervised
+/// hardware exactly like Phase A: it only descends to LOWER voltages, under the same verifier / Safe
+/// Loop / reset / hardware-floor chain, and applies no profile). The live dry-run prints these verbatim.
+#[cfg(windows)]
+fn phase_b_plan_lines(knee_seeking: bool, budget: u32) -> Vec<String> {
+    if !knee_seeking {
+        return vec![
+            "knee-seeking       : off — single-pass frontier (Phase A only; legacy behavior)"
+                .to_string(),
+        ];
+    }
+    vec![
+        format!(
+            "knee-seeking       : ENABLED (opt-in) — on a Phase-A power-bound collapse, run a focused \
+             Phase-B deep descent (budget {budget} probe(s)) to cross the knee"
+        ),
+        format!(
+            "knee thresholds    : plateau = median power-bound clock; knee = pcf crosses below {:.2}; \
+             clean deep stop at pcf <= {:.2}",
+            POWER_BOUND_FRAC, BIND_CAP_FRAC
+        ),
+        "knee budget        : global --max-probes stays the MASTER cap; --phase-b-probes only bounds \
+         the focused descent depth"
+            .to_string(),
+        "knee note          : Phase B is supervised hardware like Phase A — descends LOWER voltages \
+         only; same verifier / Safe Loop / reset / hardware-floor envelope; no profile applied"
+            .to_string(),
+    ]
+}
+
 /// Run ONE target's voltage descent from `start_mv` and capture its bracket. Mirrors the legacy
 /// inner loop exactly (same probe sequence, same deepest-stable selection); additionally records
 /// the verified floor, first failure below it, and the stop reason. The drain/crash signals on
@@ -1939,6 +2073,31 @@ fn build_frontier(
     bind_seeking: bool,
     probe: impl Fn(u32, u32) -> ProbeSample,
 ) -> FrontierBuildResult {
+    let (paired, log) =
+        run_target_descents(candidate_clocks, descent, carry, max_per_target, bind_seeking, &probe);
+    let profiles = synthesize_forge_profiles(&paired, policy);
+    FrontierBuildResult {
+        frontier: paired.into_iter().map(|(p, _)| p).collect(),
+        profiles,
+        log,
+    }
+}
+
+/// Phase-A core: run every candidate target's bounded warm-start descent and collect the
+/// `(point, confidence)` pairs plus the per-target decision log. Extracted VERBATIM from the original
+/// `build_frontier` body so the single-pass path is byte-for-byte unchanged; the F1c two-phase
+/// orchestrator reuses it (and the dropped confidence) for Phase A. Pure — the closure is the only
+/// seam to (future) hardware.
+#[cfg(windows)]
+#[allow(dead_code)] // wired to the real measurement closure in Phase 2B
+fn run_target_descents(
+    candidate_clocks: &[u32],
+    descent: &FrontierDescent,
+    carry: &BracketCarryConfig,
+    max_per_target: Option<u32>,
+    bind_seeking: bool,
+    probe: &impl Fn(u32, u32) -> ProbeSample,
+) -> (Vec<(PowerSweepPoint, f64)>, Vec<String>) {
     let mut paired: Vec<(PowerSweepPoint, f64)> = Vec::new();
     let mut log = Vec::new();
     let mut prev: Option<TargetBracket> = None;
@@ -1946,7 +2105,7 @@ fn build_frontier(
     for &target in candidate_clocks {
         let decision = warm_start_mv(prev.as_ref(), carry);
         let (mut bracket, mut point) =
-            descend_target(target, decision.start_mv, descent, max_per_target, bind_seeking, &probe);
+            descend_target(target, decision.start_mv, descent, max_per_target, bind_seeking, probe);
         bracket.warm_started = decision.warm_started;
         bracket.bracket_source_target = decision.source_target;
         bracket.bracket_reuse_start_mv = decision.warm_started.then_some(decision.start_mv);
@@ -1965,7 +2124,7 @@ fn build_frontier(
             ));
             let warm_probes = bracket.probes_used;
             let (mut fb, fb_point) =
-                descend_target(target, carry.safe_start_cap_mv, descent, max_per_target, bind_seeking, &probe);
+                descend_target(target, carry.safe_start_cap_mv, descent, max_per_target, bind_seeking, probe);
             fb.bracket_source_target = decision.source_target;
             fb.fell_back_to_cap = true;
             fb.probes_used = fb.probes_used.saturating_add(warm_probes);
@@ -2004,11 +2163,231 @@ fn build_frontier(
         prev = Some(bracket);
     }
 
-    let profiles = synthesize_forge_profiles(&paired, policy);
-    FrontierBuildResult {
-        frontier: paired.into_iter().map(|(p, _)| p).collect(),
-        profiles,
-        log,
+    (paired, log)
+}
+
+/// One Phase-B deep knee-seeking descent: every verified + dwell-stable bin probed for the focused
+/// target, in descending-voltage order, plus where/why it stopped. Pure scheduler data — no hardware,
+/// no product naming. Unlike `descend_target` (which keeps only the deepest stable point), Phase B
+/// keeps the FULL trajectory so the knee (the pcf transition) can be detected.
+#[cfg(windows)]
+#[allow(dead_code)] // wired to the real measurement closure in Phase 2B
+struct PhaseBTrajectory {
+    points: Vec<(PowerSweepPoint, f64)>,
+    stop_reason: BracketStop,
+    probes_used: u32,
+    log: Vec<String>,
+}
+
+/// Run ONE focused target's DEEP voltage descent, recording every verified + dwell-stable bin so the
+/// knee can be detected from the pcf trajectory. Mirrors `descend_target`'s stop precedence exactly
+/// (crash → abort → budget drain → verifier failure → dwell instability), and descends THROUGH the
+/// knee (a pcf drop below `POWER_BOUND_FRAC` is recorded, not a stop) so the below-knee efficiency
+/// tail is captured; it stops CLEANLY only once the card is clearly off the cap (left the power-limited
+/// regime, `pcf <= BIND_CAP_FRAC`), at the per-target `budget`, or at the hardware floor. The global
+/// `--max-probes` (enforced by the probe closure via `budget_drained`) remains the master cap. Pure;
+/// the closure is the only seam to hardware. Never writes the VF curve / runs stress itself.
+#[cfg(windows)]
+#[allow(dead_code)] // wired to the real measurement closure in Phase 2B
+fn descend_phase_b(
+    target: u32,
+    start_mv: u32,
+    descent: &FrontierDescent,
+    budget: u32,
+    probe: &impl Fn(u32, u32) -> ProbeSample,
+) -> PhaseBTrajectory {
+    let mut points: Vec<(PowerSweepPoint, f64)> = Vec::new();
+    let mut probes_used = 0u32;
+    let mut log = Vec::new();
+
+    // Snap the start UP to the lowest real bin ≥ `start_mv` (same conservative re-anchor the apply
+    // uses), then walk strictly down through every lower real bin. Only real curve bins are probed.
+    let Some(start_bin) = descent
+        .bins_desc
+        .iter()
+        .copied()
+        .filter(|&b| b >= start_mv)
+        .min()
+        .or_else(|| descent.bins_desc.first().copied())
+    else {
+        log.push("phase-b descent: empty bin domain — fail closed (no hardware)".to_string());
+        return PhaseBTrajectory {
+            points,
+            stop_reason: BracketStop::SoftUnverified,
+            probes_used,
+            log,
+        };
+    };
+
+    let mut stop_reason = BracketStop::CleanFloor;
+    for &v in descent.bins_desc.iter().filter(|&&b| b <= start_bin) {
+        if probes_used >= budget {
+            stop_reason = BracketStop::PerTargetCap;
+            break;
+        }
+        let s = probe(target, v);
+        probes_used += 1;
+        // Drain / hard-failure first — same precedence as `descend_target`; never a verify failure.
+        if s.crashed {
+            stop_reason = BracketStop::HardFailure;
+            break;
+        }
+        if s.aborted {
+            stop_reason = BracketStop::Aborted;
+            break;
+        }
+        if s.budget_drained {
+            stop_reason = BracketStop::BudgetExhausted;
+            break;
+        }
+        if !s.curve_verified {
+            stop_reason = BracketStop::SoftUnverified;
+            break;
+        }
+        match s.outcome {
+            ProbeOutcome::Stable => {
+                points.push((probe_to_point(target, v, &s), s.confidence));
+                // Descend THROUGH the knee (pcf crossing POWER_BOUND_FRAC is recorded, not a stop) to
+                // build the below-knee tail; stop CLEANLY only once clearly off the cap.
+                if matches!(valid_cap_frac(s.power_capped_frac), Some(f) if f <= BIND_CAP_FRAC) {
+                    stop_reason = BracketStop::LeftPowerRegime;
+                    break;
+                }
+            }
+            ProbeOutcome::Unstable => {
+                stop_reason = BracketStop::SoftUnstable;
+                break;
+            }
+        }
+    }
+    log.push(format!(
+        "phase-b descent: target={target} start_bin={start_bin} mV probes_used={probes_used} \
+         stable_points={} stop={stop_reason:?}",
+        points.len()
+    ));
+    PhaseBTrajectory { points, stop_reason, probes_used, log }
+}
+
+/// Result of a two-phase (F1c) frontier build. `result` is the same `FrontierBuildResult` the live run
+/// consumes (so reporting is unchanged); the rest is Phase-B telemetry for tests/logging.
+#[cfg(windows)]
+#[allow(dead_code)] // fields are diagnostic / test-facing
+struct TwoPhaseFrontier {
+    result: FrontierBuildResult,
+    phase_b_ran: bool,
+    plateau_clock: Option<u32>,
+    focus_target: Option<u32>,
+    knee_index: Option<usize>,
+    phase_b_points: usize,
+    phase_b_probes_used: u32,
+}
+
+/// Two-phase power-bound knee-seeking frontier build (F1c, opt-in). **Phase A** is the existing
+/// single-pass `build_frontier` descent (broad, shallow). When `phase_b_budget` is `None`, OR Phase A
+/// already produced a differentiated frontier, the result is byte-for-byte the `build_frontier`
+/// output. Otherwise — Phase A collapsed power-bound AND a budget is given — **Phase B** detects the
+/// plateau, selects ONE focused target near/above it, and descends that target DEEPER (recording the
+/// full trajectory) to cross the knee. Phase A + Phase B points are merged and re-synthesized by the
+/// SAME `synthesize_forge_profiles`: if Phase B crossed the knee, the now-present below-knee useful
+/// points let it differentiate (Godforge = highest sustained off-cap clock = the knee region); if
+/// Phase B never left saturation, the merge stays collapsed and the honest `PowerBoundCollapse` stands.
+/// Pure — the closure is the only seam to hardware; never writes the VF curve / runs stress itself.
+#[cfg(windows)]
+#[allow(dead_code)] // wired to the real measurement closure in Phase 2B
+fn build_frontier_two_phase(
+    candidate_clocks: &[u32],
+    descent: &FrontierDescent,
+    policy: &ForgePolicy,
+    carry: &BracketCarryConfig,
+    max_per_target: Option<u32>,
+    bind_seeking: bool,
+    phase_b_budget: Option<u32>,
+    probe: impl Fn(u32, u32) -> ProbeSample,
+) -> TwoPhaseFrontier {
+    let (paired_a, mut log) =
+        run_target_descents(candidate_clocks, descent, carry, max_per_target, bind_seeking, &probe);
+    let profiles_a = synthesize_forge_profiles(&paired_a, policy);
+
+    // Build a Phase-A-only result identical to `build_frontier`'s output (no Phase B ran).
+    let phase_a_only =
+        |paired: Vec<(PowerSweepPoint, f64)>, profiles: ForgeProfiles, log: Vec<String>| TwoPhaseFrontier {
+            result: FrontierBuildResult {
+                frontier: paired.into_iter().map(|(p, _)| p).collect(),
+                profiles,
+                log,
+            },
+            phase_b_ran: false,
+            plateau_clock: None,
+            focus_target: None,
+            knee_index: None,
+            phase_b_points: 0,
+            phase_b_probes_used: 0,
+        };
+
+    // OFF → byte-for-byte single-pass (build_frontier) behavior.
+    let Some(budget) = phase_b_budget else {
+        return phase_a_only(paired_a, profiles_a, log);
+    };
+    // Phase A already differentiated → nothing for Phase B to do.
+    if !profiles_a.power_bound_collapse {
+        log.push(
+            "PHASE-B: skipped — Phase A produced a differentiated frontier (no power-bound collapse)"
+                .to_string(),
+        );
+        return phase_a_only(paired_a, profiles_a, log);
+    }
+    // Collapse → knee-seek. Detect the plateau, pick a focused target, descend it deep.
+    let Some(plateau_clock) = detect_plateau_clock(&paired_a) else {
+        log.push(
+            "PHASE-B: skipped — collapse but no robust power-bound plateau (need >= 2 power-bound points)"
+                .to_string(),
+        );
+        return phase_a_only(paired_a, profiles_a, log);
+    };
+    let Some(focus_target) = select_phase_b_target(candidate_clocks, plateau_clock) else {
+        log.push(format!("PHASE-B: skipped — no candidate target for plateau ~{plateau_clock} MHz"));
+        return phase_a_only(paired_a, profiles_a, log);
+    };
+    log.push(format!(
+        "PHASE-B: power-bound collapse → deep knee-seeking descent target={focus_target} MHz \
+         (plateau ~{plateau_clock} MHz, budget {budget} probe(s))"
+    ));
+
+    let traj = descend_phase_b(focus_target, carry.safe_start_cap_mv, descent, budget, &probe);
+    let knee_index = detect_power_bound_knee(&traj.points);
+    for l in &traj.log {
+        log.push(l.clone());
+    }
+    log.push(format!(
+        "PHASE-B: target={focus_target} probes_used={} stop={:?} stable_points={} knee={}",
+        traj.probes_used,
+        traj.stop_reason,
+        traj.points.len(),
+        knee_index
+            .map(|i| format!("crossed@idx{i}"))
+            .unwrap_or_else(|| "not-found (still saturated — collapse stands)".to_string()),
+    ));
+
+    // Merge Phase A + Phase B points and re-synthesize. The existing synthesis EXCLUDES power-bound
+    // points and differentiates over the (now-present) below-knee useful tail; with no knee, the merge
+    // stays collapsed and the honest refusal is preserved.
+    let phase_b_points = traj.points.len();
+    let mut merged = paired_a;
+    merged.extend(traj.points);
+    let profiles_ab = synthesize_forge_profiles(&merged, policy);
+
+    TwoPhaseFrontier {
+        result: FrontierBuildResult {
+            frontier: merged.into_iter().map(|(p, _)| p).collect(),
+            profiles: profiles_ab,
+            log,
+        },
+        phase_b_ran: true,
+        plateau_clock: Some(plateau_clock),
+        focus_target: Some(focus_target),
+        knee_index,
+        phase_b_points,
+        phase_b_probes_used: traj.probes_used,
     }
 }
 
@@ -2142,6 +2521,13 @@ const FRONTIER_CLOCK_STEP_MHZ: u32 = 30;
 /// Deep Calm clock floor fraction for candidate clocks.
 #[cfg(windows)]
 const FRONTIER_FLOOR_FRAC: f64 = 0.90;
+/// Default Phase-B deep-descent budget (probes on the focused knee-seeking target) when
+/// `--power-bound-knee-seeking` is on and `--phase-b-probes` is unset. Bounded and conservative; the
+/// global `--max-probes` remains the master cap. ~4× the shallow `--max-probes-per-target 3` that
+/// confined the validated collapse run to the top ~13 mV — enough to descend past the operating-voltage
+/// knee on a power-bound card, still small.
+#[cfg(windows)]
+const FRONTIER_PHASE_B_PROBES: u32 = 12;
 
 // ── Phase 2B.2-b.3: graphics-core SANITY-DOMAIN guards ──────────────────────────────
 // NOT tuning targets — only safety guards to reject non-core / memory-domain / implausible
@@ -2189,6 +2575,17 @@ pub struct FrontierLimits {
     /// the current per-target-cap / depth-first behavior exactly. The global `max_probes` and the
     /// per-target cap remain the bounding limits; binding can only stop a target EARLIER.
     pub bind_seeking: bool,
+    /// Opt-in (`--power-bound-knee-seeking`): F1c two-phase knee-seeking. When set, after a Phase-A
+    /// power-bound collapse the run does a focused Phase-B deep descent on one target near/above the
+    /// observed plateau to cross the knee (the lowest ceiling that still sustains the power-limited
+    /// clock) and capture the below-knee efficiency tail. Default `false` → single-pass behavior,
+    /// identical to the legacy frontier build.
+    pub power_bound_knee_seeking: bool,
+    /// Phase-B deep-descent budget (`--phase-b-probes`): max probes the focused knee-seeking descent
+    /// may spend. `None` with knee-seeking ON uses `FRONTIER_PHASE_B_PROBES`. The global `--max-probes`
+    /// (enforced by the probe closure) stays the master cap; this only bounds the focused descent's
+    /// depth — it can never raise the global ceiling. Default `None`.
+    pub phase_b_probes: Option<u32>,
 }
 
 /// Semantic validation of the limiter flags — FAIL CLOSED on absurd values. Pure + testable.
@@ -2202,6 +2599,9 @@ fn validate_limits(l: &FrontierLimits, lowest_safe_mv: u32) -> Result<(), String
     }
     if l.max_probes_per_target == Some(0) {
         return Err("--max-probes-per-target must be >= 1".into());
+    }
+    if l.phase_b_probes == Some(0) {
+        return Err("--phase-b-probes must be >= 1".into());
     }
     if let Some(cap) = l.safe_start_cap_mv {
         if cap <= lowest_safe_mv {
@@ -2792,6 +3192,12 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
     for line in bind_seeking_plan_lines(limits.bind_seeking) {
         println!("{line}");
     }
+    for line in phase_b_plan_lines(
+        limits.power_bound_knee_seeking,
+        limits.phase_b_probes.unwrap_or(FRONTIER_PHASE_B_PROBES),
+    ) {
+        println!("{line}");
+    }
     println!("targets (MHz)      : {:?}", plan.targets);
     println!(
         "voltage descent    : bin-based, {} real VF bins {} mV -> {} mV (hardware floor)",
@@ -2892,15 +3298,38 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         limits.warm_start_brackets,
         FRONTIER_WARM_START_MARGIN_STEPS,
     );
-    let result = build_frontier(
-        &targets,
-        &descent,
-        &policy,
-        &carry,
-        limits.max_probes_per_target,
-        limits.bind_seeking,
-        probe,
-    );
+    // F1c (opt-in): when `--power-bound-knee-seeking` is set, a Phase-A power-bound collapse triggers
+    // a focused Phase-B deep descent. OFF → the exact single-pass `build_frontier` call (unchanged).
+    let phase_b_budget = limits
+        .power_bound_knee_seeking
+        .then(|| limits.phase_b_probes.unwrap_or(FRONTIER_PHASE_B_PROBES));
+    let result = if let Some(budget) = phase_b_budget {
+        info!(
+            "build-frontier: power-bound knee-seeking ENABLED (opt-in) — Phase-B deep-descent budget \
+             {budget} probe(s); global --max-probes stays the master cap."
+        );
+        build_frontier_two_phase(
+            &targets,
+            &descent,
+            &policy,
+            &carry,
+            limits.max_probes_per_target,
+            limits.bind_seeking,
+            Some(budget),
+            probe,
+        )
+        .result
+    } else {
+        build_frontier(
+            &targets,
+            &descent,
+            &policy,
+            &carry,
+            limits.max_probes_per_target,
+            limits.bind_seeking,
+            probe,
+        )
+    };
 
     // ALWAYS restore stock after the run (success, partial, or abort). No profile is applied.
     reset_to_stock();
@@ -4763,6 +5192,282 @@ mod tests {
         assert_eq!(*probed.borrow(), vec![1075u32, 1050]); // bin N+1 (1025) never probed
         assert_eq!(bracket.lowest_verified_mv, Some(1050));
         assert_eq!(point.unwrap().0.vf_table_voltage_mv, Some(1050));
+    }
+
+    // ── F1c two-phase power-bound knee-seeking (pure) ────────────────────────────────────────────
+    /// A verified + dwell-stable probe with an explicit achieved clock / power / power-cap fraction.
+    /// p5 is pinned to `clock` (not `clock-5`) so plateau/knee test numbers are exact. Confidence is
+    /// the first-run 0.21 (synthesis drops its gate to best-effort — the realistic frontier case).
+    #[cfg(windows)]
+    fn pb_sample(clock: u32, power: f32, pcf: f32) -> ProbeSample {
+        let mut s = stable_sample(clock, power, 0.21);
+        s.p5_clock_mhz = Some(clock);
+        s.power_capped_frac = pcf;
+        s
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plateau_clock_is_median_of_power_bound_clocks() {
+        // The jittery saturated plateau (1798/1811/1819 @ pcf 1.0): median is robust where exact-
+        // distinct detection saw "3 clocks". A non-power-bound point is IGNORED for the plateau.
+        let frontier = vec![
+            (pb_fp(1819, 199.0, 1.0), 0.21),
+            (pb_fp(1798, 199.0, 1.0), 0.21),
+            (pb_fp(1811, 199.0, 1.0), 0.21),
+            (fp(1500, 120.0), 0.21), // off-cap → not part of the plateau
+        ];
+        assert_eq!(detect_plateau_clock(&frontier), Some(1811), "median of the power-bound clocks");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plateau_clock_none_without_enough_power_bound_points() {
+        // One power-bound point is not a plateau; zero power-bound points is not a plateau.
+        assert_eq!(detect_plateau_clock(&[(pb_fp(1810, 199.0, 1.0), 0.21)]), None);
+        assert_eq!(detect_plateau_clock(&[(fp(1830, 180.0), 0.95), (fp(1770, 150.0), 0.95)]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_target_is_lowest_candidate_at_or_above_plateau() {
+        let candidates = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        // Plateau ~1810 → lowest candidate >= 1810 is 1815 (not a wasted 1935, not a below-plateau 1785).
+        assert_eq!(select_phase_b_target(&candidates, 1810), Some(1815));
+        // Exact match returns itself.
+        assert_eq!(select_phase_b_target(&candidates, 1815), Some(1815));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_target_falls_back_to_nearest_when_all_below_plateau() {
+        let candidates = [1755u32, 1785, 1815];
+        // No candidate reaches a 1900 plateau → nearest (highest) candidate.
+        assert_eq!(select_phase_b_target(&candidates, 1900), Some(1815));
+        // Empty candidate set → None.
+        assert_eq!(select_phase_b_target(&[], 1810), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn knee_transition_classification() {
+        // No previous point → a descent starts saturated; the first off-cap point is the knee.
+        assert_eq!(classify_knee_transition(None, 1.0), KneeTransition::AboveKnee);
+        assert_eq!(classify_knee_transition(None, 0.90), KneeTransition::KneeCrossed);
+        // Still saturated (>= 0.95, incl. exactly at the threshold) → keep descending.
+        assert_eq!(classify_knee_transition(Some(1.0), 0.96), KneeTransition::AboveKnee);
+        assert_eq!(classify_knee_transition(Some(1.0), POWER_BOUND_FRAC), KneeTransition::AboveKnee);
+        // Saturated → off-cap is the knee crossing.
+        assert_eq!(classify_knee_transition(Some(1.0), 0.94), KneeTransition::KneeCrossed);
+        // Already off-cap → the below-knee efficiency tail.
+        assert_eq!(classify_knee_transition(Some(0.80), 0.60), KneeTransition::BelowKneeTail);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_knee_finds_first_pcf_crossing() {
+        // Descending trajectory: saturated, saturated, then leaves saturation at index 2.
+        let traj = vec![
+            (pb_fp(1810, 199.0, 1.0), 0.21),
+            (pb_fp(1810, 199.0, 0.98), 0.21),
+            (pb_fp(1790, 185.0, 0.85), 0.21), // knee here
+            (pb_fp(1760, 170.0, 0.60), 0.21),
+        ];
+        assert_eq!(detect_power_bound_knee(&traj), Some(2));
+        // Never leaves saturation → no knee (collapse stands).
+        let saturated = vec![
+            (pb_fp(1810, 199.0, 1.0), 0.21),
+            (pb_fp(1808, 199.0, 0.99), 0.21),
+            (pb_fp(1812, 199.0, 0.97), 0.21),
+        ];
+        assert_eq!(detect_power_bound_knee(&saturated), None);
+    }
+
+    /// The synthetic power-bound card used by the descent / two-phase tests: above the operating-
+    /// voltage knee (ceiling >= 950 mV) the ceiling is inert (pcf 1.0, clock pinned at the power cap);
+    /// below it the ceiling bites and pcf/clock/power fall — the below-knee efficiency tail.
+    #[cfg(windows)]
+    fn knee_probe(_target: u32, v: u32) -> ProbeSample {
+        if v >= 950 {
+            pb_sample(1810, 199.0, 1.0)
+        } else if v >= 925 {
+            pb_sample(1790, 185.0, 0.85)
+        } else if v >= 900 {
+            pb_sample(1760, 170.0, 0.70)
+        } else if v >= 875 {
+            pb_sample(1730, 158.0, 0.55)
+        } else {
+            pb_sample(1700, 150.0, 0.45)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_descent_crosses_knee_and_records_tail() {
+        // Deep descent from the cap (1075) over real bins down to 800; budget 12 (> the depth needed).
+        let d = step_descent(1075, 25, 800); // 1075,1050,...,800 = 12 bins
+        let traj = descend_phase_b(1815, 1075, &d, 12, &knee_probe);
+        // Descends THROUGH the 6 inert top bins (>= 950 @ pcf 1.0), past the knee (925 @ 0.85), and
+        // stops CLEANLY once clearly off the cap (850 @ 0.45 <= BIND_CAP_FRAC).
+        assert_eq!(traj.stop_reason, BracketStop::LeftPowerRegime);
+        assert_eq!(traj.points.len(), 10, "1075..850 inclusive");
+        assert_eq!(detect_power_bound_knee(&traj.points), Some(6), "first off-cap point is the 7th (925 mV)");
+        let useful = traj.points.iter().filter(|(p, _)| !is_power_bound_point(p)).count();
+        assert!(useful >= 2, "below-knee tail has >= 2 useful points (got {useful})");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_descent_budget_bounds_depth() {
+        // Budget 4 stops the descent before the knee (all 4 bins are above the operating voltage).
+        let d = step_descent(1075, 25, 800);
+        let traj = descend_phase_b(1815, 1075, &d, 4, &knee_probe);
+        assert_eq!(traj.probes_used, 4);
+        assert_eq!(traj.stop_reason, BracketStop::PerTargetCap);
+        assert_eq!(detect_power_bound_knee(&traj.points), None, "too shallow to reach the knee");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_descent_stays_saturated_reaches_floor_no_knee() {
+        // A card pinned at the cap across the WHOLE curve: descend to the floor, never a knee. This is
+        // the only legitimate "true collapse" — proven by reaching the hardware floor still saturated.
+        let d = step_descent(1075, 25, 800);
+        let traj = descend_phase_b(1815, 1075, &d, 99, &|_t: u32, _v: u32| pb_sample(1810, 199.0, 1.0));
+        assert_eq!(traj.stop_reason, BracketStop::CleanFloor);
+        assert_eq!(traj.points.len(), 12, "every bin probed to the floor");
+        assert_eq!(detect_power_bound_knee(&traj.points), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_phase_off_matches_single_pass_build_frontier() {
+        // OFF (phase_b_budget = None) must be byte-for-byte the single-pass build_frontier result.
+        let d = step_descent(1075, 25, 875);
+        let targets = [1830u32, 1800, 1770];
+        let probe = |t: u32, _v: u32| pb_sample(t, 180.0, 0.0); // off-cap, distinct clocks → differentiates
+        let single = build_frontier(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
+        let two = build_frontier_two_phase(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, None, probe,
+        );
+        assert!(!two.phase_b_ran, "Phase B never runs when the budget is None");
+        let f_single: Vec<u32> = single.frontier.iter().map(|p| p.clock_mhz).collect();
+        let f_two: Vec<u32> = two.result.frontier.iter().map(|p| p.clock_mhz).collect();
+        assert_eq!(f_single, f_two, "identical frontier");
+        assert_eq!(
+            single.profiles.godforge.map(|p| p.clock_mhz),
+            two.result.profiles.godforge.map(|p| p.clock_mhz),
+            "identical Godforge",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_phase_collapse_triggers_deep_descent_and_differentiates() {
+        // The headline case. Phase A (shallow cap 3) only sees the inert top bins (1075/1050/1025 @
+        // pcf 1.0) → power-bound collapse, exactly like the validated hardware run. Phase B (budget 12)
+        // descends the focused target PAST the knee → the merged frontier differentiates honestly.
+        let d = step_descent(1075, 25, 800);
+        let targets = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        let two = build_frontier_two_phase(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d),
+            Some(3), false, Some(12), knee_probe,
+        );
+        assert!(two.phase_b_ran, "collapse must trigger Phase B");
+        assert_eq!(two.plateau_clock, Some(1810), "plateau = median power-bound clock");
+        assert_eq!(two.focus_target, Some(1815), "lowest candidate >= plateau");
+        assert_eq!(two.knee_index, Some(6), "knee detected mid-descent");
+        assert!(!two.result.profiles.power_bound_collapse, "deep descent de-collapsed the frontier");
+        assert_eq!(
+            two.result.profiles.godforge.map(|p| p.clock_mhz),
+            Some(1790),
+            "Godforge = highest sustained off-cap (knee-region) clock, not the 1810 power-bound plateau",
+        );
+        let useful = two.result.frontier.iter().filter(|p| !is_power_bound_point(p)).count();
+        assert!(useful >= 2, "merged frontier carries the below-knee useful tail (got {useful})");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_phase_no_knee_keeps_honest_collapse() {
+        // Phase A collapses; Phase B descends to the floor but the card stays pinned at the cap → no
+        // knee → the merged frontier stays collapsed and the honest refusal is PRESERVED.
+        let d = step_descent(1075, 25, 800);
+        let targets = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        let two = build_frontier_two_phase(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d),
+            Some(3), false, Some(12), |_t: u32, _v: u32| pb_sample(1810, 199.0, 1.0),
+        );
+        assert!(two.phase_b_ran);
+        assert_eq!(two.knee_index, None, "never left saturation");
+        assert!(two.result.profiles.power_bound_collapse, "true collapse: honest refusal stands");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_phase_phase_a_differentiated_skips_phase_b() {
+        // Phase A already produces a differentiated frontier (off-cap, distinct clocks) → no Phase B.
+        let d = step_descent(1075, 25, 875);
+        let targets = [1830u32, 1800, 1770];
+        let two = build_frontier_two_phase(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d),
+            None, false, Some(12), |t: u32, _v: u32| pb_sample(t, 180.0, 0.0),
+        );
+        assert!(!two.phase_b_ran, "no collapse → Phase B is skipped");
+        assert!(!two.result.profiles.power_bound_collapse);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_phase_global_max_probes_bounds_total() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        // Global --max-probes (modeled in the closure, as the real run does) bounds Phase A + Phase B
+        // TOGETHER: the Phase-B budget can never raise the global ceiling.
+        let d = step_descent(1075, 25, 800);
+        let targets = [1935u32, 1905, 1875, 1845, 1815, 1785, 1755];
+        let calls = AtomicU32::new(0);
+        let executed = AtomicU32::new(0);
+        let max = 10u32;
+        let probe = |_t: u32, _v: u32| {
+            if calls.fetch_add(1, SeqCst) >= max {
+                return budget_sample();
+            }
+            executed.fetch_add(1, SeqCst);
+            pb_sample(1810, 199.0, 1.0) // always power-bound → Phase A collapses, Phase B descends
+        };
+        let _ = build_frontier_two_phase(
+            &targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d),
+            Some(3), false, Some(12), probe,
+        );
+        assert_eq!(executed.load(SeqCst), max, "global --max-probes stays the master cap across both phases");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_probes_zero_fails_closed() {
+        let floor = 875;
+        assert!(validate_limits(&FrontierLimits { phase_b_probes: Some(0), ..Default::default() }, floor).is_err());
+        assert!(validate_limits(&FrontierLimits { phase_b_probes: Some(1), ..Default::default() }, floor).is_ok());
+        // Default (None) is valid and means single-pass.
+        assert!(validate_limits(&FrontierLimits::default(), floor).is_ok());
+        assert!(!FrontierLimits::default().power_bound_knee_seeking, "knee-seeking is opt-in / default OFF");
+        assert_eq!(FrontierLimits::default().phase_b_probes, None, "no Phase-B budget by default");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_plan_lines_report_mode_and_thresholds() {
+        let off = phase_b_plan_lines(false, 12);
+        assert_eq!(off.len(), 1);
+        assert!(off[0].contains("off"));
+        assert!(!off[0].contains("ENABLED"));
+        let on = phase_b_plan_lines(true, 12);
+        assert!(on.iter().any(|l| l.contains("ENABLED")));
+        assert!(on.iter().any(|l| l.contains("budget 12")));
+        assert!(on.iter().any(|l| l.contains("--max-probes stays the MASTER cap")));
+        assert!(on.iter().any(|l| l.contains("no profile applied")));
     }
 
     // ── F1b bind-seeking (regime-only: eligibility + left-power-regime) ─────────────────────────
