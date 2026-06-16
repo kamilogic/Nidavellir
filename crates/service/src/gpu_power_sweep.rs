@@ -1613,6 +1613,14 @@ enum BracketStop {
     /// power-bound card it false-binds (the cap, not the descent, sets the clock), so leaving the
     /// power regime is now the only early-stop signal.
     LeftPowerRegime,
+    /// Phase-B knee-seeking captured a BOUNDED below-knee tail and stopped cleanly: after the knee
+    /// crossing (first `pcf < POWER_BOUND_FRAC` point) it kept descending until it had
+    /// `PHASE_B_MIN_USEFUL_POINTS` useful off-cap points OR spent `PHASE_B_POST_KNEE_TAIL_BINS`
+    /// post-knee bins. A CLEAN, intentional stop (no failure) — distinct from `LeftPowerRegime`
+    /// (bind-seeking's first-off-cap stop), the depth `PerTargetCap`, and the `CleanFloor`. Replaces
+    /// the old Phase-B first-off-cap stop, which truncated a steep knee to ONE useful point (confirmed
+    /// hardware run 2026-06-16: pcf 1.0 → 0.437 in one bin → single point → still collapse).
+    KneeTailComplete,
     /// Dwell instability (curve verified, but the dwell was not Stable) below the verified band.
     SoftUnstable,
     /// Ceiling did not verify/apply (LiveMismatch / overshoot_veto / monotone writer fail-closed).
@@ -1925,9 +1933,9 @@ fn phase_b_plan_lines(knee_seeking: bool, budget: u32) -> Vec<String> {
              Phase-B deep descent (budget {budget} probe(s)) to cross the knee"
         ),
         format!(
-            "knee thresholds    : plateau = median power-bound clock; knee = pcf crosses below {:.2}; \
-             clean deep stop at pcf <= {:.2}",
-            POWER_BOUND_FRAC, BIND_CAP_FRAC
+            "knee thresholds    : plateau = median power-bound clock; knee = pcf crosses below {:.2}, \
+             then capture a bounded below-knee tail (≥ {} useful points or ≤ {} post-knee bins)",
+            POWER_BOUND_FRAC, PHASE_B_MIN_USEFUL_POINTS, PHASE_B_POST_KNEE_TAIL_BINS
         ),
         "knee budget        : global --max-probes stays the MASTER cap; --phase-b-probes only bounds \
          the focused descent depth"
@@ -2205,14 +2213,31 @@ struct PhaseBTrajectory {
     log: Vec<String>,
 }
 
+/// Phase-B below-knee TAIL target: keep descending past the knee crossing until at least this many
+/// useful off-cap points are captured — the synthesis differentiation threshold, so a STEEP knee that
+/// drops pcf in a single bin still yields a differentiable frontier (confirmed-run 2026-06-16 fix).
+#[cfg(windows)]
+const PHASE_B_MIN_USEFUL_POINTS: usize = MIN_USEFUL_FRONTIER_POINTS;
+
+/// Hard bound on the Phase-B below-knee tail: at most this many verified + dwell-stable bins are probed
+/// AT or AFTER the knee crossing before the tail stops cleanly, even if the useful-point target is not
+/// met (e.g. a jittery plateau that bounces back on-cap). Keeps the tail short and bounded; the
+/// failure / instability / budget / floor stops always take precedence.
+#[cfg(windows)]
+const PHASE_B_POST_KNEE_TAIL_BINS: u32 = 3;
+
 /// Run ONE focused target's DEEP voltage descent, recording every verified + dwell-stable bin so the
 /// knee can be detected from the pcf trajectory. Mirrors `descend_target`'s stop precedence exactly
 /// (crash → abort → budget drain → verifier failure → dwell instability), and descends THROUGH the
-/// knee (a pcf drop below `POWER_BOUND_FRAC` is recorded, not a stop) so the below-knee efficiency
-/// tail is captured; it stops CLEANLY only once the card is clearly off the cap (left the power-limited
-/// regime, `pcf <= BIND_CAP_FRAC`), at the per-target `budget`, or at the hardware floor. The global
-/// `--max-probes` (enforced by the probe closure via `budget_drained`) remains the master cap. Pure;
-/// the closure is the only seam to hardware. Never writes the VF curve / runs stress itself.
+/// knee (the first `pcf < POWER_BOUND_FRAC` point) so the below-knee efficiency tail is captured.
+/// **Tail policy (steep-knee fix):** once the knee is crossed it keeps descending until it has
+/// `PHASE_B_MIN_USEFUL_POINTS` useful off-cap points OR has spent `PHASE_B_POST_KNEE_TAIL_BINS`
+/// post-knee bins, then stops CLEANLY as `KneeTailComplete` — instead of stopping at the FIRST off-cap
+/// point (which truncated a steep knee to one useful point → still collapse). Failure / instability /
+/// `budget` / floor stops are checked FIRST and always win, so the tail never descends through a
+/// verifier failure, instability, drain, or below the hardware floor. The global `--max-probes`
+/// (enforced by the probe closure via `budget_drained`) remains the master cap. Pure; the closure is
+/// the only seam to hardware. Never writes the VF curve / runs stress itself.
 #[cfg(windows)]
 #[allow(dead_code)] // wired to the real measurement closure in Phase 2B
 fn descend_phase_b(
@@ -2246,6 +2271,9 @@ fn descend_phase_b(
     };
 
     let mut stop_reason = BracketStop::CleanFloor;
+    let mut useful_offcap = 0usize; // off-cap (pcf < POWER_BOUND_FRAC) points captured so far
+    let mut knee_bin: Option<u32> = None; // bin where the knee was first crossed
+    let mut tail_bins = 0u32; // verified + stable bins probed AT or AFTER the knee crossing
     for &v in descent.bins_desc.iter().filter(|&&b| b <= start_bin) {
         if probes_used >= budget {
             stop_reason = BracketStop::PerTargetCap;
@@ -2253,7 +2281,8 @@ fn descend_phase_b(
         }
         let s = probe(target, v);
         probes_used += 1;
-        // Drain / hard-failure first — same precedence as `descend_target`; never a verify failure.
+        // Drain / hard-failure / verify / instability ALWAYS win first — same precedence as
+        // `descend_target`. The tail never continues through any of these.
         if s.crashed {
             stop_reason = BracketStop::HardFailure;
             break;
@@ -2272,12 +2301,29 @@ fn descend_phase_b(
         }
         match s.outcome {
             ProbeOutcome::Stable => {
-                points.push((probe_to_point(target, v, &s), s.confidence));
-                // Descend THROUGH the knee (pcf crossing POWER_BOUND_FRAC is recorded, not a stop) to
-                // build the below-knee tail; stop CLEANLY only once clearly off the cap.
-                if matches!(valid_cap_frac(s.power_capped_frac), Some(f) if f <= BIND_CAP_FRAC) {
-                    stop_reason = BracketStop::LeftPowerRegime;
-                    break;
+                let pt = probe_to_point(target, v, &s);
+                // "Useful" = off the power cap, matching the synthesis exclusion (`is_power_bound_point`,
+                // keyed on POWER_BOUND_FRAC) so Phase B and synthesis agree on what counts.
+                let off_cap = !is_power_bound_point(&pt);
+                points.push((pt, s.confidence));
+                if off_cap {
+                    useful_offcap += 1;
+                    if knee_bin.is_none() {
+                        knee_bin = Some(v); // first off-cap point = the knee crossing
+                    }
+                }
+                // Below-knee TAIL: once the knee is crossed keep capturing a BOUNDED tail — stop once
+                // there are enough useful points to differentiate, OR a small post-knee bin window is
+                // spent (a jittery plateau that never reaches the target). Reached only after the
+                // failure/drain/verify/instability arms above, so safety always takes precedence.
+                if knee_bin.is_some() {
+                    tail_bins += 1;
+                    if useful_offcap >= PHASE_B_MIN_USEFUL_POINTS
+                        || tail_bins >= PHASE_B_POST_KNEE_TAIL_BINS
+                    {
+                        stop_reason = BracketStop::KneeTailComplete;
+                        break;
+                    }
                 }
             }
             ProbeOutcome::Unstable => {
@@ -2288,8 +2334,9 @@ fn descend_phase_b(
     }
     log.push(format!(
         "phase-b descent: target={target} start_bin={start_bin} mV probes_used={probes_used} \
-         stable_points={} stop={stop_reason:?}",
-        points.len()
+         stable_points={} useful_offcap={useful_offcap} knee_bin={} stop={stop_reason:?}",
+        points.len(),
+        knee_bin.map(|b| b.to_string()).unwrap_or_else(|| "none".to_string())
     ));
     PhaseBTrajectory { points, stop_reason, probes_used, log }
 }
@@ -5365,13 +5412,14 @@ mod tests {
         // Deep descent from the cap (1075) over real bins down to 800; budget 12 (> the depth needed).
         let d = step_descent(1075, 25, 800); // 1075,1050,...,800 = 12 bins
         let traj = descend_phase_b(1815, 1075, &d, 12, &knee_probe);
-        // Descends THROUGH the 6 inert top bins (>= 950 @ pcf 1.0), past the knee (925 @ 0.85), and
-        // stops CLEANLY once clearly off the cap (850 @ 0.45 <= BIND_CAP_FRAC).
-        assert_eq!(traj.stop_reason, BracketStop::LeftPowerRegime);
-        assert_eq!(traj.points.len(), 10, "1075..850 inclusive");
+        // Descends THROUGH the 6 inert top bins (>= 950 @ pcf 1.0), crosses the knee (925 @ 0.85), and
+        // keeps the bounded tail until it has PHASE_B_MIN_USEFUL_POINTS off-cap points (925, 900) — then
+        // stops CLEANLY as KneeTailComplete (no longer at the first off-cap point).
+        assert_eq!(traj.stop_reason, BracketStop::KneeTailComplete);
+        assert_eq!(traj.points.len(), 8, "1075..900 inclusive (stops at the 2nd off-cap point)");
         assert_eq!(detect_power_bound_knee(&traj.points), Some(6), "first off-cap point is the 7th (925 mV)");
         let useful = traj.points.iter().filter(|(p, _)| !is_power_bound_point(p)).count();
-        assert!(useful >= 2, "below-knee tail has >= 2 useful points (got {useful})");
+        assert_eq!(useful, PHASE_B_MIN_USEFUL_POINTS, "captured exactly the differentiation threshold");
     }
 
     #[cfg(windows)]
@@ -5395,6 +5443,159 @@ mod tests {
         assert_eq!(traj.stop_reason, BracketStop::CleanFloor);
         assert_eq!(traj.points.len(), 12, "every bin probed to the floor");
         assert_eq!(detect_power_bound_knee(&traj.points), None);
+    }
+
+    // ── F1c follow-up: bounded below-knee tail (steep-knee fix, confirmed run 2026-06-16) ──────────
+    /// The confirmed-hardware knee shape: pcf pinned at 1.0 above the knee, then drops STEEPLY below
+    /// 0.5 in ONE bin (1.0 → 0.40 at 975 mV), and stays off-cap below. The old policy stopped at that
+    /// first off-cap point (1 useful → collapse); the tail policy must continue and capture more.
+    #[cfg(windows)]
+    fn steep_knee_probe(_t: u32, v: u32) -> ProbeSample {
+        if v >= 1000 {
+            pb_sample(1825, 199.0, 1.0)
+        } else if v == 975 {
+            pb_sample(1820, 190.0, 0.40) // knee: 1.0 → 0.40 in one bin (below BIND_CAP_FRAC, as on hardware)
+        } else {
+            pb_sample(1810, 182.0, 0.20) // below-knee tail
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_steep_knee_captures_tail_not_single_point() {
+        // The regression the confirmed run surfaced: a steep knee must NOT truncate to one useful point.
+        let d = step_descent(1050, 25, 900); // 1050,1025,1000,975,950,925,900
+        let traj = descend_phase_b(1785, 1050, &d, 12, &steep_knee_probe);
+        assert_eq!(traj.stop_reason, BracketStop::KneeTailComplete);
+        let useful = traj.points.iter().filter(|(p, _)| !is_power_bound_point(p)).count();
+        assert!(
+            useful >= MIN_USEFUL_FRONTIER_POINTS,
+            "captured a below-knee tail, not a single point (got {useful})",
+        );
+        assert_eq!(detect_power_bound_knee(&traj.points), Some(3), "knee at 975 mV (idx 3)");
+        // The first off-cap point (975) did NOT end the descent — it continued to 950.
+        assert!(traj.points.iter().any(|(p, _)| p.vf_table_voltage_mv == Some(950)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_tail_stops_when_enough_useful_points() {
+        // A clean knee: the tail stops as soon as it has PHASE_B_MIN_USEFUL_POINTS off-cap points and
+        // does NOT keep descending further.
+        let d = step_descent(1050, 25, 800);
+        let traj = descend_phase_b(1785, 1050, &d, 24, &steep_knee_probe);
+        assert_eq!(traj.stop_reason, BracketStop::KneeTailComplete);
+        let useful = traj.points.iter().filter(|(p, _)| !is_power_bound_point(p)).count();
+        assert_eq!(useful, PHASE_B_MIN_USEFUL_POINTS, "stops at the threshold, not deeper");
+        // Knee at 975, 2nd off-cap at 950 → stops there; 925 is never probed.
+        assert!(traj.points.iter().any(|(p, _)| p.vf_table_voltage_mv == Some(950)));
+        assert!(!traj.points.iter().any(|(p, _)| p.vf_table_voltage_mv == Some(925)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_tail_bounded_by_post_knee_bins() {
+        // A JITTERY plateau: only the knee bin (975) is off-cap; the next bins bounce BACK on-cap, so
+        // the useful target is never met — the tail must still stop at PHASE_B_POST_KNEE_TAIL_BINS.
+        let d = step_descent(1050, 25, 800); // 1050,1025,1000,975,950,925,900,...
+        let probe = |_t: u32, v: u32| {
+            if v == 975 { pb_sample(1800, 185.0, 0.80) } else { pb_sample(1810, 199.0, 1.0) }
+        };
+        let traj = descend_phase_b(1785, 1050, &d, 24, &probe);
+        assert_eq!(traj.stop_reason, BracketStop::KneeTailComplete);
+        let useful = traj.points.iter().filter(|(p, _)| !is_power_bound_point(p)).count();
+        assert_eq!(useful, 1, "jittery: only the knee bin was off-cap");
+        // Tail probed exactly PHASE_B_POST_KNEE_TAIL_BINS bins from the knee (975, 950, 925); not a 4th.
+        assert!(traj.points.iter().any(|(p, _)| p.vf_table_voltage_mv == Some(925)));
+        assert!(!traj.points.iter().any(|(p, _)| p.vf_table_voltage_mv == Some(900)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_verifier_failure_after_knee_stops_immediately() {
+        // After the knee (1 off-cap point), a verifier failure must STOP the tail at once — never
+        // descend through an unverified ceiling.
+        let d = step_descent(1050, 25, 800);
+        let probe = |_t: u32, v: u32| {
+            if v >= 1000 {
+                pb_sample(1810, 199.0, 1.0)
+            } else if v == 975 {
+                pb_sample(1800, 185.0, 0.80) // knee (off-cap, 1 useful)
+            } else {
+                unverified_probe() // 950 onward: ceiling won't verify
+            }
+        };
+        let traj = descend_phase_b(1785, 1050, &d, 24, &probe);
+        assert_eq!(traj.stop_reason, BracketStop::SoftUnverified, "verify failure wins over the tail");
+        let useful = traj.points.iter().filter(|(p, _)| !is_power_bound_point(p)).count();
+        assert_eq!(useful, 1, "only the knee point captured before the verify failure");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_instability_after_knee_stops_immediately() {
+        // After the knee, dwell instability must STOP the tail at once — never descend blindly.
+        let d = step_descent(1050, 25, 800);
+        let probe = |_t: u32, v: u32| {
+            if v >= 1000 {
+                pb_sample(1810, 199.0, 1.0)
+            } else if v == 975 {
+                pb_sample(1800, 185.0, 0.80)
+            } else {
+                unstable_sample() // verified, but the dwell is unstable
+            }
+        };
+        let traj = descend_phase_b(1785, 1050, &d, 24, &probe);
+        assert_eq!(traj.stop_reason, BracketStop::SoftUnstable, "instability wins over the tail");
+        let useful = traj.points.iter().filter(|(p, _)| !is_power_bound_point(p)).count();
+        assert_eq!(useful, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_budget_bounds_tail() {
+        // A small Phase-B budget caps total probes even mid-tail (before a 2nd useful point).
+        let d = step_descent(1050, 25, 800);
+        let probe = |_t: u32, v: u32| {
+            if v >= 1000 { pb_sample(1810, 199.0, 1.0) } else { pb_sample(1800, 185.0, 0.80) }
+        };
+        // budget 4: probes 1050/1025/1000 (on-cap) then 975 (knee, useful=1) → budget hit next iteration.
+        let traj = descend_phase_b(1785, 1050, &d, 4, &probe);
+        assert_eq!(traj.probes_used, 4);
+        assert_eq!(traj.stop_reason, BracketStop::PerTargetCap, "--phase-b-probes caps the tail");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_global_budget_bounds_tail() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        // The global --max-probes (modeled in the closure) drains the tail even with a big Phase-B budget.
+        let d = step_descent(1050, 25, 800);
+        let calls = AtomicU32::new(0);
+        let max = 4u32;
+        let probe = |_t: u32, v: u32| {
+            if calls.fetch_add(1, SeqCst) >= max {
+                return budget_sample();
+            }
+            if v >= 1000 { pb_sample(1810, 199.0, 1.0) } else { pb_sample(1800, 185.0, 0.80) }
+        };
+        let traj = descend_phase_b(1785, 1050, &d, 24, &probe);
+        assert_eq!(traj.stop_reason, BracketStop::BudgetExhausted, "global --max-probes drains the tail");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn phase_b_floor_bounds_tail() {
+        // The knee is the hardware-floor bin: only 1 off-cap point exists, so the tail can never reach
+        // the useful target and stops cleanly at the floor (never probes below it).
+        let d = step_descent(1050, 25, 1000); // bins 1050,1025,1000 (floor 1000)
+        let probe = |_t: u32, v: u32| {
+            if v >= 1025 { pb_sample(1810, 199.0, 1.0) } else { pb_sample(1800, 185.0, 0.80) }
+        };
+        let traj = descend_phase_b(1785, 1050, &d, 24, &probe);
+        assert_eq!(traj.stop_reason, BracketStop::CleanFloor, "the hardware floor bounds the tail");
+        let useful = traj.points.iter().filter(|(p, _)| !is_power_bound_point(p)).count();
+        assert_eq!(useful, 1, "only the floor bin was off-cap");
     }
 
     #[cfg(windows)]
@@ -5497,8 +5698,8 @@ mod tests {
             probed.borrow().iter().filter(|(t, _)| *t == 1815).map(|(_, v)| *v).collect();
         assert_eq!(
             focus_bins,
-            vec![1075, 1050, 1025, 1000, 975, 950, 925, 900, 875, 850],
-            "Phase A probes 1075/1050/1025; Phase B continues at 1000↓ — no re-probe of the top bins",
+            vec![1075, 1050, 1025, 1000, 975, 950, 925, 900],
+            "Phase A probes 1075/1050/1025; Phase B continues at 1000↓ and stops at the 2nd off-cap bin",
         );
         let mut uniq = focus_bins.clone();
         uniq.sort_unstable();
@@ -5628,6 +5829,7 @@ mod tests {
         assert!(on.iter().any(|l| l.contains("budget 12")));
         assert!(on.iter().any(|l| l.contains("--max-probes stays the MASTER cap")));
         assert!(on.iter().any(|l| l.contains("CONTINUES below the focus target's deepest Phase-A bin")));
+        assert!(on.iter().any(|l| l.contains("bounded below-knee tail")));
         assert!(on.iter().any(|l| l.contains("no profile applied")));
     }
 
