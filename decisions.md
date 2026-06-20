@@ -2,6 +2,50 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 true-undervolt foundation — first isolated planner/verifier/probe (2026-06-20) — pure, no hardware
+- **Direction**: begin F2 (true undervolt) as a SEPARATE, ISOLATED path from F1/build-frontier. F1's
+  `build-frontier` deliberately FLATTENS DOWN: `apply_vf_ceiling_monotone` refuses `desired_offset_mhz > 0`
+  and the flatten-down verifier treats any clock above target as an overshoot failure. True undervolt is the
+  opposite operation — it must RAISE a lower-voltage bin's clock (a bounded POSITIVE offset) so the target
+  clock holds at a lower voltage. Because positive offsets are safety-critical, F2 cannot reuse the F1 writer
+  or verifier; it gets its own bounded, fail-closed symbols. Read-only safety audit verdict was
+  `READY WITH REQUIRED SAFETY CHANGES`; this is the first of those changes.
+- **What landed (no hardware, dry-run-first)**:
+  - **gpu-nvapi** (`crates/gpu-nvapi/src/lib.rs`): pure `plan_bounded_positive_offset` + windows-gated
+    `apply_bounded_positive_offset`, with `PositiveOffsetPlan` / `PositiveOffsetLimits` and conservative
+    constants `POS_OFFSET_MAX_MHZ = +30` (absolute cap) and `POS_OFFSET_STEP_MAX_MHZ = +15` (per-step cap).
+    These are NEW symbols — `apply_vf_ceiling_monotone` and the F1 flatten-down path are UNCHANGED.
+  - **Verifier** (`crates/service/src/gpu_verify.rs`): pure positive-offset-aware
+    `verify_positive_offset` → `PositiveOffsetVerification` (RaiseVerified / RaiseIncomplete / OverRaise /
+    Unverifiable). The intended raise is the SUCCESS case here (it does NOT use the flatten-down overshoot
+    veto); it still rejects an unintended over-raise above target + tolerance. The existing flatten-down
+    verifier (`classify_curve` / `eval_ceiling_evidence`) is untouched.
+  - **F2 module** (`crates/service/src/gpu_undervolt.rs`, NEW): pure `plan_undervolt_probe` search skeleton
+    (descend real voltage bins, compute the bounded positive offset each bin needs to hold the focus target,
+    stop at the first bound/floor violation), pure `undervolt_preflight` (Safe Loop read-only refusal),
+    and the windows `run_undervolt_probe` entry (dry-run plan; the `--confirm` branch fails closed).
+  - **CLI** (`crates/service/src/main.rs`): new `undervolt-probe` subcommand. DRY-RUN by default; `--confirm`
+    is parsed but REFUSED in this patch (no hardware). Flags: `--target-mhz`, `--start-mv`, `--steps`.
+- **Fail-closed safety rules (planner)**: reject an empty / foreign / non-sane base curve; reject a non-real
+  VF bin (index not on the curve); reject a bin below the hardware floor; reject offset ≤ 0
+  (positive-offset-only); reject offset above the absolute cap; reject a per-step delta above the per-step
+  cap; reject a planned clock above the conservative clock ceiling. NEVER silently clamp an unsafe offset —
+  always return an explicit `Err`, and return the plan BEFORE any write. The offset bounds are CONSTANTS, not
+  CLI-widenable, so the operator cannot loosen them.
+- **Scope of F2 v1 (deliberately small)**: ONE focus target only; small bounded positive offset only; no
+  persistence / apply / promotion; no multi-target loop; no autonomous crash-seeking. In confirmed mode
+  (future) it must stop on the first crash / TDR / instability / verifier failure.
+- **Unchanged / NOT touched**: `apply_vf_ceiling_monotone`, the validated F1/build-frontier flatten-down
+  writer + verifier, Safe Loop, boot flag, `reset_to_stock`, blacklist, last-known-good fallback, power-limit
+  / TDP / clock-lock. F2 dry-run reads Safe Loop state READ-ONLY and never mutates it.
+- **Not implemented yet (confirmed hardware path)**: arming the boot flag before a positive write; clearing it
+  only after a clean dwell + reset; leaving enough state for recovery/blacklist on crash; last-known-good
+  fallback; the actual confirmed one-step write+dwell+verify+reset loop. Left as explicit TODO/design comments
+  in `gpu_undervolt.rs` — the `--confirm` branch fails closed until that lands.
+- **Hardware: BLOCKED.** No confirmed run, no VF write, no profile apply/persist, no Safe Loop mutation in
+  this task. Next step: a dry-run review of `undervolt-probe`, THEN (only after review) a first supervised
+  one-step confirmed F2 validation.
+
 ## F1c bounded-tail — confirmed hardware validation PASS, then tail-richness follow-up (2026-06-20)
 - **Confirmed run (2026-06-20) of the bounded tail (`8667bf0`) — verdict PASS.** Command
   `build-frontier --confirm --max-targets 7 --max-probes 45 --max-probes-per-target 3 --safe-start-cap 1075

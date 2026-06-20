@@ -8,7 +8,27 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-20) — F1c bounded-tail confirmed PASS + tail-richness follow-up
+## Latest (2026-06-20) — F2 true-undervolt foundation IMPLEMENTED (pure, no hardware)
+- **First isolated F2 path** for TRUE undervolt: bounded POSITIVE VF offsets (raise a lower-voltage bin to hold
+  the target clock) — the opposite of F1/build-frontier flatten-down. F1 stays intact; F2 gets its own symbols.
+- **gpu-nvapi**: pure `plan_bounded_positive_offset` + windows `apply_bounded_positive_offset`;
+  `PositiveOffsetPlan`/`PositiveOffsetLimits`; consts `POS_OFFSET_MAX_MHZ=+30`, `POS_OFFSET_STEP_MAX_MHZ=+15`.
+  `apply_vf_ceiling_monotone` NOT touched.
+- **gpu_verify**: pure `verify_positive_offset` → `PositiveOffsetVerification` (RaiseVerified/RaiseIncomplete/
+  OverRaise/Unverifiable); intended raise is the success case (no flatten-down overshoot veto); flatten-down
+  verifier unchanged.
+- **gpu_undervolt.rs (NEW)**: pure `plan_undervolt_probe` (descend real bins, compute bounded offset to hold
+  target, stop at first bound/floor violation) + pure `undervolt_preflight` (Safe Loop read-only refusal) +
+  windows `run_undervolt_probe` (dry-run; `--confirm` fails closed). CLI: `undervolt-probe` (`--target-mhz`,
+  `--start-mv`, `--steps`; `--confirm` parsed but REFUSED this task).
+- **Fail-closed**: empty/foreign/non-sane base, non-real bin, below floor, offset≤0, offset>+30, step>+15,
+  clock>ceiling all → explicit Err (never clamps); bounds are constants, not CLI-widenable.
+- **NOT touched**: F1 flatten-down writer/verifier, Safe Loop, boot flag, reset_to_stock, blacklist,
+  last-known-good, power-limit/TDP/clock-lock. No persist/apply/promote, no multi-target loop, no crash-seeking.
+- **Hardware BLOCKED.** Next: dry-run review of `undervolt-probe`, THEN a first supervised one-step confirmed
+  F2 validation. Detail in `decisions.md`/`handoff.md` (top entries).
+
+## Checkpoint (2026-06-20) — F1c bounded-tail confirmed PASS + tail-richness follow-up
 - **Confirmed run (2026-06-20) of the bounded tail (`8667bf0`) = PASS**. Safety clean (exit 0, no
   TDR/crash/reboot, reset_to_stock ran, no persist/apply, state byte-identical, monotone positive_offsets=0).
   Phase B focus 1800, started 1056 mV (below 1062 floor), crossed knee (pcf 1.000@1012 → **0.215@1006 mV**),

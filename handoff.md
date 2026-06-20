@@ -3,7 +3,37 @@
 How to pick this up cold. State as of 2026-06-20, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-20) — F1c bounded-tail confirmed PASS + tail-richness follow-up
+## Latest backend checkpoint (2026-06-20) — F2 true-undervolt foundation IMPLEMENTED (pure, no hardware)
+- **What**: the first isolated F2 (true-undervolt) foundation. F2 needs BOUNDED POSITIVE VF offsets (raise a
+  lower-voltage bin to hold the target clock) — the OPPOSITE of F1/build-frontier's flatten-down. F1's
+  `apply_vf_ceiling_monotone` refuses positive offsets and its verifier treats clock-above-target as failure,
+  so F2 is a SEPARATE path with its own bounded, fail-closed symbols. F1/build-frontier is UNCHANGED.
+- **Files**:
+  - `crates/gpu-nvapi/src/lib.rs`: pure `plan_bounded_positive_offset` + windows `apply_bounded_positive_offset`;
+    `PositiveOffsetPlan` / `PositiveOffsetLimits`; consts `POS_OFFSET_MAX_MHZ=+30`, `POS_OFFSET_STEP_MAX_MHZ=+15`.
+  - `crates/service/src/gpu_verify.rs`: pure `verify_positive_offset` → `PositiveOffsetVerification`
+    (RaiseVerified / RaiseIncomplete / OverRaise / Unverifiable). Flatten-down verifier untouched.
+  - `crates/service/src/gpu_undervolt.rs` (NEW): pure `plan_undervolt_probe` search skeleton + pure
+    `undervolt_preflight` (Safe Loop read-only refusal) + windows `run_undervolt_probe` (dry-run; `--confirm`
+    fails closed).
+  - `crates/service/src/main.rs`: `undervolt-probe` subcommand + `parse_undervolt_args` (dry-run default;
+    `--confirm` parsed but REFUSED this task). `mod gpu_undervolt;` registered.
+- **Fail-closed planner rules**: empty/foreign/non-sane base → Err; non-real bin → Err; below hardware floor →
+  Err; offset ≤ 0 (positive-only) → Err; offset > +30 abs cap → Err; per-step delta > +15 → Err; planned clock
+  > conservative ceiling → Err. NEVER silently clamps; bounds are CONSTANTS (not CLI-widenable); returns the
+  plan BEFORE any write.
+- **Scope (v1)**: one focus target, small bounded offset, NO persist/apply/promote, NO multi-target loop, NO
+  autonomous crash-seeking. Confirmed mode (future) stops on first crash/TDR/instability/verifier-fail.
+- **NOT touched**: `apply_vf_ceiling_monotone`, F1 flatten-down writer/verifier, Safe Loop, boot flag,
+  `reset_to_stock`, blacklist, last-known-good, power-limit/TDP/clock-lock. Dry-run reads Safe Loop READ-ONLY.
+- **Confirmed path NOT implemented** (explicit TODOs in `gpu_undervolt.rs`): arm boot flag before a positive
+  write; clear only after clean dwell+reset; crash leaves recovery/blacklist state; last-known-good fallback.
+- **Validation (no hardware)**: see the implementation commit for `cargo check` / `cargo test` results.
+- **Hardware: BLOCKED.** No `--confirm`, no VF write, no apply/persist, no Safe Loop mutation. Next: dry-run
+  review of `undervolt-probe`, THEN (after review) a first supervised one-step confirmed F2 validation. Detail
+  in `decisions.md` (top entry).
+
+## Backend checkpoint (2026-06-20) — F1c bounded-tail confirmed PASS + tail-richness follow-up
 - **Confirmed run (2026-06-20) of the bounded tail (`8667bf0`) = PASS.** Safety/mechanics clean (exit 0, no
   TDR/crash/reboot, reset_to_stock ran, no persist/apply, state byte-identical, monotone writer
   positive_offsets=0). Phase A collapsed; Phase B focus 1800, started 1056 mV (below 1062 floor, skipped

@@ -5,6 +5,7 @@ mod gpu_mem_sweep;
 mod gpu_power_sweep;
 mod gpu_real;
 mod gpu_sweep_real;
+mod gpu_undervolt;
 mod gpu_verify;
 mod ipc_server;
 mod safe_loop_runtime;
@@ -60,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "run" | "console" => return run_standalone(),
             "verify-applied" => return run_verify_only(),
             "build-frontier" => return run_build_frontier_cmd(&args),
+            "undervolt-probe" => return run_undervolt_probe_cmd(&args),
             _ => {}
         }
     }
@@ -178,6 +180,33 @@ fn run_build_frontier_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::E
         tracing::info!("build-frontier: dry-run (pass --confirm to execute the supervised hardware run)");
     }
     gpu_power_sweep::run_build_frontier(&store, confirm, limits);
+    Ok(())
+}
+
+/// Supervised console entry for the F2 `undervolt-probe`. WITHOUT `--confirm` it is a read-only
+/// DRY-RUN that prints the plan (no hardware). `--confirm` is parsed but REFUSED in this patch:
+/// confirmed F2 is not implemented yet, so it deliberately does NOT run startup recovery, arm Safe
+/// Loop, apply, dwell, or write the VF curve.
+fn run_undervolt_probe_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let confirm = has_confirm_flag(args);
+    let parsed = match gpu_undervolt::parse_undervolt_args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("undervolt-probe: invalid flags: {e}");
+            println!("undervolt-probe: invalid flags: {e}");
+            return Ok(()); // clean exit, no hardware
+        }
+    };
+    if confirm {
+        tracing::warn!(
+            "undervolt-probe: --confirm present — confirmed F2 is not implemented; refusing (no hardware)"
+        );
+    } else {
+        tracing::info!("undervolt-probe: dry-run (F2 confirmed mode is not implemented in this patch)");
+    }
+    // NOTE: no startup recovery here — confirmed F2 is refused and must not touch Safe Loop state.
+    let store = SafeLoopStore::system();
+    gpu_undervolt::run_undervolt_probe(&store, confirm, parsed);
     Ok(())
 }
 

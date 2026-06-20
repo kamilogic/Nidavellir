@@ -756,6 +756,185 @@ pub fn apply_vf_ceiling_monotone(ceiling_mv: u32, target_mhz: u32) -> Result<usi
     Ok(down_caps)
 }
 
+// ── F2 true-undervolt: bounded POSITIVE-offset planner/writer ────────────────────────────────
+// True undervolt is the OPPOSITE of the build-frontier flatten-down: it RAISES a lower-voltage bin
+// (a bounded positive offset) so the focus target clock holds at a lower voltage. The monotone
+// flatten-down writer above refuses positive offsets by design; F2 therefore lives in its own
+// bounded, fail-closed symbols and does NOT touch or relax `apply_vf_ceiling_monotone`.
+
+/// Conservative absolute cap on an F2 positive (raise) frequency offset for a single VF bin (MHz).
+/// True undervolt only needs to nudge a lower-voltage bin up a little to hold the focus target, so
+/// the first F2 foundation keeps a small cap. Fail-closed: the planner REJECTS (never clamps) any
+/// offset above this; the cap is a constant, never widened by a CLI flag.
+pub const POS_OFFSET_MAX_MHZ: i32 = 30;
+
+/// Conservative cap on the per-step INCREASE in positive offset between consecutive F2 probes (MHz).
+/// Bounds how aggressively the undervolt deepens as the search descends voltage bins.
+pub const POS_OFFSET_STEP_MAX_MHZ: i32 = 15;
+
+// Sanity bounds for an F2 base-curve point (mirror the service core-VF sanity domain so a foreign /
+// memory-domain / zeroed curve is rejected). Voltage in mV, frequency in MHz.
+const POS_SANE_MV_MIN: u32 = 600;
+const POS_SANE_MV_MAX: u32 = 1150;
+const POS_SANE_MHZ_MIN: u32 = 500;
+const POS_SANE_MHZ_MAX: u32 = 3500;
+
+fn is_sane_base_point(voltage_mv: u32, freq_mhz: u32) -> bool {
+    (POS_SANE_MV_MIN..=POS_SANE_MV_MAX).contains(&voltage_mv)
+        && (POS_SANE_MHZ_MIN..=POS_SANE_MHZ_MAX).contains(&freq_mhz)
+}
+
+/// True iff `curve` is a non-empty static base curve whose every point is a plausible graphics-core
+/// VF point — used to reject an empty / foreign / non-sane base before any F2 positive-offset plan.
+fn is_sane_base_curve(curve: &[(usize, u32, u32)]) -> bool {
+    !curve.is_empty() && curve.iter().all(|&(_, mv, f)| is_sane_base_point(mv, f))
+}
+
+/// Fail-closed bounds for a bounded positive-offset (F2 true-undervolt) plan. The offset caps come
+/// from the conservative constants; the floor/ceiling are hardware-derived by the caller. The
+/// planner REJECTS anything outside these — it NEVER silently clamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositiveOffsetLimits {
+    /// Absolute cap on the positive freq offset applied to one bin (MHz).
+    pub abs_max_offset_mhz: i32,
+    /// Cap on the per-step INCREASE in offset between consecutive probes (MHz).
+    pub step_max_offset_mhz: i32,
+    /// Lowest safe voltage bin (mV); a bin below this is rejected (hardware-derived floor).
+    pub hw_floor_mv: u32,
+    /// Conservative absolute clock ceiling (MHz); a planned effective clock above this is rejected.
+    pub clock_ceiling_mhz: u32,
+}
+
+impl PositiveOffsetLimits {
+    /// Conservative limits: the built-in offset caps + the caller's hardware-derived floor/ceiling.
+    pub fn conservative(hw_floor_mv: u32, clock_ceiling_mhz: u32) -> Self {
+        Self {
+            abs_max_offset_mhz: POS_OFFSET_MAX_MHZ,
+            step_max_offset_mhz: POS_OFFSET_STEP_MAX_MHZ,
+            hw_floor_mv,
+            clock_ceiling_mhz,
+        }
+    }
+}
+
+/// A validated single-bin bounded positive-offset (F2) write plan. Pure data; produced ONLY when
+/// every fail-closed rule in [`plan_bounded_positive_offset`] passes, and returned BEFORE any write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositiveOffsetPlan {
+    pub index: usize,
+    pub voltage_mv: u32,
+    pub base_mhz: u32,
+    /// The validated positive offset to apply to this bin (> 0, ≤ abs cap).
+    pub offset_mhz: i32,
+    /// The previously-applied offset on the prior probe (0 if none) — used for the per-step delta.
+    pub prev_offset_mhz: i32,
+    /// `offset_mhz - prev_offset_mhz` (the per-step increase; ≤ step cap).
+    pub step_delta_mhz: i32,
+    /// The planned effective clock at this bin (`base + offset`, == target).
+    pub effective_mhz: u32,
+}
+
+/// Pure, fail-closed planner for ONE bounded POSITIVE-offset (F2 true-undervolt) point: raise the
+/// `bin_index` VF point just enough to hold `target_mhz` at that (lower) voltage. This is the
+/// OPPOSITE of [`plan_vf_ceiling_monotone`] (which only flattens DOWN and never raises) and is the
+/// ONLY sanctioned positive-offset planner — it does NOT relax `apply_vf_ceiling_monotone`.
+///
+/// Computes `offset = target - base` for the chosen bin and REJECTS (never clamps) when any rule
+/// fails: empty/foreign/non-sane base curve; `bin_index` not a real point on the curve; the bin's
+/// voltage is below the hardware floor; the offset is ≤ 0 (positive-offset-only); the offset exceeds
+/// the absolute cap; the per-step increase over `prev_offset_mhz` exceeds the per-step cap; or the
+/// planned effective clock exceeds the conservative clock ceiling. Returns the plan BEFORE any write.
+pub fn plan_bounded_positive_offset(
+    static_base_curve: &[(usize, u32, u32)],
+    bin_index: usize,
+    target_mhz: u32,
+    prev_offset_mhz: i32,
+    limits: &PositiveOffsetLimits,
+) -> Result<PositiveOffsetPlan, String> {
+    if static_base_curve.is_empty() {
+        return Err("F2: static VF-table base unavailable/empty — fail closed".into());
+    }
+    if !is_sane_base_curve(static_base_curve) {
+        return Err("F2: base curve has foreign / non-sane points — fail closed".into());
+    }
+    let &(index, voltage_mv, base_mhz) = static_base_curve
+        .iter()
+        .find(|(i, _, _)| *i == bin_index)
+        .ok_or_else(|| format!("F2: bin index {bin_index} is not a real VF point — fail closed"))?;
+    if voltage_mv < limits.hw_floor_mv {
+        return Err(format!(
+            "F2: bin {voltage_mv} mV is below the hardware floor {} mV — fail closed",
+            limits.hw_floor_mv
+        ));
+    }
+    let offset_mhz = target_mhz as i32 - base_mhz as i32;
+    if offset_mhz <= 0 {
+        return Err(format!(
+            "F2: bin {voltage_mv} mV base {base_mhz} MHz already >= target {target_mhz} MHz \
+             (offset {offset_mhz} <= 0) — positive-offset-only, fail closed"
+        ));
+    }
+    if offset_mhz > limits.abs_max_offset_mhz {
+        return Err(format!(
+            "F2: offset +{offset_mhz} MHz exceeds the absolute cap +{} MHz — fail closed",
+            limits.abs_max_offset_mhz
+        ));
+    }
+    let step_delta_mhz = offset_mhz - prev_offset_mhz;
+    if step_delta_mhz > limits.step_max_offset_mhz {
+        return Err(format!(
+            "F2: per-step increase +{step_delta_mhz} MHz (prev +{prev_offset_mhz}) exceeds the \
+             per-step cap +{} MHz — fail closed",
+            limits.step_max_offset_mhz
+        ));
+    }
+    let effective_mhz = base_mhz as i32 + offset_mhz; // == target_mhz by construction
+    if effective_mhz <= 0 || effective_mhz as u32 > limits.clock_ceiling_mhz {
+        return Err(format!(
+            "F2: planned clock {effective_mhz} MHz exceeds the clock ceiling {} MHz — fail closed",
+            limits.clock_ceiling_mhz
+        ));
+    }
+    Ok(PositiveOffsetPlan {
+        index,
+        voltage_mv,
+        base_mhz,
+        offset_mhz,
+        prev_offset_mhz,
+        step_delta_mhz,
+        effective_mhz: effective_mhz as u32,
+    })
+}
+
+/// F2-only bounded POSITIVE-offset writer: plan via [`plan_bounded_positive_offset`] (fail-closed)
+/// then write the single validated positive offset to the target bin via the modern ClkVfPoints
+/// API. SEPARATE from [`apply_vf_ceiling_monotone`] (which it neither calls nor relaxes) and from
+/// the flatten-down path. Re-checks the bound defensively before the write and refuses a
+/// non-positive / out-of-bound offset. Returns the executed plan. NOT called by the dry-run probe.
+#[cfg(windows)]
+pub fn apply_bounded_positive_offset(
+    static_base_curve: &[(usize, u32, u32)],
+    bin_index: usize,
+    target_mhz: u32,
+    prev_offset_mhz: i32,
+    limits: &PositiveOffsetLimits,
+) -> Result<PositiveOffsetPlan, String> {
+    let plan =
+        plan_bounded_positive_offset(static_base_curve, bin_index, target_mhz, prev_offset_mhz, limits)?;
+    // Defensive: never write a non-positive or over-cap offset even if the planner ever changes.
+    if plan.offset_mhz <= 0 || plan.offset_mhz > limits.abs_max_offset_mhz {
+        return Err(format!(
+            "F2: refusing to write out-of-bound offset {} MHz (cap +{}) — fail closed",
+            plan.offset_mhz, limits.abs_max_offset_mhz
+        ));
+    }
+    let st = vfcurve::set_point(plan.index, plan.offset_mhz * 1000);
+    if st != 0 {
+        return Err(format!("F2: set_point({}) status {}", plan.index, st));
+    }
+    Ok(plan)
+}
+
 /// Reset the modern V/F curve: zero every valid point's frequency offset.
 #[cfg(windows)]
 pub fn reset_vf_curve() -> usize {
@@ -827,7 +1006,10 @@ pub fn probe() -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{nearest_vf_bin_at_or_above, plan_vf_ceiling, plan_vf_ceiling_monotone, VfBinClass};
+    use super::{
+        nearest_vf_bin_at_or_above, plan_bounded_positive_offset, plan_vf_ceiling,
+        plan_vf_ceiling_monotone, PositiveOffsetLimits, VfBinClass,
+    };
 
     // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
     fn curve() -> Vec<(usize, u32, u32)> {
@@ -1004,5 +1186,78 @@ mod tests {
         let plan = plan_vf_ceiling_monotone(&base_curve(), 2000, 1755);
         assert!(plan.iter().all(|e| !e.in_flatten_set));
         assert!(plan.iter().all(|e| e.desired_offset_mhz == 0));
+    }
+
+    // ── plan_bounded_positive_offset (F2 true-undervolt, bounded positive raise) ──────────────
+    // Static base curve (index, voltage_mv, base_freq_mhz): lower-voltage bins have lower base, so a
+    // small positive offset lets them hold a higher target.
+    fn pos_base() -> Vec<(usize, u32, u32)> {
+        vec![(0, 850, 1700), (1, 900, 1740), (2, 950, 1770), (3, 1000, 1800), (4, 1062, 1845)]
+    }
+
+    fn pos_limits(floor_mv: u32) -> PositiveOffsetLimits {
+        // Conservative built-in caps (+30 abs, +15 step) with a generous clock ceiling.
+        PositiveOffsetLimits::conservative(floor_mv, 1900)
+    }
+
+    #[test]
+    fn pos_offset_computes_expected_offset_for_valid_lower_bin() {
+        // 900 mV bin base 1740, target 1755 → +15 offset; effective == target; prev 0 → step 15.
+        let plan = plan_bounded_positive_offset(&pos_base(), 1, 1755, 0, &pos_limits(850)).unwrap();
+        assert_eq!(plan.voltage_mv, 900);
+        assert_eq!(plan.base_mhz, 1740);
+        assert_eq!(plan.offset_mhz, 15);
+        assert_eq!(plan.effective_mhz, 1755);
+        assert_eq!(plan.step_delta_mhz, 15);
+    }
+
+    #[test]
+    fn pos_offset_rejects_above_absolute_bound() {
+        // 850 mV bin base 1700, target 1735 → +35 offset > +30 abs cap. prev 30 → step 5 (within),
+        // floor 850 ok → fails ONLY on the absolute cap.
+        let err = plan_bounded_positive_offset(&pos_base(), 0, 1735, 30, &pos_limits(850)).unwrap_err();
+        assert!(err.contains("absolute cap"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn pos_offset_rejects_per_step_bound_violation() {
+        // 950 mV bin base 1770, target 1795 → +25 offset (≤ +30 abs) but prev 0 → step +25 > +15.
+        let err = plan_bounded_positive_offset(&pos_base(), 2, 1795, 0, &pos_limits(850)).unwrap_err();
+        assert!(err.contains("per-step"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn pos_offset_rejects_nonsane_foreign_and_empty_base() {
+        // Empty base → fail closed.
+        assert!(plan_bounded_positive_offset(&[], 0, 1755, 0, &pos_limits(850)).is_err());
+        // Foreign / memory-domain point (freq 9000 MHz) → non-sane base, fail closed.
+        let foreign = vec![(0usize, 900u32, 1740u32), (1, 1500, 9000)];
+        let err = plan_bounded_positive_offset(&foreign, 0, 1755, 0, &pos_limits(850)).unwrap_err();
+        assert!(err.contains("non-sane") || err.contains("foreign"), "unexpected error: {err}");
+        // A real index that is simply not on the curve → fail closed.
+        assert!(plan_bounded_positive_offset(&pos_base(), 99, 1755, 0, &pos_limits(850)).is_err());
+    }
+
+    #[test]
+    fn pos_offset_refuses_below_hardware_floor() {
+        // Floor 950 mV; the 850 mV bin is below it → fails on the floor (before any offset math).
+        let err = plan_bounded_positive_offset(&pos_base(), 0, 1710, 0, &pos_limits(950)).unwrap_err();
+        assert!(err.contains("hardware floor"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn pos_offset_rejects_non_positive_offset() {
+        // 1062 mV bin base 1845 ≥ target 1755 → offset ≤ 0 → positive-offset-only, fail closed.
+        let err = plan_bounded_positive_offset(&pos_base(), 4, 1755, 0, &pos_limits(850)).unwrap_err();
+        assert!(err.contains("positive-offset-only"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn pos_offset_rejects_clock_above_ceiling() {
+        // Ceiling 1750 MHz; 900 mV bin base 1740, target 1755 (+15, within offset caps) → planned
+        // clock 1755 > ceiling 1750 → fail closed.
+        let limits = PositiveOffsetLimits::conservative(850, 1750);
+        let err = plan_bounded_positive_offset(&pos_base(), 1, 1755, 0, &limits).unwrap_err();
+        assert!(err.contains("clock ceiling"), "unexpected error: {err}");
     }
 }

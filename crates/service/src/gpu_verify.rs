@@ -326,6 +326,71 @@ fn eval_ceiling_evidence(
     }
 }
 
+// ── F2 true-undervolt: positive-offset-aware verification ─────────────────────────────────────
+// The flatten-down verifier above treats any clock above target as an overshoot FAILURE — correct
+// for build-frontier (it caps DOWN). F2 RAISES a lower-voltage bin (a bounded positive offset), so
+// the intended raise is the SUCCESS case and the flatten-down overshoot rule must NOT gate it. This
+// is a SEPARATE verdict; the flatten-down path (`classify_curve` / `eval_ceiling_evidence`) is
+// unchanged.
+
+/// F2 positive-offset (true-undervolt) verification verdict. DISTINCT from the flatten-down
+/// [`CurveVerification`]: a positive offset is the INTENDED effect, so clock-above-target is not, by
+/// itself, a failure — only an UNINTENDED over-raise beyond target + tolerance is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PositiveOffsetVerification {
+    /// The intended positive offset took at the target bin and the effective clock sits at the
+    /// intended target within tolerance.
+    RaiseVerified,
+    /// The applied offset / effective clock is materially BELOW the intended raise (it did not take).
+    RaiseIncomplete,
+    /// The effective clock (or applied offset) is ABOVE the intended target + tolerance — an
+    /// UNINTENDED over-raise (the F2 success case is a bounded raise, not an unbounded one).
+    OverRaise,
+    /// Offset readback evidence is unavailable → cannot verify.
+    Unverifiable,
+}
+
+/// Pure, read-only F2 verifier for a single intended positive-offset point. The OFFSET readback is
+/// the primary signal that the write took (GetStatus actual freq under-reports at idle — see
+/// [`classify_curve`]); the optional effective-freq corroboration, when supplied (e.g. under load),
+/// must place the bin at the intended target within tolerance and must NOT over-raise above it.
+///
+/// Returns, in priority order: `Unverifiable` if the offset readback is missing; `OverRaise` if the
+/// applied offset exceeds intended by more than `tol_mhz`, OR (when freq is supplied) the effective
+/// clock exceeds target by more than `tol_mhz`; `RaiseIncomplete` if the applied offset is below
+/// intended by more than `tol_mhz`, OR the effective clock is below target by more than `tol_mhz`;
+/// otherwise `RaiseVerified`. Deliberately does NOT use the flatten-down overshoot veto. Pure +
+/// testable.
+pub(crate) fn verify_positive_offset(
+    intended_offset_mhz: i32,
+    target_mhz: u32,
+    observed_offset_mhz: Option<i32>,
+    observed_freq_mhz: Option<u32>,
+    tol_mhz: u32,
+) -> PositiveOffsetVerification {
+    let Some(observed_offset) = observed_offset_mhz else {
+        return PositiveOffsetVerification::Unverifiable;
+    };
+    let tol = tol_mhz as i32;
+    // OFFSET axis (the write itself) — primary evidence.
+    if observed_offset - intended_offset_mhz > tol {
+        return PositiveOffsetVerification::OverRaise;
+    }
+    if intended_offset_mhz - observed_offset > tol {
+        return PositiveOffsetVerification::RaiseIncomplete;
+    }
+    // Effective-clock corroboration when available (idle freq is noisy → only an extra gate).
+    if let Some(freq) = observed_freq_mhz {
+        if freq as i32 - target_mhz as i32 > tol {
+            return PositiveOffsetVerification::OverRaise;
+        }
+        if target_mhz as i32 - freq as i32 > tol {
+            return PositiveOffsetVerification::RaiseIncomplete;
+        }
+    }
+    PositiveOffsetVerification::RaiseVerified
+}
+
 /// Read-only (NVAPI GET-control offset readback): build the live per-point evidence at/above
 /// the ceiling bin, then classify it via [`eval_ceiling_evidence`]. Reusable by the
 /// persisted-profile verifier (today) and the transient-ceiling probe (Phase 2B.2-b).
@@ -1746,5 +1811,70 @@ mod tests {
         assert_eq!(classify_bin_diag(None, Some(0), target), BinDiagClass::StaticBaseMissing);
         // Unreadable offset → Unreadable.
         assert_eq!(classify_bin_diag(Some(target), None, target), BinDiagClass::Unreadable);
+    }
+
+    // ── F2 positive-offset verifier (verify_positive_offset) — SEPARATE from flatten-down ─────
+    #[test]
+    fn pos_verify_accepts_intended_raise_within_tol() {
+        // Intended +15 at target 1755; observed offset +15, effective freq 1755 → RaiseVerified.
+        assert_eq!(
+            verify_positive_offset(15, 1755, Some(15), Some(1755), TOL_MHZ),
+            PositiveOffsetVerification::RaiseVerified
+        );
+        // Within tolerance on both axes is still accepted (offset +12, freq 1745 vs target 1755).
+        assert_eq!(
+            verify_positive_offset(15, 1755, Some(12), Some(1745), TOL_MHZ),
+            PositiveOffsetVerification::RaiseVerified
+        );
+    }
+
+    #[test]
+    fn pos_verify_rejects_incomplete_raise() {
+        // Applied offset far below intended (the raise did not take) → RaiseIncomplete.
+        assert_eq!(
+            verify_positive_offset(25, 1755, Some(0), Some(1730), TOL_MHZ),
+            PositiveOffsetVerification::RaiseIncomplete
+        );
+        // Offset present but effective clock well below target → RaiseIncomplete.
+        assert_eq!(
+            verify_positive_offset(25, 1755, Some(25), Some(1700), TOL_MHZ),
+            PositiveOffsetVerification::RaiseIncomplete
+        );
+    }
+
+    #[test]
+    fn pos_verify_rejects_over_raise_above_target_plus_tol() {
+        // Effective clock above target + tol is an UNINTENDED over-raise (NOT the flatten-down veto).
+        assert_eq!(
+            verify_positive_offset(15, 1755, Some(15), Some(1800), TOL_MHZ),
+            PositiveOffsetVerification::OverRaise
+        );
+        // Applied offset itself far above intended → OverRaise.
+        assert_eq!(
+            verify_positive_offset(15, 1755, Some(45), None, TOL_MHZ),
+            PositiveOffsetVerification::OverRaise
+        );
+    }
+
+    #[test]
+    fn pos_verify_unverifiable_without_offset_readback() {
+        assert_eq!(
+            verify_positive_offset(15, 1755, None, Some(1755), TOL_MHZ),
+            PositiveOffsetVerification::Unverifiable
+        );
+    }
+
+    #[test]
+    fn flatten_down_verifier_unchanged_by_f2_addition() {
+        // The flatten-down path keeps its semantics: offsets present → VerifiedCurve even when
+        // GetStatus freq sits above target (classification ignores GetStatus freq). F2 added a
+        // SEPARATE verdict and did not touch this path.
+        let expected: Vec<PointEvidence> = (0..10).map(|_| ev(Some(-120_000), 1830)).collect();
+        let (s, present, _, n) = classify_curve(1785, &expected, TOL_MHZ);
+        assert_eq!(s, CurveVerification::VerifiedCurve);
+        assert_eq!((present, n), (10, 10));
+        // The flatten-down overshoot veto still fires on a bin reading above target (unchanged).
+        let nd = eval_no_down_cap(1785, &[ev(Some(0), 1830)], Some(&[(0usize, 1700u32)]));
+        assert!(nd.overshoot_veto);
     }
 }
