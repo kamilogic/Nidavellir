@@ -1,9 +1,27 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-16, `master` (clean, latest commit
-`8667bf0`). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+How to pick this up cold. State as of 2026-06-20, `master` (clean). Deep NvAPI struct
+details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-16) — F1c follow-up: Phase B captures a bounded below-knee TAIL (commit 8667bf0) — pure, no hardware
+## Latest backend checkpoint (2026-06-20) — F1c bounded-tail confirmed PASS + tail-richness follow-up
+- **Confirmed run (2026-06-20) of the bounded tail (`8667bf0`) = PASS.** Safety/mechanics clean (exit 0, no
+  TDR/crash/reboot, reset_to_stock ran, no persist/apply, state byte-identical, monotone writer
+  positive_offsets=0). Phase A collapsed; Phase B focus 1800, started 1056 mV (below 1062 floor, skipped
+  1075/1068/1062), crossed the knee (pcf 1.000@1012 → **0.215@1006 mV**), **continued past the first off-cap
+  point to 1000 mV, captured 2 useful points**, stopped `KneeTailComplete`; **synthesis became `differentiated`**.
+- **Remaining issue**: both tail points (1006 & 1000 mV) were ~199 W → Godforge/Brokkr's/Deep Calm all
+  coincided at ~1811 MHz @ 1006 mV / 199 W. Differentiated (not collapse) but THIN.
+- **This follow-up**: enrich the tail — `PHASE_B_MIN_USEFUL_POINTS` 2→**4**, `PHASE_B_POST_KNEE_TAIL_BINS`
+  3→**5** (the synthesis collapse threshold `MIN_USEFUL_FRONTIER_POINTS` STAYS 2). Phase B now keeps a bounded
+  tail until 4 useful off-cap points OR 5 post-knee bins. Opt-in / default OFF; no new CLI flag;
+  `--phase-b-probes` + global `--max-probes` still bound it; failure/verifier/instability/floor/budget keep
+  precedence.
+- **Unchanged**: Phase A, synthesis, bind-seeking, full safety chain (writer/verifier/Safe Loop/reset_to_stock/
+  floor/cluster/persistence/power-limit/clock-lock). File: `crates/service/src/gpu_power_sweep.rs` only.
+- **Hardware**: one confirmed validation authorized for this follow-up (same flags) to see if power drops below
+  the knee and the three profiles separate. Detail in `decisions.md` (top entry).
+
+## Backend checkpoint (2026-06-16) — F1c follow-up: Phase B captures a bounded below-knee TAIL (commit 8667bf0) — pure, no hardware
 - **Why**: the FIRST confirmed knee-seeking run (2026-06-16, PASS-PARTIAL) found the real knee at **~1025 mV**
   (Phase B started 1056 mV below the 1062 Phase-A floor, descended to 1025 where **pcf dropped 1.000→0.437 in
   one 6 mV bin** — a steep knee). But Phase B stopped at that FIRST off-cap point → only **1** useful point →

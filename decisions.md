@@ -2,6 +2,33 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1c bounded-tail — confirmed hardware validation PASS, then tail-richness follow-up (2026-06-20)
+- **Confirmed run (2026-06-20) of the bounded tail (`8667bf0`) — verdict PASS.** Command
+  `build-frontier --confirm --max-targets 7 --max-probes 45 --max-probes-per-target 3 --safe-start-cap 1075
+  --bind-seeking --power-bound-knee-seeking --phase-b-probes 24`. Exit 0; no TDR/crash/reboot; `reset_to_stock`
+  ran; `gpu_applied.json`/`boot_flag.json` absent; state files byte-identical (safe_loop.json mtime-only);
+  monotone writer `positive_offsets=0` throughout. Phase A collapsed (6 pts pcf 1.0); plateau 1800; Phase B
+  focus 1800, **started at 1056 mV (below the 1062 Phase-A floor, skipped 1075/1068/1062)**, crossed the knee
+  (pcf 1.000 at 1012 → **0.215 at 1006 mV**), **continued past the first off-cap point to 1000 mV (pcf 0.224),
+  captured 2 useful off-cap points**, stopped `KneeTailComplete`. **Synthesis became `differentiated`** (2
+  useful / 14 power-bound), no longer `POWER-BOUND COLLAPSE`. The fix works end-to-end.
+- **Remaining issue → this follow-up**: the two captured tail points (1006 & 1000 mV) were BOTH ~199 W (the
+  knee hugs the power cap here), so Godforge / Brokkr's / Deep Calm all coincided at ~1811 MHz @ 1006 mV /
+  199 W — "differentiated" (not collapse) but a THIN frontier. Need MORE useful below-knee points (deeper,
+  where power actually drops) to separate the three profiles.
+- **Decision (2026-06-20)**: enrich the Phase-B tail. Raise the internal richness bounds
+  `PHASE_B_MIN_USEFUL_POINTS` 2 → **4** (decoupled from the synthesis collapse threshold
+  `MIN_USEFUL_FRONTIER_POINTS`, which STAYS 2) and `PHASE_B_POST_KNEE_TAIL_BINS` 3 → **5**. Phase B now keeps a
+  bounded tail until 4 useful off-cap points OR 5 post-knee bins. Still opt-in / default OFF; no new CLI flag;
+  `--phase-b-probes` (24) and global `--max-probes` (45) remain the external bounds. Failure / instability /
+  verifier / floor / budget stops keep precedence (checked before the tail logic).
+- **Unchanged safety surfaces**: monotone writer, verifier gates, Safe Loop, `reset_to_stock`, floor/cluster
+  selection, persistence/knowledge writes, power-limit/TDP/clock-lock. Phase A, synthesis, and bind-seeking
+  untouched. The dry-run plan auto-reports the new "≥ 4 useful points or ≤ 5 post-knee bins" tail target.
+- **Validation (no hardware)**: see the implementation commit's `cargo check` / `cargo test` results.
+- **Hardware**: one confirmed validation authorized for this follow-up to see whether power drops below the
+  knee and the three profiles separate (same flags). Non-goals unchanged.
+
 ## F1c follow-up — Phase B captures a bounded below-knee TAIL (commit 8667bf0, 2026-06-16) — pure, no hardware
 - **Driver: FIRST confirmed knee-seeking hardware run (2026-06-16) — verdict PASS-PARTIAL.** Command
   `build-frontier --confirm --max-targets 7 --max-probes 45 --max-probes-per-target 3 --safe-start-cap 1075

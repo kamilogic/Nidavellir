@@ -8,7 +8,23 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-16) — F1c follow-up: Phase B captures a bounded below-knee TAIL (commit 8667bf0) — pure, no hardware
+## Latest (2026-06-20) — F1c bounded-tail confirmed PASS + tail-richness follow-up
+- **Confirmed run (2026-06-20) of the bounded tail (`8667bf0`) = PASS**. Safety clean (exit 0, no
+  TDR/crash/reboot, reset_to_stock ran, no persist/apply, state byte-identical, monotone positive_offsets=0).
+  Phase B focus 1800, started 1056 mV (below 1062 floor), crossed knee (pcf 1.000@1012 → **0.215@1006 mV**),
+  **continued past the first off-cap point to 1000 mV, captured 2 useful points**, `KneeTailComplete`;
+  **synthesis became `differentiated`** (was collapse).
+- **Remaining issue**: both tail points ~199 W → Godforge/Brokkr's/Deep Calm coincided (~1811 MHz/1006 mV/199 W).
+  Differentiated but THIN.
+- **Follow-up (2026-06-20)**: enrich the tail — `PHASE_B_MIN_USEFUL_POINTS` 2→**4**,
+  `PHASE_B_POST_KNEE_TAIL_BINS` 3→**5** (synthesis collapse threshold `MIN_USEFUL_FRONTIER_POINTS` stays 2).
+  Bounded: 4 useful OR 5 post-knee bins; opt-in/default OFF; no new CLI flag; `--phase-b-probes`/global
+  `--max-probes` bound it; failure/verifier/instability/floor/budget keep precedence.
+- **Unchanged**: Phase A, synthesis, bind-seeking, safety chain. File: `gpu_power_sweep.rs` only.
+- **Hardware**: one confirmed validation authorized (same flags) to test whether power drops below the knee and
+  the three profiles separate. Detail in `decisions.md`/`handoff.md` (top entries).
+
+## Checkpoint (2026-06-16) — F1c follow-up: Phase B captures a bounded below-knee TAIL (commit 8667bf0) — pure, no hardware
 - **Driver**: FIRST confirmed knee-seeking run (2026-06-16) = **PASS-PARTIAL**. Found the real knee at
   **~1025 mV** (Phase B started 1056 mV, below the 1062 Phase-A floor; pcf dropped **1.000→0.437 in one 6 mV
   bin** — steep knee). Safety PASS (exit 0, no TDR/crash/reboot, reset_to_stock ran, no persist/apply, state
