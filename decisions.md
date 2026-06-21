@@ -2,6 +2,49 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 true-undervolt — FIRST confirmed hardware validation (2026-06-21) — PASS
+- **One supervised confirmed run** (operator present, ONE confirmed command, no second):
+  `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. This is the FIRST real positive-offset VF write
+  on hardware — the confirmed F2 branch implemented in `78ecfc7` (top of branch; HEAD = origin/master =
+  `78ecfc7`, tree clean). A fresh worktree-local binary was built first (`cargo build -p nidavellir-service`)
+  because `target/debug/nidavellir-service.exe` was ABSENT; the built binary mtime is newer than `78ecfc7`.
+- **Preflight gates all passed**: working tree clean; `gpu_applied.json` absent; `boot_flag.json` absent;
+  `safe_mode=false`; `boot_flag_armed=false`; `consecutive_crashes=1` (< 3); the planned point was NOT
+  blacklisted (preflight `blacklisted_points=0`; the 4 existing blacklist entries — offsets 255/855, 300/937,
+  330/925 and freq 1755/862 — are all far from 1800 MHz @ 981 mV / +15). Help printed usage only (no hardware
+  read/plan/mutation); dry-run showed exactly ONE candidate with the no-op line (no Safe Loop arm, no apply, no
+  dwell, no VF write).
+- **Confirmed result: exit 0, outcome `Validated`.** No TDR, no black-screen, no reboot, no DeviceLost, no
+  Unstable, no silent error.
+- **Exact candidate**: target **1800 MHz**, voltage bin **981 mV**, base clock at bin **1785 MHz**, positive
+  offset **+15 MHz** → effective 1800 MHz. Within both caps (per-step +15, absolute +30; constants, not
+  CLI-widenable).
+- **Execution sequence (the safety-critical motor, end-to-end)**: Safe Loop boot flag armed BEFORE the VF write
+  → F2 bounded positive-offset writer (`apply_bounded_positive_offset`) applied the offset → `verify_positive_offset`
+  passed (**`RaiseVerified`**) → single dwell **Stable** (avg clock **1868 MHz**, p5/sustained **1845 MHz**,
+  **199 W**, `silent_error=false`) → `reset_to_stock` ran and CONFIRMED stock (offset cleared) → boot flag cleared
+  after the clean reset. Point NOT blacklisted. **No profile persisted, applied, or promoted** ("validated" is
+  reported only, never written to Safe Loop `last_validated`).
+- **Post-run state (read-only verify)**: `boot_flag.json` absent; `gpu_applied.json` absent; `safe_loop.json`
+  **byte-identical** (sha256 unchanged; mtime touched only by the arm→clear cycle — `safe_mode=false`,
+  `consecutive_crashes=1`, blacklist still 4 entries, `last_validated=null`); `forge_state.json` /
+  `gpu_knowledge.json` / `heartbeat.txt` unchanged; git tree clean; HEAD still `78ecfc7`.
+- **Decision recorded**: the F2 true-undervolt HARDWARE path is now PROVEN at one bounded positive-offset point.
+  This validates the safety-critical motor (**arm → write → verify → dwell → reset → clear**) on real hardware and
+  proves it is recoverable. It does NOT yet prove an optimal undervolt profile — it proves the minimum hardware
+  path is viable and clean. The dwell clock landing ABOVE 1800 MHz (1868 avg) is EXPECTED and acceptable: this
+  probe does not lock the GPU clock, so the card still boosts per curve/power behavior; the verifier's
+  `RaiseVerified` confirms the +15 raise on the 981 mV bin.
+- **Next direction (do NOT immediately run another confirmed command)**: the next implementation/design step
+  should be one of — (1) a controlled, still-bounded/supervised F2 MULTI-STEP probe for the same target;
+  (2) explicit `--start-mv` for confirmed single-step probing if not already supported; (3) result recording /
+  Forge Knowledge for validated F2 candidates WITHOUT profile promotion. The first true optimization step should
+  search the lower-voltage limit around the 1800 MHz target using the same Safe Loop / verification / reset
+  guarantees.
+- **Scope of this entry**: docs/continuity only (`decisions.md`, `handoff.md`, `memory.md`). The only commands
+  this validation ran were one debug build, one `--help`, one dry-run, and ONE confirmed run — no code edits, no
+  tests, no further hardware.
+
 ## F2 confirmed single-step branch — IMPLEMENTED, not executed (2026-06-20) — no hardware run
 - **Decision**: implement the FIRST real confirmed F2 hardware branch (the `--confirm` path of
   `undervolt-probe`), but do NOT execute it. Single-target, single-step only. The branch is isolated

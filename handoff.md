@@ -1,7 +1,37 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-20, `master` (clean). Deep NvAPI struct
+How to pick this up cold. State as of 2026-06-21, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## Latest backend checkpoint (2026-06-21) — F2 true-undervolt FIRST CONFIRMED HARDWARE VALIDATION — PASS
+- **One supervised confirmed run** (operator present, ONE confirmed command, no second) validating the `78ecfc7`
+  F2 confirmed branch on real hardware: `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. **First real
+  positive-offset VF write.** HEAD = origin/master = `78ecfc7`, tree clean. **Fresh worktree binary built first**
+  (`cargo build -p nidavellir-service`) — `target/debug/nidavellir-service.exe` was ABSENT; built mtime newer
+  than `78ecfc7`.
+- **Preflight PASS**: tree clean; `gpu_applied.json`/`boot_flag.json` absent; `safe_mode=false`;
+  `boot_flag_armed=false`; `consecutive_crashes=1`; planned point NOT blacklisted (`blacklisted_points=0`). Help =
+  usage only; dry-run = exactly ONE candidate + no-op line (no arm/apply/dwell/VF write).
+- **Result: exit 0, outcome `Validated`.** No TDR / black-screen / reboot / DeviceLost / Unstable / silent error.
+- **Candidate**: target **1800 MHz**, bin **981 mV**, base **1785 MHz**, offset **+15 MHz** (within +15 step /
+  +30 abs caps).
+- **Sequence (motor end-to-end)**: Safe Loop armed BEFORE write → `apply_bounded_positive_offset` applied →
+  `verify_positive_offset` = **`RaiseVerified`** → dwell **Stable** (avg **1868 MHz**, p5 **1845 MHz**, **199 W**,
+  no silent error) → `reset_to_stock` ran + CONFIRMED stock (offset cleared) → boot flag cleared after clean reset.
+  Not blacklisted. **No profile persisted/applied/promoted** (Validated reported only, never written to
+  `last_validated`).
+- **Post-run**: `boot_flag.json`/`gpu_applied.json` absent; `safe_loop.json` **byte-identical** (sha256 unchanged,
+  mtime touched only — `safe_mode=false`, `consecutive_crashes=1`, blacklist 4 entries, `last_validated=null`);
+  `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt` unchanged; tree clean; HEAD `78ecfc7`.
+- **Meaning**: the F2 true-undervolt HARDWARE path is PROVEN at one bounded positive-offset point — the
+  **arm → write → verify → dwell → reset → clear** motor is viable and recoverable on real hardware. It does NOT
+  prove an optimal undervolt profile (minimum-viable path only). The dwell clock above 1800 MHz (1868 avg) is
+  EXPECTED — this probe does not lock the clock; the GPU still boosts per curve/power; `RaiseVerified` confirms
+  the +15 raise on the 981 mV bin.
+- **Next (do NOT immediately run another confirmed command)**: one of — (1) bounded/supervised F2 MULTI-STEP probe
+  for the same target; (2) explicit `--start-mv` confirmed single-step if not yet supported; (3) result recording /
+  Forge Knowledge for validated F2 candidates without promotion. First optimization = search the lower-voltage
+  limit around 1800 MHz with the same Safe Loop / verification / reset guarantees. Detail in `decisions.md` (top).
 
 ## Latest backend checkpoint (2026-06-20) — F2 CONFIRMED single-step branch IMPLEMENTED, not executed (no hardware)
 - **What**: the first real confirmed F2 hardware branch (`undervolt-probe --confirm`). Single-target,

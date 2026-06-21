@@ -8,7 +8,30 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-20) — F2 CONFIRMED single-step branch IMPLEMENTED, not executed (no hardware)
+## Latest (2026-06-21) — F2 true-undervolt FIRST confirmed hardware validation (1800 MHz @ 981 mV, +15) — PASS
+- **One supervised confirmed run** (operator present, ONE confirmed command, no second) of the `78ecfc7` F2
+  branch: `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. **First real positive-offset VF write.**
+  HEAD = origin/master = `78ecfc7`, tree clean; fresh worktree binary built first (was absent; mtime > `78ecfc7`).
+- **Preflight PASS**: `gpu_applied.json`/`boot_flag.json` absent; `safe_mode=false`; `boot_flag_armed=false`;
+  `consecutive_crashes=1`; point NOT blacklisted (`blacklisted_points=0`). Help = usage only; dry-run = exactly 1
+  candidate + no-op line.
+- **Result: exit 0, `Validated`.** No TDR/black-screen/reboot/DeviceLost/Unstable/silent-error. Candidate: target
+  **1800 MHz**, bin **981 mV**, base **1785 MHz**, **+15 MHz** (within +15 step / +30 abs caps).
+- **Motor end-to-end**: Safe Loop armed BEFORE write → `apply_bounded_positive_offset` → `verify_positive_offset`
+  = **`RaiseVerified`** → dwell **Stable** (avg **1868 MHz**, p5 **1845 MHz**, **199 W**) → `reset_to_stock` ran +
+  confirmed stock → boot flag cleared after clean reset. Not blacklisted; **no profile persisted/applied/promoted**
+  (Validated reported only, no `last_validated` write).
+- **Post-run**: `boot_flag.json`/`gpu_applied.json` absent; `safe_loop.json` byte-identical (mtime-only);
+  `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt` unchanged; tree clean; HEAD `78ecfc7`.
+- **Meaning**: F2 hardware path PROVEN at one bounded positive-offset point — **arm → write → verify → dwell →
+  reset → clear** is viable + recoverable. Does NOT prove an optimal profile (minimum-viable only). Dwell clock
+  above 1800 MHz (1868 avg) is EXPECTED — probe doesn't lock the clock; GPU still boosts per curve/power.
+- **Next (don't re-run a confirmed command yet)**: (1) bounded F2 MULTI-STEP for the same target, (2) explicit
+  `--start-mv` confirmed single-step if unsupported, or (3) result recording / Forge Knowledge for validated F2
+  candidates without promotion. First optimization = search the lower-voltage limit around 1800 MHz with the same
+  Safe Loop / verification / reset guarantees. Detail in `decisions.md` / `handoff.md` (top entries).
+
+## (2026-06-20) — F2 CONFIRMED single-step branch IMPLEMENTED, not executed (no hardware)
 - **First real confirmed F2 branch** (`undervolt-probe --confirm`): single-target, single-step only.
   IMPLEMENTED but NOT run — no `--confirm`, no VF write, no Safe Loop mutation this task.
 - **State machine** (`gpu_undervolt.rs`, trait-isolated + mock-tested `run_confirmed_f2_step`/`F2Ops`):
