@@ -2,6 +2,53 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 ANCHORED undervolt — FIRST confirmed hardware validation (2026-06-21) — PASS
+- **One supervised confirmed run** (operator present, ONE confirmed command, no second):
+  `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. This is the FIRST real ANCHORED positive-offset
+  VF write on hardware — the anchored confirmed branch from `747a11b` (HEAD = origin/master = `747a11b`,
+  tree clean). A fresh worktree-local binary was built first (`cargo build -p nidavellir-service`) because
+  `target/debug/nidavellir-service.exe` was ABSENT in the worktree; the built binary mtime is newer than `747a11b`.
+- **Preflight gates all passed**: working tree clean; `gpu_applied.json` absent; `boot_flag.json` absent;
+  `safe_mode=false`; `boot_flag_armed=false`; `consecutive_crashes=1` (< 3); the planned anchored point was NOT
+  blacklisted (preflight `blacklisted_points=0`; the 4 existing blacklist entries are all far from 1800 MHz @
+  975 mV / +15). Help printed usage only (no hardware read/plan/mutation); dry-run was mode **ANCHORED** with
+  exactly ONE anchored candidate and the no-op line (no Safe Loop arm, no apply, no dwell, no VF write).
+- **Confirmed result: exit 0, outcome `Validated`.** No TDR, no black-screen, no reboot, no DeviceLost, no
+  Unstable, no silent error.
+- **Exact anchored candidate (live curve at confirm time)**: target **1800 MHz**, anchor voltage bin **975 mV**,
+  anchor base clock **1785 MHz**, positive offset **+15 MHz** → effective 1800 MHz. **27** higher-voltage bins
+  capped DOWN to 1800 (max flatten **-150 MHz**), 1 already at target, **59** lower bins left elastic. Offset
+  within both caps (per-step +15, absolute +30; constants, not CLI-widenable). NB: the earlier read-only dry-run
+  reported the anchor as 981 mV / 25 capped / -135 / 61 elastic; the confirmed run read the live curve fresh and
+  the anchor that needed +15 to reach 1800 sat at the 975 mV bin (981 mV was already at base 1800 → capped +0).
+- **Execution sequence (the safety-critical motor, end-to-end)**: Safe Loop boot flag armed BEFORE the VF write
+  → F2 bounded ANCHORED writer (`apply_bounded_anchored_positive_offset`) applied the full curve →
+  `verify_anchored_positive_offset` passed (**`AnchoredRaiseVerified`**; summary `verifier result = Some(RaiseVerified)`)
+  → single dwell **Stable** (avg clock **1815 MHz**, p5/sustained **1815 MHz**, **183 W**, `silent_error=false`) →
+  `reset_to_stock` ran and CONFIRMED stock (all written bins cleared) → boot flag cleared after the clean reset.
+  Point NOT blacklisted. **No profile persisted, applied, or promoted** ("validated" reported only, never written
+  to Safe Loop `last_validated`).
+- **Post-run state (read-only verify)**: `boot_flag.json` absent; `gpu_applied.json` absent; `safe_loop.json`
+  **byte-identical** (sha256 unchanged; mtime touched only by the arm→clear cycle — `safe_mode=false`,
+  `consecutive_crashes=1`, blacklist still 4 entries, `last_validated=null`); `forge_state.json` /
+  `gpu_knowledge.json` / `heartbeat.txt` unchanged; git tree clean; HEAD still `747a11b`.
+- **Boost constrained vs the prior SIMPLE F2 run** — this is the key result: the simple positive-offset run boosted
+  ELASTICALLY above target (avg **1868**, p5 **1845**, **199 W**; avg > p5). The anchored run pins a flat plateau at
+  the target (avg **1815** = p5 **1815**, **183 W**; ~**16 W** lower). avg==p5 confirms the higher-voltage caps
+  prevent boost above the target; the +15 MHz over 1800 is within the verifier's 15 MHz tolerance.
+- **Decision recorded**: the F2 ANCHORED-undervolt HARDWARE path is now PROVEN at one bounded point. This confirms
+  the classic undervolt SHAPE on real hardware — `target MHz @ anchor mV`, higher-voltage bins capped to prevent
+  boost above target, lower bins elastic — and that the motor (**arm → write → verify → dwell → reset → clear**) is
+  recoverable. It is the first result that directly supports the intended METHOD: map the stable voltage limit for a
+  chosen clock, repeat across clocks, then synthesize Godforge / Brokkr's Best / Deep Calm from real curve points.
+  It does NOT yet prove the MINIMUM stable voltage for 1800 MHz — only that one bounded anchored point holds.
+- **Next direction (do NOT immediately run another confirmed command before this record is committed)**: a bounded,
+  still-supervised, same-target **MULTI-STEP** anchored probe at 1800 MHz that descends voltage until verifier fail,
+  instability, clock drop, voltage floor, or budget — using the same Safe Loop / verification / reset guarantees.
+- **Scope of this entry**: docs/continuity only (`decisions.md`, `handoff.md`, `memory.md`). No code edits, no tests,
+  no further hardware. The validation it records ran exactly one debug build, one `--help`, one dry-run, and ONE
+  confirmed run.
+
 ## F2 ANCHORED undervolt is now the intended path for classic undervolt probing (2026-06-21)
 - **Decision**: move F2 from a single positive offset at one VF bin to a true CLASSIC anchored
   undervolt point. For a chosen target clock + voltage bin, the planner now: (1) RAISES the anchor bin

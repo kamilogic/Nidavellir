@@ -8,6 +8,33 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-06-21) — F2 ANCHORED undervolt FIRST confirmed hardware validation (1800 MHz @ 975 mV, +15) — PASS
+- **One supervised confirmed run** (operator present, ONE confirmed command, no second) of the `747a11b` anchored
+  branch: `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. **First real ANCHORED positive-offset VF write.**
+  HEAD = origin/master = `747a11b`, tree clean; fresh worktree binary built first (was absent; mtime > `747a11b`).
+- **Preflight PASS**: `gpu_applied.json`/`boot_flag.json` absent; `safe_mode=false`; `boot_flag_armed=false`;
+  `consecutive_crashes=1`; anchored point NOT blacklisted. Help = usage only; dry-run = mode ANCHORED, exactly 1
+  candidate + no-op line.
+- **Result: exit 0, `Validated`.** No TDR/black-screen/reboot/DeviceLost/Unstable/silent-error. Candidate: target
+  **1800 MHz**, anchor bin **975 mV**, base **1785 MHz**, **+15 MHz**; **27** bins capped to 1800 (max -150), **59**
+  elastic (within +15 step / +30 abs caps).
+- **Motor end-to-end**: Safe Loop armed BEFORE write → `apply_bounded_anchored_positive_offset` →
+  `verify_anchored_positive_offset` = **`AnchoredRaiseVerified`** → dwell **Stable** (avg **1815 MHz**, p5 **1815 MHz**,
+  **183 W**) → `reset_to_stock` ran + confirmed stock (all written bins cleared) → boot flag cleared after clean reset.
+  Not blacklisted; **no profile persisted/applied/promoted** (Validated reported only).
+- **Post-run**: `boot_flag.json`/`gpu_applied.json` absent; `safe_loop.json` byte-identical (mtime-only);
+  `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt` unchanged; tree clean; HEAD `747a11b`.
+- **Boost constrained vs prior simple F2**: simple boosted above target (avg **1868**, p5 **1845**, **199 W**);
+  anchored pins a flat plateau (avg **1815** = p5 **1815**, **183 W**, ~**16 W** lower) → caps prevent boost above
+  1800; +15 over target is within the 15 MHz verifier tolerance.
+- **Meaning**: F2 ANCHORED-undervolt hardware path PROVEN at one bounded point — classic `MHz @ mV` SHAPE (anchor
+  raise + plateau cap + elastic lower bins) holds + the **arm → write → verify → dwell → reset → clear** motor is
+  recoverable. First direct support for the method (map stable voltage per clock → repeat → synthesize Godforge /
+  Brokkr's Best / Deep Calm). Does NOT yet prove the MINIMUM stable voltage for 1800 MHz.
+- **Next (don't re-run a confirmed command yet)**: bounded, supervised, same-target **MULTI-STEP** anchored probe at
+  1800 MHz descending voltage until verifier fail / instability / clock drop / floor / budget. Detail in
+  `decisions.md` / `handoff.md` (top entries).
+
 ## Latest (2026-06-21) — F2 ANCHORED undervolt planning IMPLEMENTED (no hardware)
 - **What**: F2 now plans a true CLASSIC anchored undervolt point — RAISE the anchor bin to target AND
   CAP every higher-voltage bin DOWN to the same target (≤ 0 offsets), lower bins elastic. **ANCHORED is

@@ -3,6 +3,38 @@
 How to pick this up cold. State as of 2026-06-21, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Latest backend checkpoint (2026-06-21) — F2 ANCHORED undervolt FIRST CONFIRMED HARDWARE VALIDATION — PASS
+- **One supervised confirmed run** (operator present, ONE confirmed command, no second) validating the `747a11b`
+  anchored branch on real hardware: `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. **First real ANCHORED
+  positive-offset VF write.** HEAD = origin/master = `747a11b`, tree clean. **Fresh worktree binary built first**
+  (`cargo build -p nidavellir-service`) — `target/debug/nidavellir-service.exe` was ABSENT; built mtime newer than
+  `747a11b`.
+- **Preflight PASS**: tree clean; `gpu_applied.json`/`boot_flag.json` absent; `safe_mode=false`;
+  `boot_flag_armed=false`; `consecutive_crashes=1`; planned anchored point NOT blacklisted. Help = usage only;
+  dry-run = mode **ANCHORED**, exactly ONE candidate + no-op line (no arm/apply/dwell/VF write).
+- **Result: exit 0, outcome `Validated`.** No TDR / black-screen / reboot / DeviceLost / Unstable / silent error.
+- **Anchored candidate (live curve)**: target **1800 MHz**, anchor bin **975 mV**, base **1785 MHz**, offset
+  **+15 MHz** → 1800; **27** higher-voltage bins capped DOWN to 1800 (max flatten **-150 MHz**), **59** lower bins
+  elastic. Within +15 step / +30 abs caps. (Earlier dry-run had read 981 mV / 25 / -135 / 61; the live curve at
+  confirm time put the +15 anchor at 975 mV — 981 mV was already at base 1800 → capped +0.)
+- **Sequence (motor end-to-end)**: Safe Loop armed BEFORE write → `apply_bounded_anchored_positive_offset` applied →
+  `verify_anchored_positive_offset` = **`AnchoredRaiseVerified`** → dwell **Stable** (avg **1815 MHz**, p5 **1815 MHz**,
+  **183 W**, no silent error) → `reset_to_stock` ran + CONFIRMED stock (all written bins cleared) → boot flag cleared
+  after clean reset. Not blacklisted. **No profile persisted/applied/promoted** (Validated reported only).
+- **Post-run**: `boot_flag.json`/`gpu_applied.json` absent; `safe_loop.json` **byte-identical** (sha256 unchanged,
+  mtime touched only); `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt` unchanged; tree clean; HEAD `747a11b`.
+- **Boost constrained vs prior SIMPLE F2**: simple run boosted elastically above target (avg **1868**, p5 **1845**,
+  **199 W**); anchored run pins a flat plateau (avg **1815** = p5 **1815**, **183 W**, ~**16 W** lower). avg==p5
+  confirms the plateau caps prevent boost above 1800; the +15 over target is within the 15 MHz verifier tolerance.
+- **Meaning**: the F2 ANCHORED-undervolt HARDWARE path is PROVEN at one bounded point — the classic `MHz @ mV`
+  undervolt SHAPE (anchor raise + plateau cap + elastic lower bins) holds on real hardware and the
+  **arm → write → verify → dwell → reset → clear** motor is recoverable. First result that directly supports the
+  intended method (map stable voltage per clock → repeat across clocks → synthesize Godforge / Brokkr's Best /
+  Deep Calm). Does NOT yet prove the MINIMUM stable voltage for 1800 MHz.
+- **Next (do NOT immediately run another confirmed command before this record is committed)**: a bounded, supervised,
+  same-target **MULTI-STEP** anchored probe at 1800 MHz descending voltage until verifier fail / instability / clock
+  drop / floor / budget, with the same Safe Loop / verification / reset guarantees. Detail in `decisions.md` (top).
+
 ## Latest backend checkpoint (2026-06-21) — F2 ANCHORED undervolt planning IMPLEMENTED (no hardware)
 - **What**: F2 moves from a single positive offset at one VF bin to a true CLASSIC anchored undervolt
   point. The planner now RAISES the anchor bin to target AND CAPS every higher-voltage bin DOWN to the
