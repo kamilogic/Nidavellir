@@ -2947,11 +2947,43 @@ fn derive_core_seed(curve: &[(usize, u32, u32)]) -> Result<CoreSeed, String> {
 
 /// Restore the GPU to stock: zero the core offset, clear the modern VF-curve offsets, and
 /// release any NVML clock cap. Idempotent; called on every exit path of the supervised run.
+/// `pub(crate)` so the isolated F2 confirmed path (`gpu_undervolt`) reuses the SAME reset as
+/// build-frontier (single source of truth); behavior is unchanged for F1.
 #[cfg(windows)]
-fn reset_to_stock() {
+pub(crate) fn reset_to_stock() {
     let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(0);
     let _ = nidavellir_gpu_nvapi::reset_vf_curve();
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+}
+
+/// A single load-dwell outcome, simplified for reuse by the isolated F2 confirmed path. Maps the
+/// internal [`Measured`] verdict to plain booleans + the headline stats. Domain-neutral so
+/// `gpu_power_sweep` stays F1-focused.
+#[cfg(windows)]
+pub(crate) struct SingleDwell {
+    pub crashed: bool,
+    pub silent_error: bool,
+    pub stable: bool,
+    pub avg_clock_mhz: u32,
+    pub p5_clock_mhz: u32,
+    pub power_w: f32,
+}
+
+/// Run ONE game-power load dwell via the validated [`load_and_measure`] path (fresh wgpu context,
+/// FurMark-class render, steady-state measurement, TDR/device-lost detection) and return the
+/// simplified outcome. Reused by the F2 confirmed single step so it shares the hardware-tested
+/// measurement path rather than duplicating it. No VF write / no apply happens here.
+#[cfg(windows)]
+pub(crate) fn single_load_dwell() -> SingleDwell {
+    let m = load_and_measure(DWELL_MS);
+    SingleDwell {
+        crashed: matches!(m.result, StabilityResult::Crash),
+        silent_error: matches!(m.result, StabilityResult::SilentError),
+        stable: matches!(m.result, StabilityResult::Stable),
+        avg_clock_mhz: m.clock_mhz,
+        p5_clock_mhz: m.p5_clock_mhz,
+        power_w: m.power_w,
+    }
 }
 
 /// A no-hardware "unverified" probe result: tells `build_frontier` to stop this clock's

@@ -3,7 +3,35 @@
 How to pick this up cold. State as of 2026-06-20, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-20) — F2 true-undervolt foundation IMPLEMENTED (pure, no hardware)
+## Latest backend checkpoint (2026-06-20) — F2 CONFIRMED single-step branch IMPLEMENTED, not executed (no hardware)
+- **What**: the first real confirmed F2 hardware branch (`undervolt-probe --confirm`). Single-target,
+  single-step only. IMPLEMENTED but NOT executed — no `--confirm` run, no VF write, no Safe Loop mutation.
+- **Confirmed state machine** (`gpu_undervolt.rs`, trait-isolated + mock-tested): `run_confirmed_f2_step`
+  over `F2Ops` = arm boot flag → apply ONE bounded positive offset (`apply_bounded_positive_offset`) →
+  verify (offset-presence; idle freq=None) → dwell once → `reset_to_stock` on EVERY exit → clear flag ONLY
+  after a CONFIRMED reset. Outcomes: ArmFailed/ApplyFailed/VerifyFailed/Unstable/DeviceLost/ResetFailed/
+  Validated.
+- **Boot-flag / reset policy** (unit-tested): real `reset_to_stock` re-reads the bin offset and returns Ok
+  ONLY if it confirms ~0 (unreadable/non-zero → fail closed → flag RETAINED — F2 never leaves a curve
+  applied). Flag cleared only on confirmed reset; RETAINED on DeviceLost + on reset failure. DeviceLost/
+  Unstable blacklist the point; only Stable+confirmed-reset → Validated (reported only, never written to
+  `last_validated`). No persist/apply/promotion.
+- **Preflight** (`confirmed_f2_refusal`, pure): refuses unless --steps 1; not Safe Mode; no armed flag;
+  consecutive_crashes < 3 (`SAFE_MODE_CRASH_THRESHOLD`); candidate exists + within bounds; not blacklisted
+  (3-axis F2 intent OR 2-axis freq/vf_bin). `run_undervolt_probe_cmd` runs startup recovery on --confirm.
+- **Help fixed**: `--help`/`-h` short-circuits before any hardware/plan/Safe-Loop access; prints usage +
+  --confirm WARNING (may write VF; operator required).
+- **F1 untouched**: `apply_vf_ceiling_monotone` + build-frontier unchanged; `gpu_power_sweep.rs` edits are
+  additive/visibility only (`reset_to_stock` pub(crate); new `single_load_dwell`/`SingleDwell` reusing
+  `load_and_measure`). No power-limit/TDP/clock-lock. Dry-run output unchanged except footer + help.
+- **Files**: `crates/service/src/gpu_undervolt.rs` (confirmed branch + tests), `gpu_power_sweep.rs`
+  (adapters), `main.rs` (help + confirm dispatch), `gpu-nvapi/src/lib.rs` UNCHANGED this task.
+- **Validation (no hardware)**: `cargo check` clean; `cargo test -p nidavellir-service` **228/0** (+15);
+  `cargo test -p nidavellir-gpu-nvapi` **25/0**; dry-run + `--help` exercised read-only.
+- **First future run** (operator present, ONE run only): `undervolt-probe --target-mhz 1800 --steps 1 --confirm`.
+- **Hardware: STILL BLOCKED / not validated.** Detail in `decisions.md` (top entry).
+
+## Backend checkpoint (2026-06-20) — F2 true-undervolt foundation IMPLEMENTED (pure, no hardware)
 - **What**: the first isolated F2 (true-undervolt) foundation. F2 needs BOUNDED POSITIVE VF offsets (raise a
   lower-voltage bin to hold the target clock) — the OPPOSITE of F1/build-frontier's flatten-down. F1's
   `apply_vf_ceiling_monotone` refuses positive offsets and its verifier treats clock-above-target as failure,

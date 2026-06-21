@@ -8,7 +8,26 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-20) — F2 true-undervolt foundation IMPLEMENTED (pure, no hardware)
+## Latest (2026-06-20) — F2 CONFIRMED single-step branch IMPLEMENTED, not executed (no hardware)
+- **First real confirmed F2 branch** (`undervolt-probe --confirm`): single-target, single-step only.
+  IMPLEMENTED but NOT run — no `--confirm`, no VF write, no Safe Loop mutation this task.
+- **State machine** (`gpu_undervolt.rs`, trait-isolated + mock-tested `run_confirmed_f2_step`/`F2Ops`):
+  arm boot flag → apply ONE bounded positive offset → verify (offset-presence, idle freq=None) → dwell →
+  `reset_to_stock` on EVERY exit → clear flag ONLY after a CONFIRMED reset (real reset re-reads the bin and
+  fails closed if not ~0). DeviceLost/reset-fail RETAIN the flag; DeviceLost/Unstable blacklist; only
+  Stable+confirmed-reset → Validated (reported only, no `last_validated` write). No persist/apply/promote.
+- **Preflight** `confirmed_f2_refusal`: requires `--steps 1`; refuses Safe Mode / armed flag /
+  consecutive_crashes ≥ 3 / no candidate / out-of-bounds / blacklisted (3-axis + 2-axis). `--confirm` runs
+  startup recovery first.
+- **Help fixed**: `--help`/`-h` prints usage + `--confirm` may-write-VF/operator warning; no hardware read.
+- **F1 untouched**: `apply_vf_ceiling_monotone` + build-frontier unchanged; `gpu_power_sweep.rs` edits are
+  additive/visibility (`reset_to_stock` pub(crate); `single_load_dwell`/`SingleDwell` reuse
+  `load_and_measure`). Dry-run output unchanged except footer + help.
+- **Validation**: `cargo check` clean; service tests **228/0** (+15); gpu-nvapi **25/0**; dry-run + help
+  read-only. **Hardware NOT validated.** First future run: `undervolt-probe --target-mhz 1800 --steps 1
+  --confirm` (operator present, one run). Detail in `decisions.md`/`handoff.md` (top entries).
+
+## Checkpoint (2026-06-20) — F2 true-undervolt foundation IMPLEMENTED (pure, no hardware)
 - **First isolated F2 path** for TRUE undervolt: bounded POSITIVE VF offsets (raise a lower-voltage bin to hold
   the target clock) — the opposite of F1/build-frontier flatten-down. F1 stays intact; F2 gets its own symbols.
 - **gpu-nvapi**: pure `plan_bounded_positive_offset` + windows `apply_bounded_positive_offset`;

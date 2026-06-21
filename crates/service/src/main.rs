@@ -87,6 +87,14 @@ fn has_confirm_flag(args: &[OsString]) -> bool {
     args.iter().any(|a| a.to_string_lossy() == "--confirm")
 }
 
+/// `--help` / `-h` present? Pure (unit-testable without hardware).
+fn has_help_flag(args: &[OsString]) -> bool {
+    args.iter().any(|a| {
+        let s = a.to_string_lossy();
+        s == "--help" || s == "-h"
+    })
+}
+
 /// Parse the first-run limiter flags (`--max-targets N`, `--max-probes N`,
 /// `--max-probes-per-target N`, `--safe-start-cap MV`). Syntax-only: missing/non-numeric values
 /// FAIL CLOSED (`Err`). Semantic checks (0 values, cap vs crash floor) happen in
@@ -183,11 +191,17 @@ fn run_build_frontier_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// Supervised console entry for the F2 `undervolt-probe`. WITHOUT `--confirm` it is a read-only
-/// DRY-RUN that prints the plan (no hardware). `--confirm` is parsed but REFUSED in this patch:
-/// confirmed F2 is not implemented yet, so it deliberately does NOT run startup recovery, arm Safe
-/// Loop, apply, dwell, or write the VF curve.
+/// Supervised console entry for the F2 `undervolt-probe`. `--help`/`-h` prints usage and exits
+/// (no hardware, no plan, no Safe Loop access). WITHOUT `--confirm` it is a read-only DRY-RUN that
+/// prints the plan (no hardware). WITH `--confirm` it runs startup recovery FIRST, then ONE
+/// supervised F2 single step (single-step only; requires `--steps 1`; can write a bounded positive
+/// VF offset and TDR/reboot). It never persists, applies, or promotes a profile.
 fn run_undervolt_probe_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    // Help short-circuits BEFORE anything else — no hardware read, no plan, no Safe Loop access.
+    if has_help_flag(args) {
+        println!("{}", gpu_undervolt::undervolt_usage());
+        return Ok(());
+    }
     let confirm = has_confirm_flag(args);
     let parsed = match gpu_undervolt::parse_undervolt_args(args) {
         Ok(a) => a,
@@ -197,15 +211,18 @@ fn run_undervolt_probe_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::
             return Ok(()); // clean exit, no hardware
         }
     };
+    let store = SafeLoopStore::system();
     if confirm {
         tracing::warn!(
-            "undervolt-probe: --confirm present — confirmed F2 is not implemented; refusing (no hardware)"
+            "undervolt-probe: --confirm set — running startup recovery, then ONE supervised F2 single \
+             step (may write a bounded positive VF offset; can TDR/reboot)"
         );
+        safe_loop_runtime::run_startup_recovery(&store);
     } else {
-        tracing::info!("undervolt-probe: dry-run (F2 confirmed mode is not implemented in this patch)");
+        tracing::info!(
+            "undervolt-probe: dry-run (pass `--steps 1 --confirm` to execute one supervised single step)"
+        );
     }
-    // NOTE: no startup recovery here — confirmed F2 is refused and must not touch Safe Loop state.
-    let store = SafeLoopStore::system();
     gpu_undervolt::run_undervolt_probe(&store, confirm, parsed);
     Ok(())
 }
@@ -217,6 +234,14 @@ mod cli_tests {
 
     fn os(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn help_flag_detected_for_long_and_short() {
+        assert!(!super::has_help_flag(&os(&["undervolt-probe"])));
+        assert!(super::has_help_flag(&os(&["undervolt-probe", "--help"])));
+        assert!(super::has_help_flag(&os(&["undervolt-probe", "-h"])));
+        assert!(!super::has_help_flag(&os(&["undervolt-probe", "--target-mhz", "1800"])));
     }
 
     #[test]

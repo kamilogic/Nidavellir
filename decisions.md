@@ -2,6 +2,47 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 confirmed single-step branch — IMPLEMENTED, not executed (2026-06-20) — no hardware run
+- **Decision**: implement the FIRST real confirmed F2 hardware branch (the `--confirm` path of
+  `undervolt-probe`), but do NOT execute it. Single-target, single-step only. The branch is isolated
+  behind a trait so its fail-closed state machine is unit-tested with a mock (no hardware), while the
+  real executor wires to the validated NVAPI writer + dwell + reset.
+- **Confirmed state machine** (`run_confirmed_f2_step` over the `F2Ops` trait, in `gpu_undervolt.rs`):
+  arm Safe Loop boot flag → apply ONE bounded positive offset (the F2 writer
+  `apply_bounded_positive_offset`, NOT `apply_vf_ceiling*`) → verify the write (offset-presence;
+  idle GetStatus freq passed as `None`) → dwell once → `reset_to_stock` on EVERY exit path → clear the
+  boot flag ONLY after a CONFIRMED reset. Outcomes: ArmFailed / ApplyFailed / VerifyFailed / Unstable /
+  DeviceLost / ResetFailed / Validated.
+- **Cleanup / boot-flag policy** (the critical invariants, all unit-tested):
+  - reset is attempted after any post-arm exit; the real `reset_to_stock` re-reads the bin offset and
+    returns `Ok` ONLY when it confirms ~0 — an unreadable or non-zero readback FAILS CLOSED → flag
+    RETAINED. (F2 must NEVER leave a positive offset applied after exit.)
+  - boot flag cleared ONLY when reset is confirmed; on DeviceLost (crash/TDR) the flag is RETAINED so
+    startup recovery blacklists + recedes; on a failed reset the outcome becomes `ResetFailed` and the
+    flag is retained.
+  - DeviceLost and Unstable record the point in the Safe Loop blacklist (crash knowledge); only a
+    Stable dwell + confirmed reset yields `Validated` — and "validated" is REPORTED only, never written
+    to Safe Loop `last_validated` (so nothing auto-reapplies). No profile persist/apply/promotion.
+- **Confirmed preflight** (`confirmed_f2_refusal`, pure, fail-closed): refuses unless `--steps 1`
+  (single-step only); not in Safe Mode; no boot flag already armed; `consecutive_crashes` <
+  `SAFE_MODE_CRASH_THRESHOLD` (=3); a candidate exists; the candidate is within all offset/floor/clock
+  bounds (defensive re-check); and the intent is not blacklisted (checked against BOTH the 3-axis F2
+  intent and the 2-axis freq/vf_bin point, matching build-frontier regions). `run_undervolt_probe_cmd`
+  runs startup recovery first on `--confirm` (mirrors build-frontier); on refusal NO hardware is touched.
+- **CLI help fix**: `undervolt-probe --help` / `-h` now short-circuits in `run_undervolt_probe_cmd`
+  BEFORE any hardware read / plan / Safe Loop access, printing usage (all flags + an explicit
+  `--confirm` may-write-VF / operator-supervision warning).
+- **F1 untouched**: `apply_vf_ceiling_monotone` and the build-frontier algorithm are unchanged; the only
+  `gpu_power_sweep.rs` edits are ADDITIVE/visibility — `reset_to_stock` → `pub(crate)` and new
+  `pub(crate) single_load_dwell()` / `SingleDwell` adapters that reuse the validated `load_and_measure`.
+  No power-limit/TDP/clock-lock change. Dry-run output unchanged except the footer + help.
+- **First future run** (operator present, no second confirmed run):
+  `undervolt-probe --target-mhz 1800 --steps 1 --confirm`.
+- **Hardware: STILL NOT VALIDATED.** No `--confirm` executed in this task; no VF write; no Safe Loop
+  mutation (the confirmed branch — the only mutating path — was never run). Validation: `cargo check`
+  clean; `cargo test -p nidavellir-service` 228/0; `cargo test -p nidavellir-gpu-nvapi` 25/0; dry-run +
+  `--help` exercised read-only.
+
 ## F2 true-undervolt foundation — first isolated planner/verifier/probe (2026-06-20) — pure, no hardware
 - **Direction**: begin F2 (true undervolt) as a SEPARATE, ISOLATED path from F1/build-frontier. F1's
   `build-frontier` deliberately FLATTENS DOWN: `apply_vf_ceiling_monotone` refuses `desired_offset_mhz > 0`
