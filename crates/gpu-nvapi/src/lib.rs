@@ -935,6 +935,234 @@ pub fn apply_bounded_positive_offset(
     Ok(plan)
 }
 
+// ── F2 ANCHORED true-undervolt: a classic curve point (raise the anchor + cap the plateau) ──────
+// The bounded single-bin raise above proves the positive-offset MOTOR but leaves the rest of the
+// boost curve free, so the GPU still boosts ABOVE the nominal target. A CLASSIC undervolt point is
+// ANCHORED: the selected (lower-voltage) bin is RAISED to the target, and every HIGHER-voltage bin
+// is CAPPED / flattened DOWN to the same target so the card cannot boost above it during the test;
+// lower-voltage bins stay elastic (offset 0, never raised). This COMPOSES the bounded positive-offset
+// planner (for the anchor) with a flatten-DOWN cap on the bins above it — it does NOT call, touch, or
+// relax `apply_vf_ceiling_monotone` (the build-frontier writer) or the single-bin F2 path.
+
+/// Role of one bin within an [`AnchoredPositiveOffsetPlan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchoredBinRole {
+    /// The selected anchor bin: a bounded POSITIVE offset raises it to the target.
+    Anchor,
+    /// A higher-voltage bin held at/below the target by a ≤ 0 offset (capped DOWN, or already
+    /// ≤ target). This is what prevents the GPU from boosting above the target during the test.
+    CappedAbove,
+    /// A lower-voltage bin left elastic (offset 0, never raised).
+    ElasticBelow,
+}
+
+/// One bin's entry in an anchored plan. Pure data; carries exactly what the writer applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchoredBinEntry {
+    pub index: usize,
+    pub voltage_mv: u32,
+    pub base_mhz: u32,
+    /// Offset to write: `> 0` ONLY at the anchor; `≤ 0` for capped higher-voltage bins; `0` for
+    /// elastic lower-voltage bins.
+    pub offset_mhz: i32,
+    /// `base + offset` — never above `target_mhz` for any bin.
+    pub effective_mhz: u32,
+    pub role: AnchoredBinRole,
+}
+
+/// A validated ANCHORED positive-offset (classic undervolt point) plan. Produced ONLY when every
+/// fail-closed rule in [`plan_bounded_anchored_positive_offset`] passes, returned BEFORE any write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredPositiveOffsetPlan {
+    pub target_mhz: u32,
+    /// The validated bounded positive raise at the anchor bin (re-uses the single-bin planner, so it
+    /// inherits every floor/offset/per-step/ceiling fail-closed rule).
+    pub anchor: PositiveOffsetPlan,
+    /// Every curve bin's write entry, in input-curve order (the anchor + the caps + the elastic).
+    pub entries: Vec<AnchoredBinEntry>,
+    /// Higher-voltage bins capped DOWN (negative offset) to the target.
+    pub capped_above_bins: u32,
+    /// Higher-voltage bins already at/below the target (offset 0 — no cap needed, never raised).
+    pub above_already_ok_bins: u32,
+    /// Lower-voltage bins left elastic (offset 0).
+    pub elastic_below_bins: u32,
+    /// The largest positive offset across all bins (== the anchor offset).
+    pub max_positive_offset_mhz: i32,
+    /// The largest downward flatten across the higher-voltage bins (absolute MHz; 0 if none capped).
+    pub max_negative_flatten_mhz: i32,
+}
+
+/// Pure, fail-closed planner for an ANCHORED positive-offset (F2 classic undervolt) point. Raises
+/// the `anchor_bin_index` bin to `target_mhz` (a bounded positive offset, re-using
+/// [`plan_bounded_positive_offset`] so it inherits EVERY fail-closed rule), then CAPS every
+/// higher-voltage bin DOWN to the target (offset ≤ 0; never raised) and leaves every lower-voltage
+/// bin elastic (offset 0, never raised). The result is the classic point `target MHz @ anchor mV with
+/// boost above target prevented`.
+///
+/// REJECTS (never clamps) when: the anchor raise fails any single-bin rule (empty/foreign/non-sane
+/// curve; bin not real; below floor; non-positive offset; absolute or per-step cap; clock ceiling); a
+/// higher-voltage bin would require a positive offset (only the anchor may be raised); a
+/// higher-voltage bin would remain above the target after the cap; a lower-voltage bin's base already
+/// sits above the target (a non-monotone / unsafe curve); or the final plan carries any positive
+/// offset outside the anchor. Returns the plan BEFORE any write. Does NOT touch
+/// `apply_vf_ceiling_monotone`.
+pub fn plan_bounded_anchored_positive_offset(
+    static_base_curve: &[(usize, u32, u32)],
+    anchor_bin_index: usize,
+    target_mhz: u32,
+    prev_offset_mhz: i32,
+    limits: &PositiveOffsetLimits,
+) -> Result<AnchoredPositiveOffsetPlan, String> {
+    // The anchor raise re-uses the single-bin planner → it inherits EVERY fail-closed rule
+    // (empty/foreign/non-sane curve, bin-not-real, below-floor, non-positive offset, absolute &
+    // per-step offset caps, clock ceiling). If it rejects, the whole anchored plan is rejected.
+    let anchor = plan_bounded_positive_offset(
+        static_base_curve,
+        anchor_bin_index,
+        target_mhz,
+        prev_offset_mhz,
+        limits,
+    )?;
+    let anchor_mv = anchor.voltage_mv;
+    let target_i = target_mhz as i32;
+
+    let mut entries = Vec::with_capacity(static_base_curve.len());
+    let mut capped_above_bins = 0u32;
+    let mut above_already_ok_bins = 0u32;
+    let mut elastic_below_bins = 0u32;
+    let mut max_negative_flatten_mhz = 0i32;
+
+    for &(index, voltage_mv, base_mhz) in static_base_curve {
+        if index == anchor.index {
+            entries.push(AnchoredBinEntry {
+                index,
+                voltage_mv,
+                base_mhz,
+                offset_mhz: anchor.offset_mhz,
+                effective_mhz: target_mhz,
+                role: AnchoredBinRole::Anchor,
+            });
+            continue;
+        }
+        if voltage_mv > anchor_mv {
+            // Higher-voltage bin: cap DOWN to target if above it; NEVER raise. Emit an offset ≤ 0.
+            let base_i = base_mhz as i32;
+            let offset = if base_i > target_i { target_i - base_i } else { 0 };
+            // Defensive: a higher-voltage bin must NEVER receive a positive offset.
+            if offset > 0 {
+                return Err(format!(
+                    "F2 anchored: higher-voltage bin {voltage_mv} mV would need a positive offset \
+                     +{offset} — only the anchor may be raised, fail closed"
+                ));
+            }
+            let effective = base_i + offset;
+            // Defensive: no higher-voltage bin may remain above the target after the cap.
+            if effective > target_i {
+                return Err(format!(
+                    "F2 anchored: higher-voltage bin {voltage_mv} mV stays at {effective} MHz above \
+                     target {target_mhz} MHz — fail closed"
+                ));
+            }
+            if offset < 0 {
+                capped_above_bins += 1;
+                max_negative_flatten_mhz = max_negative_flatten_mhz.max(-offset);
+            } else {
+                above_already_ok_bins += 1;
+            }
+            entries.push(AnchoredBinEntry {
+                index,
+                voltage_mv,
+                base_mhz,
+                offset_mhz: offset,
+                effective_mhz: effective.max(0) as u32,
+                role: AnchoredBinRole::CappedAbove,
+            });
+        } else {
+            // Lower-voltage bin: leave elastic (offset 0, never raised). Monotone sanity: a bin below
+            // the anchor must not already sit above the target (non-monotone / unsafe) — fail closed.
+            if base_mhz as i32 > target_i {
+                return Err(format!(
+                    "F2 anchored: lower-voltage bin {voltage_mv} mV base {base_mhz} MHz already above \
+                     target {target_mhz} MHz — non-monotone/unsafe, fail closed"
+                ));
+            }
+            elastic_below_bins += 1;
+            entries.push(AnchoredBinEntry {
+                index,
+                voltage_mv,
+                base_mhz,
+                offset_mhz: 0,
+                effective_mhz: base_mhz,
+                role: AnchoredBinRole::ElasticBelow,
+            });
+        }
+    }
+
+    // Defensive global invariant: EXACTLY one positive offset, and it is the anchor bin.
+    let positive: Vec<&AnchoredBinEntry> = entries.iter().filter(|e| e.offset_mhz > 0).collect();
+    if positive.len() != 1 || positive[0].index != anchor.index {
+        return Err(
+            "F2 anchored: plan would carry a positive offset outside the anchor bin — fail closed".into(),
+        );
+    }
+
+    Ok(AnchoredPositiveOffsetPlan {
+        target_mhz,
+        anchor,
+        entries,
+        capped_above_bins,
+        above_already_ok_bins,
+        elastic_below_bins,
+        max_positive_offset_mhz: anchor.offset_mhz,
+        max_negative_flatten_mhz,
+    })
+}
+
+/// F2-only ANCHORED writer: plan via [`plan_bounded_anchored_positive_offset`] (fail-closed) then
+/// write EVERY bin's offset — the anchor's bounded positive raise, the higher-voltage down-caps, and
+/// zeros on the elastic bins — via the modern ClkVfPoints API. SEPARATE from
+/// [`apply_vf_ceiling_monotone`] (neither called nor relaxed) and from the single-bin
+/// [`apply_bounded_positive_offset`]. Defensively refuses any positive offset outside the anchor (and
+/// an out-of-bound anchor offset) before each write. Returns the executed plan. NOT called by the
+/// dry-run probe.
+#[cfg(windows)]
+pub fn apply_bounded_anchored_positive_offset(
+    static_base_curve: &[(usize, u32, u32)],
+    anchor_bin_index: usize,
+    target_mhz: u32,
+    prev_offset_mhz: i32,
+    limits: &PositiveOffsetLimits,
+) -> Result<AnchoredPositiveOffsetPlan, String> {
+    let plan = plan_bounded_anchored_positive_offset(
+        static_base_curve,
+        anchor_bin_index,
+        target_mhz,
+        prev_offset_mhz,
+        limits,
+    )?;
+    // Defensive: the anchor offset must stay positive and within the absolute cap.
+    if plan.anchor.offset_mhz <= 0 || plan.anchor.offset_mhz > limits.abs_max_offset_mhz {
+        return Err(format!(
+            "F2 anchored: refusing to write out-of-bound anchor offset {} MHz (cap +{}) — fail closed",
+            plan.anchor.offset_mhz, limits.abs_max_offset_mhz
+        ));
+    }
+    for e in &plan.entries {
+        // Defensive per-bin: only the anchor may carry a positive offset (caps are ≤ 0).
+        if e.offset_mhz > 0 && e.index != plan.anchor.index {
+            return Err(format!(
+                "F2 anchored: refusing positive offset +{} on non-anchor bin {} mV — fail closed",
+                e.offset_mhz, e.voltage_mv
+            ));
+        }
+        let st = vfcurve::set_point(e.index, e.offset_mhz * 1000);
+        if st != 0 {
+            return Err(format!("F2 anchored: set_point({}) status {}", e.index, st));
+        }
+    }
+    Ok(plan)
+}
+
 /// Reset the modern V/F curve: zero every valid point's frequency offset.
 #[cfg(windows)]
 pub fn reset_vf_curve() -> usize {
@@ -1007,8 +1235,9 @@ pub fn probe() -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        nearest_vf_bin_at_or_above, plan_bounded_positive_offset, plan_vf_ceiling,
-        plan_vf_ceiling_monotone, PositiveOffsetLimits, VfBinClass,
+        nearest_vf_bin_at_or_above, plan_bounded_anchored_positive_offset,
+        plan_bounded_positive_offset, plan_vf_ceiling, plan_vf_ceiling_monotone, AnchoredBinRole,
+        PositiveOffsetLimits, VfBinClass,
     };
 
     // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
@@ -1259,5 +1488,102 @@ mod tests {
         let limits = PositiveOffsetLimits::conservative(850, 1750);
         let err = plan_bounded_positive_offset(&pos_base(), 1, 1755, 0, &limits).unwrap_err();
         assert!(err.contains("clock ceiling"), "unexpected error: {err}");
+    }
+
+    // ── plan_bounded_anchored_positive_offset (F2 anchored classic undervolt point) ───────────
+    // pos_base(): (idx, mV, base) = 850/1700, 900/1740, 950/1770, 1000/1800, 1062/1845.
+    // Anchor the 900 mV bin (base 1740) at target 1755: +15 raise; the 950/1000/1062 mV bins are all
+    // above target → capped DOWN; the 850 mV bin is below the anchor → elastic.
+    #[test]
+    fn anchored_raises_selected_bin_to_target() {
+        let plan =
+            plan_bounded_anchored_positive_offset(&pos_base(), 1, 1755, 0, &pos_limits(850)).unwrap();
+        assert_eq!(plan.target_mhz, 1755);
+        let a = plan.entries.iter().find(|e| e.role == AnchoredBinRole::Anchor).unwrap();
+        assert_eq!((a.voltage_mv, a.base_mhz, a.offset_mhz, a.effective_mhz), (900, 1740, 15, 1755));
+        assert_eq!(plan.anchor.index, a.index);
+        assert_eq!(plan.max_positive_offset_mhz, 15);
+        // Exactly one positive offset, and it is the anchor.
+        assert_eq!(plan.entries.iter().filter(|e| e.offset_mhz > 0).count(), 1);
+    }
+
+    #[test]
+    fn anchored_caps_all_higher_voltage_bins_to_target() {
+        let plan =
+            plan_bounded_anchored_positive_offset(&pos_base(), 1, 1755, 0, &pos_limits(850)).unwrap();
+        let caps: Vec<_> =
+            plan.entries.iter().filter(|e| e.role == AnchoredBinRole::CappedAbove).collect();
+        // 950 (1770→-15), 1000 (1800→-45), 1062 (1845→-90) — all land exactly at target, offset ≤ 0.
+        assert_eq!(caps.len(), 3);
+        for e in &caps {
+            assert!(e.offset_mhz <= 0);
+            assert_eq!(e.effective_mhz, 1755);
+            assert_eq!(e.base_mhz as i32 + e.offset_mhz, 1755);
+        }
+        assert_eq!(plan.capped_above_bins, 3);
+        assert_eq!(plan.max_negative_flatten_mhz, 90);
+        // No higher-voltage bin remains above the target.
+        assert!(caps.iter().all(|e| e.effective_mhz <= 1755));
+    }
+
+    #[test]
+    fn anchored_does_not_over_raise_lower_voltage_bins() {
+        let plan =
+            plan_bounded_anchored_positive_offset(&pos_base(), 1, 1755, 0, &pos_limits(850)).unwrap();
+        let below: Vec<_> =
+            plan.entries.iter().filter(|e| e.role == AnchoredBinRole::ElasticBelow).collect();
+        // The 850 mV bin (below the 900 mV anchor) stays elastic at offset 0 — never raised.
+        assert_eq!(below.len(), 1);
+        assert_eq!((below[0].voltage_mv, below[0].offset_mhz), (850, 0));
+        assert_eq!(plan.elastic_below_bins, 1);
+    }
+
+    #[test]
+    fn anchored_rejects_positive_offset_above_absolute_cap() {
+        // Anchor the 850 mV bin (base 1700) at 1735 → +35 > +30 abs cap; prev 30 → step 5 (within),
+        // floor 850 ok → rejects ONLY on the absolute cap (inherited from the single-bin planner).
+        let err = plan_bounded_anchored_positive_offset(&pos_base(), 0, 1735, 30, &pos_limits(850))
+            .unwrap_err();
+        assert!(err.contains("absolute cap"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn anchored_rejects_per_step_cap_violation() {
+        // Anchor the 950 mV bin (base 1770) at 1795 → +25 (≤ +30 abs) but prev 0 → step +25 > +15.
+        let err =
+            plan_bounded_anchored_positive_offset(&pos_base(), 2, 1795, 0, &pos_limits(850)).unwrap_err();
+        assert!(err.contains("per-step"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn anchored_rejects_target_above_clock_ceiling() {
+        // Ceiling 1750 MHz; anchoring the 900 mV bin at 1755 → planned clock 1755 > 1750 → fail closed.
+        let limits = PositiveOffsetLimits::conservative(850, 1750);
+        let err = plan_bounded_anchored_positive_offset(&pos_base(), 1, 1755, 0, &limits).unwrap_err();
+        assert!(err.contains("clock ceiling"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn anchored_rejects_non_real_bin_and_malformed_curve() {
+        // Index not on the curve → fail closed.
+        assert!(plan_bounded_anchored_positive_offset(&pos_base(), 99, 1755, 0, &pos_limits(850)).is_err());
+        // Empty base curve → fail closed.
+        assert!(plan_bounded_anchored_positive_offset(&[], 0, 1755, 0, &pos_limits(850)).is_err());
+        // Foreign / non-sane base (freq 9000 MHz) → fail closed.
+        let foreign = vec![(0usize, 900u32, 1740u32), (1, 1500, 9000)];
+        let err = plan_bounded_anchored_positive_offset(&foreign, 0, 1755, 0, &pos_limits(850)).unwrap_err();
+        assert!(err.contains("non-sane") || err.contains("foreign"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn anchored_rejects_non_monotone_lower_bin_above_target() {
+        // A lower-voltage bin whose base already sits ABOVE target is non-monotone/unsafe. Anchor the
+        // 1000 mV bin (base 1800) at 1810 (+10); the 950 mV lower bin base 1770 ≤ 1810 is fine, but a
+        // crafted curve with a below-anchor bin above target must be rejected.
+        let curve = vec![(0usize, 850u32, 1820u32), (1, 1000, 1800)];
+        // Anchor index 1 (1000 mV, base 1800) at 1810 → +10. The 850 mV bin base 1820 > 1810 target.
+        let err =
+            plan_bounded_anchored_positive_offset(&curve, 1, 1810, 0, &pos_limits(850)).unwrap_err();
+        assert!(err.contains("non-monotone"), "unexpected error: {err}");
     }
 }

@@ -8,7 +8,28 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-21) — F2 true-undervolt FIRST confirmed hardware validation (1800 MHz @ 981 mV, +15) — PASS
+## Latest (2026-06-21) — F2 ANCHORED undervolt planning IMPLEMENTED (no hardware)
+- **What**: F2 now plans a true CLASSIC anchored undervolt point — RAISE the anchor bin to target AND
+  CAP every higher-voltage bin DOWN to the same target (≤ 0 offsets), lower bins elastic. **ANCHORED is
+  the DEFAULT** mode; `--simple` keeps the old single-bin descent. Code + tests + docs only — **no
+  `--confirm`, no VF write, no Safe Loop mutation, no build-frontier/stress/sweep.**
+- **Why**: the prior confirmed run proved the positive-offset MOTOR but was not anchored — the GPU still
+  boosted ABOVE the 1800 MHz target. Classic `MHz @ mV` undervolt must test an anchored curve point.
+- **New symbols** (SEPARATE from F1; `apply_vf_ceiling_monotone` UNTOUCHED):
+  `plan_bounded_anchored_positive_offset` / `apply_bounded_anchored_positive_offset` /
+  `AnchoredPositiveOffsetPlan` (gpu-nvapi — anchor reuses the bounded single-bin planner →inherits all
+  bounds); `verify_anchored_positive_offset` / `AnchoredOffsetVerification::AnchoredRaiseVerified`
+  (gpu_verify); `UndervoltMode` / `plan_anchored_undervolt` / `anchored_plan_lines` (gpu_undervolt).
+- **Confirmed branch (anchored, NOT executed)**: ONE anchored curve plan, single-step (`--steps 1`), arms
+  Safe Loop before write, resets on every post-arm exit, clears boot flag only after a confirmed reset,
+  confirms ALL written bins read ~0, no persistence/apply/promotion.
+- **Validation**: `cargo check` clean; service **240** tests + gpu-nvapi **33** tests pass (F1 + simple-F2
+  still green). Read-only dry-run (`--target-mhz 1800 --steps 1`): anchor **981 mV/1785 +15 → 1800**, **25**
+  bins capped to 1800 (max -135), **61** elastic, self-check `AnchoredRaiseVerified`, no write.
+- **Hardware NOT validated for anchored mode.** First future anchored run: `--target-mhz 1800 --steps 1
+  --confirm` — ONE candidate, operator present, NOT multi-step. Detail in `decisions.md`/`handoff.md` (top).
+
+## (2026-06-21) — F2 true-undervolt FIRST confirmed hardware validation (1800 MHz @ 981 mV, +15) — PASS
 - **One supervised confirmed run** (operator present, ONE confirmed command, no second) of the `78ecfc7` F2
   branch: `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. **First real positive-offset VF write.**
   HEAD = origin/master = `78ecfc7`, tree clean; fresh worktree binary built first (was absent; mtime > `78ecfc7`).

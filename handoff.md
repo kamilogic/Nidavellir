@@ -3,6 +3,36 @@
 How to pick this up cold. State as of 2026-06-21, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Latest backend checkpoint (2026-06-21) — F2 ANCHORED undervolt planning IMPLEMENTED (no hardware)
+- **What**: F2 moves from a single positive offset at one VF bin to a true CLASSIC anchored undervolt
+  point. The planner now RAISES the anchor bin to target AND CAPS every higher-voltage bin DOWN to the
+  same target (≤ 0 offsets), leaving lower bins elastic. **ANCHORED is the DEFAULT** mode; `--simple`
+  keeps the old single-bin descent. Code + tests + docs only — **no `--confirm`, no VF write, no Safe
+  Loop mutation, no build-frontier, no stress, no power sweep.**
+- **Why**: the prior confirmed F2 run (below) proved the positive-offset MOTOR but was NOT anchored — the
+  GPU still boosted ABOVE the 1800 MHz target (dwell avg 1868). Classic `MHz @ mV` undervolt must test an
+  anchored curve point, not one raised bin with the boost curve still free above it.
+- **New symbols** (all SEPARATE from F1/build-frontier; `apply_vf_ceiling_monotone` UNTOUCHED):
+  `plan_bounded_anchored_positive_offset` / `apply_bounded_anchored_positive_offset` /
+  `AnchoredPositiveOffsetPlan` (gpu-nvapi, the anchor reuses the bounded single-bin planner →inherits all
+  caps/floor/ceiling rules); `verify_anchored_positive_offset` / `AnchoredOffsetVerification` (gpu_verify);
+  `UndervoltMode` / `plan_anchored_undervolt` / `select_anchor_bin` / `anchored_plan_lines` /
+  `run_anchored_undervolt_probe` (gpu_undervolt). `RealF2Ops` gained `mode` + `anchored` (writes the full
+  curve, verifies with the anchored verifier, confirms ALL written bins read ~0 on reset).
+- **Confirmed branch (anchored, NOT executed)**: ONE anchored curve plan, single-step (`--steps 1`), arms
+  Safe Loop before write, resets on every post-arm exit, clears boot flag only after a confirmed reset, no
+  persistence/apply/promotion. `confirmed_f2_refusal` reuses the anchor as the candidate.
+- **Validation**: `cargo check -p nidavellir-service` clean; `cargo test -p nidavellir-service` **240
+  passed**; `cargo test -p nidavellir-gpu-nvapi` **33 passed**. F1/build-frontier + simple-F2 tests still
+  green. **Read-only dry-run** (`undervolt-probe --target-mhz 1800 --steps 1`, NO `--confirm`): anchor
+  **981 mV base 1785 +15 → 1800** (same point as the prior confirmed run), **25** higher-voltage bins
+  capped DOWN to 1800 (max flatten **-135 MHz**), 2 already at target, **61** lower bins elastic; `plan
+  self-check = AnchoredRaiseVerified`; no-op (no arm/apply/dwell/VF write). `--help` and `--simple` both
+  verified. No Safe Loop / forge state mutated (only the 3 source files changed).
+- **Hardware NOT yet validated for anchored mode.** First future anchored validation should be:
+  `undervolt-probe --target-mhz 1800 --steps 1 --confirm` — ONE candidate, operator present, NOT
+  multi-step, no second confirmed run. Detail in `decisions.md` (top).
+
 ## Latest backend checkpoint (2026-06-21) — F2 true-undervolt FIRST CONFIRMED HARDWARE VALIDATION — PASS
 - **One supervised confirmed run** (operator present, ONE confirmed command, no second) validating the `78ecfc7`
   F2 confirmed branch on real hardware: `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. **First real

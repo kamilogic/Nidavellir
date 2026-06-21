@@ -2,6 +2,46 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 ANCHORED undervolt is now the intended path for classic undervolt probing (2026-06-21)
+- **Decision**: move F2 from a single positive offset at one VF bin to a true CLASSIC anchored
+  undervolt point. For a chosen target clock + voltage bin, the planner now: (1) RAISES the anchor bin
+  to the target with a bounded positive offset; (2) CAPS/flattens every HIGHER-voltage bin DOWN to the
+  same target (offset ≤ 0; already-at/below-target bins stay 0 — never raised); (3) leaves LOWER-voltage
+  bins elastic (offset 0). The result is the point `target MHz @ anchor mV with boost above target
+  prevented`. **ANCHORED is the DEFAULT mode**; `--simple` retains the original single-bin descent for
+  comparison/diagnostics.
+- **Why**: the first confirmed F2 hardware run (`78ecfc7`, below) proved the positive-offset MOTOR but
+  was NOT anchored — the GPU still boosted ABOVE the nominal 1800 MHz target (dwell avg 1868, p5 1845).
+  For the classic undervolt method, `1800 MHz @ 981 mV` must be tested as an anchored curve point, not
+  one raised bin with the rest of the boost curve free. The anchored plan caps the whole plateau so the
+  card cannot exceed the target during the test.
+- **Isolation / safety**: this is a NEW, separate, fail-closed path. It does NOT touch or relax
+  `apply_vf_ceiling_monotone` (build-frontier flatten-down) or the F1 path. New symbols:
+  `plan_bounded_anchored_positive_offset` / `apply_bounded_anchored_positive_offset` /
+  `AnchoredPositiveOffsetPlan` (gpu-nvapi); `verify_anchored_positive_offset` /
+  `AnchoredOffsetVerification::AnchoredRaiseVerified` (gpu_verify); `plan_anchored_undervolt` /
+  `anchored_plan_lines` / `UndervoltMode` (gpu_undervolt). The anchor raise REUSES the bounded single-bin
+  planner, so it inherits every floor/offset/per-step/clock-ceiling fail-closed rule. The planner REJECTS
+  (never clamps) a non-real anchor, an empty/foreign/non-sane curve, a target above the clock ceiling, an
+  offset above the absolute/per-step cap, any positive offset outside the anchor, a higher-voltage bin
+  left above target, or a non-monotone lower bin above target.
+- **Anchored verifier**: confirms the anchor was raised to target (within tol), every higher-voltage bin
+  sits at/below target + tol, and NO bin outside the anchor carries a positive offset. Verdicts:
+  `AnchoredRaiseVerified` / `AnchorRaiseIncomplete` / `AnchorOverRaise` / `HigherBinAboveTarget` /
+  `UnexpectedPositiveOffset` / `Unverifiable`. The simple `verify_positive_offset` and the F1 flatten-down
+  verifier are UNCHANGED.
+- **Confirmed branch** (NOT executed this patch): in anchored mode it writes ONE anchored curve plan
+  (anchor + plateau caps + elastic zeros) via the anchored writer, verifies with the anchored verifier,
+  and confirms EVERY written bin reads ~0 after `reset_to_stock`. Still single-step only (requires
+  `--steps 1`), still arms Safe Loop before the write, still resets on every post-arm exit, still clears
+  the boot flag only after a confirmed reset, still no persistence/apply/promotion.
+- **Dry-run validated read-only** on hardware (`--target-mhz 1800 --steps 1`, no `--confirm`): anchor
+  **981 mV base 1785 +15 → 1800** (the same candidate the prior confirmed run used), **25** higher-voltage
+  bins capped DOWN to 1800 (max flatten **-135 MHz**), 2 already at target, **61** lower bins elastic,
+  `plan self-check = AnchoredRaiseVerified`, no-op (no arm/apply/dwell/VF write). No Safe Loop mutation.
+- **Hardware NOT yet validated for anchored mode.** First future anchored validation: `--target-mhz 1800
+  --steps 1` (one candidate, operator present, no second confirmed run). NOT multi-step yet.
+
 ## F2 true-undervolt — FIRST confirmed hardware validation (2026-06-21) — PASS
 - **One supervised confirmed run** (operator present, ONE confirmed command, no second):
   `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. This is the FIRST real positive-offset VF write

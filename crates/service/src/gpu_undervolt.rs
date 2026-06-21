@@ -33,13 +33,18 @@ use std::ffi::OsString;
 use nidavellir_core::safe_loop::{
     SafeLoopRecord, SafeLoopStore, TuningPoint, SAFE_MODE_CRASH_THRESHOLD,
 };
-use nidavellir_gpu_nvapi::{plan_bounded_positive_offset, PositiveOffsetLimits, PositiveOffsetPlan};
+use nidavellir_gpu_nvapi::{
+    plan_bounded_anchored_positive_offset, plan_bounded_positive_offset, AnchoredBinRole,
+    AnchoredPositiveOffsetPlan, PositiveOffsetLimits, PositiveOffsetPlan,
+};
 
 #[cfg(windows)]
 use nidavellir_core::safe_loop::{BlacklistRegion, BootFlag, DEFAULT_BLACKLIST_RADIUS};
 #[cfg(windows)]
 use tracing::{info, warn};
 
+#[cfg(windows)]
+use crate::gpu_verify::AnchoredOffsetVerification;
 use crate::gpu_verify::PositiveOffsetVerification;
 
 /// Default number of descent steps (candidate bins) when `--steps` is omitted. Small by design —
@@ -75,13 +80,28 @@ fn is_f2_sane_point(voltage_mv: u32, freq_mhz: u32) -> bool {
         && (F2_SANE_MHZ_MIN..=F2_SANE_MHZ_MAX).contains(&freq_mhz)
 }
 
+/// Which F2 plan the probe builds. `Anchored` is the DEFAULT: a classic undervolt point that raises
+/// the anchor bin to the target AND caps the higher-voltage plateau so the GPU cannot boost above the
+/// target. `Simple` is the original single-bin positive-offset descent (proves the motor only; leaves
+/// the boost curve free above the target).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UndervoltMode {
+    /// Classic anchored undervolt point (raise the anchor + cap the plateau). The main F2 path.
+    #[default]
+    Anchored,
+    /// Original single-bin positive-offset descent (retained for comparison/diagnostics).
+    Simple,
+}
+
 /// Parsed `undervolt-probe` flags (syntax only; missing/non-numeric values FAIL CLOSED). `--confirm`
-/// is handled separately by the caller (and refused this patch).
+/// is handled separately by the caller. `mode` defaults to [`UndervoltMode::Anchored`]; `--simple`
+/// selects the original single-bin mode.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UndervoltArgs {
     pub target_mhz: Option<u32>,
     pub start_mv: Option<u32>,
     pub steps: Option<usize>,
+    pub mode: UndervoltMode,
 }
 
 /// Parse the `undervolt-probe` flags (`--target-mhz`, `--start-mv`, `--steps`). Pure + unit-testable;
@@ -109,6 +129,14 @@ pub fn parse_undervolt_args(args: &[OsString]) -> Result<UndervoltArgs, String> 
                 let v = strs.get(i + 1).ok_or_else(|| "--steps needs a value".to_string())?;
                 out.steps = Some(v.parse().map_err(|_| format!("--steps: invalid number '{v}'"))?);
                 i += 2;
+            }
+            "--simple" => {
+                out.mode = UndervoltMode::Simple;
+                i += 1;
+            }
+            "--anchored" => {
+                out.mode = UndervoltMode::Anchored;
+                i += 1;
             }
             _ => i += 1,
         }
@@ -189,6 +217,84 @@ pub fn plan_undervolt_probe(
         points,
         stop_reason,
         skipped_above_target,
+    }
+}
+
+/// Pick the anchored-undervolt ANCHOR bin: the HIGHEST-voltage real bin whose static base is below
+/// `target_mhz` (so a bounded positive offset can raise it to target), honoring `start_mv` (bins
+/// above it are ignored). Choosing the highest such bin keeps the raise smallest and leaves the whole
+/// plateau above it to be capped. Returns the bin index, or `None` if no bin needs a raise (every
+/// considered bin already holds the target). Pure.
+fn select_anchor_bin(
+    static_base_curve: &[(usize, u32, u32)],
+    target_mhz: u32,
+    start_mv: Option<u32>,
+) -> Option<usize> {
+    static_base_curve
+        .iter()
+        .filter(|&&(_, mv, base)| start_mv.map_or(true, |s| mv <= s) && base < target_mhz)
+        .max_by_key(|&&(_, mv, _)| mv)
+        .map(|&(idx, _, _)| idx)
+}
+
+/// The result of planning an ANCHORED undervolt probe: the single anchored curve plan when a valid
+/// anchor exists and the bounded raise + plateau caps all pass, or a `note` explaining why none was
+/// produced (no candidate bin, or a fail-closed rejection). Single-target, single anchored curve.
+/// This is a PLAN only — it performs no hardware action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredProbePlan {
+    pub focus_target_mhz: u32,
+    pub start_mv: Option<u32>,
+    /// The selected anchor bin voltage (mV), if one was found.
+    pub anchor_mv: Option<u32>,
+    /// The validated anchored curve plan (raise the anchor + cap the plateau + elastic below).
+    pub plan: Option<AnchoredPositiveOffsetPlan>,
+    /// Why no plan was produced (no candidate / fail-closed rejection); `None` when `plan` is `Some`.
+    pub note: Option<String>,
+}
+
+/// Pure ANCHORED-undervolt planner: select the anchor bin, then build the bounded anchored curve
+/// (raise the anchor to target + cap every higher-voltage bin down to target + leave lower bins
+/// elastic) via [`plan_bounded_anchored_positive_offset`]. Single-target, single anchored curve. No
+/// hardware — returns a plan (or a fail-closed note) only.
+pub fn plan_anchored_undervolt(
+    static_base_curve: &[(usize, u32, u32)],
+    focus_target_mhz: u32,
+    start_mv: Option<u32>,
+    limits: &PositiveOffsetLimits,
+) -> AnchoredProbePlan {
+    let Some(anchor_idx) = select_anchor_bin(static_base_curve, focus_target_mhz, start_mv) else {
+        return AnchoredProbePlan {
+            focus_target_mhz,
+            start_mv,
+            anchor_mv: None,
+            plan: None,
+            note: Some(
+                "no bin below target needs a bounded positive raise (nothing to anchor)".to_string(),
+            ),
+        };
+    };
+    let anchor_mv = static_base_curve
+        .iter()
+        .find(|(i, _, _)| *i == anchor_idx)
+        .map(|&(_, mv, _)| mv);
+    // Single-step anchored: prev_offset = 0. The planner is fail-closed and never silently clamps.
+    match plan_bounded_anchored_positive_offset(static_base_curve, anchor_idx, focus_target_mhz, 0, limits)
+    {
+        Ok(plan) => AnchoredProbePlan {
+            focus_target_mhz,
+            start_mv,
+            anchor_mv,
+            plan: Some(plan),
+            note: None,
+        },
+        Err(reason) => AnchoredProbePlan {
+            focus_target_mhz,
+            start_mv,
+            anchor_mv,
+            plan: None,
+            note: Some(reason),
+        },
     }
 }
 
@@ -309,19 +415,131 @@ pub fn undervolt_plan_lines(
     out
 }
 
+/// Format the ANCHORED `undervolt-probe` dry-run plan as printable lines (pure + testable). Shows the
+/// target, the selected anchor bin (mV / base MHz / positive offset), the higher-voltage bins that
+/// will be capped to target, the max positive offset and max downward flatten, the voltage floor and
+/// clock ceiling, the Safe Loop preflight, the reset_to_stock requirement, the anchored guarantee
+/// (boost above target is prevented), and the explicit no-op (no-write) line.
+pub fn anchored_plan_lines(
+    probe: &AnchoredProbePlan,
+    limits: &PositiveOffsetLimits,
+    preflight: &PreflightVerdict,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push("=== undervolt-probe PLAN (F2 anchored true-undervolt, dry-run preview) ===".to_string());
+    out.push(
+        "mode               : ANCHORED (classic undervolt point — raise the anchor + cap the plateau)"
+            .to_string(),
+    );
+    out.push(format!(
+        "focus target       : {} MHz (single target; F2 holds an existing clock — it never overclocks)",
+        probe.focus_target_mhz
+    ));
+    out.push(format!(
+        "offset caps        : abs +{} MHz, per-step +{} MHz (constants — NOT CLI-widenable)",
+        limits.abs_max_offset_mhz, limits.step_max_offset_mhz
+    ));
+    out.push(format!(
+        "voltage floor      : {} mV (lowest real core VF bin; the anchor never goes below it)",
+        limits.hw_floor_mv
+    ));
+    out.push(format!(
+        "clock ceiling      : {} MHz (a planned clock above it is rejected)",
+        limits.clock_ceiling_mhz
+    ));
+    out.push(format!(
+        "start voltage      : {}",
+        probe.start_mv.map_or("curve top (highest candidate bin)".to_string(), |s| format!(
+            "{s} mV (anchor at/below here)"
+        ))
+    ));
+    match &probe.plan {
+        None => {
+            out.push(format!(
+                "anchored plan      : none — {}",
+                probe.note.clone().unwrap_or_else(|| "no plan".to_string())
+            ));
+        }
+        Some(p) => {
+            out.push(format!(
+                "anchor bin         : {} mV  base {} MHz  +{} MHz (step +{}) -> {} MHz (raised to target)",
+                p.anchor.voltage_mv,
+                p.anchor.base_mhz,
+                p.anchor.offset_mhz,
+                p.anchor.step_delta_mhz,
+                p.anchor.effective_mhz
+            ));
+            out.push(format!(
+                "max positive offset: +{} MHz (at the anchor bin only)",
+                p.max_positive_offset_mhz
+            ));
+            out.push(format!(
+                "max neg flatten    : -{} MHz (largest downward cap on a higher-voltage bin)",
+                p.max_negative_flatten_mhz
+            ));
+            out.push(format!(
+                "higher-voltage bins: {} capped DOWN to target, {} already at/below target (never raised):",
+                p.capped_above_bins, p.above_already_ok_bins
+            ));
+            let mut caps: Vec<&_> = p
+                .entries
+                .iter()
+                .filter(|e| e.role == AnchoredBinRole::CappedAbove)
+                .collect();
+            caps.sort_by(|a, b| a.voltage_mv.cmp(&b.voltage_mv));
+            for e in caps {
+                out.push(format!(
+                    "  cap  {:>4} mV  base {:>4} MHz  {:>+4} MHz offset -> {} MHz",
+                    e.voltage_mv, e.base_mhz, e.offset_mhz, e.effective_mhz
+                ));
+            }
+            out.push(format!(
+                "lower-voltage bins : {} left elastic (offset 0, never raised)",
+                p.elastic_below_bins
+            ));
+        }
+    }
+    out.push(format!(
+        "Safe Loop preflight: safe_mode={} consecutive_crashes={} boot_flag_armed={} blacklisted_points={}",
+        preflight.safe_mode, preflight.consecutive_crashes, preflight.boot_flag_armed,
+        preflight.blacklisted_points
+    ));
+    out.push(format!(
+        "preflight verdict  : {}",
+        if preflight.safe {
+            "OK (a future confirmed run would be allowed to start)".to_string()
+        } else {
+            format!("REFUSE — {}", preflight.reasons.join("; "))
+        }
+    ));
+    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock on every exit path".to_string());
+    out.push(
+        "anchored guarantee : anchored mode prevents boost above the target during this probe"
+            .to_string(),
+    );
+    out.push("no-op (dry-run)    : no Safe Loop arm, no apply, no dwell, no VF write".to_string());
+    out
+}
+
 /// Help/usage text for `undervolt-probe`. Pure — printing it reads no hardware, plans nothing, and
 /// mutates nothing. Includes an explicit `--confirm` hardware warning.
 pub fn undervolt_usage() -> String {
     [
         "Usage: nidavellir-service undervolt-probe [OPTIONS]",
         "",
-        "F2 true-undervolt probe. Plans a bounded POSITIVE VF offset so a focus clock holds at a",
-        "lower voltage. Dry-run by default; with --confirm it executes ONE supervised single step.",
+        "F2 true-undervolt probe. The default ANCHORED mode plans a classic undervolt point: it raises",
+        "the chosen (lower-voltage) anchor bin to the focus clock AND caps every higher-voltage bin to",
+        "the same clock so the GPU cannot boost above the target. Dry-run by default; with --confirm it",
+        "executes ONE supervised single anchored step.",
         "",
         "Options:",
         "  --target-mhz <MHz>   Focus target clock (default: stock boost top; never overclocks).",
-        "  --start-mv <mV>      Highest voltage bin to consider (default: curve top).",
-        "  --steps <N>          Candidate bins to plan (default: 4). Confirmed mode REQUIRES --steps 1.",
+        "  --start-mv <mV>      Highest voltage bin to anchor at (default: curve top).",
+        "  --steps <N>          Candidate bins to plan in --simple mode (default: 4). Confirmed mode",
+        "                       REQUIRES --steps 1.",
+        "  --anchored           Plan the anchored classic undervolt point (DEFAULT).",
+        "  --simple             Plan the original single-bin positive-offset descent (boost above the",
+        "                       target is NOT prevented; for comparison/diagnostics only).",
         "  --confirm            Execute ONE supervised single step (see WARNING). Default: dry-run.",
         "  -h, --help           Print this help and exit (no hardware read, no plan, no mutation).",
         "",
@@ -624,13 +842,19 @@ pub fn confirmed_report_lines(
 }
 
 /// Windows real executor for the confirmed F2 single step. Wires [`F2Ops`] to NVAPI (the bounded
-/// positive-offset writer + offset readback), the validated load dwell + reset (`gpu_power_sweep`),
-/// and the Safe Loop store. NOT invoked unless the operator passes `--confirm` (refused this task).
+/// positive-offset / anchored writer + offset readback), the validated load dwell + reset
+/// (`gpu_power_sweep`), and the Safe Loop store. In `Anchored` mode it writes the full anchored curve
+/// (`anchored` is `Some`) and verifies it with the anchored verifier; in `Simple` mode it writes/verifies
+/// the single anchor bin. NOT invoked unless the operator passes `--confirm`.
 #[cfg(windows)]
 struct RealF2Ops<'a> {
     store: &'a SafeLoopStore,
     curve: Vec<(usize, u32, u32)>,
+    /// The anchor bin (the raised bin) — both modes use this for arm/blacklist/single-bin verify.
     candidate: PositiveOffsetPlan,
+    /// The full anchored curve plan, `Some` in [`UndervoltMode::Anchored`] (drives apply/verify/reset).
+    anchored: Option<AnchoredPositiveOffsetPlan>,
+    mode: UndervoltMode,
     limits: PositiveOffsetLimits,
     target_mhz: u32,
 }
@@ -645,27 +869,80 @@ impl F2Ops for RealF2Ops<'_> {
     }
 
     fn apply_positive_offset(&mut self) -> Result<(), String> {
-        // Single-step → prev_offset = 0. The writer re-validates every bound and fails closed.
-        nidavellir_gpu_nvapi::apply_bounded_positive_offset(
-            &self.curve,
-            self.candidate.index,
-            self.target_mhz,
-            0,
-            &self.limits,
-        )
-        .map(|_| ())
+        // Single-step → prev_offset = 0. Each writer re-validates every bound and fails closed.
+        match (self.mode, &self.anchored) {
+            (UndervoltMode::Anchored, Some(_)) => {
+                // Anchored: write the full curve (anchor raise + plateau caps + elastic zeros). The
+                // writer refuses any positive offset outside the anchor.
+                nidavellir_gpu_nvapi::apply_bounded_anchored_positive_offset(
+                    &self.curve,
+                    self.candidate.index,
+                    self.target_mhz,
+                    0,
+                    &self.limits,
+                )
+                .map(|_| ())
+            }
+            _ => nidavellir_gpu_nvapi::apply_bounded_positive_offset(
+                &self.curve,
+                self.candidate.index,
+                self.target_mhz,
+                0,
+                &self.limits,
+            )
+            .map(|_| ()),
+        }
     }
 
     fn verify(&mut self) -> PositiveOffsetVerification {
         // Offset readback is primary (idle GetStatus freq under-reports → pass freq = None).
-        let observed = nidavellir_gpu_nvapi::vf_get_point_khz(self.candidate.index).map(|khz| khz / 1000);
-        crate::gpu_verify::verify_positive_offset(
-            self.candidate.offset_mhz,
-            self.candidate.effective_mhz,
-            observed,
-            None,
-            F2_VERIFY_TOL_MHZ,
-        )
+        match (self.mode, &self.anchored) {
+            (UndervoltMode::Anchored, Some(plan)) => {
+                // Anchored: read back EVERY bin's offset and run the anchored verifier (anchor raised +
+                // higher-voltage plateau capped + no stray positive offset). Map onto the state
+                // machine's single-bin gate, logging the detailed anchored verdict.
+                let observed: Vec<(usize, Option<i32>)> = plan
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        (e.index, nidavellir_gpu_nvapi::vf_get_point_khz(e.index).map(|khz| khz / 1000))
+                    })
+                    .collect();
+                let av = crate::gpu_verify::verify_anchored_positive_offset(
+                    plan,
+                    &observed,
+                    F2_VERIFY_TOL_MHZ,
+                );
+                info!("undervolt-probe anchored verify: {av:?}");
+                match av {
+                    AnchoredOffsetVerification::AnchoredRaiseVerified => {
+                        PositiveOffsetVerification::RaiseVerified
+                    }
+                    AnchoredOffsetVerification::AnchorRaiseIncomplete => {
+                        PositiveOffsetVerification::RaiseIncomplete
+                    }
+                    AnchoredOffsetVerification::AnchorOverRaise
+                    | AnchoredOffsetVerification::HigherBinAboveTarget
+                    | AnchoredOffsetVerification::UnexpectedPositiveOffset => {
+                        PositiveOffsetVerification::OverRaise
+                    }
+                    AnchoredOffsetVerification::Unverifiable => {
+                        PositiveOffsetVerification::Unverifiable
+                    }
+                }
+            }
+            _ => {
+                let observed =
+                    nidavellir_gpu_nvapi::vf_get_point_khz(self.candidate.index).map(|khz| khz / 1000);
+                crate::gpu_verify::verify_positive_offset(
+                    self.candidate.offset_mhz,
+                    self.candidate.effective_mhz,
+                    observed,
+                    None,
+                    F2_VERIFY_TOL_MHZ,
+                )
+            }
+        }
     }
 
     fn dwell(&mut self) -> F2DwellOutcome {
@@ -687,13 +964,24 @@ impl F2Ops for RealF2Ops<'_> {
 
     fn reset_to_stock(&mut self) -> Result<(), String> {
         crate::gpu_power_sweep::reset_to_stock();
-        // F2 must NEVER leave a positive offset applied: confirm the candidate bin reads ~0 before
-        // reporting success. An unreadable or non-zero readback fails closed (flag retained).
-        match nidavellir_gpu_nvapi::vf_get_point_khz(self.candidate.index) {
-            Some(khz) if khz.abs() <= F2_RESET_TOL_KHZ => Ok(()),
-            Some(khz) => Err(format!("reset readback offset {khz} kHz not cleared")),
-            None => Err("reset readback unavailable — cannot confirm cleared".to_string()),
+        // F2 must NEVER leave any offset applied: confirm EVERY bin the writer touched reads ~0 before
+        // reporting success. In anchored mode that is every bin in the plan (anchor + caps + elastic);
+        // in simple mode it is just the candidate bin. An unreadable or non-zero readback fails closed
+        // (flag retained).
+        let indices: Vec<usize> = match (self.mode, &self.anchored) {
+            (UndervoltMode::Anchored, Some(plan)) => plan.entries.iter().map(|e| e.index).collect(),
+            _ => vec![self.candidate.index],
+        };
+        for idx in indices {
+            match nidavellir_gpu_nvapi::vf_get_point_khz(idx) {
+                Some(khz) if khz.abs() <= F2_RESET_TOL_KHZ => {}
+                Some(khz) => return Err(format!("reset readback offset {khz} kHz not cleared at idx {idx}")),
+                None => {
+                    return Err(format!("reset readback unavailable at idx {idx} — cannot confirm cleared"))
+                }
+            }
         }
+        Ok(())
     }
 
     fn clear_boot_flag(&mut self) -> Result<(), String> {
@@ -737,11 +1025,29 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
     // overclock above stock. The offset caps are the conservative constants (not CLI-widenable).
     let limits = PositiveOffsetLimits::conservative(floor_mv, boost_top);
 
+    // Read-only Safe Loop state (shared by both modes; the dry-run NEVER mutates it).
+    let record = store.load_record();
+    let boot_flag_armed = store.is_boot_flag_armed();
+
+    // ANCHORED is the default F2 path — a classic undervolt point that ALSO prevents boost above the
+    // target. `--simple` falls back to the original single-bin positive-offset descent below.
+    if args.mode == UndervoltMode::Anchored {
+        run_anchored_undervolt_probe(
+            store,
+            confirm,
+            &args,
+            &sane,
+            &limits,
+            focus_target,
+            &record,
+            boot_flag_armed,
+        );
+        return;
+    }
+
     let plan = plan_undervolt_probe(&sane, focus_target, args.start_mv, &limits, max_steps);
 
     // Read-only Safe Loop preflight over the planned points (axis keys match build-frontier's intent).
-    let record = store.load_record();
-    let boot_flag_armed = store.is_boot_flag_armed();
     let points: Vec<TuningPoint> = plan
         .points
         .iter()
@@ -807,6 +1113,8 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
                     store,
                     curve: sane,
                     candidate: cand,
+                    anchored: None,
+                    mode: UndervoltMode::Simple,
                     limits,
                     target_mhz: focus_target,
                 };
@@ -814,16 +1122,120 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
                 for line in confirmed_report_lines(focus_target, &cand, &limits, &report) {
                     println!("{line}");
                 }
-                info!("undervolt-probe: confirmed F2 single step outcome={:?}", report.outcome);
+                info!("undervolt-probe: confirmed F2 single step (simple) outcome={:?}", report.outcome);
             }
         }
         return;
     }
     println!("(dry-run — pass `--steps 1 --confirm` for ONE supervised single step; nothing was written)");
     info!(
-        "undervolt-probe: DRY-RUN — target={} MHz floor={} mV ceiling={} MHz steps={} candidates={} \
+        "undervolt-probe: DRY-RUN (simple) — target={} MHz floor={} mV ceiling={} MHz steps={} candidates={} \
          preflight_safe={} — no Safe Loop arm, no apply, no dwell, no VF write.",
         focus_target, floor_mv, boost_top, max_steps, plan.points.len(), preflight.safe
+    );
+}
+
+/// ANCHORED F2 probe (default mode). DRY-RUN by default: plans the classic undervolt point (raise the
+/// anchor bin to target + cap the higher-voltage plateau to target + leave lower bins elastic), runs
+/// the Safe Loop preflight read-only, prints the plan, and self-checks the planned curve with the SAME
+/// anchored verifier the confirmed path uses. WITH `--confirm` it runs the fail-closed preflight then
+/// ONE supervised single anchored step (single anchored curve; requires `--steps 1`; can TDR/reboot).
+/// Single-target, single-step only; never persists/applies/promotes a profile.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_anchored_undervolt_probe(
+    store: &SafeLoopStore,
+    confirm: bool,
+    args: &UndervoltArgs,
+    sane: &[(usize, u32, u32)],
+    limits: &PositiveOffsetLimits,
+    focus_target: u32,
+    record: &SafeLoopRecord,
+    boot_flag_armed: bool,
+) {
+    let probe = plan_anchored_undervolt(sane, focus_target, args.start_mv, limits);
+
+    // Read-only Safe Loop preflight over every planned bin (anchor + caps + elastic). Axis keys match
+    // build-frontier's intent so the blacklist applies consistently.
+    let points: Vec<TuningPoint> = probe.plan.as_ref().map_or_else(Vec::new, |p| {
+        p.entries
+            .iter()
+            .map(|e| {
+                TuningPoint::from_axes([
+                    ("gpu_freq_mhz", focus_target as i64),
+                    ("gpu_vf_bin_mv", e.voltage_mv as i64),
+                ])
+            })
+            .collect()
+    });
+    let preflight = undervolt_preflight(record, boot_flag_armed, &points);
+
+    for line in anchored_plan_lines(&probe, limits, &preflight) {
+        println!("{line}");
+    }
+
+    // Plan/verifier self-consistency: the planned curve must verify as AnchoredRaiseVerified using the
+    // SAME verifier the confirmed path uses — catches planner/verifier drift without any hardware.
+    if let Some(plan) = &probe.plan {
+        let observed: Vec<(usize, Option<i32>)> =
+            plan.entries.iter().map(|e| (e.index, Some(e.offset_mhz))).collect();
+        let v = crate::gpu_verify::verify_anchored_positive_offset(plan, &observed, F2_VERIFY_TOL_MHZ);
+        println!("plan self-check    : anchored plan verifies as {v:?} (tol {F2_VERIFY_TOL_MHZ} MHz)");
+    }
+
+    if confirm {
+        // Confirmed anchored single step. The candidate is the anchor bin; confirmed mode requires
+        // --steps 1 and re-runs the full fail-closed preflight before touching anything.
+        let candidate = probe.plan.as_ref().map(|p| p.anchor);
+        match confirmed_f2_refusal(
+            record,
+            boot_flag_armed,
+            args.steps,
+            candidate.as_ref(),
+            limits,
+            focus_target,
+        ) {
+            Some(reason) => {
+                println!(
+                    "undervolt-probe: --confirm REFUSED — {reason}. No Safe Loop arm, no apply, no \
+                     dwell, no VF write performed."
+                );
+                warn!("undervolt-probe: --confirm refused (anchored): {reason} — no hardware touched");
+            }
+            None => {
+                let plan = probe.plan.expect("refusal None guarantees a plan");
+                let anchor = plan.anchor;
+                warn!(
+                    "undervolt-probe: --confirm — executing ONE supervised ANCHORED F2 step \
+                     ({} MHz @ {} mV, +{} MHz anchor, {} plateau cap(s)) — can TDR/reboot.",
+                    focus_target, anchor.voltage_mv, anchor.offset_mhz, plan.capped_above_bins
+                );
+                let mut ops = RealF2Ops {
+                    store,
+                    curve: sane.to_vec(),
+                    candidate: anchor,
+                    anchored: Some(plan.clone()),
+                    mode: UndervoltMode::Anchored,
+                    limits: *limits,
+                    target_mhz: focus_target,
+                };
+                let report = run_confirmed_f2_step(&mut ops);
+                for line in confirmed_report_lines(focus_target, &anchor, limits, &report) {
+                    println!("{line}");
+                }
+                info!("undervolt-probe: confirmed ANCHORED F2 single step outcome={:?}", report.outcome);
+            }
+        }
+        return;
+    }
+    println!(
+        "(dry-run — pass `--steps 1 --confirm` for ONE supervised anchored single step; nothing was written)"
+    );
+    info!(
+        "undervolt-probe: DRY-RUN (anchored) — target={} MHz floor={} mV ceiling={} MHz anchor_mv={:?} \
+         has_plan={} preflight_safe={} — no Safe Loop arm, no apply, no dwell, no VF write.",
+        focus_target, limits.hw_floor_mv, limits.clock_ceiling_mhz, probe.anchor_mv,
+        probe.plan.is_some(), preflight.safe
     );
 }
 
@@ -861,13 +1273,32 @@ mod tests {
         assert_eq!(a.target_mhz, Some(1755));
         assert_eq!(a.start_mv, Some(1000));
         assert_eq!(a.steps, Some(4));
-        // Defaults when absent.
+        // Defaults when absent — and the DEFAULT mode is anchored.
         let d = parse_undervolt_args(&os(&["undervolt-probe"])).unwrap();
         assert_eq!((d.target_mhz, d.start_mv, d.steps), (None, None, None));
+        assert_eq!(d.mode, UndervoltMode::Anchored);
         // Missing / non-numeric values fail closed.
         assert!(parse_undervolt_args(&os(&["undervolt-probe", "--target-mhz"])).is_err());
         assert!(parse_undervolt_args(&os(&["undervolt-probe", "--steps", "x"])).is_err());
         assert!(parse_undervolt_args(&os(&["undervolt-probe", "--start-mv", "abc"])).is_err());
+    }
+
+    #[test]
+    fn parse_undervolt_args_reads_mode_flags() {
+        // --simple selects the original single-bin mode; --anchored is explicit (and the default).
+        assert_eq!(
+            parse_undervolt_args(&os(&["undervolt-probe", "--simple"])).unwrap().mode,
+            UndervoltMode::Simple
+        );
+        assert_eq!(
+            parse_undervolt_args(&os(&["undervolt-probe", "--anchored"])).unwrap().mode,
+            UndervoltMode::Anchored
+        );
+        // Last mode flag wins.
+        assert_eq!(
+            parse_undervolt_args(&os(&["undervolt-probe", "--simple", "--anchored"])).unwrap().mode,
+            UndervoltMode::Anchored
+        );
     }
 
     // ── plan_undervolt_probe (pure search; no hardware, no write) ─────────────────────────────
@@ -922,6 +1353,95 @@ mod tests {
         assert!(text.contains("Safe Loop preflight"));
     }
 
+    // ── anchored probe (plan_anchored_undervolt / select_anchor_bin / anchored_plan_lines) ────
+    // Anchor-focused base: lower bins below target, higher bins above target so the plateau caps
+    // engage. (idx, mV, base): 850/1700, 900/1740, 950/1770, 1000/1800, 1062/1845.
+    fn a_base() -> Vec<(usize, u32, u32)> {
+        vec![(0, 850, 1700), (1, 900, 1740), (2, 950, 1770), (3, 1000, 1800), (4, 1062, 1845)]
+    }
+
+    #[test]
+    fn select_anchor_bin_picks_highest_below_target() {
+        // target 1755: bins below it are 850(1700) and 900(1740) → highest is the 900 mV bin (idx 1).
+        assert_eq!(select_anchor_bin(&a_base(), 1755, None), Some(1));
+        // --start-mv 875 ignores the 900 mV bin → the 850 mV bin (idx 0) becomes the anchor.
+        assert_eq!(select_anchor_bin(&a_base(), 1755, Some(875)), Some(0));
+        // Target at/below every base → nothing to anchor.
+        assert_eq!(select_anchor_bin(&a_base(), 1600, None), None);
+    }
+
+    #[test]
+    fn anchored_probe_raises_anchor_caps_plateau_and_keeps_lower_elastic() {
+        let limits = PositiveOffsetLimits::conservative(850, 1900);
+        let probe = plan_anchored_undervolt(&a_base(), 1755, None, &limits);
+        assert_eq!(probe.anchor_mv, Some(900));
+        let plan = probe.plan.expect("a valid anchored plan");
+        // Anchor 900 mV raised +15 → 1755.
+        assert_eq!((plan.anchor.voltage_mv, plan.anchor.offset_mhz, plan.anchor.effective_mhz), (900, 15, 1755));
+        // Plateau (950/1000/1062) capped DOWN to target; lower bin (850) elastic.
+        assert_eq!(plan.capped_above_bins, 3);
+        assert_eq!(plan.elastic_below_bins, 1);
+        // Exactly one positive offset, and no bin sits above target.
+        assert_eq!(plan.entries.iter().filter(|e| e.offset_mhz > 0).count(), 1);
+        assert!(plan.entries.iter().all(|e| e.effective_mhz <= 1755));
+    }
+
+    #[test]
+    fn anchored_probe_single_candidate_only() {
+        // The anchored probe yields exactly ONE anchored curve (single candidate), never a descent list.
+        let limits = PositiveOffsetLimits::conservative(850, 1900);
+        let probe = plan_anchored_undervolt(&a_base(), 1755, None, &limits);
+        let plan = probe.plan.unwrap();
+        assert_eq!(plan.max_positive_offset_mhz, plan.anchor.offset_mhz);
+        assert_eq!(plan.entries.iter().filter(|e| e.role == AnchoredBinRole::Anchor).count(), 1);
+    }
+
+    #[test]
+    fn anchored_probe_reports_note_when_no_candidate() {
+        // Target at/below every base → no anchor, a note, and no plan (never a silent empty write).
+        let limits = PositiveOffsetLimits::conservative(850, 1900);
+        let probe = plan_anchored_undervolt(&a_base(), 1600, None, &limits);
+        assert!(probe.plan.is_none());
+        assert!(probe.note.is_some());
+        assert!(probe.anchor_mv.is_none());
+    }
+
+    #[test]
+    fn anchored_plan_lines_state_anchored_mode_and_no_write() {
+        let limits = PositiveOffsetLimits::conservative(850, 1900);
+        let probe = plan_anchored_undervolt(&a_base(), 1755, None, &limits);
+        let pf = undervolt_preflight(&SafeLoopRecord::default(), false, &[]);
+        let text = anchored_plan_lines(&probe, &limits, &pf).join("\n");
+        // Mode + the anchored guarantee + the explicit no-op/no-write semantics.
+        assert!(text.contains("ANCHORED"));
+        assert!(text.contains("anchored mode prevents boost above the target"));
+        assert!(text.contains("no Safe Loop arm"));
+        assert!(text.contains("no apply"));
+        assert!(text.contains("no dwell"));
+        assert!(text.contains("no VF write"));
+        // Required anchored plan content.
+        assert!(text.contains("anchor bin"));
+        assert!(text.contains("max positive offset"));
+        assert!(text.contains("max neg flatten"));
+        assert!(text.contains("higher-voltage bins"));
+        assert!(text.contains("clock ceiling"));
+        assert!(text.contains("voltage floor"));
+    }
+
+    #[test]
+    fn anchored_confirmed_branch_is_single_step_only() {
+        // The anchor IS a PositiveOffsetPlan candidate → the confirmed preflight refuses --steps != 1
+        // and allows --steps 1, exactly like the simple path (single anchored curve = single step).
+        let limits = PositiveOffsetLimits::conservative(850, 1900);
+        let plan = plan_anchored_undervolt(&a_base(), 1755, None, &limits).plan.unwrap();
+        let anchor = plan.anchor;
+        assert!(confirmed_f2_refusal(&SafeLoopRecord::default(), false, Some(3), Some(&anchor), &limits, 1755)
+            .unwrap()
+            .contains("single-step only"));
+        assert!(confirmed_f2_refusal(&SafeLoopRecord::default(), false, Some(1), Some(&anchor), &limits, 1755)
+            .is_none());
+    }
+
     // ── undervolt_preflight (pure; refuses unsafe state) ──────────────────────────────────────
     #[test]
     fn preflight_refuses_unsafe_state() {
@@ -953,9 +1473,12 @@ mod tests {
         assert!(u.contains("--target-mhz"));
         assert!(u.contains("--start-mv"));
         assert!(u.contains("--steps"));
+        assert!(u.contains("--simple"));
+        assert!(u.contains("--anchored"));
         assert!(u.contains("--confirm"));
         assert!(u.contains("-h, --help"));
         assert!(u.to_lowercase().contains("operator"));
+        assert!(u.to_uppercase().contains("ANCHORED"));
         assert!(u.contains("WARNING"));
         // Text only — it does not produce a plan / candidate listing.
         assert!(!u.contains("candidate bins"));

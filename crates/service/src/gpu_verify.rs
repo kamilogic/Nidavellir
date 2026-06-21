@@ -391,6 +391,84 @@ pub(crate) fn verify_positive_offset(
     PositiveOffsetVerification::RaiseVerified
 }
 
+// ── F2 ANCHORED true-undervolt: a classic curve point verdict ──────────────────────────────────
+// The single-bin [`verify_positive_offset`] confirms ONE bin was raised — it cannot, by itself, prove
+// the GPU was prevented from boosting ABOVE the target (the whole point of an anchored undervolt). The
+// anchored verifier ALSO confirms every higher-voltage bin was capped at/below target and that NO bin
+// outside the anchor carries a positive offset. It re-uses `verify_positive_offset` for the anchor
+// axis and does NOT touch the flatten-down path.
+
+/// F2 ANCHORED positive-offset verification verdict. DISTINCT from [`PositiveOffsetVerification`]
+/// (single bin): an anchored point must ALSO confirm the higher-voltage plateau was capped so the GPU
+/// cannot boost above the target, and that NO bin outside the anchor carries a positive offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnchoredOffsetVerification {
+    /// The anchor was raised to target within tolerance, every higher-voltage bin sits at/below
+    /// target + tol, and no non-anchor bin carries a positive offset.
+    AnchoredRaiseVerified,
+    /// The anchor's applied offset is materially BELOW the intended raise (it did not take).
+    AnchorRaiseIncomplete,
+    /// The anchor over-raised above target + tol (an unintended over-raise at the anchor bin).
+    AnchorOverRaise,
+    /// A higher-voltage bin still sits ABOVE target + tol (the cap did not hold → boost not prevented).
+    HigherBinAboveTarget,
+    /// A bin OUTSIDE the anchor carries an unintended positive offset (> tol).
+    UnexpectedPositiveOffset,
+    /// Offset readback evidence is missing for at least one bin → cannot verify.
+    Unverifiable,
+}
+
+/// Pure, read-only F2 ANCHORED verifier. Confirms an applied anchored plan holds the classic
+/// undervolt point: the anchor raised to target, the higher-voltage plateau capped at/below target,
+/// and no positive offset outside the anchor. The OFFSET readback per bin is the primary signal
+/// (GetStatus idle freq under-reports — see [`classify_curve`]). `observed_offset_mhz_by_index` maps
+/// each bin index → its read-back applied offset (MHz), `None` if the readback failed for that bin.
+/// Re-uses [`verify_positive_offset`] for the anchor axis; deliberately does NOT apply the
+/// flatten-down overshoot veto to the anchor. Pure + testable.
+pub(crate) fn verify_anchored_positive_offset(
+    plan: &nidavellir_gpu_nvapi::AnchoredPositiveOffsetPlan,
+    observed_offset_mhz_by_index: &[(usize, Option<i32>)],
+    tol_mhz: u32,
+) -> AnchoredOffsetVerification {
+    let observed = |idx: usize| {
+        observed_offset_mhz_by_index
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .and_then(|(_, o)| *o)
+    };
+    let target = plan.target_mhz;
+    let tol = tol_mhz as i32;
+
+    // 1. Anchor axis — re-use the single-bin positive-offset verifier (offset readback primary).
+    match verify_positive_offset(plan.anchor.offset_mhz, target, observed(plan.anchor.index), None, tol_mhz)
+    {
+        PositiveOffsetVerification::Unverifiable => return AnchoredOffsetVerification::Unverifiable,
+        PositiveOffsetVerification::RaiseIncomplete => {
+            return AnchoredOffsetVerification::AnchorRaiseIncomplete
+        }
+        PositiveOffsetVerification::OverRaise => return AnchoredOffsetVerification::AnchorOverRaise,
+        PositiveOffsetVerification::RaiseVerified => {}
+    }
+
+    // 2. Every non-anchor bin: no unintended positive offset, and effective clock ≤ target + tol.
+    for e in &plan.entries {
+        if e.index == plan.anchor.index {
+            continue;
+        }
+        let Some(obs) = observed(e.index) else {
+            return AnchoredOffsetVerification::Unverifiable;
+        };
+        if obs > tol {
+            return AnchoredOffsetVerification::UnexpectedPositiveOffset;
+        }
+        let effective = e.base_mhz as i32 + obs;
+        if effective - target as i32 > tol {
+            return AnchoredOffsetVerification::HigherBinAboveTarget;
+        }
+    }
+    AnchoredOffsetVerification::AnchoredRaiseVerified
+}
+
 /// Read-only (NVAPI GET-control offset readback): build the live per-point evidence at/above
 /// the ceiling bin, then classify it via [`eval_ceiling_evidence`]. Reusable by the
 /// persisted-profile verifier (today) and the transient-ceiling probe (Phase 2B.2-b).
@@ -1876,5 +1954,100 @@ mod tests {
         // The flatten-down overshoot veto still fires on a bin reading above target (unchanged).
         let nd = eval_no_down_cap(1785, &[ev(Some(0), 1830)], Some(&[(0usize, 1700u32)]));
         assert!(nd.overshoot_veto);
+    }
+
+    // ── F2 ANCHORED verifier (verify_anchored_positive_offset) ─────────────────────────────────
+    // Anchored base: anchor the 900 mV bin (base 1740) at 1755 (+15); the 950/1000/1062 mV bins are
+    // capped DOWN (-15/-45/-90); the 850 mV bin stays elastic (0). This is the plan the writer applies.
+    fn anchored_base() -> Vec<(usize, u32, u32)> {
+        vec![(0, 850, 1700), (1, 900, 1740), (2, 950, 1770), (3, 1000, 1800), (4, 1062, 1845)]
+    }
+    fn anchored_plan() -> nidavellir_gpu_nvapi::AnchoredPositiveOffsetPlan {
+        let limits = nidavellir_gpu_nvapi::PositiveOffsetLimits::conservative(850, 1900);
+        nidavellir_gpu_nvapi::plan_bounded_anchored_positive_offset(&anchored_base(), 1, 1755, 0, &limits)
+            .unwrap()
+    }
+    /// Observed offsets == the planned offsets (the write took exactly).
+    fn observed_as_planned(
+        plan: &nidavellir_gpu_nvapi::AnchoredPositiveOffsetPlan,
+    ) -> Vec<(usize, Option<i32>)> {
+        plan.entries.iter().map(|e| (e.index, Some(e.offset_mhz))).collect()
+    }
+
+    #[test]
+    fn anchored_verify_accepts_correctly_anchored_curve() {
+        let plan = anchored_plan();
+        let observed = observed_as_planned(&plan);
+        assert_eq!(
+            verify_anchored_positive_offset(&plan, &observed, TOL_MHZ),
+            AnchoredOffsetVerification::AnchoredRaiseVerified
+        );
+    }
+
+    #[test]
+    fn anchored_verify_rejects_anchor_not_raised_enough() {
+        let plan = anchored_plan();
+        let mut observed = observed_as_planned(&plan);
+        // Anchor read back well below the intended +15 raise (it did not take) → AnchorRaiseIncomplete.
+        // The gap must EXCEED tol (15); +15 intended vs a readback of -20 is a 35 MHz shortfall.
+        for o in observed.iter_mut() {
+            if o.0 == plan.anchor.index {
+                o.1 = Some(-20);
+            }
+        }
+        assert_eq!(
+            verify_anchored_positive_offset(&plan, &observed, TOL_MHZ),
+            AnchoredOffsetVerification::AnchorRaiseIncomplete
+        );
+    }
+
+    #[test]
+    fn anchored_verify_rejects_higher_bin_above_target() {
+        let plan = anchored_plan();
+        let mut observed = observed_as_planned(&plan);
+        // The 1062 mV bin (base 1845) was NOT capped (offset 0) → effective 1845 >> 1755 + tol.
+        let hot = plan.entries.iter().find(|e| e.voltage_mv == 1062).unwrap().index;
+        for o in observed.iter_mut() {
+            if o.0 == hot {
+                o.1 = Some(0);
+            }
+        }
+        assert_eq!(
+            verify_anchored_positive_offset(&plan, &observed, TOL_MHZ),
+            AnchoredOffsetVerification::HigherBinAboveTarget
+        );
+    }
+
+    #[test]
+    fn anchored_verify_rejects_unexpected_positive_offset_outside_anchor() {
+        let plan = anchored_plan();
+        let mut observed = observed_as_planned(&plan);
+        // A higher-voltage bin carries a stray positive offset (+40 > tol) → UnexpectedPositiveOffset.
+        let other = plan.entries.iter().find(|e| e.voltage_mv == 950).unwrap().index;
+        for o in observed.iter_mut() {
+            if o.0 == other {
+                o.1 = Some(40);
+            }
+        }
+        assert_eq!(
+            verify_anchored_positive_offset(&plan, &observed, TOL_MHZ),
+            AnchoredOffsetVerification::UnexpectedPositiveOffset
+        );
+    }
+
+    #[test]
+    fn anchored_verify_unverifiable_without_readback() {
+        let plan = anchored_plan();
+        let mut observed = observed_as_planned(&plan);
+        // The anchor's offset readback failed → Unverifiable (cannot prove the raise took).
+        for o in observed.iter_mut() {
+            if o.0 == plan.anchor.index {
+                o.1 = None;
+            }
+        }
+        assert_eq!(
+            verify_anchored_positive_offset(&plan, &observed, TOL_MHZ),
+            AnchoredOffsetVerification::Unverifiable
+        );
     }
 }
