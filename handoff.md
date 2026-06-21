@@ -3,7 +3,29 @@
 How to pick this up cold. State as of 2026-06-21, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-21) — F2 ANCHORED undervolt FIRST CONFIRMED HARDWARE VALIDATION — PASS
+## Latest backend checkpoint (2026-06-21) — F2 ANCHORED MULTI-STEP descent IMPLEMENTED (not yet HW-validated)
+- **What**: bounded SAME-TARGET ANCHORED multi-step descent for `undervolt-probe`. `--steps 2..=3` (anchored)
+  executes a short sequence of anchored candidates at ONE target, safer/higher voltage → lower voltage,
+  STOPPING at the first non-stable candidate and keeping the last good point. **Code + tests + docs only —
+  no hardware, no `--confirm`, no VF write, no Safe Loop mutation outside tests.**
+- **Files**: `crates/service/src/gpu_undervolt.rs` (planner + orchestrator + trait + refusal + formatters +
+  RealF2MultiOps + 12 tests), `crates/service/src/main.rs` (doc comment only).
+- **Step cap**: `F2_CONFIRMED_MAX_STEPS = 3`, enforced by `confirmed_f2_multi_refusal` (`--steps` 1..=3 else
+  FAIL CLOSED). `--steps 1` = the validated single-step path (untouched). `--simple` = single-step only.
+- **How it works**: `plan_anchored_undervolt_descent` (anchored analog of `plan_undervolt_probe`; chains the
+  +15 per-step cap, stops at first rejection) → `run_confirmed_f2_multi_step` drives the SAME validated
+  `run_confirmed_f2_step` motor per candidate via the `F2MultiStepOps` candidate-cursor trait. `select(i)`
+  re-checks Safe Loop + blacklist before each write. Continues only on a stable `Validated` candidate
+  (dwell stable + reset confirmed + flag cleared); stops on `VerifierFailed`/`Unstable`/`DeviceLost`/
+  `ClockDrop`/`ResetFailed`/`Blacklisted`. New `F2DwellOutcome::ClockDrop` (p5 < target − 30 MHz on an
+  otherwise-stable dwell) stops the descent; additive — single-step Stable/Unstable/DeviceLost unchanged.
+- **Validated (no hardware)**: 256 service tests + 33 nvapi tests pass (incl. F1/build-frontier + single-step).
+  Dry-run `--target-mhz 1800 --steps 3` → 3 candidates (975 mV +15 → 968 mV +30 → 962 mV +30, stop=budget),
+  preflight OK, no-op line; `--help`/`--steps 1` unchanged; `boot_flag.json`/`gpu_applied.json` absent.
+- **NEXT (hardware, one confirmed run, operator present, stop after first non-stable)**:
+  `undervolt-probe --target-mhz 1800 --steps 3 --confirm`. No persist/apply/promote. NOT yet HW-validated.
+
+## Earlier checkpoint (2026-06-21) — F2 ANCHORED undervolt FIRST CONFIRMED HARDWARE VALIDATION — PASS
 - **One supervised confirmed run** (operator present, ONE confirmed command, no second) validating the `747a11b`
   anchored branch on real hardware: `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. **First real ANCHORED
   positive-offset VF write.** HEAD = origin/master = `747a11b`, tree clean. **Fresh worktree binary built first**

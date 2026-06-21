@@ -2,6 +2,49 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 ANCHORED multi-step descent — bounded same-target probing IMPLEMENTED (not yet HW-validated) (2026-06-21)
+- **What**: a controlled, bounded, SAME-TARGET ANCHORED multi-step descent for `undervolt-probe`. For one
+  target (e.g. 1800 MHz) a confirmed run executes a SHORT sequence of anchored candidates from
+  safer/higher voltage to lower voltage, stopping at the first real failure and preserving the last good
+  point. Code + tests + docs only — **no hardware was run, no `--confirm`, no VF write** in this patch.
+- **Why**: the first confirmed run proved ONE anchored point (1800 @ 975 mV, +15) but not the minimum stable
+  voltage for 1800. The descent walks voltage down at the same target to find where it stops holding.
+- **Scope (fail-closed)**: single target only; anchored mode only; `--simple` stays single-step. No
+  multi-target automation, no autonomous crash-seeking, no profile persistence/apply/promotion, no
+  power-limit/TDP/clock-lock change. F1/build-frontier, `apply_vf_ceiling_monotone`, Safe Loop,
+  `reset_to_stock`, and the verifier gates are **untouched**.
+- **Step cap**: `F2_CONFIRMED_MAX_STEPS = 3`. Confirmed mode enforces its OWN cap
+  (`confirmed_f2_multi_refusal`): `--steps` must be `1..=3`, else FAIL CLOSED. The read-only dry-run may
+  preview a longer plan (`plan_anchored_undervolt_descent` honors the requested `--steps`), but the
+  confirmed branch never executes more than the cap. `--steps 1` keeps the previously hardware-validated
+  single-step path byte-for-byte (`confirmed_f2_refusal` + `run_confirmed_f2_step`).
+- **Design (reuse, not duplication)**: the descent planner is the anchored analog of
+  `plan_undervolt_probe` (descend bins, chain `prev_offset` so the +15 per-step cap bounds how fast the
+  undervolt deepens, stop at the first anchored-plan rejection). The orchestrator
+  `run_confirmed_f2_multi_step` drives the SAME validated per-candidate motor (`run_confirmed_f2_step`) via
+  a candidate-cursor trait `F2MultiStepOps` (`select(i)` re-checks Safe Loop + blacklist BEFORE each
+  write). It CONTINUES only on a stably-`Validated` candidate (dwell stable + reset confirmed + boot flag
+  cleared) and STOPS immediately on any other result, never attempting a deeper candidate.
+- **Per-candidate sequence (unchanged motor)**: check Safe Loop + blacklist → arm boot flag → apply the
+  bounded anchored curve → `verify_anchored_positive_offset` → dwell once → `reset_to_stock` → clear boot
+  flag ONLY after a confirmed reset. A reset that cannot be confirmed RETAINS the boot flag (fail closed).
+- **Stop reasons** (`F2MultiStopReason`): `CompletedAllPlanned`, `VerifierFailed`, `Unstable`,
+  `DeviceLost`, `ClockDrop`, `ResetFailed`, `Blacklisted`, `ArmFailed`/`ApplyFailed`, `NoMoreCandidates`.
+- **New ClockDrop signal**: `F2DwellOutcome::ClockDrop` — a STABLE (no crash/error) dwell whose sustained
+  (p5) clock sags below `target − F2_CLOCK_DROP_TOL_MHZ` (30 MHz) is reclassified as a clock drop: the
+  undervolt did not hold the clock under load → stop. It resets + (clears on confirmed reset) + never
+  validates + does NOT blacklist (not a crash/instability to record). Additive: the single-step motor's
+  Stable/Unstable/DeviceLost behavior is unchanged (the 975 mV point dwelt at p5 1815 ≥ 1800 → Stable).
+- **Validation done (no hardware)**: `cargo check`/`cargo test -p nidavellir-service` (256 pass, incl.
+  F1/build-frontier + single-step + 12 new multi-step tests), `cargo test -p nidavellir-gpu-nvapi` (33
+  pass), clippy introduced no new categories. Read-only dry-run `--target-mhz 1800 --steps 3` planned 3
+  anchored candidates (975 mV +15 → 968 mV +30 → 962 mV +30, stop = step budget), preflight OK, explicit
+  no-op line; `--help` and `--steps 1` (single-step) output unchanged; `boot_flag.json`/`gpu_applied.json`
+  absent after the dry-runs.
+- **Intended NEXT hardware validation (one confirmed run, operator present, stop after first non-stable)**:
+  `undervolt-probe --target-mhz 1800 --steps 3 --confirm`. No profile persistence/apply/promotion. The
+  multi-step path is NOT yet hardware-validated.
+
 ## F2 ANCHORED undervolt — FIRST confirmed hardware validation (2026-06-21) — PASS
 - **One supervised confirmed run** (operator present, ONE confirmed command, no second):
   `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. This is the FIRST real ANCHORED positive-offset

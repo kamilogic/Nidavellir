@@ -193,9 +193,11 @@ fn run_build_frontier_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::E
 
 /// Supervised console entry for the F2 `undervolt-probe`. `--help`/`-h` prints usage and exits
 /// (no hardware, no plan, no Safe Loop access). WITHOUT `--confirm` it is a read-only DRY-RUN that
-/// prints the plan (no hardware). WITH `--confirm` it runs startup recovery FIRST, then ONE
-/// supervised F2 single step (single-step only; requires `--steps 1`; can write a bounded positive
-/// VF offset and TDR/reboot). It never persists, applies, or promotes a profile.
+/// prints the plan (no hardware). WITH `--confirm` it runs startup recovery FIRST, then a supervised
+/// F2 run: anchored `--steps 1` is ONE single step; anchored `--steps 2..=3` is a bounded same-target
+/// multi-step descent that stops at the first non-stable candidate (`--simple` stays single-step).
+/// Confirmed mode can write bounded positive VF offsets and TDR/reboot. It never persists, applies,
+/// or promotes a profile.
 fn run_undervolt_probe_cmd(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     // Help short-circuits BEFORE anything else — no hardware read, no plan, no Safe Loop access.
     if has_help_flag(args) {

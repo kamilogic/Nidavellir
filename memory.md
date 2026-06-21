@@ -8,7 +8,26 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-21) — F2 ANCHORED undervolt FIRST confirmed hardware validation (1800 MHz @ 975 mV, +15) — PASS
+## Latest (2026-06-21) — F2 ANCHORED multi-step descent IMPLEMENTED (not yet HW-validated)
+- **What**: bounded SAME-TARGET ANCHORED multi-step descent for `undervolt-probe`. `--steps 2..=3` (anchored)
+  runs a short sequence of anchored candidates at ONE target, safer/higher voltage → lower voltage, stopping
+  at the first non-stable candidate and keeping the last good point. **Code + tests + docs only — no hardware,
+  no `--confirm`, no VF write, no Safe Loop mutation outside tests.** Files: `gpu_undervolt.rs` (+ 12 tests),
+  `main.rs` (doc comment only).
+- **Cap**: `F2_CONFIRMED_MAX_STEPS = 3`, enforced by `confirmed_f2_multi_refusal` (`--steps` 1..=3 else fail
+  closed). `--steps 1` keeps the validated single-step path; `--simple` stays single-step.
+- **Design**: `plan_anchored_undervolt_descent` (anchored analog of `plan_undervolt_probe`, chains the +15
+  per-step cap, stops at first rejection) → `run_confirmed_f2_multi_step` drives the SAME validated
+  `run_confirmed_f2_step` motor per candidate via the `F2MultiStepOps` cursor trait (`select(i)` re-checks
+  Safe Loop + blacklist before each write). Continues only on stable `Validated`; stops on VerifierFailed/
+  Unstable/DeviceLost/ClockDrop/ResetFailed/Blacklisted. New `F2DwellOutcome::ClockDrop` (p5 < target − 30 MHz
+  on an otherwise-stable dwell) — additive; single-step Stable/Unstable/DeviceLost unchanged.
+- **Validated (no HW)**: 256 service + 33 nvapi tests pass (incl. F1/build-frontier + single-step). Dry-run
+  `--target-mhz 1800 --steps 3` → 3 candidates (975 mV +15 → 968 mV +30 → 962 mV +30, stop=budget), preflight
+  OK, no-op line; `--help`/`--steps 1` unchanged. **NEXT HW (one confirmed run, operator, stop after first
+  non-stable)**: `undervolt-probe --target-mhz 1800 --steps 3 --confirm`. No persist/apply/promote.
+
+## Earlier (2026-06-21) — F2 ANCHORED undervolt FIRST confirmed hardware validation (1800 MHz @ 975 mV, +15) — PASS
 - **One supervised confirmed run** (operator present, ONE confirmed command, no second) of the `747a11b` anchored
   branch: `undervolt-probe --target-mhz 1800 --steps 1 --confirm`. **First real ANCHORED positive-offset VF write.**
   HEAD = origin/master = `747a11b`, tree clean; fresh worktree binary built first (was absent; mtime > `747a11b`).
