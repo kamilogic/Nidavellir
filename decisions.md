@@ -2,6 +2,48 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 MANUAL-PRIOR anchor mode — explicit dev/known-GPU shortcut IMPLEMENTED (not yet HW-validated) (2026-06-21)
+- **What**: an OPT-IN `--manual-prior` path for `undervolt-probe` that anchors at an operator-provided
+  `--start-mv` using a SEPARATE, larger bounded positive-offset cap. It exists ONLY to validate a KNOWN
+  manual point faster on the current dev GPU (e.g. `1800 MHz @ 875 mV`). It is NOT the default and NOT
+  for unknown GPUs. Code + tests + docs; **no hardware run, no `--confirm`, no VF write** in this patch.
+- **Default unchanged**: the official/autonomous unknown-GPU behavior remains progressive anchored
+  descent with the conservative caps (+30 abs / +15 per-step). Manual-prior branches BEFORE the default
+  dispatch (`run_undervolt_probe`, gated on `args.manual_prior`) and never widens the default caps.
+- **Separate cap**: `F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ = 250` (service), surfaced via
+  `PositiveOffsetLimits::manual_prior(floor, ceiling, max)` (gpu-nvapi) which widens ONLY the offset caps
+  (abs + per-step both = max, since manual-prior is single-step) while floor / clock-ceiling / real-bin /
+  sanity checks stay EXACTLY as `conservative`. Still fail-closed: an offset above the cap is REFUSED,
+  never clamped; the stock clock ceiling still caps the effective clock (can never overclock).
+- **Why 250**: the known point `1800 @ 875` needs ~+210 MHz (live base at the 875 mV bin is 1590 MHz). 250
+  covers it with margin yet stays a hard, fail-closed bound. The default +30 cap correctly REFUSES +210.
+- **Planner** (`plan_manual_prior_undervolt`): resolves `--start-mv` to the nearest real VF bin at/below
+  it (via `select_anchor_bin`), reuses `plan_anchored_undervolt` with the manual limits (so it inherits
+  every anchored fail-closed rule), and reports the selected bin / base / required offset even on refusal.
+  Anchored semantics intact: anchor raised to target, higher-voltage bins capped DOWN to target, lower
+  bins elastic.
+- **Confirmed gate** (`confirmed_manual_prior_refusal`): REQUIRES `--start-mv`, then delegates to the
+  shared `confirmed_f2_refusal` with the manual limits — inheriting the `--steps 1` single-step gate, the
+  Safe Mode / armed-flag / crash-threshold gates, the candidate bound re-checks, and the blacklist check.
+  The confirmed branch reuses the validated single-step motor (`run_confirmed_f2_step` / `RealF2Ops`) with
+  `limits: manual_limits`; one anchored candidate only; never persists/applies/promotes a profile.
+- **Untouched**: F1/build-frontier and `apply_vf_ceiling_monotone` (its positive-offset refusal guard is
+  intact), Safe Loop, `reset_to_stock`, the verifier (`verify_anchored_positive_offset`), the blacklist,
+  power-limit/TDP/clock-lock. The gpu-nvapi diff adds only the `manual_prior` constructor.
+- **Dry-run `1800 @ 875` (read-only, live curve)**: mode ANCHORED + MANUAL-PRIOR; warning "uses
+  user-provided prior; not the default unknown-GPU discovery path"; selected **875 mV** bin, base **1590
+  MHz**, required **+210 MHz**, manual cap **+250 MHz**, within bounds **YES**, 26 higher bins capped (max
+  flatten **-150 MHz**), 43 lower elastic, plan self-check **AnchoredRaiseVerified**; explicit no-op /
+  no-write + no-persist/apply/promote lines. Default progressive `1800 --steps 3` remained **unchanged**
+  (975 / 968 / 962 mV).
+- **Validation (no hardware)**: `cargo check` clean; `cargo test -p nidavellir-service` 269/0 (incl. F1 +
+  12 new manual-prior tests); `cargo test -p nidavellir-gpu-nvapi` 33/0. Focused adversarial safety review
+  of the diff: no blockers (default unchanged, fail-closed cap, F1 untouched, gates intact).
+- **Clocks above 1800 at 875 mV are NOT assumed** — they must still be discovered progressively.
+- **Next hardware validation (one confirmed run, operator present, stop after the single candidate)**:
+  `undervolt-probe --target-mhz 1800 --start-mv 875 --steps 1 --manual-prior --confirm`. No profile
+  persistence/apply/promotion. Manual-prior is NOT yet hardware-validated.
+
 ## F2 ANCHORED multi-step descent — bounded same-target probing IMPLEMENTED (not yet HW-validated) (2026-06-21)
 - **What**: a controlled, bounded, SAME-TARGET ANCHORED multi-step descent for `undervolt-probe`. For one
   target (e.g. 1800 MHz) a confirmed run executes a SHORT sequence of anchored candidates from

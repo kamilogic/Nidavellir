@@ -3,7 +3,28 @@
 How to pick this up cold. State as of 2026-06-21, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-21) — F2 ANCHORED MULTI-STEP descent IMPLEMENTED (not yet HW-validated)
+## Latest backend checkpoint (2026-06-21) — F2 MANUAL-PRIOR anchor mode IMPLEMENTED (not yet HW-validated)
+- **What**: opt-in `--manual-prior` for `undervolt-probe` — anchors at an explicit `--start-mv` with a
+  SEPARATE larger bounded offset cap to validate a KNOWN point fast (`1800 MHz @ 875 mV`). NOT the default,
+  NOT for unknown GPUs. **Code + tests + docs only — no hardware, no `--confirm`, no VF write.**
+- **Files**: `crates/gpu-nvapi/src/lib.rs` (+`PositiveOffsetLimits::manual_prior`),
+  `crates/service/src/gpu_undervolt.rs` (planner + formatter + refusal + dispatch + 13 tests),
+  `crates/service/src/main.rs` (doc comment only).
+- **Default unchanged**: progressive anchored descent + conservative caps (+30/+15) are the official
+  unknown-GPU path. Manual-prior branches BEFORE the default dispatch (gated on `args.manual_prior`).
+- **Cap**: `F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ = 250` (default `+30` untouched). Fail-closed: an
+  offset above the cap is REFUSED, never clamped; the stock clock ceiling still caps the effective clock.
+- **Gates**: `--manual-prior` requires `--start-mv`; confirmed requires `--steps 1` (delegates to
+  `confirmed_f2_refusal`); confirmed reuses `run_confirmed_f2_step`/`RealF2Ops` with `manual_limits`; one
+  candidate; no persist/apply/promote. F1/`apply_vf_ceiling_monotone`/Safe Loop/reset/verifier untouched.
+- **Dry-run `1800 @ 875`**: selected **875 mV**, base **1590 MHz**, required **+210 MHz**, cap **+250**,
+  within bounds, **AnchoredRaiseVerified**, no-op/no-write. Default `1800 --steps 3` unchanged (975/968/962).
+- **Validated (no HW)**: 269 service + 33 nvapi tests pass; manual safety review no blockers.
+- **NEXT HW (one confirmed run, operator present)**:
+  `undervolt-probe --target-mhz 1800 --start-mv 875 --steps 1 --manual-prior --confirm`. Clocks above 1800
+  at 875 mV are NOT assumed (still discover progressively). NOT yet hardware-validated.
+
+## Earlier checkpoint (2026-06-21) — F2 ANCHORED MULTI-STEP descent IMPLEMENTED (not yet HW-validated)
 - **What**: bounded SAME-TARGET ANCHORED multi-step descent for `undervolt-probe`. `--steps 2..=3` (anchored)
   executes a short sequence of anchored candidates at ONE target, safer/higher voltage → lower voltage,
   STOPPING at the first non-stable candidate and keeping the last good point. **Code + tests + docs only —

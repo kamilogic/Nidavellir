@@ -807,10 +807,28 @@ pub struct PositiveOffsetLimits {
 
 impl PositiveOffsetLimits {
     /// Conservative limits: the built-in offset caps + the caller's hardware-derived floor/ceiling.
+    /// This is the DEFAULT/autonomous-discovery envelope and is never widened by a CLI flag.
     pub fn conservative(hw_floor_mv: u32, clock_ceiling_mhz: u32) -> Self {
         Self {
             abs_max_offset_mhz: POS_OFFSET_MAX_MHZ,
             step_max_offset_mhz: POS_OFFSET_STEP_MAX_MHZ,
+            hw_floor_mv,
+            clock_ceiling_mhz,
+        }
+    }
+
+    /// MANUAL-PRIOR (explicit development / known-GPU shortcut) limits: a SEPARATE, larger bounded
+    /// positive-offset envelope for an operator-provided prior. Widens ONLY the offset caps — the
+    /// absolute AND the per-step cap are both set to `max_offset_mhz` (manual-prior is single-step, so
+    /// the per-step cap must admit the same one-shot raise) — while the hardware floor, the clock
+    /// ceiling, and every real-bin/sanity check stay EXACTLY as `conservative`. Still fail-closed: the
+    /// planner REJECTS (never clamps) an offset above `max_offset_mhz`. Used ONLY by the opt-in
+    /// manual-prior path; the default/autonomous discovery keeps `conservative` (+30 / +15) and never
+    /// sees this envelope.
+    pub fn manual_prior(hw_floor_mv: u32, clock_ceiling_mhz: u32, max_offset_mhz: i32) -> Self {
+        Self {
+            abs_max_offset_mhz: max_offset_mhz,
+            step_max_offset_mhz: max_offset_mhz,
             hw_floor_mv,
             clock_ceiling_mhz,
         }

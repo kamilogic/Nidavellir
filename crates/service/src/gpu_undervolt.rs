@@ -23,15 +23,22 @@
 //! - a bounded same-target ANCHORED MULTI-STEP descent ([`plan_anchored_undervolt_descent`] +
 //!   [`run_confirmed_f2_multi_step`] over the [`F2MultiStepOps`] trait): `--steps 2..=`[`F2_CONFIRMED_MAX_STEPS`]
 //!   executes a SHORT sequence of anchored candidates at ONE target (safer/higher voltage → lower
-//!   voltage), running the SAME per-step motor and STOPPING at the first non-stable candidate.
+//!   voltage), running the SAME per-step motor and STOPPING at the first non-stable candidate; and
+//! - an explicit MANUAL-PRIOR development/known-GPU shortcut ([`plan_manual_prior_undervolt`] +
+//!   `run_manual_prior_undervolt_probe`, gated by [`confirmed_manual_prior_refusal`]): `--manual-prior`
+//!   anchors at an operator-provided `--start-mv` using a SEPARATE larger bounded offset cap
+//!   ([`F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ`]) to validate a KNOWN point fast. It is OPT-IN, never
+//!   the default, requires `--start-mv`, and is single-step under `--confirm`.
 //!
 //! Safety invariants: no profile apply/persist/promotion, no MULTI-TARGET automation (the multi-step
 //! descent stays on a single target), no autonomous crash-seeking, no power-limit/TDP/clock-lock
 //! change; the confirmed multi-step branch is bounded by [`F2_CONFIRMED_MAX_STEPS`] (a larger request
-//! fails closed); the dry-run reads Safe Loop state READ-ONLY (it never arms the boot flag, mutates
-//! the record, applies, dwells, or writes VF); and the confirmed branch never leaves a positive
-//! offset applied after exit (a reset that cannot be confirmed fails closed and retains the boot flag
-//! for startup recovery).
+//! fails closed); the MANUAL-PRIOR larger offset cap is OPT-IN ONLY (it never changes the
+//! default/autonomous discovery caps) and still fail-closed (an offset above it is REFUSED, never
+//! clamped, and the stock clock ceiling still caps the effective clock); the dry-run reads Safe Loop
+//! state READ-ONLY (it never arms the boot flag, mutates the record, applies, dwells, or writes VF);
+//! and the confirmed branch never leaves a positive offset applied after exit (a reset that cannot be
+//! confirmed fails closed and retains the boot flag for startup recovery).
 
 use std::ffi::OsString;
 
@@ -62,6 +69,14 @@ const F2_DEFAULT_STEPS: usize = 4;
 /// non-stable candidate. A larger `--steps` request FAILS CLOSED in confirmed mode; the read-only
 /// dry-run may still preview a longer plan. Single-step (`--steps 1`) keeps its own validated path.
 const F2_CONFIRMED_MAX_STEPS: usize = 3;
+
+/// Hard cap (MHz) on the bounded POSITIVE offset for the explicit MANUAL-PRIOR development path ONLY.
+/// The default/autonomous discovery keeps the conservative +30 absolute / +15 per-step caps and NEVER
+/// sees this value. Manual-prior is an opt-in shortcut to validate a KNOWN manual point (e.g. 1800 MHz
+/// @ 875 mV, which on the test GPU needs ~+210 MHz from a 1590 MHz base): the cap is large enough to
+/// admit such a known raise yet still a HARD, fail-closed bound — an offset above it is REFUSED, never
+/// clamped — and the stock clock ceiling still caps the effective clock so this can never overclock.
+const F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ: i32 = 250;
 
 /// Tolerance (MHz) for the verifier (one boost bin) — used by the dry-run self-check and the
 /// confirmed-mode post-write verify.
@@ -114,13 +129,17 @@ pub enum UndervoltMode {
 
 /// Parsed `undervolt-probe` flags (syntax only; missing/non-numeric values FAIL CLOSED). `--confirm`
 /// is handled separately by the caller. `mode` defaults to [`UndervoltMode::Anchored`]; `--simple`
-/// selects the original single-bin mode.
+/// selects the original single-bin mode. `manual_prior` (`--manual-prior`) opts into the explicit
+/// development/known-GPU shortcut (anchored, larger bounded cap; requires `--start-mv`); it defaults
+/// to `false` so default/autonomous behavior is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UndervoltArgs {
     pub target_mhz: Option<u32>,
     pub start_mv: Option<u32>,
     pub steps: Option<usize>,
     pub mode: UndervoltMode,
+    /// Opt-in manual-prior mode (`--manual-prior`). NEVER the default; requires an explicit `--start-mv`.
+    pub manual_prior: bool,
 }
 
 /// Parse the `undervolt-probe` flags (`--target-mhz`, `--start-mv`, `--steps`). Pure + unit-testable;
@@ -155,6 +174,10 @@ pub fn parse_undervolt_args(args: &[OsString]) -> Result<UndervoltArgs, String> 
             }
             "--anchored" => {
                 out.mode = UndervoltMode::Anchored;
+                i += 1;
+            }
+            "--manual-prior" => {
+                out.manual_prior = true;
                 i += 1;
             }
             _ => i += 1,
@@ -314,6 +337,77 @@ pub fn plan_anchored_undervolt(
             plan: None,
             note: Some(reason),
         },
+    }
+}
+
+/// The result of planning a MANUAL-PRIOR anchored undervolt point: the operator's explicit prior
+/// (`requested_start_mv`), the REAL VF bin it resolved to (at/below the requested mV), that bin's base
+/// clock, the required positive offset to reach the target, the manual-prior offset cap, whether the
+/// point is within bounds, and the underlying [`AnchoredProbePlan`]. Single-target, single anchored
+/// point. A PLAN only — no hardware action. Manual-prior is an explicit development/known-GPU shortcut,
+/// NOT the default autonomous discovery path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualPriorPlan {
+    pub focus_target_mhz: u32,
+    /// The voltage the operator asked to anchor at (`--start-mv`).
+    pub requested_start_mv: u32,
+    /// The real VF bin index selected (highest bin at/below `requested_start_mv` whose base < target).
+    pub selected_idx: Option<usize>,
+    /// The selected bin's actual voltage (mV) — may differ from `requested_start_mv` if it is not exact.
+    pub selected_mv: Option<u32>,
+    /// The selected bin's static base clock (MHz).
+    pub base_mhz: Option<u32>,
+    /// The positive offset the target needs at the selected bin (`target - base`); may exceed the cap.
+    pub required_offset_mhz: Option<i32>,
+    /// The manual-prior absolute offset cap actually in force (MHz).
+    pub manual_cap_mhz: i32,
+    /// True iff the underlying anchored plan was produced (offset within cap, bin real/above floor, etc.).
+    pub within_bounds: bool,
+    /// The underlying anchored plan (raise the anchor + cap the plateau + elastic below), or `None`.
+    pub probe: AnchoredProbePlan,
+    /// Refusal/explanation when no anchored plan was produced (over cap / below floor / nothing to anchor).
+    pub note: Option<String>,
+}
+
+/// Pure MANUAL-PRIOR anchored planner: resolve the operator's explicit `requested_start_mv` to the
+/// nearest REAL VF bin at/below it whose base is below `focus_target_mhz` (via [`select_anchor_bin`]),
+/// then build the bounded anchored curve at that bin using the MANUAL-PRIOR limits (a SEPARATE, larger
+/// offset cap — the default/autonomous discovery never sees it). Reuses [`plan_anchored_undervolt`], so
+/// it inherits EVERY anchored fail-closed rule (real-bin, hardware floor, clock ceiling, monotone
+/// sanity, no positive offset outside the anchor) and only the offset cap differs. Also surfaces the
+/// selected bin, its base, and the required offset even when the plan is REFUSED (so the dry-run can
+/// report required offset vs cap). Single-target, single anchored point. No hardware — returns a plan.
+pub fn plan_manual_prior_undervolt(
+    static_base_curve: &[(usize, u32, u32)],
+    focus_target_mhz: u32,
+    requested_start_mv: u32,
+    manual_limits: &PositiveOffsetLimits,
+) -> ManualPriorPlan {
+    let selected_idx = select_anchor_bin(static_base_curve, focus_target_mhz, Some(requested_start_mv));
+    let (selected_mv, base_mhz, required_offset_mhz) = match selected_idx {
+        Some(idx) => static_base_curve
+            .iter()
+            .find(|(i, _, _)| *i == idx)
+            .map(|&(_, mv, base)| (Some(mv), Some(base), Some(focus_target_mhz as i32 - base as i32)))
+            .unwrap_or((None, None, None)),
+        None => (None, None, None),
+    };
+    // Reuse the anchored planner with the MANUAL-PRIOR limits; it fails closed (never clamps) on an
+    // offset above the manual cap, a below-floor bin, a non-monotone curve, or a missing anchor.
+    let probe = plan_anchored_undervolt(static_base_curve, focus_target_mhz, Some(requested_start_mv), manual_limits);
+    let within_bounds = probe.plan.is_some();
+    let note = probe.note.clone();
+    ManualPriorPlan {
+        focus_target_mhz,
+        requested_start_mv,
+        selected_idx,
+        selected_mv,
+        base_mhz,
+        required_offset_mhz,
+        manual_cap_mhz: manual_limits.abs_max_offset_mhz,
+        within_bounds,
+        probe,
+        note,
     }
 }
 
@@ -739,6 +833,131 @@ pub fn anchored_descent_plan_lines(
     out
 }
 
+/// Format the MANUAL-PRIOR anchored dry-run plan as printable lines (pure + testable). Shows the
+/// ANCHORED + MANUAL-PRIOR mode, the explicit manual-prior warning, the target, the requested
+/// `--start-mv`, the REAL selected VF bin + its base, the required positive offset, the manual-prior
+/// offset cap (and that the default discovery cap is unchanged), the anchored caps/elastic/flatten
+/// (when within bounds) or the refusal (required offset vs cap / below floor / nothing to anchor), the
+/// Safe Loop preflight, the reset_to_stock requirement, the confirmed single-step requirement, and the
+/// explicit no-op (no-write) + no-persist/apply/promote lines.
+pub fn manual_prior_plan_lines(
+    plan: &ManualPriorPlan,
+    manual_limits: &PositiveOffsetLimits,
+    preflight: &PreflightVerdict,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push("=== undervolt-probe PLAN (F2 ANCHORED + MANUAL-PRIOR, dry-run preview) ===".to_string());
+    out.push(
+        "mode               : ANCHORED + MANUAL-PRIOR (explicit operator prior — NOT default discovery)"
+            .to_string(),
+    );
+    out.push(
+        "manual-prior       : uses user-provided prior; not the default unknown-GPU discovery path"
+            .to_string(),
+    );
+    out.push(format!(
+        "focus target       : {} MHz (single target; manual-prior holds a known clock — never overclocks)",
+        plan.focus_target_mhz
+    ));
+    out.push(format!(
+        "requested start-mv : {} mV (explicit; REQUIRED for manual-prior)",
+        plan.requested_start_mv
+    ));
+    match (plan.selected_mv, plan.base_mhz, plan.required_offset_mhz) {
+        (Some(mv), Some(base), Some(off)) => {
+            out.push(format!(
+                "selected anchor    : {mv} mV (real VF bin at/below requested) base {base} MHz"
+            ));
+            out.push(format!("required offset    : {off:+} MHz (target - base)"));
+        }
+        _ => {
+            out.push(
+                "selected anchor    : none — no real VF bin at/below the requested start-mv is below target"
+                    .to_string(),
+            );
+            out.push("required offset    : n/a".to_string());
+        }
+    }
+    out.push(format!(
+        "manual offset cap  : +{} MHz (F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ; DEFAULT discovery cap \
+         stays +{} — unaffected)",
+        manual_limits.abs_max_offset_mhz, nidavellir_gpu_nvapi::POS_OFFSET_MAX_MHZ
+    ));
+    out.push(format!(
+        "voltage floor      : {} mV (the anchor never goes below it)",
+        manual_limits.hw_floor_mv
+    ));
+    out.push(format!(
+        "clock ceiling      : {} MHz (a planned clock above it is rejected)",
+        manual_limits.clock_ceiling_mhz
+    ));
+    match &plan.probe.plan {
+        Some(p) => {
+            out.push(format!(
+                "anchor bin         : {} mV  base {} MHz  +{} MHz (step +{}) -> {} MHz (raised to target)",
+                p.anchor.voltage_mv,
+                p.anchor.base_mhz,
+                p.anchor.offset_mhz,
+                p.anchor.step_delta_mhz,
+                p.anchor.effective_mhz
+            ));
+            out.push(format!(
+                "max positive offset: +{} MHz (at the anchor bin only)",
+                p.max_positive_offset_mhz
+            ));
+            out.push(format!(
+                "max neg flatten    : -{} MHz (largest downward cap on a higher-voltage bin)",
+                p.max_negative_flatten_mhz
+            ));
+            out.push(format!(
+                "higher-voltage bins: {} capped DOWN to target, {} already at/below target (never raised)",
+                p.capped_above_bins, p.above_already_ok_bins
+            ));
+            out.push(format!(
+                "lower-voltage bins : {} left elastic (offset 0, never raised)",
+                p.elastic_below_bins
+            ));
+            out.push("within bounds      : YES (required offset within the manual-prior cap)".to_string());
+        }
+        None => {
+            out.push(format!(
+                "within bounds      : NO — {}",
+                plan.note.clone().unwrap_or_else(|| "no anchored plan produced".to_string())
+            ));
+            out.push(
+                "refusal            : no write (required offset exceeds the manual-prior cap, or the \
+                 bin is invalid / below floor / nothing to anchor) — never clamped"
+                    .to_string(),
+            );
+        }
+    }
+    out.push(format!(
+        "Safe Loop preflight: safe_mode={} consecutive_crashes={} boot_flag_armed={} blacklisted_points={}",
+        preflight.safe_mode, preflight.consecutive_crashes, preflight.boot_flag_armed,
+        preflight.blacklisted_points
+    ));
+    out.push(format!(
+        "preflight verdict  : {}",
+        if preflight.safe {
+            "OK (a future confirmed run would be allowed to start)".to_string()
+        } else {
+            format!("REFUSE — {}", preflight.reasons.join("; "))
+        }
+    ));
+    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock on every exit path".to_string());
+    out.push(
+        "anchored guarantee : anchored mode prevents boost above the target during this probe"
+            .to_string(),
+    );
+    out.push(
+        "confirmed mode     : single-step only (requires --start-mv + --steps 1 + --manual-prior + --confirm)"
+            .to_string(),
+    );
+    out.push("no-op (dry-run)    : no Safe Loop arm, no apply, no dwell, no VF write".to_string());
+    out.push("profile            : none persisted, applied, or promoted".to_string());
+    out
+}
+
 /// Help/usage text for `undervolt-probe`. Pure — printing it reads no hardware, plans nothing, and
 /// mutates nothing. Includes an explicit `--confirm` hardware warning.
 pub fn undervolt_usage() -> String {
@@ -762,16 +981,23 @@ pub fn undervolt_usage() -> String {
         "  --anchored           Plan the anchored classic undervolt point(s) (DEFAULT).",
         "  --simple             Plan the original single-bin positive-offset descent (boost above the",
         "                       target is NOT prevented; for comparison/diagnostics only).",
+        "  --manual-prior       Explicit DEVELOPMENT / known-GPU shortcut: anchor at an operator-provided",
+        "                       --start-mv with a SEPARATE larger bounded offset cap",
+        "                       (F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ). NOT the default and NOT for",
+        "                       unknown GPUs; REQUIRES --start-mv; confirmed mode is single-step (--steps",
+        "                       1). The default/autonomous discovery cap (+30) is unaffected.",
         "  --confirm            Execute supervised anchored candidate(s) (see WARNING). Default: dry-run.",
         "  -h, --help           Print this help and exit (no hardware read, no plan, no mutation).",
         "",
         "First hardware optimization should start small, e.g. `--steps 3`, with an operator present.",
+        "Default behavior is autonomous progressive anchored discovery; manual-prior is opt-in only.",
         "",
         "WARNING: --confirm MAY WRITE bounded positive VF offsets and run load dwells. It can TDR or",
         "         reboot the machine and REQUIRES an operator present and able to reboot. Anchored",
-        "         confirmed mode runs at most F2_CONFIRMED_MAX_STEPS (3) candidates at ONE target,",
-        "         arms Safe Loop before each write, resets to stock after EVERY candidate, stops at the",
-        "         first non-stable candidate, and never persists, applies, or promotes a profile.",
+        "         confirmed mode runs at most F2_CONFIRMED_MAX_STEPS (3) candidates at ONE target;",
+        "         manual-prior confirmed mode runs ONE anchored point at the explicit --start-mv. Both",
+        "         arm Safe Loop before each write, reset to stock after EVERY candidate, stop at the",
+        "         first non-stable candidate, and never persist, apply, or promote a profile.",
     ]
     .join("\n")
 }
@@ -1190,6 +1416,28 @@ pub fn confirmed_f2_refusal(
         return Some("the candidate intent is blacklisted".to_string());
     }
     None
+}
+
+/// Pure confirmed MANUAL-PRIOR preflight. Returns `Some(reason)` to REFUSE (fail closed) before any
+/// hardware, or `None` to proceed. Manual-prior is opt-in and single-step: it REQUIRES an explicit
+/// `--start-mv`, then delegates to [`confirmed_f2_refusal`] with the MANUAL-PRIOR limits — so it
+/// inherits the `--steps 1` single-step gate, the Safe Mode / armed-flag / crash-threshold gates, the
+/// candidate-present check, the defensive offset/floor/clock bound re-checks (against the larger
+/// manual-prior cap), and the blacklist check. It NEVER relaxes any of those — only the offset cap
+/// differs from default discovery.
+pub fn confirmed_manual_prior_refusal(
+    record: &SafeLoopRecord,
+    boot_flag_armed: bool,
+    start_mv: Option<u32>,
+    steps: Option<usize>,
+    candidate: Option<&PositiveOffsetPlan>,
+    manual_limits: &PositiveOffsetLimits,
+    target_mhz: u32,
+) -> Option<String> {
+    if start_mv.is_none() {
+        return Some("manual-prior requires an explicit --start-mv".to_string());
+    }
+    confirmed_f2_refusal(record, boot_flag_armed, steps, candidate, manual_limits, target_mhz)
 }
 
 /// Pure confirmed ANCHORED multi-step preflight (run-level gate). Returns `Some(reason)` to REFUSE
@@ -1649,6 +1897,17 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
     let record = store.load_record();
     let boot_flag_armed = store.is_boot_flag_armed();
 
+    // MANUAL-PRIOR (explicit development / known-GPU shortcut): opt-in, anchored single point at an
+    // operator-provided --start-mv with a SEPARATE larger bounded offset cap. NEVER the default;
+    // branches BEFORE the autonomous anchored/simple dispatch so it cannot change default discovery
+    // behavior or its conservative caps. Anchored-only (any --simple is ignored under --manual-prior).
+    if args.manual_prior {
+        run_manual_prior_undervolt_probe(
+            store, confirm, &args, &sane, floor_mv, boost_top, focus_target, &record, boot_flag_armed,
+        );
+        return;
+    }
+
     // ANCHORED is the default F2 path — a classic undervolt point that ALSO prevents boost above the
     // target. `--simple` falls back to the original single-bin positive-offset descent below.
     if args.mode == UndervoltMode::Anchored {
@@ -1960,6 +2219,133 @@ fn run_anchored_multi_step(
         "undervolt-probe: DRY-RUN (anchored multi-step) — target={} MHz candidates={} requested_steps={} \
          confirmed_cap={} preflight_safe={} — no Safe Loop arm, no apply, no dwell, no VF write.",
         focus_target, descent.candidates.len(), max_steps, F2_CONFIRMED_MAX_STEPS, preflight.safe
+    );
+}
+
+/// MANUAL-PRIOR anchored probe (`--manual-prior`, explicit development / known-GPU shortcut). DRY-RUN
+/// by default: requires an explicit `--start-mv`, plans ONE anchored point at that operator-provided
+/// voltage using a SEPARATE larger bounded offset cap ([`F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ`]),
+/// runs the Safe Loop preflight read-only, prints the plan + self-check, and reports required offset vs
+/// cap. WITH `--confirm` it runs the fail-closed manual-prior preflight ([`confirmed_manual_prior_refusal`],
+/// single-step only) then ONE supervised anchored step over the SAME validated motor
+/// ([`run_confirmed_f2_step`] / [`RealF2Ops`]) with the manual-prior limits. NEVER the default; the
+/// default/autonomous discovery caps are untouched; never persists/applies/promotes a profile.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_manual_prior_undervolt_probe(
+    store: &SafeLoopStore,
+    confirm: bool,
+    args: &UndervoltArgs,
+    sane: &[(usize, u32, u32)],
+    floor_mv: u32,
+    boost_top: u32,
+    focus_target: u32,
+    record: &SafeLoopRecord,
+    boot_flag_armed: bool,
+) {
+    // Manual-prior REQUIRES an explicit --start-mv — it never guesses a voltage for an unknown GPU.
+    let Some(start_mv) = args.start_mv else {
+        println!(
+            "undervolt-probe: --manual-prior REQUIRES an explicit --start-mv (e.g. --start-mv 875). \
+             No hardware touched."
+        );
+        warn!("undervolt-probe: --manual-prior without --start-mv — refused, no hardware touched");
+        return;
+    };
+    // SEPARATE manual-prior offset envelope (larger bounded cap); floor / ceiling / sanity / real-bin
+    // checks stay EXACTLY as default discovery. The default/autonomous path NEVER sees this cap.
+    let manual_limits =
+        PositiveOffsetLimits::manual_prior(floor_mv, boost_top, F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ);
+    let plan = plan_manual_prior_undervolt(sane, focus_target, start_mv, &manual_limits);
+
+    // Read-only Safe Loop preflight over the planned bins (anchor + caps + elastic), if a plan exists.
+    let points: Vec<TuningPoint> = plan.probe.plan.as_ref().map_or_else(Vec::new, |p| {
+        p.entries
+            .iter()
+            .map(|e| {
+                TuningPoint::from_axes([
+                    ("gpu_freq_mhz", focus_target as i64),
+                    ("gpu_vf_bin_mv", e.voltage_mv as i64),
+                ])
+            })
+            .collect()
+    });
+    let preflight = undervolt_preflight(record, boot_flag_armed, &points);
+
+    for line in manual_prior_plan_lines(&plan, &manual_limits, &preflight) {
+        println!("{line}");
+    }
+
+    // Plan/verifier self-consistency (only when within bounds): the planned curve must verify as
+    // AnchoredRaiseVerified using the SAME verifier the confirmed path uses — no hardware.
+    if let Some(p) = &plan.probe.plan {
+        let observed: Vec<(usize, Option<i32>)> =
+            p.entries.iter().map(|e| (e.index, Some(e.offset_mhz))).collect();
+        let v = crate::gpu_verify::verify_anchored_positive_offset(p, &observed, F2_VERIFY_TOL_MHZ);
+        println!("plan self-check    : anchored plan verifies as {v:?} (tol {F2_VERIFY_TOL_MHZ} MHz)");
+    }
+
+    if confirm {
+        // Confirmed MANUAL-PRIOR single step. The candidate is the anchor bin; the gate requires an
+        // explicit --start-mv + --steps 1, then re-runs the full fail-closed preflight (with the
+        // manual-prior limits) before touching anything.
+        let candidate = plan.probe.plan.as_ref().map(|p| p.anchor);
+        match confirmed_manual_prior_refusal(
+            record,
+            boot_flag_armed,
+            args.start_mv,
+            args.steps,
+            candidate.as_ref(),
+            &manual_limits,
+            focus_target,
+        ) {
+            Some(reason) => {
+                println!(
+                    "undervolt-probe: --confirm REFUSED — {reason}. No Safe Loop arm, no apply, no \
+                     dwell, no VF write performed."
+                );
+                warn!("undervolt-probe: --confirm refused (manual-prior): {reason} — no hardware touched");
+            }
+            None => {
+                let p = plan.probe.plan.expect("refusal None guarantees a plan");
+                let anchor = p.anchor;
+                warn!(
+                    "undervolt-probe: --confirm — executing ONE supervised MANUAL-PRIOR ANCHORED F2 step \
+                     ({} MHz @ {} mV, +{} MHz anchor, {} plateau cap(s)) — can TDR/reboot.",
+                    focus_target, anchor.voltage_mv, anchor.offset_mhz, p.capped_above_bins
+                );
+                let mut ops = RealF2Ops {
+                    store,
+                    curve: sane.to_vec(),
+                    candidate: anchor,
+                    anchored: Some(p.clone()),
+                    mode: UndervoltMode::Anchored,
+                    limits: manual_limits,
+                    target_mhz: focus_target,
+                };
+                let report = run_confirmed_f2_step(&mut ops);
+                for line in confirmed_report_lines(focus_target, &anchor, &manual_limits, &report) {
+                    println!("{line}");
+                }
+                info!(
+                    "undervolt-probe: confirmed MANUAL-PRIOR ANCHORED F2 single step outcome={:?}",
+                    report.outcome
+                );
+            }
+        }
+        return;
+    }
+    println!(
+        "(dry-run — pass `--target-mhz {} --start-mv {} --steps 1 --manual-prior --confirm` for ONE \
+         supervised manual-prior step; nothing was written)",
+        focus_target, start_mv
+    );
+    info!(
+        "undervolt-probe: DRY-RUN (manual-prior) — target={} MHz start_mv={} selected_mv={:?} \
+         required_offset={:?} manual_cap=+{} within_bounds={} preflight_safe={} — no Safe Loop arm, \
+         no apply, no dwell, no VF write.",
+        focus_target, start_mv, plan.selected_mv, plan.required_offset_mhz,
+        F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ, plan.within_bounds, preflight.safe
     );
 }
 
@@ -2728,5 +3114,176 @@ mod tests {
                 "select" | "arm" | "apply" | "verify" | "dwell" | "reset" | "clear" | "blacklist"
             ));
         }
+    }
+
+    // ── F2 MANUAL-PRIOR (explicit dev/known-GPU shortcut; pure planner + gate; no hardware) ─────
+    // Anchor-at-875 fixture: the 875 mV bin needs a large raise (+210) to hold 1800 (base 1590); the
+    // 1062 mV bin sits above target so the plateau cap engages; the 850 mV bin sits below the anchor
+    // so the elastic case is exercised. (idx, mV, base_mhz).
+    fn mp_base() -> Vec<(usize, u32, u32)> {
+        vec![(0, 850, 1560), (1, 875, 1590), (2, 900, 1740), (3, 950, 1770), (4, 1000, 1800), (5, 1062, 1845)]
+    }
+
+    #[test]
+    fn parse_reads_manual_prior_flag_default_false() {
+        // Manual-prior is opt-in: absent → false (NOT the default).
+        assert!(!parse_undervolt_args(&os(&["undervolt-probe"])).unwrap().manual_prior);
+        assert!(parse_undervolt_args(&os(&["undervolt-probe", "--manual-prior"])).unwrap().manual_prior);
+        // It composes with the other flags without disturbing them.
+        let a = parse_undervolt_args(&os(&[
+            "undervolt-probe", "--target-mhz", "1800", "--start-mv", "875", "--steps", "1", "--manual-prior",
+        ]))
+        .unwrap();
+        assert_eq!((a.target_mhz, a.start_mv, a.steps, a.manual_prior), (Some(1800), Some(875), Some(1), true));
+    }
+
+    #[test]
+    fn manual_prior_limits_widen_only_the_offset_caps() {
+        // Manual-prior widens ONLY the offset caps (abs + per-step to the same value); floor/ceiling
+        // are unchanged, and the DEFAULT conservative caps (+30 / +15) are a separate, untouched thing.
+        let m = PositiveOffsetLimits::manual_prior(612, 1950, 250);
+        assert_eq!((m.abs_max_offset_mhz, m.step_max_offset_mhz), (250, 250));
+        assert_eq!((m.hw_floor_mv, m.clock_ceiling_mhz), (612, 1950));
+        let c = PositiveOffsetLimits::conservative(612, 1950);
+        assert_eq!((c.abs_max_offset_mhz, c.step_max_offset_mhz), (30, 15));
+    }
+
+    #[test]
+    fn manual_prior_selects_anchor_and_computes_required_offset() {
+        let m = PositiveOffsetLimits::manual_prior(800, 1950, 250);
+        let p = plan_manual_prior_undervolt(&mp_base(), 1800, 875, &m);
+        assert_eq!(p.selected_mv, Some(875));
+        assert_eq!(p.base_mhz, Some(1590));
+        assert_eq!(p.required_offset_mhz, Some(210)); // 1800 - 1590
+        assert!(p.within_bounds);
+        let plan = p.probe.plan.expect("within bounds → a plan");
+        assert_eq!(
+            (plan.anchor.voltage_mv, plan.anchor.offset_mhz, plan.anchor.effective_mhz),
+            (875, 210, 1800)
+        );
+    }
+
+    #[test]
+    fn manual_prior_caps_higher_bins_and_keeps_lower_elastic() {
+        let m = PositiveOffsetLimits::manual_prior(800, 1950, 250);
+        let plan = plan_manual_prior_undervolt(&mp_base(), 1800, 875, &m).probe.plan.unwrap();
+        // 1062 (base 1845 > 1800) capped DOWN; 850 (below the anchor) left elastic.
+        assert_eq!(plan.capped_above_bins, 1);
+        assert_eq!(plan.elastic_below_bins, 1);
+        // No bin above target, and ONLY the anchor carries a positive offset.
+        assert!(plan.entries.iter().all(|e| e.effective_mhz <= 1800));
+        assert_eq!(plan.entries.iter().filter(|e| e.offset_mhz > 0).count(), 1);
+    }
+
+    #[test]
+    fn manual_prior_rejects_required_offset_above_cap() {
+        // Target 1900 @ 875 (base 1590) needs +310 > cap 250 → REFUSED (never clamped), no plan.
+        let m = PositiveOffsetLimits::manual_prior(800, 1950, 250);
+        let p = plan_manual_prior_undervolt(&mp_base(), 1900, 875, &m);
+        assert_eq!(p.required_offset_mhz, Some(310));
+        assert!(!p.within_bounds);
+        assert!(p.probe.plan.is_none());
+        let note = p.note.as_deref().unwrap_or_default();
+        assert!(note.contains("absolute cap") && note.contains("250"));
+    }
+
+    #[test]
+    fn manual_prior_rejects_below_floor_bin() {
+        // Floor 900: the 875 mV anchor is below the floor → REFUSED on the floor check (not clamped).
+        let m = PositiveOffsetLimits::manual_prior(900, 1950, 250);
+        let p = plan_manual_prior_undervolt(&mp_base(), 1800, 875, &m);
+        assert_eq!(p.selected_mv, Some(875));
+        assert!(!p.within_bounds);
+        assert!(p.note.as_deref().unwrap_or_default().contains("floor"));
+    }
+
+    #[test]
+    fn manual_prior_rejects_when_nothing_to_anchor() {
+        // start-mv 700 is below every real bin (lowest is 850 mV) → no anchor candidate, no plan.
+        let m = PositiveOffsetLimits::manual_prior(600, 1950, 250);
+        let p = plan_manual_prior_undervolt(&mp_base(), 1800, 700, &m);
+        assert_eq!(p.selected_mv, None);
+        assert_eq!(p.required_offset_mhz, None);
+        assert!(!p.within_bounds);
+        assert!(p.note.is_some());
+    }
+
+    #[test]
+    fn manual_prior_nonexact_start_mv_resolves_to_nearest_real_bin() {
+        // 880 mV is not a real bin → resolves to the nearest real bin at/below it (875 mV).
+        let m = PositiveOffsetLimits::manual_prior(800, 1950, 250);
+        let p = plan_manual_prior_undervolt(&mp_base(), 1800, 880, &m);
+        assert_eq!(p.requested_start_mv, 880);
+        assert_eq!(p.selected_mv, Some(875));
+    }
+
+    #[test]
+    fn confirmed_manual_prior_requires_start_mv_and_single_step() {
+        let m = PositiveOffsetLimits::manual_prior(800, 1950, 250);
+        let cand = plan_manual_prior_undervolt(&mp_base(), 1800, 875, &m).probe.plan.unwrap().anchor;
+        let rec = SafeLoopRecord::default();
+        // Missing --start-mv → refuse.
+        assert!(confirmed_manual_prior_refusal(&rec, false, None, Some(1), Some(&cand), &m, 1800)
+            .unwrap()
+            .contains("requires an explicit --start-mv"));
+        // --steps > 1 → refuse (single-step only for first hardware validation).
+        assert!(confirmed_manual_prior_refusal(&rec, false, Some(875), Some(2), Some(&cand), &m, 1800)
+            .unwrap()
+            .contains("single-step only"));
+        // start-mv + steps 1 + a valid in-bounds candidate + clean record → allowed.
+        assert!(confirmed_manual_prior_refusal(&rec, false, Some(875), Some(1), Some(&cand), &m, 1800).is_none());
+    }
+
+    #[test]
+    fn manual_prior_plan_lines_show_warning_required_offset_and_no_write() {
+        let m = PositiveOffsetLimits::manual_prior(800, 1950, 250);
+        let p = plan_manual_prior_undervolt(&mp_base(), 1800, 875, &m);
+        let pf = undervolt_preflight(&SafeLoopRecord::default(), false, &[]);
+        let text = manual_prior_plan_lines(&p, &m, &pf).join("\n");
+        assert!(text.contains("MANUAL-PRIOR"));
+        assert!(text.contains("uses user-provided prior; not the default unknown-GPU discovery path"));
+        assert!(text.contains("requested start-mv : 875"));
+        assert!(text.contains("selected anchor"));
+        assert!(text.contains("required offset    : +210"));
+        assert!(text.contains("manual offset cap  : +250"));
+        assert!(text.contains("DEFAULT discovery cap")); // shows the default cap stays unaffected
+        assert!(text.contains("within bounds      : YES"));
+        // No-op / no-write + no-persist/apply/promote semantics.
+        assert!(text.contains("no Safe Loop arm"));
+        assert!(text.contains("no apply"));
+        assert!(text.contains("no dwell"));
+        assert!(text.contains("no VF write"));
+        assert!(text.contains("none persisted, applied, or promoted"));
+    }
+
+    #[test]
+    fn manual_prior_plan_lines_report_over_cap_refusal_no_write() {
+        let m = PositiveOffsetLimits::manual_prior(800, 1950, 250);
+        let p = plan_manual_prior_undervolt(&mp_base(), 1900, 875, &m); // +310 > cap 250
+        let pf = undervolt_preflight(&SafeLoopRecord::default(), false, &[]);
+        let text = manual_prior_plan_lines(&p, &m, &pf).join("\n");
+        assert!(text.contains("required offset    : +310"));
+        assert!(text.contains("manual offset cap  : +250"));
+        assert!(text.contains("within bounds      : NO"));
+        assert!(text.contains("no VF write"));
+    }
+
+    #[test]
+    fn manual_prior_does_not_affect_default_discovery_caps() {
+        // The SAME bin/target manual-prior admits (+210) is REFUSED under the DEFAULT conservative
+        // caps (+30) — proving manual-prior never widens default/autonomous discovery.
+        let default_limits = PositiveOffsetLimits::conservative(800, 1950);
+        let probe = plan_anchored_undervolt(&mp_base(), 1800, Some(875), &default_limits);
+        assert!(probe.plan.is_none());
+        assert!(probe.note.as_deref().unwrap_or_default().contains("+30"));
+    }
+
+    #[test]
+    fn usage_lists_manual_prior() {
+        let u = undervolt_usage();
+        assert!(u.contains("--manual-prior"));
+        assert!(u.contains("--start-mv")); // manual-prior requires it
+        assert!(u.to_uppercase().contains("MANUAL-PRIOR"));
+        assert!(!u.contains("candidate bins"));
     }
 }

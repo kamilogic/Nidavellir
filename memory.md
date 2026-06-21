@@ -8,7 +8,24 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-21) — F2 ANCHORED multi-step descent IMPLEMENTED (not yet HW-validated)
+## Latest (2026-06-21) — F2 MANUAL-PRIOR anchor mode IMPLEMENTED (not yet HW-validated)
+- **What**: opt-in `--manual-prior` for `undervolt-probe` — anchor at an explicit `--start-mv` with a
+  SEPARATE larger bounded offset cap, to validate a KNOWN point fast (`1800 MHz @ 875 mV`). NOT the
+  default, NOT for unknown GPUs. **Code + tests + docs only — no hardware, no `--confirm`, no VF write.**
+- **Default unchanged**: progressive anchored descent + conservative caps (+30/+15) remain the official
+  unknown-GPU path; manual-prior branches BEFORE the default dispatch (gated on `args.manual_prior`).
+- **Cap**: `F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ = 250` (default +30 untouched); fail-closed (offset
+  above cap REFUSED, never clamped; stock clock ceiling still caps effective clock). Gate: `--manual-prior`
+  requires `--start-mv`; confirmed requires `--steps 1`; reuses `run_confirmed_f2_step`/`RealF2Ops` with
+  manual limits; one candidate; no persist/apply/promote. F1/`apply_vf_ceiling_monotone`/Safe Loop/reset/
+  verifier untouched.
+- **Dry-run `1800 @ 875`**: selected 875 mV, base 1590 MHz, required +210 MHz, cap +250, within bounds,
+  AnchoredRaiseVerified, no-op/no-write. Default `1800 --steps 3` unchanged (975/968/962). 269 service + 33
+  nvapi tests pass; manual safety review no blockers.
+- **NEXT HW (one confirmed run, operator present)**: `undervolt-probe --target-mhz 1800 --start-mv 875
+  --steps 1 --manual-prior --confirm`. Clocks above 1800 at 875 mV NOT assumed. NOT yet HW-validated.
+
+## Earlier (2026-06-21) — F2 ANCHORED multi-step descent IMPLEMENTED (not yet HW-validated)
 - **What**: bounded SAME-TARGET ANCHORED multi-step descent for `undervolt-probe`. `--steps 2..=3` (anchored)
   runs a short sequence of anchored candidates at ONE target, safer/higher voltage → lower voltage, stopping
   at the first non-stable candidate and keeping the last good point. **Code + tests + docs only — no hardware,
