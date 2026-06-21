@@ -8,7 +8,7 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-21) — F2 MANUAL-PRIOR anchor mode IMPLEMENTED (not yet HW-validated)
+## Latest (2026-06-21) — F2 MANUAL-PRIOR anchor mode HARDWARE VALIDATED (1800 @ 875 mV, +210) — PASS
 - **What**: opt-in `--manual-prior` for `undervolt-probe` — anchor at an explicit `--start-mv` with a
   SEPARATE larger bounded offset cap, to validate a KNOWN point fast (`1800 MHz @ 875 mV`). NOT the
   default, NOT for unknown GPUs. **Code + tests + docs only — no hardware, no `--confirm`, no VF write.**
@@ -22,8 +22,14 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 - **Dry-run `1800 @ 875`**: selected 875 mV, base 1590 MHz, required +210 MHz, cap +250, within bounds,
   AnchoredRaiseVerified, no-op/no-write. Default `1800 --steps 3` unchanged (975/968/962). 269 service + 33
   nvapi tests pass; manual safety review no blockers.
-- **NEXT HW (one confirmed run, operator present)**: `undervolt-probe --target-mhz 1800 --start-mv 875
-  --steps 1 --manual-prior --confirm`. Clocks above 1800 at 875 mV NOT assumed. NOT yet HW-validated.
+- **HARDWARE PASS (one confirmed run, operator present)**: `undervolt-probe --target-mhz 1800 --start-mv
+  875 --steps 1 --manual-prior --confirm` → exit 0, **Validated**. Anchor 875 mV / base 1590 / +210 → 1800;
+  **AnchoredRaiseVerified**; dwell **Stable** avg/p5 **1815 MHz**, **157 W** (~26 W under the 975 mV/183 W
+  run — same clock, lower voltage); reset_to_stock OK (all bins cleared); boot flag cleared; not
+  blacklisted; **no persist/apply/promote** (`last_validated` null). No TDR/crash/reboot; `safe_loop.json`
+  byte-identical (mtime-only); `boot_flag.json`/`gpu_applied.json` absent. Impl commit `34581d0`.
+- **NEXT**: clocks above 1800 at 875 mV NOT assumed (discover progressively). Either descend below 875 mV
+  for 1800 (min stable voltage) or progressive discovery for 1815+. No second confirmed run made.
 
 ## Earlier (2026-06-21) — F2 ANCHORED multi-step descent IMPLEMENTED (not yet HW-validated)
 - **What**: bounded SAME-TARGET ANCHORED multi-step descent for `undervolt-probe`. `--steps 2..=3` (anchored)

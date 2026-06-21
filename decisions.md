@@ -2,7 +2,35 @@
 
 Durable technical decisions and their rationale. Newest first.
 
-## F2 MANUAL-PRIOR anchor mode — explicit dev/known-GPU shortcut IMPLEMENTED (not yet HW-validated) (2026-06-21)
+## F2 MANUAL-PRIOR anchor mode — FIRST confirmed hardware validation (1800 MHz @ 875 mV, +210) — PASS (2026-06-21)
+- **One supervised confirmed run** (operator present, ONE confirmed command, no second):
+  `undervolt-probe --target-mhz 1800 --start-mv 875 --steps 1 --manual-prior --confirm` on the
+  freshly-built binary at commit `34581d0`. **First real MANUAL-PRIOR anchored VF write.**
+- **Result: exit 0, outcome `Validated`.** No TDR / black-screen / reboot / DeviceLost / Unstable /
+  ClockDrop / silent error; the machine stayed responsive.
+- **Candidate (live curve)**: target **1800 MHz**, anchor bin **875 mV**, base **1590 MHz**, offset
+  **+210 MHz** → 1800; **26** higher-voltage bins capped DOWN to 1800 (max flatten **-150 MHz**), 18
+  already at/below target, **43** lower bins elastic. Offset within the manual-prior cap (+250) and below
+  the +250 per-step cap; effective clock 1800 ≤ ceiling 1950.
+- **Motor (end-to-end)**: startup recovery ran first ("clean boot, nothing to restore") → Safe Loop
+  armed BEFORE the write → `apply_bounded_anchored_positive_offset` (manual limits) → anchored verify
+  **`AnchoredRaiseVerified`** (`verifier result = Some(RaiseVerified)`) → dwell **Stable** (avg **1815
+  MHz**, p5/sustained **1815 MHz**, **157 W**, `silent_error=false`) → `reset_to_stock` ran + CONFIRMED
+  stock (all written bins cleared) → boot flag cleared after the clean reset. Not blacklisted. **No
+  profile persisted, applied, or promoted** (Validated reported only; `last_validated` stays null).
+- **Undervolt benefit vs the 975 mV run**: same 1800 MHz held at **875 mV** draws **157 W** vs **183 W**
+  at 975 mV — ~**26 W** lower for the same clock. avg==p5 (1815) confirms the plateau caps prevent boost
+  above 1800; the +15 over target is within the 15 MHz verifier tolerance.
+- **State after run**: `boot_flag.json`/`gpu_applied.json` absent; `safe_loop.json` **byte-identical**
+  (sha256 `40D4DE38…`, mtime-only touch; `consecutive_crashes=1`, blacklist unchanged, `safe_mode=false`);
+  `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt` unchanged; repo tree clean.
+- **Manual-prior is an explicit dev/known-GPU shortcut**; the official unknown-GPU behavior remains
+  progressive anchored descent with conservative caps (+30/+15). **Clocks above 1800 at 875 mV are NOT
+  assumed** — they must still be discovered progressively.
+- **Next recommendation (no second confirmed run in this task)**: either descend below 875 mV for 1800
+  (find the minimum stable voltage), or begin progressive discovery for 1815+ without assuming 875 mV.
+
+### Implementation record (pre-hardware)
 - **What**: an OPT-IN `--manual-prior` path for `undervolt-probe` that anchors at an operator-provided
   `--start-mv` using a SEPARATE, larger bounded positive-offset cap. It exists ONLY to validate a KNOWN
   manual point faster on the current dev GPU (e.g. `1800 MHz @ 875 mV`). It is NOT the default and NOT
@@ -40,9 +68,9 @@ Durable technical decisions and their rationale. Newest first.
   12 new manual-prior tests); `cargo test -p nidavellir-gpu-nvapi` 33/0. Focused adversarial safety review
   of the diff: no blockers (default unchanged, fail-closed cap, F1 untouched, gates intact).
 - **Clocks above 1800 at 875 mV are NOT assumed** — they must still be discovered progressively.
-- **Next hardware validation (one confirmed run, operator present, stop after the single candidate)**:
-  `undervolt-probe --target-mhz 1800 --start-mv 875 --steps 1 --manual-prior --confirm`. No profile
-  persistence/apply/promotion. Manual-prior is NOT yet hardware-validated.
+- Hardware validation status: **PASS** — see the validation record at the top of this section
+  (`undervolt-probe --target-mhz 1800 --start-mv 875 --steps 1 --manual-prior --confirm`, outcome
+  `Validated`). One confirmed run only; no profile persistence/apply/promotion.
 
 ## F2 ANCHORED multi-step descent — bounded same-target probing IMPLEMENTED (not yet HW-validated) (2026-06-21)
 - **What**: a controlled, bounded, SAME-TARGET ANCHORED multi-step descent for `undervolt-probe`. For one

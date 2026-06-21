@@ -3,7 +3,7 @@
 How to pick this up cold. State as of 2026-06-21, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-21) — F2 MANUAL-PRIOR anchor mode IMPLEMENTED (not yet HW-validated)
+## Latest backend checkpoint (2026-06-21) — F2 MANUAL-PRIOR anchor mode HARDWARE VALIDATED (1800 @ 875 mV, +210) — PASS
 - **What**: opt-in `--manual-prior` for `undervolt-probe` — anchors at an explicit `--start-mv` with a
   SEPARATE larger bounded offset cap to validate a KNOWN point fast (`1800 MHz @ 875 mV`). NOT the default,
   NOT for unknown GPUs. **Code + tests + docs only — no hardware, no `--confirm`, no VF write.**
@@ -19,10 +19,17 @@ details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
   candidate; no persist/apply/promote. F1/`apply_vf_ceiling_monotone`/Safe Loop/reset/verifier untouched.
 - **Dry-run `1800 @ 875`**: selected **875 mV**, base **1590 MHz**, required **+210 MHz**, cap **+250**,
   within bounds, **AnchoredRaiseVerified**, no-op/no-write. Default `1800 --steps 3` unchanged (975/968/962).
-- **Validated (no HW)**: 269 service + 33 nvapi tests pass; manual safety review no blockers.
-- **NEXT HW (one confirmed run, operator present)**:
-  `undervolt-probe --target-mhz 1800 --start-mv 875 --steps 1 --manual-prior --confirm`. Clocks above 1800
-  at 875 mV are NOT assumed (still discover progressively). NOT yet hardware-validated.
+- **Tests/review**: 269 service + 33 nvapi tests pass; manual safety review no blockers. Implementation
+  commit `34581d0`.
+- **HARDWARE PASS (one confirmed run, operator present)**: `undervolt-probe --target-mhz 1800 --start-mv
+  875 --steps 1 --manual-prior --confirm` → exit 0, outcome **Validated**. Anchor 875 mV / base 1590 /
+  **+210 → 1800**; verify **AnchoredRaiseVerified**; dwell **Stable** avg/p5 **1815 MHz** at **157 W** (~26 W
+  under the 975 mV/183 W run); `reset_to_stock` OK (all bins cleared); boot flag cleared; not blacklisted;
+  **no persist/apply/promote** (`last_validated` null). No TDR/crash/reboot. `safe_loop.json` byte-identical
+  (mtime-only); `boot_flag.json`/`gpu_applied.json` absent.
+- **NEXT**: clocks above 1800 at 875 mV are NOT assumed (discover progressively). Options: descend below
+  875 mV for 1800 (minimum stable voltage), or progressive discovery for 1815+. No second confirmed run was
+  made.
 
 ## Earlier checkpoint (2026-06-21) — F2 ANCHORED MULTI-STEP descent IMPLEMENTED (not yet HW-validated)
 - **What**: bounded SAME-TARGET ANCHORED multi-step descent for `undervolt-probe`. `--steps 2..=3` (anchored)
