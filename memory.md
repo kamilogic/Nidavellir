@@ -8,7 +8,24 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-22) — F2 discovery/learning algorithm IMPLEMENTED (not yet HW-validated)
+## Latest (2026-06-22) — F2 OFFICIAL target sweep FIRST HARDWARE RUN (1800 @ 975 mV) — PASS-PARTIAL
+- **What**: first bounded hardware run of the OFFICIAL F2 target sweep (progressive anchored descent, NOT
+  manual-prior): `undervolt-probe --target-mhz 1800 --auto-sweep --confirm` at HEAD `8dbd296`. One confirmed
+  command, operator present, no second run.
+- **Result — PASS-PARTIAL** (exit 0): #1 **Validated** 975 mV / base 1785 / +15 → 1800; **RaiseVerified**;
+  dwell **Stable** avg/p5 **1815 MHz**, **191 W**, no silent error. #2 **aborted_by_safety_gate** (planner
+  per-step +30 > +15 cap; **no VF write**, `not_run`). `last_good=975 mV`, `first_bad=None`, frontier updated.
+  No TDR/DeviceLost/Unstable/ClockDrop/reboot.
+- **Cleanup all correct**: reset_to_stock + boot_flag_cleared true for both; `gpu_applied.json`/`boot_flag.json`
+  absent after; forge_state/gpu_knowledge/heartbeat byte-identical; safe_loop unchanged (safe_mode=false). 2
+  observations now in `f2_observations.jsonl` (first official observation file). No profile persisted/applied/
+  promoted. git clean.
+- **Algorithm insight (not changed this task)**: candidates restart from stock (+0); the +15 per-step cap
+  makes only the base-within-+15 anchor (1785→+15) reachable, so deeper anchors self-abort and the 1800 sweep
+  validates ONE point per run. Bracketing below 975 mV needs a planner that carries the prior validated offset
+  forward (same-target descent) — a future reviewed refinement, not this run.
+
+## Earlier (2026-06-22) — F2 discovery/learning algorithm IMPLEMENTED (not yet HW-validated)
 - **What**: the four-block F2 discovery/learning algorithm. **Code + tests + docs only — no hardware, no
   `--confirm`, no VF write, no profile apply/persist/promote.** Commits `0df6179` (store + target sweep),
   `cb125b6` (ladder + learned frontier).

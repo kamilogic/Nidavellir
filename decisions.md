@@ -2,6 +2,30 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 target sweep — FIRST official hardware run (1800 MHz @ 975 mV validated) — PASS-PARTIAL (2026-06-22)
+- **What**: the FIRST bounded hardware run of the OFFICIAL F2 target sweep (progressive anchored descent,
+  NOT manual-prior): `undervolt-probe --target-mhz 1800 --auto-sweep --confirm` on the freshly-built debug
+  binary at HEAD `8dbd296`. One confirmed command, operator present, no second run.
+- **Result — PASS-PARTIAL** (exit 0): candidate **#1 Validated** (anchor **975 mV**, base 1785, **+15 →
+  1800 MHz**; verify **RaiseVerified**; dwell **Stable** avg/p5 **1815 MHz**, **191 W**, `silent_error=false`);
+  candidate **#2 aborted_by_safety_gate** — a benign planner fail-closed (per-step **+30 > +15** cap), **no
+  VF write** (`verifier/dwell = not_run`, watts null). `last_good=975 mV`, `first_bad=None`, bracket=None,
+  frontier updated. No TDR / DeviceLost / Unstable / ClockDrop / reboot.
+- **Cleanup correct**: `reset_to_stock_ok=true` and `boot_flag_cleared=true` for BOTH candidates; ended safe
+  (reset). `gpu_applied.json` / `boot_flag.json` ABSENT after run; `forge_state.json` / `gpu_knowledge.json`
+  / `heartbeat.txt` byte-identical (no profile persisted/applied/promoted, no knowledge mutation);
+  `safe_loop.json` content unchanged (`safe_mode=false`, no new blacklist). 2 observations appended to
+  `f2_observations.jsonl` (first official observation file).
+- **Algorithm observation (NOT changed this task)**: because every candidate restarts from stock (+0) and the
+  per-step cap is +15 MHz, only the candidate whose real base is within +15 of the target (1785 → +15) is
+  reachable in one supervised step; the deeper-anchor candidates (base 1770, +30) self-abort via the cap. So
+  the 1800 MHz progressive sweep effectively validates a single point per run, and the descent below 975 mV
+  is not explorable under the current single-step-from-stock + +15 cap design.
+- **Next recommended task**: a planner refinement so the official sweep can descend past the first reachable
+  anchor (e.g. carry the prior validated offset as the next step's baseline for SAME-TARGET descent, or widen
+  the per-step cap for descent only), then re-run the 1800 MHz sweep to actually bracket the minimum stable
+  voltage. Algorithm change only — separate, reviewed task.
+
 ## F2 discovery/learning algorithm — observation store + target sweep + ladder sweep + learned frontier IMPLEMENTED (not yet HW-validated) (2026-06-22)
 - **What**: the four-block F2 discovery/learning algorithm. Code + tests + docs only — **no hardware, no
   `--confirm`, no VF write, no profile apply/persist/promote** in this task. Checkpoints `0df6179` (store +

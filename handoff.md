@@ -1,9 +1,27 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-21, `master` (clean). Deep NvAPI struct
+How to pick this up cold. State as of 2026-06-22, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-22) — F2 discovery/learning algorithm IMPLEMENTED (not yet HW-validated)
+## Latest backend checkpoint (2026-06-22) — F2 OFFICIAL target sweep FIRST HARDWARE RUN (1800 @ 975 mV) — PASS-PARTIAL
+- **What**: first bounded hardware run of the OFFICIAL F2 target sweep (progressive anchored descent, NOT
+  manual-prior): `undervolt-probe --target-mhz 1800 --auto-sweep --confirm` at HEAD `8dbd296` (freshly-built
+  debug binary). One confirmed command, operator present, no second run.
+- **Result — PASS-PARTIAL** (exit 0): #1 **Validated** 975 mV / base 1785 / +15 → 1800; **RaiseVerified**;
+  dwell **Stable** avg/p5 **1815 MHz**, **191 W**. #2 **aborted_by_safety_gate** (planner per-step +30 > +15
+  cap; **no VF write**, `not_run`). `last_good=975`, `first_bad=None`, frontier updated. No TDR/DeviceLost/
+  Unstable/ClockDrop/reboot.
+- **State after run (all safe)**: `reset_to_stock_ok` + `boot_flag_cleared` true for both candidates;
+  `gpu_applied.json`/`boot_flag.json` ABSENT; `forge_state.json`/`gpu_knowledge.json`/`heartbeat.txt`
+  byte-identical; `safe_loop.json` content unchanged (`safe_mode=false`, blacklist 4 entries unchanged). 2
+  observations appended to the now-existing `f2_observations.jsonl`. `git` clean.
+- **Key finding (algorithm, NOT changed)**: each candidate starts from stock (+0); with the +15 per-step cap,
+  only base-within-+15 (1785) is reachable, so the deeper anchors (base 1770, +30) self-abort and the 1800
+  sweep validates ONE point per run. To bracket the min stable voltage the planner must carry the prior
+  validated offset as the next baseline (or widen the same-target descent step) — a future reviewed task.
+- **NEXT**: planner refinement for same-target descent, then re-run the 1800 sweep to bracket below 975 mV.
+
+## Earlier backend checkpoint (2026-06-22) — F2 discovery/learning algorithm IMPLEMENTED (not yet HW-validated)
 - **What**: the four-block F2 discovery/learning algorithm. **Code + tests + docs only — no hardware, no
   `--confirm`, no VF write, no profile apply/persist/promote.** Commits `0df6179` (store + target sweep),
   `cb125b6` (ladder + learned frontier).
