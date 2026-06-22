@@ -1108,6 +1108,44 @@ struct ForgeProfiles {
     log: Vec<String>,
 }
 
+/// Read-only BRIDGE: feed an F2 LEARNED FRONTIER to the EXISTING profile classifier and return a
+/// compact summary of which Godforge / Brokkr's Best / Deep Calm points it WOULD pick. Builds the
+/// canonical `(PowerSweepPoint, confidence)` input via
+/// [`nidavellir_core::f2_observation::frontier_to_points`] and runs the SAME [`synthesize_forge_profiles`]
+/// with the balanced policy — NO new scoring. It NEVER selects, applies, persists, or promotes a
+/// profile; it only previews what the learned frontier classifies to.
+#[cfg(windows)]
+pub(crate) fn classify_f2_frontier_summary(
+    entries: &[nidavellir_core::f2_observation::F2FrontierEntry],
+) -> Vec<String> {
+    let points = nidavellir_core::f2_observation::frontier_to_points(entries);
+    let profiles = synthesize_forge_profiles(&points, &ForgePolicy::balanced());
+    let fmt = |label: &str, p: &Option<PowerSweepPoint>| -> String {
+        match p {
+            Some(pt) => format!(
+                "  {label:<13}: {} MHz @ {} mV (sustained {:?} MHz, {:.0} W)",
+                pt.clock_mhz,
+                pt.vf_table_voltage_mv.unwrap_or(pt.voltage_mv),
+                pt.p5_clock_mhz,
+                pt.power_w
+            ),
+            None => format!("  {label:<13}: none (no qualifying frontier point)"),
+        }
+    };
+    let mut out = vec![format!(
+        "classifier bridge  : {} frontier point(s) -> synthesize_forge_profiles (ForgePolicy::balanced; read-only, NOT applied)",
+        points.len()
+    )];
+    out.push(fmt("Godforge", &profiles.godforge));
+    out.push(fmt("Brokkr's Best", &profiles.brokkrs));
+    out.push(fmt("Deep Calm", &profiles.deep_calm));
+    out.push(
+        "  (classifier PREVIEW only — no profile is selected, persisted, applied, or promoted)"
+            .to_string(),
+    );
+    out
+}
+
 /// A dwell is **power-bound** when it stayed pinned at the power cap for at least this fraction of
 /// its samples: the achieved clock was set by the cap, not the voltage descent, so the point carries
 /// no clock-frontier information. From the F1b algorithm audit (`decisions.md`): `POWER_BOUND_FRAC`.

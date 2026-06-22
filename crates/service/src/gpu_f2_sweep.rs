@@ -274,6 +274,148 @@ pub fn frontier_preview_for(store: &F2ObservationStore, target_mhz: u32) -> Opti
     frontier_entry_for_target(&store.query_by_target(target_mhz), target_mhz)
 }
 
+// ── F2 ladder sweep: conservative priors + sequencing (pure, testable) ──────────────────────────
+
+/// Conservative descent FLOOR (mV) for a ladder target given the previous (lower) target's discovered
+/// minimum stable voltage. A HIGHER clock needs at least as much voltage as a lower clock, so the
+/// higher target's descent must NOT probe BELOW where the lower target's minimum already sat — doing so
+/// would be known-risky AND cannot hold the higher clock. This BOUNDS the descent conservatively; it
+/// NEVER assumes the prior voltage actually holds the higher clock (the descent still validates from the
+/// top down). Returns `max(base_floor_mv, prev_last_good_mv)` (or `base_floor_mv` when there is no prior).
+pub fn ladder_target_floor(base_floor_mv: u32, prev_last_good_mv: Option<u32>) -> u32 {
+    match prev_last_good_mv {
+        Some(p) => base_floor_mv.max(p),
+        None => base_floor_mv,
+    }
+}
+
+/// Whether a ladder may continue to the NEXT target after the current target's sweep. Conservative: the
+/// current target's sweep must have ended reset-CLEAN (no `ResetFailed`/crash). A normal
+/// unstable/clock-drop candidate that reset cleanly does NOT stop the ladder; an unsafe end does.
+pub fn ladder_should_continue(current_target_safe: bool) -> bool {
+    current_target_safe
+}
+
+/// One ladder target's planned descent (dry-run view): the conservative floor in force, the prior used,
+/// and the descent shape. Pure data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LadderTargetPlan {
+    pub target_mhz: u32,
+    pub conservative_floor_mv: u32,
+    pub prior_last_good_mv: Option<u32>,
+    pub candidate_count: usize,
+    pub anchor_hi_mv: Option<u32>,
+    pub anchor_lo_mv: Option<u32>,
+    pub descent_stop: Option<String>,
+}
+
+/// Build a ladder target plan from an already-planned descent + the conservative floor + prior.
+pub fn ladder_target_plan(
+    target_mhz: u32,
+    conservative_floor_mv: u32,
+    prior_last_good_mv: Option<u32>,
+    descent: &AnchoredDescentPlan,
+) -> LadderTargetPlan {
+    LadderTargetPlan {
+        target_mhz,
+        conservative_floor_mv,
+        prior_last_good_mv,
+        candidate_count: descent.candidates.len(),
+        anchor_hi_mv: descent.candidates.first().map(|c| c.anchor.voltage_mv),
+        anchor_lo_mv: descent.candidates.last().map(|c| c.anchor.voltage_mv),
+        descent_stop: descent.stop_reason.clone(),
+    }
+}
+
+/// Format the LADDER-SWEEP dry-run plan (pure + testable). Shows the target list, the conservative-prior
+/// policy, each target's planned descent (with the floor + prior it would use), the per-target stop +
+/// ladder continuation rules, where observations would be recorded, and the explicit no-op/no-write line.
+pub fn ladder_plan_lines(plans: &[LadderTargetPlan], confirmed_cap: usize, obs_path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(
+        "=== undervolt-probe LADDER SWEEP (F2 multi-target minimum-stable-voltage discovery, dry-run preview) ==="
+            .to_string(),
+    );
+    out.push(format!(
+        "targets            : {} (each runs an autonomous progressive target sweep, in order)",
+        plans.iter().map(|p| p.target_mhz.to_string()).collect::<Vec<_>>().join(", ")
+    ));
+    out.push(
+        "conservative prior : a higher target NEVER assumes a lower target's voltage holds — it only \
+         uses the lower target's last-good as a descent FLOOR (won't probe below it) and re-validates top-down"
+            .to_string(),
+    );
+    out.push(format!(
+        "confirmed cap      : up to {confirmed_cap} candidate(s) PER target (fail closed beyond it; no infinite search)"
+    ));
+    for p in plans {
+        out.push(format!("--- target {} MHz ---", p.target_mhz));
+        out.push(format!(
+            "  conservative floor: {} mV{}",
+            p.conservative_floor_mv,
+            match p.prior_last_good_mv {
+                Some(prev) => format!(" (raised to the prior target's last-good {prev} mV)"),
+                None => " (base floor — no prior target)".to_string(),
+            }
+        ));
+        if p.candidate_count == 0 {
+            out.push("  candidates        : none (no bin needs a bounded positive raise to hold the target)".to_string());
+        } else {
+            out.push(format!(
+                "  candidates        : {} planned (anchors {} → {} mV, safer/higher voltage first)",
+                p.candidate_count,
+                p.anchor_hi_mv.map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+                p.anchor_lo_mv.map(|v| v.to_string()).unwrap_or_else(|| "?".into())
+            ));
+        }
+        out.push(format!(
+            "  descent stop      : {}",
+            p.descent_stop.clone().unwrap_or_else(|| "descent exhausted candidate bins".to_string())
+        ));
+    }
+    out.push(
+        "per-target stop    : planner floor / cap / VerifierFailed / Unstable / silent error / DeviceLost / ClockDrop / ResetFailed / blacklist / safety-gate"
+            .to_string(),
+    );
+    out.push(
+        "ladder stop        : STOPS the whole ladder on a SAFETY failure (ResetFailed / unrecovered crash / inconsistent boot flag); a normal bad candidate stops only THAT target and the ladder continues only if that target ended reset-clean"
+            .to_string(),
+    );
+    out.push(format!(
+        "observations       : a confirmed run records ONE observation per executed candidate (all targets) to {obs_path}"
+    ));
+    out.push("no-op (dry-run)    : no Safe Loop arm, no apply, no dwell, no VF write, no observation recorded".to_string());
+    out.push("profile            : none persisted, applied, or promoted".to_string());
+    out
+}
+
+/// Format the LEARNED FRONTIER report (pure + testable): one line per target entry plus a header. The
+/// classifier-bridge preview (Godforge/Brokkr's/Deep Calm) is appended separately by the windows caller
+/// (it needs the service-private synthesizer). NEVER selects/applies/persists/promotes a profile.
+pub fn frontier_report_lines(entries: &[F2FrontierEntry]) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push("=== F2 LEARNED FRONTIER (derived from recorded observations; read-only) ===".to_string());
+    if entries.is_empty() {
+        out.push("(no validated observations yet — frontier is empty)".to_string());
+        return out;
+    }
+    for e in entries {
+        out.push(format!(
+            "target {:>4} MHz: best {} mV (+{} MHz), sustained {:?} MHz, {:?} W, conf {:.2}, first_bad {:?} mV, bracket {:?} mV, {} obs",
+            e.target_mhz,
+            e.best_anchor_mv,
+            e.offset_mhz,
+            e.sustained_clock_mhz,
+            e.watts,
+            e.confidence,
+            e.first_bad_mv,
+            e.bracket_width_mv,
+            e.observation_count
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +608,54 @@ mod tests {
         assert!(text.contains("none persisted, applied, or promoted"));
         // Avoid the forbidden substring the usage test guards.
         assert!(!text.contains("candidate bins"));
+    }
+
+    #[test]
+    fn ladder_floor_uses_prior_as_lower_bound_only() {
+        // No prior → base floor unchanged.
+        assert_eq!(ladder_target_floor(612, None), 612);
+        // Prior last-good ABOVE the base floor raises the floor (higher target won't probe below it).
+        assert_eq!(ladder_target_floor(612, Some(962)), 962);
+        // Prior BELOW the base floor never lowers the hardware floor.
+        assert_eq!(ladder_target_floor(970, Some(962)), 970);
+    }
+
+    #[test]
+    fn ladder_continues_only_when_prev_target_safe() {
+        assert!(ladder_should_continue(true));
+        assert!(!ladder_should_continue(false)); // a safety failure stops the ladder
+    }
+
+    #[test]
+    fn ladder_plan_lines_show_conservative_prior_and_no_write() {
+        let d1 = descent(&[(975, 1785), (968, 1770)], 1800);
+        let d2 = descent(&[(982, 1797)], 1815);
+        let plans = vec![
+            ladder_target_plan(1800, 612, None, &d1),
+            // 1815's floor was raised to 1800's last-good (968 mV): the prior is a FLOOR, not an assumption.
+            ladder_target_plan(1815, 968, Some(968), &d2),
+        ];
+        let text = ladder_plan_lines(&plans, 3, "C:/ProgramData/Nidavellir/f2_observations.jsonl").join("\n");
+        assert!(text.contains("LADDER SWEEP"));
+        assert!(text.contains("targets            : 1800, 1815"));
+        assert!(text.contains("NEVER assumes a lower target's voltage holds"));
+        assert!(text.contains("--- target 1800 MHz ---"));
+        assert!(text.contains("--- target 1815 MHz ---"));
+        assert!(text.contains("raised to the prior target's last-good 968 mV"));
+        assert!(text.contains("ladder stop        : STOPS the whole ladder on a SAFETY failure"));
+        assert!(text.contains("no VF write"));
+        assert!(text.contains("none persisted, applied, or promoted"));
+    }
+
+    #[test]
+    fn frontier_report_lines_render_entries() {
+        // Empty frontier.
+        assert!(frontier_report_lines(&[]).join("\n").contains("frontier is empty"));
+        // One entry (a validated point at 962 mV for 1800 MHz).
+        let v = vec![observation_from_anchored_step(&ctx(), 1800, &anchored(962, 1785, 1800), &validated_step())];
+        let fr = nidavellir_core::f2_observation::learned_frontier(&v);
+        let text = frontier_report_lines(&fr).join("\n");
+        assert!(text.contains("F2 LEARNED FRONTIER"));
+        assert!(text.contains("target 1800 MHz: best 962 mV"));
     }
 }

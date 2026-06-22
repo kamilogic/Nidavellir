@@ -150,6 +150,11 @@ pub struct UndervoltArgs {
     /// `--target-mhz` via the official progressive anchored descent, recording observations. NEVER the
     /// default; dry-run unless `--confirm`.
     pub auto_sweep: bool,
+    /// Opt-in multi-target ladder sweep (`--ladder-sweep`): run an autonomous target sweep for each of
+    /// `--targets`, in order, using lower targets' results only as conservative priors. NEVER the default.
+    pub ladder_sweep: bool,
+    /// Target clocks (MHz) for `--ladder-sweep` (`--targets 1800,1815,1830`). Empty unless provided.
+    pub targets: Vec<u32>,
 }
 
 /// Parse the `undervolt-probe` flags (`--target-mhz`, `--start-mv`, `--steps`). Pure + unit-testable;
@@ -193,6 +198,19 @@ pub fn parse_undervolt_args(args: &[OsString]) -> Result<UndervoltArgs, String> 
             "--auto-sweep" => {
                 out.auto_sweep = true;
                 i += 1;
+            }
+            "--ladder-sweep" => {
+                out.ladder_sweep = true;
+                i += 1;
+            }
+            "--targets" => {
+                let v = strs.get(i + 1).ok_or_else(|| "--targets needs a value".to_string())?;
+                let mut targets = Vec::new();
+                for t in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    targets.push(t.parse().map_err(|_| format!("--targets: invalid number '{t}'"))?);
+                }
+                out.targets = targets;
+                i += 2;
             }
             _ => i += 1,
         }
@@ -1004,6 +1022,11 @@ pub fn undervolt_usage() -> String {
         "                       --target-mhz via the OFFICIAL progressive anchored descent (conservative",
         "                       caps), recording an observation per candidate. Bounded; ignores --steps;",
         "                       NOT manual-prior. Dry-run plans + previews the learned frontier.",
+        "  --ladder-sweep       Autonomous MULTI-target sweep over --targets, in order. Lower targets'",
+        "                       results are used only as conservative descent FLOORS for higher targets",
+        "                       (never assumed to hold the higher clock). Stops the ladder on a safety",
+        "                       failure. Dry-run plans + reports the learned frontier + classifier bridge.",
+        "  --targets <a,b,..>   Comma-separated target clocks (MHz) for --ladder-sweep.",
         "  --confirm            Execute supervised anchored candidate(s) (see WARNING). Default: dry-run.",
         "  -h, --help           Print this help and exit (no hardware read, no plan, no mutation).",
         "",
@@ -1926,6 +1949,13 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
         return;
     }
 
+    // LADDER-SWEEP (autonomous multi-target sweep): opt-in; runs a target sweep per `--targets` in order
+    // with conservative priors. NEVER the default. Branches before auto-sweep / the plain dispatch.
+    if args.ladder_sweep {
+        run_anchored_ladder_sweep(store, confirm, &args, &sane, &limits);
+        return;
+    }
+
     // AUTO-SWEEP (autonomous same-target minimum-stable-voltage discovery): opt-in; uses the OFFICIAL
     // progressive anchored descent (conservative caps) + observation learning. NEVER the default; branches
     // before the plain anchored/simple dispatch so default behavior is unchanged.
@@ -2382,6 +2412,161 @@ fn run_anchored_target_sweep(
         "undervolt-probe: DRY-RUN (auto-sweep) — target={} MHz candidates={} preflight_safe={} — no Safe \
          Loop arm, no apply, no dwell, no VF write, no observation.",
         focus_target, descent.candidates.len(), preflight.safe
+    );
+}
+
+/// LADDER-SWEEP: autonomous multi-target minimum-stable-voltage discovery (`--ladder-sweep --targets
+/// a,b,c`). Runs an autonomous target sweep for each target IN ORDER, using a lower target's discovered
+/// minimum only as a conservative descent FLOOR for higher targets (never assuming the lower voltage
+/// holds the higher clock). DRY-RUN by default: plans each target's descent, prints the conservative-prior
+/// policy + the current learned frontier + the classifier-bridge preview — no Safe Loop arm / apply /
+/// dwell / VF write / observation. WITH `--confirm` it runs each target's bounded sweep sequentially,
+/// records observations, and STOPS the whole ladder on a safety failure. Never persists/applies/promotes
+/// a profile.
+#[cfg(windows)]
+fn run_anchored_ladder_sweep(
+    store: &SafeLoopStore,
+    confirm: bool,
+    args: &UndervoltArgs,
+    sane: &[(usize, u32, u32)],
+    limits: &PositiveOffsetLimits,
+) {
+    use nidavellir_core::f2_observation::{
+        last_good_for_target, new_run_id, now_rfc3339, F2ObsMode, F2ObservationStore,
+    };
+
+    if args.targets.is_empty() {
+        println!(
+            "undervolt-probe: --ladder-sweep REQUIRES --targets (e.g. --targets 1800,1815,1830). \
+             No hardware touched."
+        );
+        warn!("undervolt-probe: --ladder-sweep without --targets — refused, no hardware touched");
+        return;
+    }
+
+    // Safe Loop state is re-read per target inside the confirmed loop (a prior target may change it).
+    let obs_store = F2ObservationStore::system();
+    let obs_path = obs_store.path().display().to_string();
+    let base_floor = limits.hw_floor_mv;
+
+    // Dry-run plan: per target, a conservative descent floor from the prior target's KNOWN last-good
+    // (read-only from the store) — a FLOOR, never an assumption that the prior voltage holds.
+    let mut plans = Vec::new();
+    for (idx, &target) in args.targets.iter().enumerate() {
+        let prior = if idx > 0 {
+            let prev_t = args.targets[idx - 1];
+            last_good_for_target(&obs_store.query_by_target(prev_t), prev_t).map(|o| o.anchor_mv)
+        } else {
+            None
+        };
+        let floor_mv = crate::gpu_f2_sweep::ladder_target_floor(base_floor, prior);
+        let target_limits = PositiveOffsetLimits { hw_floor_mv: floor_mv, ..*limits };
+        let descent =
+            plan_anchored_undervolt_descent(sane, target, args.start_mv, &target_limits, F2_SWEEP_DRYRUN_BUDGET);
+        plans.push(crate::gpu_f2_sweep::ladder_target_plan(target, floor_mv, prior, &descent));
+    }
+    for line in crate::gpu_f2_sweep::ladder_plan_lines(&plans, F2_CONFIRMED_MAX_STEPS, &obs_path) {
+        println!("{line}");
+    }
+    // Learned frontier report + the read-only classifier-bridge preview (no profile applied/persisted).
+    let frontier = obs_store.learned_frontier();
+    for line in crate::gpu_f2_sweep::frontier_report_lines(&frontier) {
+        println!("{line}");
+    }
+    for line in crate::gpu_power_sweep::classify_f2_frontier_summary(&frontier) {
+        println!("{line}");
+    }
+
+    if confirm {
+        // CONFIRMED ladder (bounded; stops on a safety failure). Each target runs its own autonomous
+        // sweep with a conservative floor from the PREVIOUS target's discovered last-good; a normal bad
+        // candidate stops only that target, but a safety failure stops the whole ladder.
+        warn!(
+            "undervolt-probe: --confirm — executing autonomous LADDER SWEEP over {:?} (per-target bounded; \
+             stops on safety failure) — can TDR/reboot.",
+            args.targets
+        );
+        let run_id = new_run_id("f2-ladder");
+        let mut prev_good: Option<u32> = None;
+        for &target in &args.targets {
+            let rec = store.load_record();
+            let armed = store.is_boot_flag_armed();
+            let prior = prev_good.or_else(|| {
+                args.targets.iter().position(|&t| t == target).and_then(|i| {
+                    i.checked_sub(1).map(|j| args.targets[j]).and_then(|prev_t| {
+                        last_good_for_target(&obs_store.query_by_target(prev_t), prev_t).map(|o| o.anchor_mv)
+                    })
+                })
+            });
+            let floor_mv = crate::gpu_f2_sweep::ladder_target_floor(base_floor, prior);
+            let target_limits = PositiveOffsetLimits { hw_floor_mv: floor_mv, ..*limits };
+            let descent = plan_anchored_undervolt_descent(
+                sane,
+                target,
+                args.start_mv,
+                &target_limits,
+                F2_SWEEP_DRYRUN_BUDGET,
+            );
+            match confirmed_f2_multi_refusal(
+                &rec,
+                armed,
+                Some(F2_CONFIRMED_MAX_STEPS),
+                descent.candidates.len(),
+                F2_CONFIRMED_MAX_STEPS,
+            ) {
+                Some(reason) => {
+                    println!("ladder: target {target} MHz REFUSED — {reason}; stopping ladder.");
+                    warn!("undervolt-probe: ladder stopped at {target} MHz — refused: {reason}");
+                    break;
+                }
+                None => {
+                    let mut ops = RealF2MultiOps {
+                        store,
+                        curve: sane.to_vec(),
+                        candidates: descent.candidates.clone(),
+                        limits: target_limits,
+                        target_mhz: target,
+                        cur: None,
+                    };
+                    let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
+                    let ctx = crate::gpu_f2_sweep::ObsContext {
+                        run_id: run_id.clone(),
+                        timestamp: now_rfc3339(),
+                        gpu_key: nidavellir_gpu_nvapi::read_curve().ok().map(|c| c.name),
+                        mode: F2ObsMode::LadderSweep,
+                        requested_start_mv: args.start_mv,
+                        positive_offset_cap_mhz: target_limits.abs_max_offset_mhz,
+                    };
+                    let summary =
+                        crate::gpu_f2_sweep::record_target_sweep(&ctx, target, &descent, &report, &obs_store);
+                    println!(
+                        "ladder: target {} MHz → last_good {:?} mV, first_bad {:?} mV, safe {}, stop {}",
+                        target, summary.last_good_mv, summary.first_bad_mv, summary.safe, summary.stop_reason
+                    );
+                    if !crate::gpu_f2_sweep::ladder_should_continue(summary.safe) {
+                        println!("ladder: target {target} MHz ended UNSAFE — stopping ladder (no further targets).");
+                        warn!("undervolt-probe: ladder stopped at {target} MHz — unsafe end");
+                        break;
+                    }
+                    prev_good = summary.last_good_mv;
+                }
+            }
+        }
+        println!("=== F2 LADDER result — final learned frontier ===");
+        for line in crate::gpu_f2_sweep::frontier_report_lines(&obs_store.learned_frontier()) {
+            println!("{line}");
+        }
+        println!("profile            : none persisted, applied, or promoted");
+        return;
+    }
+    println!(
+        "(dry-run — pass `--ladder-sweep --targets {} --confirm` for a bounded autonomous ladder; nothing was written)",
+        args.targets.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+    );
+    info!(
+        "undervolt-probe: DRY-RUN (ladder-sweep) — targets={:?} — no Safe Loop arm, no apply, no dwell, \
+         no VF write, no observation.",
+        args.targets
     );
 }
 
