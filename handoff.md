@@ -3,7 +3,32 @@
 How to pick this up cold. State as of 2026-06-21, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-21) — F2 MANUAL-PRIOR anchor mode HARDWARE VALIDATED (1800 @ 875 mV, +210) — PASS
+## Latest backend checkpoint (2026-06-22) — F2 discovery/learning algorithm IMPLEMENTED (not yet HW-validated)
+- **What**: the four-block F2 discovery/learning algorithm. **Code + tests + docs only — no hardware, no
+  `--confirm`, no VF write, no profile apply/persist/promote.** Commits `0df6179` (store + target sweep),
+  `cb125b6` (ladder + learned frontier).
+- **Files**: `crates/core/src/f2_observation.rs` (NEW — pure store/queries/frontier/bridge),
+  `crates/core/src/lib.rs` (module), `crates/service/src/gpu_f2_sweep.rs` (NEW — mapper/recorder/
+  formatters/ladder helpers), `crates/service/src/gpu_undervolt.rs` (CLI args/parse/dispatch +
+  run_anchored_target_sweep + run_anchored_ladder_sweep + usage), `crates/service/src/gpu_power_sweep.rs`
+  (classify_f2_frontier_summary read-only classifier bridge), `crates/service/src/main.rs` (module).
+- **CLI**: `undervolt-probe --auto-sweep` (same-target min-stable-voltage discovery; official progressive
+  caps; bounded by F2_CONFIRMED_MAX_STEPS; records observations on --confirm only) and `--ladder-sweep
+  --targets a,b,c` (multi-target; lower target's last-good used only as a conservative FLOOR; stops on
+  safety failure). Dry-run default; both write nothing.
+- **Learning**: observations → `f2_observations.jsonl` (JSONL, append-only, learning data NOT a profile);
+  `learned_frontier()` derives per-target best/first-bad/bracket; `classify_f2_frontier_summary` bridges to
+  the EXISTING `synthesize_forge_profiles` (read-only preview of Godforge/Brokkr's/Deep Calm — nothing
+  applied). last_good = lowest validated anchor; first_bad = highest failure; instability that resets clean
+  is learning data, not a safety failure (only ResetFailed/crash stops a sweep/ladder).
+- **Untouched**: default progressive + manual-prior; F1/build-frontier; apply_vf_ceiling_monotone; Safe
+  Loop; reset_to_stock; verifier; synthesize_forge_profiles (reused). v1 GPU-only; CPU/RAM/UI deferred.
+- **Validated (no HW)**: core 56/0, service 278/0, nvapi 33/0; clippy clean; all dry-runs write nothing
+  (`f2_observations.jsonl`/`boot_flag.json`/`gpu_applied.json` absent).
+- **NEXT**: first bounded hardware run of the official target sweep — `undervolt-probe --target-mhz 1800
+  --auto-sweep --confirm` (operator present). NOT another manual validation.
+
+## Earlier checkpoint (2026-06-21) — F2 MANUAL-PRIOR anchor mode HARDWARE VALIDATED (1800 @ 875 mV, +210) — PASS
 - **What**: opt-in `--manual-prior` for `undervolt-probe` — anchors at an explicit `--start-mv` with a
   SEPARATE larger bounded offset cap to validate a KNOWN point fast (`1800 MHz @ 875 mV`). NOT the default,
   NOT for unknown GPUs. **Code + tests + docs only — no hardware, no `--confirm`, no VF write.**

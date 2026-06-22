@@ -2,6 +2,54 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 discovery/learning algorithm — observation store + target sweep + ladder sweep + learned frontier IMPLEMENTED (not yet HW-validated) (2026-06-22)
+- **What**: the four-block F2 discovery/learning algorithm. Code + tests + docs only — **no hardware, no
+  `--confirm`, no VF write, no profile apply/persist/promote** in this task. Checkpoints `0df6179` (store +
+  target sweep) and `cb125b6` (ladder + learned frontier).
+- **Block 1 — observation store** (`crates/core/src/f2_observation.rs`, pure + testable): `F2Observation`
+  DTO (full per-attempt outcome) + serializable `F2ObsMode`/`F2ObsVerifier`/`F2ObsDwell`/`F2ObsOutcome`;
+  `F2ObservationStore` = APPEND-ONLY JSONL at `default_data_dir()/f2_observations.jsonl` (mirrors the
+  SafeLoopStore path/serde conventions but accumulates across runs; BOM-tolerant; skips malformed lines).
+  This is LEARNING data only — NOT profile persistence. Pure queries: `last_good_for_target` (lowest
+  validated), `first_bad_for_target` (highest failure), `bracket_for_target` (Vmin in (first_bad,
+  last_good]), `is_known_bad` (conservative downward), `learned_frontier`.
+- **Block 2 — target sweep** (`undervolt-probe --auto-sweep`): autonomous same-target minimum-stable-
+  voltage discovery via the OFFICIAL progressive anchored descent (conservative +30/+15 caps — NOT
+  manual-prior), reusing `plan_anchored_undervolt_descent` + `run_confirmed_f2_multi_step`. Bounded by
+  `F2_CONFIRMED_MAX_STEPS` (ignores `--steps`; fail closed; no infinite search). The confirmed path records
+  one observation per executed candidate (`record_target_sweep`) and reports the discovered last-good /
+  first-bad / bracket. Dry-run plans + previews + writes nothing.
+- **Block 3 — ladder sweep** (`undervolt-probe --ladder-sweep --targets a,b,c`): runs a target sweep per
+  target IN ORDER. A lower target's discovered last-good is used ONLY as a conservative descent FLOOR for
+  higher targets (`ladder_target_floor`) — it NEVER assumes the lower voltage holds the higher clock (the
+  descent still validates top-down). The ladder STOPS on a safety failure (`ladder_should_continue` =
+  reset-clean); a normal bad candidate stops only that target.
+- **Block 4 — learned frontier + classifier bridge**: `learned_frontier` emits one `F2FrontierEntry` per
+  target (best anchor / offset / sustained / watts / confidence / first_bad / bracket / counts).
+  `to_power_sweep_point` bridges each entry to the canonical `(PowerSweepPoint, confidence)` the EXISTING
+  classifier consumes (F2 apply axis = the LOWER anchored bin; non-power-bound; `stable=true`).
+  `classify_f2_frontier_summary` (gpu_power_sweep) runs the SAME `synthesize_forge_profiles`
+  (`ForgePolicy::balanced`) READ-ONLY and previews Godforge / Brokkr's Best / Deep Calm — **no new
+  scoring, and no profile selected/applied/persisted/promoted**.
+- **Confidence**: `frontier_confidence(validated_count)` is a simple monotone heuristic (one clean
+  validation clears the 0.85 balanced gate; repeats raise toward 0.99) — deliberately DECOUPLED from the
+  F1b Wilson trial model so F2 learning does not touch profile scoring.
+- **Instability is learning data**: `Unstable`/`ClockDrop`/`VerifierFailed` that reset cleanly are recorded
+  as bad points (they bracket Vmin) but are NOT safety failures; only `ResetFailed`/`CrashOrRecovery` are
+  safety failures that stop a sweep/ladder (`is_safety_failure`).
+- **Untouched**: default progressive + manual-prior behavior (the new branches gate on their flags and
+  return before the default dispatch); F1/build-frontier; `apply_vf_ceiling_monotone`; Safe Loop;
+  `reset_to_stock`; the verifier; `synthesize_forge_profiles` (reused, not modified). v1 stays GPU-only —
+  CPU/RAM tuning explicitly deferred; no UI work.
+- **Validated (no hardware)**: `cargo test` core 56/0, service 278/0 (incl. F1/build-frontier), nvapi 33/0;
+  clippy clean of new code. Dry-runs: `--auto-sweep` (1800) plans the official descent (975/968/962) and
+  writes nothing; `--ladder-sweep --targets 1800,1815,1830` plans all three with the conservative-prior
+  policy + learned-frontier + classifier preview; default `--steps 3`, manual-prior, and auto-sweep stay
+  distinct; `f2_observations.jsonl` / `boot_flag.json` / `gpu_applied.json` ABSENT after every dry-run.
+- **Next recommended task**: the FIRST bounded hardware run of the official F2 target sweep
+  (`undervolt-probe --target-mhz 1800 --auto-sweep --confirm`, operator present) — NOT another manual
+  validation. Manual-prior remains a dev/known-GPU shortcut only.
+
 ## F2 MANUAL-PRIOR anchor mode — FIRST confirmed hardware validation (1800 MHz @ 875 mV, +210) — PASS (2026-06-21)
 - **One supervised confirmed run** (operator present, ONE confirmed command, no second):
   `undervolt-probe --target-mhz 1800 --start-mv 875 --steps 1 --manual-prior --confirm` on the
