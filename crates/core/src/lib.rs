@@ -1,5 +1,6 @@
 pub mod capability;
 pub mod detector;
+pub mod f2_observation;
 pub mod fingerprint;
 pub mod gpu_control;
 pub mod gpu_sweep;

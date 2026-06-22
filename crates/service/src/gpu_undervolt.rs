@@ -70,6 +70,12 @@ const F2_DEFAULT_STEPS: usize = 4;
 /// dry-run may still preview a longer plan. Single-step (`--steps 1`) keeps its own validated path.
 const F2_CONFIRMED_MAX_STEPS: usize = 3;
 
+/// Candidate budget for the AUTO-SWEEP dry-run preview. Generous on purpose — the conservative offset
+/// caps stop the descent earlier anyway — so the preview shows the full natural descent. The CONFIRMED
+/// auto-sweep stays bounded by [`F2_CONFIRMED_MAX_STEPS`] regardless (no infinite search).
+#[cfg(windows)]
+const F2_SWEEP_DRYRUN_BUDGET: usize = 6;
+
 /// Hard cap (MHz) on the bounded POSITIVE offset for the explicit MANUAL-PRIOR development path ONLY.
 /// The default/autonomous discovery keeps the conservative +30 absolute / +15 per-step caps and NEVER
 /// sees this value. Manual-prior is an opt-in shortcut to validate a KNOWN manual point (e.g. 1800 MHz
@@ -140,6 +146,10 @@ pub struct UndervoltArgs {
     pub mode: UndervoltMode,
     /// Opt-in manual-prior mode (`--manual-prior`). NEVER the default; requires an explicit `--start-mv`.
     pub manual_prior: bool,
+    /// Opt-in autonomous same-target sweep (`--auto-sweep`): discover the minimum stable voltage for one
+    /// `--target-mhz` via the official progressive anchored descent, recording observations. NEVER the
+    /// default; dry-run unless `--confirm`.
+    pub auto_sweep: bool,
 }
 
 /// Parse the `undervolt-probe` flags (`--target-mhz`, `--start-mv`, `--steps`). Pure + unit-testable;
@@ -178,6 +188,10 @@ pub fn parse_undervolt_args(args: &[OsString]) -> Result<UndervoltArgs, String> 
             }
             "--manual-prior" => {
                 out.manual_prior = true;
+                i += 1;
+            }
+            "--auto-sweep" => {
+                out.auto_sweep = true;
                 i += 1;
             }
             _ => i += 1,
@@ -986,6 +1000,10 @@ pub fn undervolt_usage() -> String {
         "                       (F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ). NOT the default and NOT for",
         "                       unknown GPUs; REQUIRES --start-mv; confirmed mode is single-step (--steps",
         "                       1). The default/autonomous discovery cap (+30) is unaffected.",
+        "  --auto-sweep         Autonomous same-target sweep: discover the minimum stable voltage for one",
+        "                       --target-mhz via the OFFICIAL progressive anchored descent (conservative",
+        "                       caps), recording an observation per candidate. Bounded; ignores --steps;",
+        "                       NOT manual-prior. Dry-run plans + previews the learned frontier.",
         "  --confirm            Execute supervised anchored candidate(s) (see WARNING). Default: dry-run.",
         "  -h, --help           Print this help and exit (no hardware read, no plan, no mutation).",
         "",
@@ -1908,6 +1926,16 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
         return;
     }
 
+    // AUTO-SWEEP (autonomous same-target minimum-stable-voltage discovery): opt-in; uses the OFFICIAL
+    // progressive anchored descent (conservative caps) + observation learning. NEVER the default; branches
+    // before the plain anchored/simple dispatch so default behavior is unchanged.
+    if args.auto_sweep {
+        run_anchored_target_sweep(
+            store, confirm, &args, &sane, &limits, focus_target, &record, boot_flag_armed,
+        );
+        return;
+    }
+
     // ANCHORED is the default F2 path — a classic undervolt point that ALSO prevents boost above the
     // target. `--simple` falls back to the original single-bin positive-offset descent below.
     if args.mode == UndervoltMode::Anchored {
@@ -2219,6 +2247,141 @@ fn run_anchored_multi_step(
         "undervolt-probe: DRY-RUN (anchored multi-step) — target={} MHz candidates={} requested_steps={} \
          confirmed_cap={} preflight_safe={} — no Safe Loop arm, no apply, no dwell, no VF write.",
         focus_target, descent.candidates.len(), max_steps, F2_CONFIRMED_MAX_STEPS, preflight.safe
+    );
+}
+
+/// AUTO-SWEEP: autonomous same-target minimum-stable-voltage discovery (`--auto-sweep`). Uses the
+/// OFFICIAL progressive anchored descent (conservative caps) — NOT manual-prior. DRY-RUN by default:
+/// plans the descent, previews the current learned frontier (READ-ONLY), and prints where observations
+/// would be recorded — no Safe Loop arm / apply / dwell / VF write / observation. WITH `--confirm` it
+/// runs the bounded multi-step descent (cap [`F2_CONFIRMED_MAX_STEPS`]), records ONE observation per
+/// executed candidate via [`crate::gpu_f2_sweep::record_target_sweep`], and reports the discovered
+/// last-good / first-bad / bracket. Single-target; autonomous (ignores `--steps`); never
+/// persists/applies/promotes a profile.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_anchored_target_sweep(
+    store: &SafeLoopStore,
+    confirm: bool,
+    args: &UndervoltArgs,
+    sane: &[(usize, u32, u32)],
+    limits: &PositiveOffsetLimits,
+    focus_target: u32,
+    record: &SafeLoopRecord,
+    boot_flag_armed: bool,
+) {
+    use nidavellir_core::f2_observation::{new_run_id, now_rfc3339, F2ObsMode, F2ObservationStore};
+
+    let descent =
+        plan_anchored_undervolt_descent(sane, focus_target, args.start_mv, limits, F2_SWEEP_DRYRUN_BUDGET);
+
+    // Read-only Safe Loop preflight over every planned bin (anchor + caps + elastic).
+    let points: Vec<TuningPoint> = descent
+        .candidates
+        .iter()
+        .flat_map(|c| {
+            c.entries.iter().map(|e| {
+                TuningPoint::from_axes([
+                    ("gpu_freq_mhz", focus_target as i64),
+                    ("gpu_vf_bin_mv", e.voltage_mv as i64),
+                ])
+            })
+        })
+        .collect();
+    let preflight = undervolt_preflight(record, boot_flag_armed, &points);
+
+    // Read-only learned-frontier preview from the observation store (NEVER written in the dry-run).
+    let obs_store = F2ObservationStore::system();
+    let obs_path = obs_store.path().display().to_string();
+    let frontier_preview = crate::gpu_f2_sweep::frontier_preview_for(&obs_store, focus_target);
+
+    for line in crate::gpu_f2_sweep::target_sweep_plan_lines(
+        focus_target,
+        &descent,
+        limits,
+        F2_CONFIRMED_MAX_STEPS,
+        &obs_path,
+        frontier_preview.as_ref(),
+        preflight.safe,
+    ) {
+        println!("{line}");
+    }
+
+    if confirm {
+        // Autonomous + bounded: the sweep's confirmed cap is always F2_CONFIRMED_MAX_STEPS (it ignores
+        // --steps). The shared multi-step refusal still enforces Safe Mode / armed-flag / crash-threshold
+        // / has-candidates and the cap (fail closed beyond it).
+        match confirmed_f2_multi_refusal(
+            record,
+            boot_flag_armed,
+            Some(F2_CONFIRMED_MAX_STEPS),
+            descent.candidates.len(),
+            F2_CONFIRMED_MAX_STEPS,
+        ) {
+            Some(reason) => {
+                println!(
+                    "undervolt-probe: --confirm REFUSED — {reason}. No Safe Loop arm, no apply, no dwell, \
+                     no VF write, no observation recorded."
+                );
+                warn!("undervolt-probe: --confirm refused (auto-sweep): {reason} — no hardware touched");
+            }
+            None => {
+                warn!(
+                    "undervolt-probe: --confirm — executing autonomous TARGET SWEEP at {} MHz (up to {} \
+                     candidate(s), descending; stops at first non-stable) — can TDR/reboot.",
+                    focus_target,
+                    F2_CONFIRMED_MAX_STEPS.min(descent.candidates.len())
+                );
+                let mut ops = RealF2MultiOps {
+                    store,
+                    curve: sane.to_vec(),
+                    candidates: descent.candidates.clone(),
+                    limits: *limits,
+                    target_mhz: focus_target,
+                    cur: None,
+                };
+                let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
+                for line in confirmed_multi_report_lines(focus_target, &descent.candidates, limits, &report) {
+                    println!("{line}");
+                }
+                // Record ONE observation per executed candidate (confirmed path ONLY), then report the
+                // discovered minimum-stable-voltage bracket. No profile is persisted/applied/promoted.
+                let ctx = crate::gpu_f2_sweep::ObsContext {
+                    run_id: new_run_id("f2-target-sweep"),
+                    timestamp: now_rfc3339(),
+                    gpu_key: nidavellir_gpu_nvapi::read_curve().ok().map(|c| c.name),
+                    mode: F2ObsMode::TargetSweep,
+                    requested_start_mv: args.start_mv,
+                    positive_offset_cap_mhz: limits.abs_max_offset_mhz,
+                };
+                let summary =
+                    crate::gpu_f2_sweep::record_target_sweep(&ctx, focus_target, &descent, &report, &obs_store);
+                println!("=== TARGET SWEEP result ===");
+                println!("executed/recorded  : {}/{}", summary.executed, summary.recorded);
+                println!("last_good (min V)  : {:?} mV", summary.last_good_mv);
+                println!("first_bad          : {:?} mV", summary.first_bad_mv);
+                println!("bracket            : {:?}", summary.bracket);
+                println!("stop reason        : {}", summary.stop_reason);
+                println!("frontier updated   : {}", summary.frontier_updated);
+                println!("ended safe (reset) : {}", summary.safe);
+                println!("profile            : none persisted, applied, or promoted");
+                info!(
+                    "undervolt-probe: confirmed TARGET SWEEP — target={} last_good={:?} first_bad={:?} \
+                     recorded={} safe={}",
+                    focus_target, summary.last_good_mv, summary.first_bad_mv, summary.recorded, summary.safe
+                );
+            }
+        }
+        return;
+    }
+    println!(
+        "(dry-run — pass `--target-mhz {focus_target} --auto-sweep --confirm` for a bounded autonomous \
+         sweep; nothing was written)"
+    );
+    info!(
+        "undervolt-probe: DRY-RUN (auto-sweep) — target={} MHz candidates={} preflight_safe={} — no Safe \
+         Loop arm, no apply, no dwell, no VF write, no observation.",
+        focus_target, descent.candidates.len(), preflight.safe
     );
 }
 

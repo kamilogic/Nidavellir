@@ -1,5 +1,6 @@
 mod gpu_apply;
 mod gpu_benchmark;
+mod gpu_f2_sweep;
 mod gpu_forge_all;
 mod gpu_mem_sweep;
 mod gpu_power_sweep;
