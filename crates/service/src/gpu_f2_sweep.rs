@@ -190,14 +190,16 @@ pub fn target_sweep_plan_lines(
             .to_string(),
     );
     out.push(
-        "mode               : AUTONOMOUS PROGRESSIVE (official unknown-GPU path — anchored, conservative caps; NOT manual-prior)"
+        "mode               : AUTONOMOUS PROGRESSIVE (official unknown-GPU path — anchored, learned offset horizon; NOT manual-prior)"
             .to_string(),
     );
     out.push(format!(
         "focus target       : {target_mhz} MHz (single target; discover the minimum stable anchor voltage)"
     ));
     out.push(format!(
-        "offset caps        : abs +{} MHz, per-step +{} MHz (conservative discovery caps — NOT manual-prior)",
+        "offset caps        : abs +{} MHz (TARGET-SWEEP LEARNING HORIZON — reachable ONLY via validated \
+         chained per-step increments; NOT the +30 default and NOT the manual-prior known-point cap), \
+         per-step +{} MHz (each chained increment stays bounded)",
         limits.abs_max_offset_mhz, limits.step_max_offset_mhz
     ));
     out.push(format!(
@@ -223,11 +225,12 @@ pub fn target_sweep_plan_lines(
         ));
         for (i, c) in descent.candidates.iter().enumerate() {
             out.push(format!(
-                "  #{:<2} anchor {:>4} mV  base {:>4} MHz  +{:>2} MHz -> {} MHz | {} capped (max -{} MHz), {} elastic",
+                "  #{:<2} anchor {:>4} mV  base {:>4} MHz  +{:>3} MHz (step Δ+{} MHz) -> {} MHz | {} capped (max -{} MHz), {} elastic",
                 i + 1,
                 c.anchor.voltage_mv,
                 c.anchor.base_mhz,
                 c.anchor.offset_mhz,
+                c.anchor.step_delta_mhz,
                 c.anchor.effective_mhz,
                 c.capped_above_bins,
                 c.max_negative_flatten_mhz,
@@ -644,6 +647,26 @@ mod tests {
         // The absolute cap is still advertised as bounding each candidate.
         assert!(text.contains("absolute +30 cap"));
         assert!(!text.contains("chained baseline   : none"));
+    }
+
+    #[test]
+    fn target_sweep_plan_lines_show_learning_horizon_cap_and_step_delta() {
+        // The official sweep runs with the TARGET-SWEEP LEARNING HORIZON envelope (abs +210, per-step
+        // +15). The dry-run must name that hard cap explicitly (NOT the +30 default, NOT manual-prior)
+        // and show each candidate's per-step delta so the chained descent is transparent.
+        let d = descent(&[(975, 1785), (900, 1755), (850, 1740)], 1800); // +15, +45, +60
+        let limits = PositiveOffsetLimits::target_sweep_learning_horizon(612, 1950);
+        let text = target_sweep_plan_lines(
+            1800, &d, &limits, 3, "C:/ProgramData/Nidavellir/f2_observations.jsonl", None, None, true,
+        )
+        .join("\n");
+        assert!(text.contains("learned offset horizon"));
+        assert!(text.contains("TARGET-SWEEP LEARNING HORIZON"));
+        assert!(text.contains("abs +210 MHz"));
+        // Per-candidate step delta is surfaced (chained-increment transparency).
+        assert!(text.contains("step Δ+"));
+        // Still explicitly NOT the manual-prior known-point cap.
+        assert!(text.contains("NOT the manual-prior known-point cap"));
     }
 
     #[test]

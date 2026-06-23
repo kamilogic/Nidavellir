@@ -1996,11 +1996,17 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
     }
 
     // AUTO-SWEEP (autonomous same-target minimum-stable-voltage discovery): opt-in; uses the OFFICIAL
-    // progressive anchored descent (conservative caps) + observation learning. NEVER the default; branches
-    // before the plain anchored/simple dispatch so default behavior is unchanged.
+    // progressive anchored descent + observation learning. NEVER the default; branches before the plain
+    // anchored/simple dispatch so default behavior is unchanged. It gets a SEPARATE limits envelope — the
+    // TARGET-SWEEP LEARNING HORIZON (absolute cap +210, per-step still +15) — so the chained descent can
+    // keep discovering deeper bins beyond the +30 default ABSOLUTE cap, but ONLY through validated
+    // per-step increments. This is NOT a global cap widening: `limits` (conservative +30/+15) is unchanged
+    // and still used by the default, ladder, and manual-prior paths.
     if args.auto_sweep {
+        let target_sweep_limits =
+            PositiveOffsetLimits::target_sweep_learning_horizon(floor_mv, boost_top);
         run_anchored_target_sweep(
-            store, confirm, &args, &sane, &limits, focus_target, &record, boot_flag_armed,
+            store, confirm, &args, &sane, &target_sweep_limits, focus_target, &record, boot_flag_armed,
         );
         return;
     }
@@ -2821,6 +2827,37 @@ mod tests {
         // ABSOLUTE +30 cap still rejects it (fail closed) — chaining never widens the absolute bound.
         let err = plan_bounded_anchored_positive_offset(&t_base(), 0, 1755, 45, &limits).unwrap_err();
         assert!(err.contains("absolute cap"));
+    }
+
+    // ── TARGET-SWEEP learned offset horizon (official --auto-sweep descent envelope) ─────────────
+    // A clean +15-per-bin ladder so the descent crosses the +30 default absolute cap: the horizon keeps
+    // descending (through validated chained increments) exactly where the conservative envelope stops.
+    fn sweep_base() -> Vec<(usize, u32, u32)> {
+        vec![(0, 850, 1740), (1, 900, 1755), (2, 950, 1770), (3, 1000, 1785), (4, 1062, 1810)]
+    }
+
+    #[test]
+    fn target_sweep_horizon_descent_continues_past_plus30_where_conservative_stops() {
+        // Conservative envelope: the descent reaches +15, +30 and then STOPS — the 900 mV bin needs +45,
+        // which the +30 ABSOLUTE cap rejects (even though the per-step delta from +30 is a valid +15).
+        let cons = PositiveOffsetLimits::conservative(850, 1800);
+        let dc =
+            plan_anchored_undervolt_descent(&sweep_base(), 1800, None, &cons, F2_SWEEP_DRYRUN_BUDGET);
+        let cons_offs: Vec<i32> = dc.candidates.iter().map(|c| c.anchor.offset_mhz).collect();
+        assert_eq!(cons_offs, vec![15, 30]);
+        assert!(dc.stop_reason.unwrap().contains("absolute cap"));
+
+        // Target-sweep learning horizon: SAME per-step +15 chaining, but the larger absolute cap lets the
+        // descent keep planning deeper bins (+45, +60) — each reached only via a valid +15 chained step.
+        let hz = PositiveOffsetLimits::target_sweep_learning_horizon(850, 1800);
+        let dh =
+            plan_anchored_undervolt_descent(&sweep_base(), 1800, None, &hz, F2_SWEEP_DRYRUN_BUDGET);
+        let hz_offs: Vec<i32> = dh.candidates.iter().map(|c| c.anchor.offset_mhz).collect();
+        assert_eq!(hz_offs, vec![15, 30, 45, 60]);
+        // No-last-good start is still conservative: candidate 0 is a +15 step from stock (+0).
+        assert_eq!(dh.candidates[0].anchor.step_delta_mhz, 15);
+        // Every chained step stays within the conserved per-step cap — the horizon never relaxes it.
+        assert!(dh.candidates.iter().all(|c| c.anchor.step_delta_mhz <= hz.step_max_offset_mhz));
     }
 
     // ── parse_undervolt_args ──────────────────────────────────────────────────────────────────

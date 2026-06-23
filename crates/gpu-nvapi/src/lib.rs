@@ -772,6 +772,19 @@ pub const POS_OFFSET_MAX_MHZ: i32 = 30;
 /// Bounds how aggressively the undervolt deepens as the search descends voltage bins.
 pub const POS_OFFSET_STEP_MAX_MHZ: i32 = 15;
 
+/// Hard ABSOLUTE cap on an F2 positive offset for the OFFICIAL TARGET SWEEP's progressive learned
+/// horizon (MHz). This is NOT a global cap widening and is DISTINCT from both the default/autonomous
+/// absolute cap [`POS_OFFSET_MAX_MHZ`] (+30, for a single conservative descent — unchanged) and the
+/// manual-prior cap (+250, an operator-PROVIDED KNOWN point applied in ONE shot). The target-sweep
+/// horizon means "the maximum absolute offset discoverable ONLY through validated CHAINED per-step
+/// increments": the per-step cap stays [`POS_OFFSET_STEP_MAX_MHZ`] (+15), so this absolute ceiling is
+/// reachable solely by accumulating many small steps, each gated by a prior Validated outcome + clean
+/// reset + cleared boot flag. It is deliberately smaller than the manual-prior cap (autonomous
+/// discovery stays more conservative than an asserted point) yet large enough to let the descent reach
+/// a low-voltage bin ~200 MHz below the target. Still fail-closed: the planner REJECTS (never clamps)
+/// an offset above this, and it is a constant, never CLI-widenable.
+pub const TARGET_SWEEP_HORIZON_MAX_MHZ: i32 = 210;
+
 // Sanity bounds for an F2 base-curve point (mirror the service core-VF sanity domain so a foreign /
 // memory-domain / zeroed curve is rejected). Voltage in mV, frequency in MHz.
 const POS_SANE_MV_MIN: u32 = 600;
@@ -829,6 +842,26 @@ impl PositiveOffsetLimits {
         Self {
             abs_max_offset_mhz: max_offset_mhz,
             step_max_offset_mhz: max_offset_mhz,
+            hw_floor_mv,
+            clock_ceiling_mhz,
+        }
+    }
+
+    /// OFFICIAL TARGET-SWEEP learned-offset-horizon limits: a SEPARATE envelope for the autonomous
+    /// same-target minimum-stable-voltage sweep. Raises ONLY the absolute cap to
+    /// [`TARGET_SWEEP_HORIZON_MAX_MHZ`] (+210) while keeping the per-step cap at the conservative
+    /// [`POS_OFFSET_STEP_MAX_MHZ`] (+15) — the CRITICAL difference from [`manual_prior`], which widens
+    /// BOTH caps for a one-shot known point. Here the larger absolute ceiling is reachable ONLY by
+    /// accumulating validated chained +15 increments (each gated by a prior Validated outcome + clean
+    /// reset + cleared boot flag), so a single step can never jump to it. The hardware floor, the clock
+    /// ceiling, and every real-bin/sanity check stay EXACTLY as `conservative`. Still fail-closed: the
+    /// planner REJECTS (never clamps) an offset above the absolute cap or a per-step delta above +15.
+    /// Used ONLY by the opt-in `--auto-sweep` path; the default discovery keeps `conservative` (+30/+15),
+    /// manual-prior keeps its own envelope, and neither is affected by this constructor.
+    pub fn target_sweep_learning_horizon(hw_floor_mv: u32, clock_ceiling_mhz: u32) -> Self {
+        Self {
+            abs_max_offset_mhz: TARGET_SWEEP_HORIZON_MAX_MHZ,
+            step_max_offset_mhz: POS_OFFSET_STEP_MAX_MHZ,
             hw_floor_mv,
             clock_ceiling_mhz,
         }
@@ -1255,7 +1288,8 @@ mod tests {
     use super::{
         nearest_vf_bin_at_or_above, plan_bounded_anchored_positive_offset,
         plan_bounded_positive_offset, plan_vf_ceiling, plan_vf_ceiling_monotone, AnchoredBinRole,
-        PositiveOffsetLimits, VfBinClass,
+        PositiveOffsetLimits, VfBinClass, POS_OFFSET_MAX_MHZ, POS_OFFSET_STEP_MAX_MHZ,
+        TARGET_SWEEP_HORIZON_MAX_MHZ,
     };
 
     // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
@@ -1603,5 +1637,69 @@ mod tests {
         let err =
             plan_bounded_anchored_positive_offset(&curve, 1, 1810, 0, &pos_limits(850)).unwrap_err();
         assert!(err.contains("non-monotone"), "unexpected error: {err}");
+    }
+
+    // ── TARGET-SWEEP learned offset horizon (official --auto-sweep envelope) ──────────────────
+    // The horizon raises ONLY the absolute cap (+210) while keeping the per-step cap at +15, so a
+    // deeper bin is reachable solely through validated chained +15 increments — never one big jump.
+    fn horizon_limits(floor_mv: u32) -> PositiveOffsetLimits {
+        PositiveOffsetLimits::target_sweep_learning_horizon(floor_mv, 2000)
+    }
+
+    #[test]
+    fn target_sweep_horizon_raises_only_absolute_cap_keeps_per_step() {
+        let h = PositiveOffsetLimits::target_sweep_learning_horizon(850, 1900);
+        assert_eq!(h.abs_max_offset_mhz, TARGET_SWEEP_HORIZON_MAX_MHZ);
+        assert_eq!(h.abs_max_offset_mhz, 210);
+        // CRITICAL: per-step stays conservative (unlike manual_prior, which widens BOTH caps).
+        assert_eq!(h.step_max_offset_mhz, POS_OFFSET_STEP_MAX_MHZ);
+        assert_eq!(h.step_max_offset_mhz, 15);
+        // Floor / ceiling pass through unchanged from the caller (same as `conservative`).
+        assert_eq!((h.hw_floor_mv, h.clock_ceiling_mhz), (850, 1900));
+    }
+
+    #[test]
+    fn target_sweep_horizon_allows_plus45_after_validated_plus30() {
+        // The +30 default ABSOLUTE cap saturates here: the 850 mV bin (base 1700) at 1745 needs +45.
+        // Under the conservative envelope +45 > +30 → rejected; under the horizon, +45 ≤ +210 AND the
+        // per-step delta from the last validated +30 is +15 ≤ +15 → it PLANS.
+        assert!(plan_bounded_positive_offset(&pos_base(), 0, 1745, 30, &pos_limits(850)).is_err());
+        let plan =
+            plan_bounded_positive_offset(&pos_base(), 0, 1745, 30, &horizon_limits(850)).unwrap();
+        assert_eq!(plan.offset_mhz, 45);
+        assert_eq!(plan.step_delta_mhz, 15);
+        assert_eq!(plan.effective_mhz, 1745);
+    }
+
+    #[test]
+    fn target_sweep_horizon_still_rejects_per_step_jump_past_15() {
+        // Even under the horizon, a +60 candidate after a validated +30 is a +30 per-step jump
+        // (> +15) → rejected on the per-step cap; the +210 absolute cap is NOT the limiter here.
+        let err =
+            plan_bounded_positive_offset(&pos_base(), 0, 1760, 30, &horizon_limits(850)).unwrap_err();
+        assert!(err.contains("per-step"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn target_sweep_horizon_rejects_offset_above_hard_cap() {
+        // An absolute offset past the +210 horizon hard cap is rejected even with a within-cap
+        // per-step delta and a clock under the ceiling — the horizon is still a hard, bounded ceiling.
+        let err =
+            plan_bounded_positive_offset(&pos_base(), 0, 1911, 200, &horizon_limits(850)).unwrap_err();
+        assert!(err.contains("absolute cap"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn horizon_does_not_perturb_conservative_or_manual_prior_caps() {
+        // Regression: the new constructor must leave the other two envelopes byte-for-byte the same.
+        let c = PositiveOffsetLimits::conservative(850, 1900);
+        assert_eq!(
+            (c.abs_max_offset_mhz, c.step_max_offset_mhz),
+            (POS_OFFSET_MAX_MHZ, POS_OFFSET_STEP_MAX_MHZ)
+        );
+        assert_eq!((c.abs_max_offset_mhz, c.step_max_offset_mhz), (30, 15));
+        // Manual-prior still widens BOTH caps to the operator max (single-shot known point).
+        let m = PositiveOffsetLimits::manual_prior(850, 1900, 250);
+        assert_eq!((m.abs_max_offset_mhz, m.step_max_offset_mhz), (250, 250));
     }
 }
