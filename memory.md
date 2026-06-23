@@ -8,7 +8,26 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-22) — F2 OFFICIAL target sweep FIRST HARDWARE RUN (1800 @ 975 mV) — PASS-PARTIAL
+## Latest (2026-06-22) — F2 CHAINED DESCENT refinement + first FULL-descent HW run (1800 @ 962 mV) — PASS
+- **What**: implemented observation-aware chained same-target descent (commit `fcdf04d`), then ran the first
+  confirmed sweep with it: `undervolt-probe --target-mhz 1800 --auto-sweep --confirm`. One confirmed command,
+  operator present, no second run.
+- **Fix**: the confirmed motor bounds each candidate's per-step increase against the LAST VALIDATED offset
+  (prior candidate this run, only reached after it validated; or the deepest prior validated same-target/
+  same-GPU observation for candidate 0; 0 when none) instead of stock +0. The absolute +30 cap still bounds
+  each candidate. `validated_descent_baseline` (core) + `chained_prev_offset` (service); gpu-nvapi writer,
+  `apply_vf_ceiling_monotone`, verifier, and manual-prior (+250) cap UNCHANGED. A no-write `AbortedBySafetyGate`
+  record is never a baseline/first_bad/blacklist, so the prior 968/+30 abort does not block replanning.
+- **Result — PASS** (exit 0): **3/3 Validated**, `CompletedAllPlanned`. #1 975/+15 (avg 1803/p5 1770, 198 W),
+  #2 968/+15 (1800/1800, 190 W), #3 **962/+30** (1800/1800, 191 W) — the +30 point that aborted in the
+  PASS-PARTIAL run now validates. New min stable voltage **962 mV** (was 975), `first_bad None`, frontier
+  updated. No TDR/DeviceLost/Unstable/ClockDrop.
+- **Cleanup all correct**: reset + boot-flag cleared for all 3; `gpu_applied.json`/`boot_flag.json` absent
+  after; forge_state/gpu_knowledge/heartbeat/safe_loop byte-identical (no persist/apply/promote, no new
+  blacklist). `f2_observations.jsonl` 2→5 (prior 2 incl. old abort preserved). git clean. Tests: core 59,
+  service 282, gpu-nvapi 33 — all green.
+
+## Earlier (2026-06-22) — F2 OFFICIAL target sweep FIRST HARDWARE RUN (1800 @ 975 mV) — PASS-PARTIAL
 - **What**: first bounded hardware run of the OFFICIAL F2 target sweep (progressive anchored descent, NOT
   manual-prior): `undervolt-probe --target-mhz 1800 --auto-sweep --confirm` at HEAD `8dbd296`. One confirmed
   command, operator present, no second run.

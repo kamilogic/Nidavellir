@@ -2,6 +2,38 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 target sweep — observation-aware CHAINED DESCENT + first full-descent hardware run (1800 MHz @ 962 mV) — PASS (2026-06-22)
+- **What**: the planner refinement the PASS-PARTIAL run called for, then its first confirmed hardware run.
+  `undervolt-probe --target-mhz 1800 --auto-sweep --confirm` at HEAD `fcdf04d`. One confirmed command,
+  operator present, no second run.
+- **The bug**: the confirmed motor applied each candidate's offset from STOCK (+0) after `reset_to_stock`, so
+  a candidate needing +30 was rejected by the +15 per-step cap even when it was only +15 above an already
+  VALIDATED point — the PASS-PARTIAL stop at candidate #2.
+- **The fix — observation-aware chained same-target descent** (`feat(service): refine f2 target sweep descent
+  baseline`): the confirmed motor measures each candidate's per-step increase against the **last validated
+  offset** — the prior candidate THIS run (the motor only reaches candidate `i` after `i-1` validated), or for
+  candidate 0 the deepest prior VALIDATED same-target/same-GPU **observation** (cross-run resume), or 0 when
+  none. The **ABSOLUTE +30 cap still bounds every candidate's absolute offset**; only the per-step REFERENCE
+  moves from stock to the last validated point. Pure helpers: `validated_descent_baseline` (core),
+  `chained_prev_offset` (service). gpu-nvapi cap functions were already parameterized by `prev_offset_mhz`, so
+  the writer, `apply_vf_ceiling_monotone`, the verifier, and the manual-prior (+250) cap are all UNCHANGED.
+- **Why it is safe**: a no-write `AbortedBySafetyGate`/`RejectedByPlanner` record is never `Validated`, so it
+  can never become a baseline, a `first_bad`, or a blacklist entry — the prior 968/+30 abort does NOT block
+  replanning. A baseline is only as deep as a point that ALREADY validated on this hardware, so chaining can
+  never authorize an absolute offset beyond +30. Default progressive, manual-prior, F1/build-frontier, and the
+  ladder's voltage-FLOOR policy are untouched (the `--steps`/ladder confirmed paths share the within-run
+  advancement — the same bug fix — but seed no cross-run baseline).
+- **Result — PASS** (exit 0): **3/3 candidates Validated**, `CompletedAllPlanned`. #1 975 mV/+15 (avg 1803,
+  p5 1770, 198 W), #2 968 mV/+15 (avg/p5 1800, 190 W), #3 **962 mV/+30** (avg/p5 1800, 191 W) — the exact +30
+  point that ABORTED in the PASS-PARTIAL run now validates via the chained +15 delta. New min stable voltage
+  **962 mV** (was 975); `first_bad None`, frontier updated, ended safe. No TDR/DeviceLost/Unstable/ClockDrop.
+- **Cleanup correct**: `reset_to_stock_ok` + `boot_flag_cleared` true for all 3; `gpu_applied.json` /
+  `boot_flag.json` ABSENT after; `forge_state.json` / `gpu_knowledge.json` / `heartbeat.txt` / `safe_loop.json`
+  byte-identical (no persist/apply/promote, no knowledge mutation, no new blacklist). 3 observations appended
+  (store 2→5); the 2 prior records (incl. the old no-write abort) preserved as history.
+- **Next recommended task**: extend the validated 1800 MHz frontier with a bounded LADDER (multiple targets)
+  to build the real multi-clock frontier (F1b/F2 convergence), still supervised, one confirmed run at a time.
+
 ## F2 target sweep — FIRST official hardware run (1800 MHz @ 975 mV validated) — PASS-PARTIAL (2026-06-22)
 - **What**: the FIRST bounded hardware run of the OFFICIAL F2 target sweep (progressive anchored descent,
   NOT manual-prior): `undervolt-probe --target-mhz 1800 --auto-sweep --confirm` on the freshly-built debug

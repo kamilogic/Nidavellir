@@ -3,7 +3,28 @@
 How to pick this up cold. State as of 2026-06-22, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-22) — F2 OFFICIAL target sweep FIRST HARDWARE RUN (1800 @ 975 mV) — PASS-PARTIAL
+## Latest backend checkpoint (2026-06-22) — F2 CHAINED DESCENT refinement + first FULL-descent HW run (1800 @ 962 mV) — PASS
+- **What**: the planner refinement the PASS-PARTIAL run called for, committed `fcdf04d`
+  (`feat(service): refine f2 target sweep descent baseline`), then its first confirmed hardware run
+  `undervolt-probe --target-mhz 1800 --auto-sweep --confirm`. One confirmed command, operator present.
+- **Fix**: observation-aware chained same-target descent. The confirmed motor bounds each candidate's per-step
+  increase against the LAST VALIDATED offset (prior candidate this run — only reached after it validated — or
+  the deepest prior validated same-target/same-GPU observation for candidate 0; 0 when none), not stock +0.
+  The absolute +30 cap still bounds each candidate's absolute offset. Files: `crates/core/src/f2_observation.rs`
+  (`validated_descent_baseline` + tests), `crates/service/src/gpu_undervolt.rs` (`chained_prev_offset`,
+  `RealF2Ops.prev_offset_mhz`, `RealF2MultiOps.baseline_offset_mhz`, `run_anchored_target_sweep`),
+  `crates/service/src/gpu_f2_sweep.rs` (dry-run "chained baseline" line). **gpu-nvapi / apply_vf_ceiling_monotone
+  / verifier / manual-prior UNCHANGED.** Tests: core 59/0, service 282/0, gpu-nvapi 33/0.
+- **Result — PASS** (exit 0): **3/3 Validated**, `CompletedAllPlanned`. #1 975/+15 (avg 1803, p5 1770, 198 W),
+  #2 968/+15 (1800/1800, 190 W), #3 **962/+30** (1800/1800, 191 W) — the +30 point that aborted before now
+  validates. Min stable voltage **962 mV** (was 975), `first_bad None`, frontier updated, ended safe.
+- **State after run (all safe)**: reset + boot-flag cleared for all 3; `gpu_applied.json`/`boot_flag.json`
+  ABSENT; `forge_state`/`gpu_knowledge`/`heartbeat`/`safe_loop` byte-identical (no persist/apply/promote, no
+  new blacklist); `f2_observations.jsonl` 2→5 records (prior 2 incl. the old abort preserved). `git` clean.
+- **NEXT**: bounded LADDER over multiple targets (real multi-clock frontier), supervised, one confirmed run
+  at a time.
+
+## Earlier backend checkpoint (2026-06-22) — F2 OFFICIAL target sweep FIRST HARDWARE RUN (1800 @ 975 mV) — PASS-PARTIAL
 - **What**: first bounded hardware run of the OFFICIAL F2 target sweep (progressive anchored descent, NOT
   manual-prior): `undervolt-probe --target-mhz 1800 --auto-sweep --confirm` at HEAD `8dbd296` (freshly-built
   debug binary). One confirmed command, operator present, no second run.
