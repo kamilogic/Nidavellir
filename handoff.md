@@ -3,7 +3,34 @@
 How to pick this up cold. State as of 2026-06-22, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-22) — F2 1800 MHz second confirmed chained run; frontier saturated at +30 cap — PASS
+## Latest backend checkpoint (2026-06-22) — F2 LEARNED OFFSET HORIZON implemented (+210 abs / +15 step); HW run HELD
+- **What**: target-sweep-specific progressive absolute-offset horizon. Commit `c40a78d`
+  (`feat(service): add f2 target sweep learned offset horizon`), pushed to `origin/master`. No hardware run executed.
+- **Change**: gpu-nvapi gains `TARGET_SWEEP_HORIZON_MAX_MHZ = +210` + `PositiveOffsetLimits::target_sweep_learning_horizon(floor, ceiling)`
+  (abs +210, per-step STILL +15 — unlike `manual_prior`, which widens both). Only the `--auto-sweep` dispatch in
+  `gpu_undervolt.rs` builds it; default/ladder/manual-prior keep `conservative` (+30/+15). `gpu_f2_sweep.rs` dry-run
+  names the horizon cap + shows per-candidate step delta. 8 new tests. Files: `crates/gpu-nvapi/src/lib.rs`,
+  `crates/service/src/gpu_undervolt.rs`, `crates/service/src/gpu_f2_sweep.rs`.
+- **Validation**: cargo check clean; gpu-nvapi 38 / core 59 / service 284 tests pass; clippy zero new warnings;
+  independent safety audit = **GO** (all 11 items PASS; no unsafe clock/floor bypass; no single +210 jump — ~14
+  validated +15 steps; confirmed sweep still bounded by `F2_CONFIRMED_MAX_STEPS`=3; no profile persist).
+- **Dry-runs (no --confirm)**: default still `abs +30 / +15` (unchanged); manual-prior still `+250` (unchanged);
+  `--auto-sweep` shows `abs +210` horizon, resumes from prior validated 962 mV/+30, PLANS 6 candidates continuing
+  below 962 (#4 962/+45, #5 956/+45, #6 950/+60; each step Δ ≤ +15).
+- **Why the HW run was HELD (operator choice)**: today's live curve has THREE bins within +30 at the top
+  (981/+15, 975/+15, 968/+30), so a confirmed run — capped at 3 candidates, descent restarting from the curve top —
+  would reach only **968 mV** (shallower than the 962 frontier) and would NOT advance discovery. The +30 cap is NOT
+  today's binding limit; the 3-step budget + descent-start is. Spending a TDR-risk run to re-validate known-good
+  points is poor value. (Safety auditor independently flagged the same — its C1.)
+- **State (untouched)**: no `--confirm` run; observation store still 8 records / `last_good 962 mV` / `first_bad None`;
+  no `gpu_applied.json` / `boot_flag.json`; no profile apply/persist/promotion. Implementation pushed to `master`
+  (worktree branch `claude/adoring-lewin-2a7c8b`); tree clean after the docs commit.
+- **NEXT**: scoped, separately-reviewed follow-up — let the confirmed sweep RESUME ITS DESCENT START near the
+  validated baseline (skip already-validated shallow bins) so the deep candidates (962/+45, 956, 950) fall within
+  the 3-step budget; THEN one supervised confirmed run actually advances the frontier. Alt: bounded LADDER over
+  1815/1830.
+
+## Earlier backend checkpoint (2026-06-22) — F2 1800 MHz second confirmed chained run; frontier saturated at +30 cap — PASS
 - **What**: third confirmed official target sweep (`undervolt-probe --target-mhz 1800 --auto-sweep --confirm`)
   at HEAD `01b97ca`. One confirmed command, operator present. No code change (hardware validation only).
 - **Result — PASS** (exit 0): **3/3 Validated**, `CompletedAllPlanned`. #1 981/+15 (1815/1815, 191 W),

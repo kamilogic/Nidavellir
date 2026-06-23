@@ -2,6 +2,45 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 target sweep — LEARNED OFFSET HORIZON implemented (+210 abs / +15 step); dry-run shows step-budget is today's binding limit; hardware run HELD (2026-06-22)
+- **What**: implemented the target-sweep-specific progressive absolute-offset horizon the prior entry called
+  for (its "separately-reviewed algorithm change … NOT a cap widening"). Commit `c40a78d`
+  `feat(service): add f2 target sweep learned offset horizon`, pushed to `origin/master`.
+- **Design**: new `TARGET_SWEEP_HORIZON_MAX_MHZ = +210` constant + `PositiveOffsetLimits::target_sweep_learning_horizon(floor, ceiling)`
+  in gpu-nvapi — abs +210, per-step STILL +15 (the critical difference from `manual_prior`, which widens BOTH
+  caps for a one-shot known point). Only the `--auto-sweep` dispatch builds it; default/ladder/manual-prior keep
+  `conservative` (+30/+15). +210 is reachable ONLY by accumulating validated chained +15 steps, each gated by a
+  prior Validated outcome + clean reset + cleared boot flag. NOT a global cap widening.
+- **Hard-cap rationale (+210)**: lets the descent reach a low-voltage bin ~200 MHz below target; stays strictly
+  below the manual-prior +250 (autonomous discovery stays more conservative than an operator-asserted point);
+  explicit, bounded, constant, never CLI-widenable. The per-step +15 + chained validation is the real safety
+  mechanism; the abs cap is a hard backstop. effective_mhz = base+offset = target, so the larger abs cap can
+  never authorize a clock above the stock-boost-top ceiling, nor bypass the hardware floor.
+- **Validation**: cargo check clean; tests pass — `nidavellir-gpu-nvapi` 38, `nidavellir-core` 59,
+  `nidavellir-service` 284 (8 new horizon tests); clippy adds ZERO new warnings. Independent safety audit
+  (nidavellir-safety-auditor): **GO**, all 11 checklist items PASS — no global widening, manual-prior isolated,
+  per-step +15 preserved, both caps still fail-closed, `apply_vf_ceiling_monotone`/F1 untouched, no single +210
+  jump (~14 validated steps), confirmed sweep still bounded by `F2_CONFIRMED_MAX_STEPS=3`, no profile persist.
+- **Dry-runs (no --confirm)**: default progressive still `abs +30 / per-step +15 (constants — NOT CLI-widenable)`
+  (unchanged); manual-prior still `+250 (DEFAULT discovery cap stays +30 — unaffected)` (unchanged); `--auto-sweep`
+  now shows `abs +210 MHz (TARGET-SWEEP LEARNING HORIZON …)`, resumes from prior validated 962 mV/+30, and PLANS
+  6 candidates continuing below 962: #4 962/+45, #5 956/+45, #6 950/+60 (each step Δ ≤ +15).
+- **MATERIAL FINDING — today's binding limit is the STEP BUDGET, not the +30 cap**: the prior entry attributed
+  the 968 mV saturation to the +30 absolute cap, but this session's live curve has THREE bins within +30 near
+  the top (981/+15, 975/+15, 968/+30). A confirmed run executes only the first `F2_CONFIRMED_MAX_STEPS`=3
+  candidates AND the descent restarts from the curve top (981 mV) each run, so it would reach only **968 mV** —
+  shallower than the 962 mV frontier — and would NOT advance discovery this session. Raising the absolute cap
+  correctly unblocks the PLANNER (candidates #4–#6 now exist) but does not, by itself, make the confirmed run
+  reach them. The safety auditor independently flagged the same (its C1).
+- **Decision — HARDWARE RUN HELD** (operator choice): no confirmed sweep was run. A TDR/reboot-risk operation
+  that only re-validates already-known-good points (981/975/968) without advancing the frontier is poor value;
+  safety-first favors holding. State untouched: no `--confirm`, no VF write, no Safe Loop arm, no profile
+  apply/persist/promotion; observation store still 8 records / `last_good 962 mV / first_bad None`.
+- **Next recommended task**: a SCOPED, separately-reviewed follow-up so the confirmed sweep RESUMES ITS DESCENT
+  START near the validated baseline (skip already-validated shallow bins) — then the deep candidates (962/+45,
+  956, 950) fall within the 3-step budget and the horizon actually advances the frontier in one supervised run.
+  Alternative: a bounded multi-clock LADDER over 1815/1830.
+
 ## F2 target sweep 1800 MHz — second confirmed chained run; frontier saturated at the +30 absolute cap (~962–968 mV) — PASS (2026-06-22)
 - **What**: a third confirmed official target sweep (second run of the chained-descent build) at HEAD
   `01b97ca`: `undervolt-probe --target-mhz 1800 --auto-sweep --confirm`. One confirmed command, operator

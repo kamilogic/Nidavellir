@@ -8,7 +8,29 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-22) — F2 1800 MHz second confirmed chained run; frontier saturated at +30 cap — PASS
+## Latest (2026-06-22) — F2 LEARNED OFFSET HORIZON implemented (+210 abs / +15 step); HW run HELD
+- **What**: target-sweep-specific progressive absolute-offset horizon. Commit `c40a78d`
+  (`feat(service): add f2 target sweep learned offset horizon`) + docs commit, pushed to `origin/master`.
+- **Change**: gpu-nvapi `TARGET_SWEEP_HORIZON_MAX_MHZ = +210` + `PositiveOffsetLimits::target_sweep_learning_horizon`
+  (abs +210, per-step STILL +15 — unlike `manual_prior` which widens both). Only `--auto-sweep` uses it;
+  default/ladder/manual-prior keep `conservative` (+30/+15). The +210 is reachable ONLY via validated chained +15
+  steps. NOT a global cap widening. 8 new tests.
+- **Validation**: cargo check clean; gpu-nvapi 38 / core 59 / service 284 tests pass; clippy zero new warnings;
+  independent safety audit **GO** (all 11 PASS — no unsafe clock/floor bypass; no single +210 jump; confirmed
+  sweep still bounded by `F2_CONFIRMED_MAX_STEPS`=3; no profile persist).
+- **MATERIAL FINDING**: today's live curve has 3 bins within +30 at the top (981/975/968), so a confirmed run
+  (cap 3, descent restarts from the curve top) reaches only **968 mV** — shallower than the 962 frontier — and
+  would NOT advance discovery. The +30 cap is NOT today's binding limit; the 3-step budget + descent-start is.
+  The horizon correctly unblocks the PLANNER (dry-run plans 962/+45, 956/+45, 950/+60) but the confirmed run
+  can't reach those without resuming the descent START near the baseline.
+- **Decision — HW run HELD** (operator choice): no `--confirm`. A TDR-risk run that only re-validates known-good
+  points without advancing the frontier is poor value. Observation store still 8 records / `last_good 962 mV` /
+  `first_bad None`; no profile apply/persist/promotion; no Safe Loop change. Tree clean.
+- **Next**: scoped, separately-reviewed follow-up so the confirmed sweep RESUMES ITS DESCENT START near the
+  validated baseline (deep candidates then fall within the 3-step budget) → one supervised run advances the
+  frontier. Alt: bounded LADDER over 1815/1830.
+
+## Earlier (2026-06-22) — F2 1800 MHz second confirmed chained run; frontier saturated at +30 cap — PASS
 - **What**: third confirmed official target sweep `undervolt-probe --target-mhz 1800 --auto-sweep --confirm`
   at HEAD `01b97ca` (no code change — hardware validation only). One confirmed command, operator present.
 - **Result — PASS** (exit 0): **3/3 Validated**, `CompletedAllPlanned`. #1 981/+15 (1815/1815, 191 W),
