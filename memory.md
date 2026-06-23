@@ -8,7 +8,23 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-22) — F2 CHAINED DESCENT refinement + first FULL-descent HW run (1800 @ 962 mV) — PASS
+## Latest (2026-06-22) — F2 1800 MHz second confirmed chained run; frontier saturated at +30 cap — PASS
+- **What**: third confirmed official target sweep `undervolt-probe --target-mhz 1800 --auto-sweep --confirm`
+  at HEAD `01b97ca` (no code change — hardware validation only). One confirmed command, operator present.
+- **Result — PASS** (exit 0): **3/3 Validated**, `CompletedAllPlanned`. #1 981/+15 (1815/1815, 191 W),
+  #2 975/+15 (1803/1800, 198 W), #3 968/+30 (1815/1815, 193 W). All reset + boot-flag cleared; no TDR/crash/
+  DeviceLost/Unstable/ClockDrop. `first_bad None`, frontier updated, ended safe.
+- **Key finding**: the 1800 MHz conservative sweep is **absolute-cap-bounded** at +30. This session's VF read
+  sat higher (boost top 1935), so the deepest reachable bin was 968 mV/+30 (next needs +45 → fail-closed). The
+  chained baseline relaxes only the per-step cap, never the absolute cap, so `last_good` stays **962 mV** (the
+  prior run's deeper point). Re-running 1800 only adds confidence — the frontier is at its conservative floor.
+- **Cleanup all correct**: `gpu_applied.json`/`boot_flag.json` absent; forge_state/gpu_knowledge/heartbeat/
+  safe_loop byte-identical (no persist/apply/promote, no new blacklist); `f2_observations.jsonl` 5→8 (7
+  validated + 1 preserved abort). git clean.
+- **Next**: pivot to a bounded multi-target LADDER (1815/1830) for the multi-clock frontier — supervised, one
+  confirmed run at a time — rather than re-running the saturated 1800 sweep.
+
+## Earlier (2026-06-22) — F2 CHAINED DESCENT refinement + first FULL-descent HW run (1800 @ 962 mV) — PASS
 - **What**: implemented observation-aware chained same-target descent (commit `fcdf04d`), then ran the first
   confirmed sweep with it: `undervolt-probe --target-mhz 1800 --auto-sweep --confirm`. One confirmed command,
   operator present, no second run.

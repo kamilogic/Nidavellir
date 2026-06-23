@@ -3,7 +3,24 @@
 How to pick this up cold. State as of 2026-06-22, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-22) — F2 CHAINED DESCENT refinement + first FULL-descent HW run (1800 @ 962 mV) — PASS
+## Latest backend checkpoint (2026-06-22) — F2 1800 MHz second confirmed chained run; frontier saturated at +30 cap — PASS
+- **What**: third confirmed official target sweep (`undervolt-probe --target-mhz 1800 --auto-sweep --confirm`)
+  at HEAD `01b97ca`. One confirmed command, operator present. No code change (hardware validation only).
+- **Result — PASS** (exit 0): **3/3 Validated**, `CompletedAllPlanned`. #1 981/+15 (1815/1815, 191 W),
+  #2 975/+15 (1803/1800, 198 W), #3 968/+30 (1815/1815, 193 W). All reset + boot-flag cleared; no TDR/crash/
+  DeviceLost/Unstable/ClockDrop. `first_bad None`, frontier updated, ended safe.
+- **Key finding**: the 1800 MHz conservative sweep is now **absolute-cap-bounded**. This session's VF read sat
+  higher (boost top 1935), so the deepest reachable bin within the **+30 abs cap** was 968 mV/+30; the next
+  needs +45 → fail-closed. The chained baseline relaxes only the PER-STEP cap, never the ABSOLUTE cap, so it
+  can't push below ~962 mV. `last_good` stays **962 mV** (prior run's deeper point). The frontier has hit its
+  conservative floor — re-running 1800 only adds confidence/observations.
+- **State after run (all safe)**: `gpu_applied.json`/`boot_flag.json` ABSENT; `forge_state`/`gpu_knowledge`/
+  `heartbeat`/`safe_loop` byte-identical; `f2_observations.jsonl` 5→8 (7 validated + 1 preserved abort). git
+  clean.
+- **NEXT**: stop re-running 1800 (saturated); start a bounded LADDER over additional targets (1815/1830) to
+  build the real multi-clock frontier — supervised, one confirmed run at a time.
+
+## Earlier backend checkpoint (2026-06-22) — F2 CHAINED DESCENT refinement + first FULL-descent HW run (1800 @ 962 mV) — PASS
 - **What**: the planner refinement the PASS-PARTIAL run called for, committed `fcdf04d`
   (`feat(service): refine f2 target sweep descent baseline`), then its first confirmed hardware run
   `undervolt-probe --target-mhz 1800 --auto-sweep --confirm`. One confirmed command, operator present.

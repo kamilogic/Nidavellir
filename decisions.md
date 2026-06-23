@@ -2,6 +2,29 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 target sweep 1800 MHz — second confirmed chained run; frontier saturated at the +30 absolute cap (~962–968 mV) — PASS (2026-06-22)
+- **What**: a third confirmed official target sweep (second run of the chained-descent build) at HEAD
+  `01b97ca`: `undervolt-probe --target-mhz 1800 --auto-sweep --confirm`. One confirmed command, operator
+  present, no second run.
+- **Result — PASS** (exit 0): **3/3 Validated**, `CompletedAllPlanned`. #1 981 mV/+15 (avg/p5 1815, 191 W),
+  #2 975 mV/+15 (avg 1803/p5 1800, 198 W), #3 968 mV/+30 (avg/p5 1815, 193 W). All RaiseVerified + dwell
+  Stable; reset + boot-flag cleared for all 3; no TDR/DeviceLost/Unstable/ClockDrop. `first_bad None`,
+  frontier updated, ended safe.
+- **Key finding — the conservative sweep is now ABSOLUTE-CAP-BOUNDED**: this session's static VF-table read
+  sat slightly higher (boost top 1935 vs 1950 MHz), so the deepest bin reachable within the **+30 absolute
+  cap** was **968 mV/+30**; the next bin needs +45 → `offset +45 exceeds the absolute cap +30 — fail closed`.
+  The chained baseline (resume from the prior validated 962 mV/+30) only relaxes the PER-STEP cap, never the
+  ABSOLUTE cap, so it cannot push below ~962 mV. `last_good` therefore stays **962 mV** (the prior run's
+  deeper point in the full store) — the 1800 MHz official frontier has reached its conservative floor and
+  re-confirms cleanly across sessions. Going deeper would need a separately-reviewed algorithm change (e.g.
+  cumulative multi-run offset beyond a single +30 step), NOT a cap widening.
+- **Cleanup correct**: `gpu_applied.json`/`boot_flag.json` ABSENT after; `forge_state`/`gpu_knowledge`/
+  `heartbeat`/`safe_loop` byte-identical (no persist/apply/promote, no knowledge mutation, no new blacklist);
+  `f2_observations.jsonl` 5→8 (7 validated + the 1 preserved no-write abort). git clean.
+- **Next recommended task**: the 1800 MHz conservative frontier is saturated at the +30 cap; pivot to a
+  bounded LADDER over additional targets (e.g. 1815/1830) to build the real multi-clock frontier — supervised,
+  one confirmed run at a time — rather than re-running 1800.
+
 ## F2 target sweep — observation-aware CHAINED DESCENT + first full-descent hardware run (1800 MHz @ 962 mV) — PASS (2026-06-22)
 - **What**: the planner refinement the PASS-PARTIAL run called for, then its first confirmed hardware run.
   `undervolt-probe --target-mhz 1800 --auto-sweep --confirm` at HEAD `fcdf04d`. One confirmed command,
