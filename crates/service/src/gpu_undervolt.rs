@@ -70,6 +70,12 @@ const F2_DEFAULT_STEPS: usize = 4;
 /// dry-run may still preview a longer plan. Single-step (`--steps 1`) keeps its own validated path.
 const F2_CONFIRMED_MAX_STEPS: usize = 3;
 
+/// Hard upper bound on `--validation-passes` for the `--auto-sweep` confidence opt-in. A request above
+/// this is REFUSED (fail closed), never clamped silently — extra validations are real hardware time
+/// (arm→apply→verify→dwell→reset per pass), so the total is bounded so it can never run unbounded.
+#[cfg(windows)]
+const F2_MAX_VALIDATION_PASSES: usize = 20;
+
 /// Candidate budget for the AUTO-SWEEP dry-run preview. Generous on purpose — the conservative offset
 /// caps stop the descent earlier anyway — so the preview shows the full natural descent. The CONFIRMED
 /// auto-sweep stays bounded by [`F2_CONFIRMED_MAX_STEPS`] regardless (no infinite search).
@@ -138,7 +144,7 @@ pub enum UndervoltMode {
 /// selects the original single-bin mode. `manual_prior` (`--manual-prior`) opts into the explicit
 /// development/known-GPU shortcut (anchored, larger bounded cap; requires `--start-mv`); it defaults
 /// to `false` so default/autonomous behavior is unchanged.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndervoltArgs {
     pub target_mhz: Option<u32>,
     pub start_mv: Option<u32>,
@@ -155,6 +161,28 @@ pub struct UndervoltArgs {
     pub ladder_sweep: bool,
     /// Target clocks (MHz) for `--ladder-sweep` (`--targets 1800,1815,1830`). Empty unless provided.
     pub targets: Vec<u32>,
+    /// Confidence opt-in for `--auto-sweep` (`--validation-passes N`, default 1): how many TOTAL validated
+    /// passes the deepest discovered point gets in one session. 1 = today's behavior (one validation). A
+    /// value > 1 re-validates only that single deepest point up to `N-1` additional times (each a full
+    /// arm→apply→verify→dwell→reset), accumulating confidence. Bounded by [`F2_MAX_VALIDATION_PASSES`].
+    pub validation_passes: usize,
+}
+
+impl Default for UndervoltArgs {
+    fn default() -> Self {
+        Self {
+            target_mhz: None,
+            start_mv: None,
+            steps: None,
+            mode: UndervoltMode::default(),
+            manual_prior: false,
+            auto_sweep: false,
+            ladder_sweep: false,
+            targets: Vec::new(),
+            // Confidence opt-in defaults to ONE validated pass (today's behavior).
+            validation_passes: 1,
+        }
+    }
 }
 
 /// Parse the `undervolt-probe` flags (`--target-mhz`, `--start-mv`, `--steps`). Pure + unit-testable;
@@ -181,6 +209,12 @@ pub fn parse_undervolt_args(args: &[OsString]) -> Result<UndervoltArgs, String> 
             "--steps" => {
                 let v = strs.get(i + 1).ok_or_else(|| "--steps needs a value".to_string())?;
                 out.steps = Some(v.parse().map_err(|_| format!("--steps: invalid number '{v}'"))?);
+                i += 2;
+            }
+            "--validation-passes" => {
+                let v = strs.get(i + 1).ok_or_else(|| "--validation-passes needs a value".to_string())?;
+                out.validation_passes =
+                    v.parse().map_err(|_| format!("--validation-passes: invalid number '{v}'"))?;
                 i += 2;
             }
             "--simple" => {
@@ -1393,6 +1427,36 @@ pub fn run_confirmed_f2_multi_step<O: F2MultiStepOps>(
     }
 }
 
+/// CONFIDENCE OPT-IN: re-validate the SINGLE deepest already-validated candidate (`deepest_index`) up to
+/// `extra_passes` additional times, using the SAME validated per-candidate motor ([`run_confirmed_f2_step`])
+/// — each pass is a full select → arm → apply → verify → dwell → reset → clear (reset after EVERY pass,
+/// identical safety to the normal descent). STOPS immediately on ANY non-`Validated` / safety failure (a
+/// point that just failed is never hammered again). Returns ONE report per executed extra pass (in order),
+/// so the caller can record ONE observation per pass (accumulating `validations_at_best`). `extra_passes`
+/// is the caller-clamped, BOUNDED number of EXTRA re-validations (`validation_passes - 1`); 0 ⇒ no-op,
+/// preserving today's single-validation behavior exactly. NEVER persists/applies/promotes a profile.
+pub fn run_confirmed_f2_extra_validations<O: F2MultiStepOps>(
+    ops: &mut O,
+    deepest_index: usize,
+    extra_passes: usize,
+) -> Vec<F2StepReport> {
+    let mut reports: Vec<F2StepReport> = Vec::with_capacity(extra_passes);
+    for _ in 0..extra_passes {
+        // Per-pass Safe Loop + blacklist precheck BEFORE arming / writing (refusal stops further passes).
+        if ops.select(deepest_index).is_err() {
+            break;
+        }
+        let report = run_confirmed_f2_step(ops);
+        let validated = matches!(report.outcome, F2Outcome::Validated);
+        reports.push(report);
+        // Stop the moment a re-validation is anything other than a clean Validated pass.
+        if !validated {
+            break;
+        }
+    }
+    reports
+}
+
 /// Canonical F2 intent for a candidate (target clock, target voltage bin, positive offset). Used to
 /// arm the boot flag and to blacklist the point on a crash.
 fn f2_intent(target_mhz: u32, cand: &PositiveOffsetPlan) -> TuningPoint {
@@ -2398,8 +2462,26 @@ fn run_anchored_target_sweep(
     ) {
         println!("{line}");
     }
+    println!(
+        "validation passes  : {} (extra confidence-building re-validations of the deepest point; default 1)",
+        args.validation_passes
+    );
 
     if confirm {
+        // Confidence opt-in is BOUNDED: a request above the hard cap is REFUSED (fail closed), never
+        // clamped — extra validations are real arm→apply→verify→dwell→reset hardware time per pass.
+        if args.validation_passes > F2_MAX_VALIDATION_PASSES {
+            println!(
+                "undervolt-probe: --confirm REFUSED — --validation-passes {} exceeds the hard cap {} \
+                 (fail closed). No Safe Loop arm, no apply, no dwell, no VF write, no observation recorded.",
+                args.validation_passes, F2_MAX_VALIDATION_PASSES
+            );
+            warn!(
+                "undervolt-probe: --confirm refused (auto-sweep): validation-passes {} > cap {} — no hardware touched",
+                args.validation_passes, F2_MAX_VALIDATION_PASSES
+            );
+            return;
+        }
         // Autonomous + bounded: the sweep's confirmed cap is always F2_CONFIRMED_MAX_STEPS (it ignores
         // --steps). The shared multi-step refusal still enforces Safe Mode / armed-flag / crash-threshold
         // / has-candidates and the cap (fail closed beyond it).
@@ -2463,6 +2545,91 @@ fn run_anchored_target_sweep(
                      recorded={} safe={}",
                     focus_target, summary.last_good_mv, summary.first_bad_mv, summary.recorded, summary.safe
                 );
+
+                // CONFIDENCE OPT-IN (--validation-passes > 1): re-validate ONLY the deepest validated
+                // candidate up to `validation_passes - 1` extra times. Each pass is a full, reset-clean
+                // arm→apply→verify→dwell→reset on the SAME point (no new/deeper point is tried), recording
+                // ONE observation per pass so `validations_at_best` accumulates and raises the frontier
+                // confidence. Stops immediately on any non-Validated / safety failure. No-op when the flag
+                // is absent (default 1) or the descent produced no validated point.
+                let extra_passes = args.validation_passes.saturating_sub(1);
+                if extra_passes > 0 {
+                    if let Some(deepest_index) = report.last_good_index {
+                        if let Some(deepest) = descent.candidates.get(deepest_index).cloned() {
+                            println!(
+                                "=== confidence re-validation: deepest point ({} mV, +{} MHz) × up to {} extra pass(es) ===",
+                                deepest.anchor.voltage_mv, deepest.anchor.offset_mhz, extra_passes
+                            );
+                            // Reproduce the deepest point exactly: a single-candidate motor whose baseline
+                            // is the offset the deepest candidate chained from during the descent.
+                            let deepest_baseline =
+                                chained_prev_offset(&descent.candidates, deepest_index, baseline_offset_mhz);
+                            let mut rev_ops = RealF2MultiOps {
+                                store,
+                                curve: sane.to_vec(),
+                                candidates: vec![deepest.clone()],
+                                limits: *limits,
+                                target_mhz: focus_target,
+                                baseline_offset_mhz: deepest_baseline,
+                                cur: None,
+                            };
+                            let extra_reports =
+                                run_confirmed_f2_extra_validations(&mut rev_ops, 0, extra_passes);
+                            // Record ONE observation per executed extra pass at the deepest point.
+                            let single = AnchoredDescentPlan {
+                                focus_target_mhz: focus_target,
+                                start_mv: descent.start_mv,
+                                max_steps: 1,
+                                candidates: vec![deepest],
+                                stop_reason: None,
+                                skipped_above_target: 0,
+                            };
+                            let mut extra_recorded = 0usize;
+                            for (pass, step) in extra_reports.iter().enumerate() {
+                                let one = F2MultiStepReport {
+                                    planned: 1,
+                                    executed: 1,
+                                    steps: vec![step.clone()],
+                                    last_good_index: matches!(step.outcome, F2Outcome::Validated)
+                                        .then_some(0),
+                                    stop_reason: F2MultiStopReason::CompletedAllPlanned,
+                                };
+                                let rev_ctx = crate::gpu_f2_sweep::ObsContext {
+                                    run_id: new_run_id("f2-target-sweep-reval"),
+                                    timestamp: now_rfc3339(),
+                                    gpu_key: gpu_key.clone(),
+                                    mode: F2ObsMode::TargetSweep,
+                                    requested_start_mv: args.start_mv,
+                                    positive_offset_cap_mhz: limits.abs_max_offset_mhz,
+                                };
+                                let rev_summary = crate::gpu_f2_sweep::record_target_sweep(
+                                    &rev_ctx, focus_target, &single, &one, &obs_store,
+                                );
+                                extra_recorded += rev_summary.recorded;
+                                println!(
+                                    "  pass {:>2}: outcome {:?}, safe {}",
+                                    pass + 1,
+                                    step.outcome,
+                                    rev_summary.safe
+                                );
+                            }
+                            let final_frontier =
+                                crate::gpu_f2_sweep::frontier_preview_for(&obs_store, focus_target);
+                            println!(
+                                "re-validations     : {}/{} extra pass(es) executed/recorded; frontier confidence now {:?}",
+                                extra_reports.len(),
+                                extra_passes,
+                                final_frontier.map(|e| e.confidence)
+                            );
+                            println!("profile            : none persisted, applied, or promoted");
+                            info!(
+                                "undervolt-probe: confirmed TARGET SWEEP re-validation — target={} deepest_idx={} \
+                                 extra_passes_requested={} executed={} recorded={}",
+                                focus_target, deepest_index, extra_passes, extra_reports.len(), extra_recorded
+                            );
+                        }
+                    }
+                }
             }
         }
         return;
@@ -2516,16 +2683,18 @@ fn run_anchored_ladder_sweep(
     // (read-only from the store) — a FLOOR, never an assumption that the prior voltage holds.
     let mut plans = Vec::new();
     for (idx, &target) in args.targets.iter().enumerate() {
-        let prior = if idx > 0 {
-            let prev_t = args.targets[idx - 1];
+        let prev_target = idx.checked_sub(1).map(|j| args.targets[j]);
+        let prior = prev_target.and_then(|prev_t| {
             last_good_for_target(&obs_store.query_by_target(prev_t), prev_t).map(|o| o.anchor_mv)
-        } else {
-            None
-        };
-        let floor_mv = crate::gpu_f2_sweep::ladder_target_floor(base_floor, prior);
+        });
+        // Direction-aware: descending uses the prior last-good as a START ceiling (full base floor);
+        // ascending/first uses it as a conservative FLOOR (today's behavior).
+        let (start_mv, floor_mv) = crate::gpu_f2_sweep::ladder_target_descent_bounds(
+            base_floor, prior, target, prev_target, args.start_mv,
+        );
         let target_limits = PositiveOffsetLimits { hw_floor_mv: floor_mv, ..*limits };
         let descent =
-            plan_anchored_undervolt_descent(sane, target, args.start_mv, &target_limits, F2_SWEEP_DRYRUN_BUDGET);
+            plan_anchored_undervolt_descent(sane, target, start_mv, &target_limits, F2_SWEEP_DRYRUN_BUDGET);
         plans.push(crate::gpu_f2_sweep::ladder_target_plan(target, floor_mv, prior, &descent));
     }
     for line in crate::gpu_f2_sweep::ladder_plan_lines(&plans, F2_CONFIRMED_MAX_STEPS, &obs_path) {
@@ -2551,22 +2720,25 @@ fn run_anchored_ladder_sweep(
         );
         let run_id = new_run_id("f2-ladder");
         let mut prev_good: Option<u32> = None;
-        for &target in &args.targets {
+        for (idx, &target) in args.targets.iter().enumerate() {
             let rec = store.load_record();
             let armed = store.is_boot_flag_armed();
+            let prev_target = idx.checked_sub(1).map(|j| args.targets[j]);
             let prior = prev_good.or_else(|| {
-                args.targets.iter().position(|&t| t == target).and_then(|i| {
-                    i.checked_sub(1).map(|j| args.targets[j]).and_then(|prev_t| {
-                        last_good_for_target(&obs_store.query_by_target(prev_t), prev_t).map(|o| o.anchor_mv)
-                    })
+                prev_target.and_then(|prev_t| {
+                    last_good_for_target(&obs_store.query_by_target(prev_t), prev_t).map(|o| o.anchor_mv)
                 })
             });
-            let floor_mv = crate::gpu_f2_sweep::ladder_target_floor(base_floor, prior);
+            // Direction-aware: descending uses the prior last-good as a START ceiling (full base floor);
+            // ascending/first uses it as a conservative FLOOR (today's behavior).
+            let (start_mv, floor_mv) = crate::gpu_f2_sweep::ladder_target_descent_bounds(
+                base_floor, prior, target, prev_target, args.start_mv,
+            );
             let target_limits = PositiveOffsetLimits { hw_floor_mv: floor_mv, ..*limits };
             let descent = plan_anchored_undervolt_descent(
                 sane,
                 target,
-                args.start_mv,
+                start_mv,
                 &target_limits,
                 F2_SWEEP_DRYRUN_BUDGET,
             );
@@ -2878,6 +3050,22 @@ mod tests {
         assert!(parse_undervolt_args(&os(&["undervolt-probe", "--target-mhz"])).is_err());
         assert!(parse_undervolt_args(&os(&["undervolt-probe", "--steps", "x"])).is_err());
         assert!(parse_undervolt_args(&os(&["undervolt-probe", "--start-mv", "abc"])).is_err());
+    }
+
+    #[test]
+    fn parse_undervolt_args_reads_validation_passes_and_defaults_to_one() {
+        // Default (flag absent) = 1 (today's behavior — one validation per point).
+        assert_eq!(parse_undervolt_args(&os(&["undervolt-probe"])).unwrap().validation_passes, 1);
+        // Explicit value parses.
+        assert_eq!(
+            parse_undervolt_args(&os(&["undervolt-probe", "--validation-passes", "5"]))
+                .unwrap()
+                .validation_passes,
+            5
+        );
+        // Non-numeric / missing values fail closed (like the other numeric flags).
+        assert!(parse_undervolt_args(&os(&["undervolt-probe", "--validation-passes", "x"])).is_err());
+        assert!(parse_undervolt_args(&os(&["undervolt-probe", "--validation-passes"])).is_err());
     }
 
     #[test]
@@ -3601,6 +3789,119 @@ mod tests {
                 "select" | "arm" | "apply" | "verify" | "dwell" | "reset" | "clear" | "blacklist"
             ));
         }
+    }
+
+    // ── F2 confidence opt-in: extra re-validations of the deepest point (mock; no hardware) ─────
+    // A mock that scripts a SEQUENCE of per-PASS outcomes for a SINGLE re-validated candidate, so each
+    // extra validation pass can return a different result (the production MockMultiOps keys scripts by
+    // candidate index, which is identical across passes). `candidate_count() == 1` (one deepest point).
+    struct RevalMockOps {
+        passes: Vec<CandScript>,
+        pass: usize,
+        cur: usize,
+        log: Vec<String>,
+    }
+    impl RevalMockOps {
+        fn new(passes: Vec<CandScript>) -> Self {
+            RevalMockOps { passes, pass: 0, cur: 0, log: Vec::new() }
+        }
+        fn s(&self) -> &CandScript {
+            // The pass cursor advanced past the script on `select`; the motor reads the just-selected pass.
+            &self.passes[self.pass - 1]
+        }
+    }
+    impl F2Ops for RevalMockOps {
+        fn arm_boot_flag(&mut self) -> Result<(), String> { self.log.push(format!("arm{}", self.cur)); self.s().arm.clone() }
+        fn apply_positive_offset(&mut self) -> Result<(), String> { self.log.push(format!("apply{}", self.cur)); self.s().apply.clone() }
+        fn verify(&mut self) -> PositiveOffsetVerification { self.log.push(format!("verify{}", self.cur)); self.s().verify }
+        fn dwell(&mut self) -> F2DwellResult {
+            self.log.push(format!("dwell{}", self.cur));
+            F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0 }
+        }
+        fn reset_to_stock(&mut self) -> Result<(), String> { self.log.push(format!("reset{}", self.cur)); self.s().reset.clone() }
+        fn clear_boot_flag(&mut self) -> Result<(), String> { self.log.push(format!("clear{}", self.cur)); self.s().clear.clone() }
+        fn blacklist_point(&mut self) -> Result<(), String> { self.log.push(format!("blacklist{}", self.cur)); self.s().blacklist.clone() }
+    }
+    impl F2MultiStepOps for RevalMockOps {
+        fn candidate_count(&self) -> usize { 1 }
+        fn select(&mut self, i: usize) -> Result<(), String> {
+            self.cur = i;
+            let p = self.pass;
+            self.pass += 1;
+            self.log.push(format!("select{i}#{p}"));
+            self.passes[p].precheck.clone()
+        }
+    }
+
+    #[test]
+    fn extra_validations_default_one_does_no_extra_passes() {
+        // validation_passes == 1 ⇒ extra_passes == 0 ⇒ NO re-validation runs (today's behavior).
+        let mut ops = RevalMockOps::new(vec![CandScript::stable(); 4]);
+        let reports = run_confirmed_f2_extra_validations(&mut ops, 0, 0);
+        assert!(reports.is_empty());
+        assert!(ops.log.is_empty()); // never armed/applied/reset anything
+    }
+
+    #[test]
+    fn extra_validations_revalidates_deepest_n_minus_one_times() {
+        // validation_passes == 3 ⇒ 2 EXTRA re-validations of the deepest point, each a full reset-clean
+        // pass; 2 reports returned (one observation per pass would be recorded by the caller).
+        let mut ops = RevalMockOps::new(vec![CandScript::stable(); 3]);
+        let reports = run_confirmed_f2_extra_validations(&mut ops, 0, 2);
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(r.validated);
+            assert_eq!(r.reset_ok, Some(true)); // reset after EVERY pass
+            assert!(r.boot_flag_cleared);
+        }
+        // Both passes selected the SAME deepest index (0) and ran the full motor each time.
+        assert_eq!(
+            ops.log,
+            vec![
+                "select0#0", "arm0", "apply0", "verify0", "dwell0", "reset0", "clear0",
+                "select0#1", "arm0", "apply0", "verify0", "dwell0", "reset0", "clear0",
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_validations_stop_immediately_on_unstable_pass() {
+        // Pass 1 stable, pass 2 Unstable ⇒ the loop STOPS (no pass 3), even though 3 extra were requested.
+        let mut ops = RevalMockOps::new(vec![
+            CandScript::stable(),
+            CandScript::stable().with_dwell(F2DwellOutcome::Unstable),
+            CandScript::stable(),
+        ]);
+        let reports = run_confirmed_f2_extra_validations(&mut ops, 0, 3);
+        assert_eq!(reports.len(), 2); // stopped after the unstable pass; pass 3 never ran
+        assert!(reports[0].validated);
+        assert!(!reports[1].validated);
+        assert!(matches!(reports[1].outcome, F2Outcome::Unstable));
+        assert!(!ops.log.iter().any(|l| l == "select0#2")); // never started a 3rd pass
+    }
+
+    #[test]
+    fn extra_validations_stop_on_precheck_refusal() {
+        // A pass whose Safe Loop / blacklist precheck refuses STOPS further passes and writes nothing.
+        let mut ops = RevalMockOps::new(vec![
+            CandScript::stable(),
+            CandScript { precheck: Err("blacklisted".to_string()), ..CandScript::stable() },
+        ]);
+        let reports = run_confirmed_f2_extra_validations(&mut ops, 0, 3);
+        assert_eq!(reports.len(), 1); // only the first pass produced a report
+        assert!(ops.log.iter().any(|l| l == "select0#1")); // precheck happened on pass 2
+        // Exactly one full motor pass ran; pass 2 was refused before any write.
+        assert_eq!(ops.log.iter().filter(|l| l.starts_with("arm")).count(), 1);
+    }
+
+    #[test]
+    fn f2_max_validation_passes_is_bounded() {
+        // The hard cap exists and is a small, bounded number (never unbounded hardware time).
+        assert_eq!(F2_MAX_VALIDATION_PASSES, 20);
+        // A request above the cap is REFUSED by the auto-sweep confirm gate (see run_anchored_target_sweep);
+        // the gate compares args.validation_passes > F2_MAX_VALIDATION_PASSES and fails closed.
+        let refused = 21usize;
+        assert!(refused > F2_MAX_VALIDATION_PASSES);
     }
 
     // ── F2 MANUAL-PRIOR (explicit dev/known-GPU shortcut; pure planner + gate; no hardware) ─────

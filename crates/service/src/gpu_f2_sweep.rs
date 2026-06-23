@@ -308,6 +308,40 @@ pub fn ladder_target_floor(base_floor_mv: u32, prev_last_good_mv: Option<u32>) -
     }
 }
 
+/// Direction-aware descent bounds for a ladder target: `(start_mv, floor_mv)`.
+///
+/// The prior target's last-good is treated DIFFERENTLY depending on the ladder direction, because a
+/// "minimum stable voltage" relationship is monotone in clock (a lower clock can run at or BELOW a
+/// higher clock's min-V; a higher clock needs at least as much):
+///
+/// - **DESCENDING** (`prev_target_mhz` is `Some` AND `target_mhz < prev_target_mhz`): the prior (higher)
+///   clock's last-good is a CEILING / descent START point — the lower clock can hold that voltage and
+///   then go DEEPER — so we start the descent AT the prior last-good and keep the FULL base hardware
+///   floor so the lower clock can reach its own deeper min-V. Using the prior as a floor here would
+///   OVER-FLOOR the descent and collapse the frontier. Returns `(prior.or(global_start), base_floor)`.
+/// - **ASCENDING or first target**: unchanged from today — the prior (lower) clock's last-good is a
+///   conservative FLOOR (a higher clock won't probe below where a lower clock already needed voltage),
+///   and the descent starts from the caller's global start. Returns
+///   `(global_start, ladder_target_floor(base_floor, prior))`.
+pub fn ladder_target_descent_bounds(
+    base_floor_mv: u32,
+    prior_last_good_mv: Option<u32>,
+    target_mhz: u32,
+    prev_target_mhz: Option<u32>,
+    global_start_mv: Option<u32>,
+) -> (Option<u32>, u32) {
+    match prev_target_mhz {
+        Some(prev) if target_mhz < prev => {
+            // Descending: prior last-good is a START ceiling, not a floor; keep the full base floor.
+            (prior_last_good_mv.or(global_start_mv), base_floor_mv)
+        }
+        _ => {
+            // Ascending or first target: prior last-good is a conservative floor (today's behavior).
+            (global_start_mv, ladder_target_floor(base_floor_mv, prior_last_good_mv))
+        }
+    }
+}
+
 /// Whether a ladder may continue to the NEXT target after the current target's sweep. Conservative: the
 /// current target's sweep must have ended reset-CLEAN (no `ResetFailed`/crash). A normal
 /// unstable/clock-drop candidate that reset cleanly does NOT stop the ladder; an unsafe end does.
@@ -677,6 +711,27 @@ mod tests {
         assert_eq!(ladder_target_floor(612, Some(962)), 962);
         // Prior BELOW the base floor never lowers the hardware floor.
         assert_eq!(ladder_target_floor(970, Some(962)), 970);
+    }
+
+    #[test]
+    fn ladder_descent_bounds_are_direction_aware() {
+        // DESCENDING (target < prev): prior last-good is a START ceiling; floor stays the full base.
+        let (start, floor) = ladder_target_descent_bounds(612, Some(962), 1785, Some(1800), Some(975));
+        assert_eq!((start, floor), (Some(962), 612));
+        // Descending with no prior last-good falls back to the global start; floor still base.
+        let (start, floor) = ladder_target_descent_bounds(612, None, 1785, Some(1800), Some(975));
+        assert_eq!((start, floor), (Some(975), 612));
+
+        // ASCENDING (target > prev): prior last-good is a conservative FLOOR; global start unchanged.
+        let (start, floor) = ladder_target_descent_bounds(612, Some(962), 1815, Some(1800), Some(975));
+        assert_eq!((start, floor), (Some(975), 962)); // max(base, prior)
+        // Ascending where the prior sits below the base floor never lowers the hardware floor.
+        let (start, floor) = ladder_target_descent_bounds(970, Some(962), 1815, Some(1800), Some(975));
+        assert_eq!((start, floor), (Some(975), 970));
+
+        // FIRST target (no prev): global start passes through; floor is the base floor.
+        let (start, floor) = ladder_target_descent_bounds(612, None, 1800, None, Some(975));
+        assert_eq!((start, floor), (Some(975), 612));
     }
 
     #[test]

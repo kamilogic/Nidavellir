@@ -1018,9 +1018,11 @@ struct ForgePolicy {
 #[cfg(windows)]
 #[allow(dead_code)] // conservative/aggressive wired by F1b Phase 2 (profile selector)
 impl ForgePolicy {
-    /// Default daily-use policy: Brokkr's >= 98% clock, Deep Calm >= 90% clock, gate .85.
+    /// Default daily-use policy: Brokkr's >= 95% clock, Deep Calm >= 90% clock, gate .85.
+    /// Brokkr's floor relaxed 0.98 -> 0.95 so the knee can sit a little deeper (up to 5% clock
+    /// traded for much larger efficiency gains) without colliding into Deep Calm's 90% floor.
     fn balanced() -> Self {
-        Self { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 }
+        Self { brokkrs_min_clock_frac: 0.95, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 }
     }
     fn conservative() -> Self {
         Self { brokkrs_min_clock_frac: 0.99, deep_calm_min_clock_frac: 0.92, confidence_threshold: 0.95 }
@@ -3991,7 +3993,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn f1b_rtx3060ti_power_capped_frontier() {
-        // Hard power-capped frontier (200 W); Balanced floors 98% / 90% of Godforge.
+        // Hard power-capped frontier (200 W); this test verifies selection at the 98% Brokkr's
+        // floor it was designed for, so it pins the policy explicitly (decoupled from the default,
+        // which relaxed to 95%).
         let frontier = vec![
             (fp(1830, 190.0), 0.95),
             (fp(1815, 177.0), 0.95),
@@ -3999,7 +4003,8 @@ mod tests {
             (fp(1770, 156.0), 0.95),
             (fp(1740, 150.0), 0.95),
         ];
-        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        let policy = ForgePolicy { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 };
+        let p = synthesize_forge_profiles(&frontier, &policy);
         assert_eq!(p.godforge.unwrap().clock_mhz, 1830, "Godforge = highest sustainable clock");
         // Brokkr's floor 0.98*1830 = 1793.4 → only 1815/1800 eligible; max R = 1815.
         assert_eq!(p.brokkrs.unwrap().clock_mhz, 1815, "Brokkr's = best R within 98% floor");
@@ -4019,7 +4024,10 @@ mod tests {
             (fp(2760, 260.0), 0.95),
             (fp(2700, 245.0), 0.95),
         ];
-        let p = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        // Pins the 98% Brokkr's floor explicitly (decoupled from the default, which relaxed to 95%)
+        // so the test keeps verifying max-R selection at the floor it was designed for.
+        let policy = ForgePolicy { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 };
+        let p = synthesize_forge_profiles(&frontier, &policy);
         assert_eq!(p.godforge.unwrap().clock_mhz, 2880, "Godforge = highest sustainable clock");
         // Floor 0.98*2880 = 2822.4 → 2860/2840 eligible. Max-R rule: 2860 (R≈14.3) beats
         // 2840 (R≈12.4) → principled choice is 2860 (stays nearest Godforge).
@@ -4049,13 +4057,25 @@ mod tests {
     #[test]
     fn f1b_brokkrs_floor_boundary() {
         // Godforge 2000; Brokkr's floor 0.98 = 1960. A point at 1960 is eligible; 1959 is not.
+        // Pins the 98% floor explicitly (decoupled from the default, which relaxed to 95%) so the
+        // boundary semantics this test exercises stay anchored to 0.98.
+        let policy = ForgePolicy { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 };
         let at_floor = vec![(fp(2000, 200.0), 0.95), (fp(1960, 150.0), 0.95)];
-        let p = synthesize_forge_profiles(&at_floor, &ForgePolicy::balanced());
+        let p = synthesize_forge_profiles(&at_floor, &policy);
         assert_eq!(p.brokkrs.unwrap().clock_mhz, 1960, "exactly at floor → eligible");
 
         let below_floor = vec![(fp(2000, 200.0), 0.95), (fp(1959, 150.0), 0.95)];
-        let p2 = synthesize_forge_profiles(&below_floor, &ForgePolicy::balanced());
+        let p2 = synthesize_forge_profiles(&below_floor, &policy);
         assert_eq!(p2.brokkrs.unwrap().clock_mhz, 2000, "below floor → no candidate → Godforge");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn balanced_policy_relaxed_brokkrs_floor_to_95() {
+        // The default daily-use policy relaxed Brokkr's floor 0.98 → 0.95 (Deep Calm stays 0.90).
+        let b = ForgePolicy::balanced();
+        assert_eq!(b.brokkrs_min_clock_frac, 0.95, "Brokkr's floor relaxed to 95%");
+        assert_eq!(b.deep_calm_min_clock_frac, 0.90, "Deep Calm floor unchanged at 90%");
     }
 
     #[cfg(windows)]
