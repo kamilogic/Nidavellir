@@ -2,6 +2,44 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 multi-clock profile package — Brokkr's 0.95 + descending ladder (Caminho B) + confidence opt-in; "906 vs 868" is the CONFIDENCE GATE, not a margin (2026-06-23)
+- **What**: three approved backend changes toward the v0.5 multi-clock profile frontier — implemented +
+  validated + safety-audited, NOT yet committed (awaiting operator approval). No hardware run.
+- **Key finding (answers "why applied 906 not the 868 the sweep reached")**: `synthesize_forge_profiles`
+  selection is **voltage-agnostic** — it picks points by clock/power/p5/**confidence**; `vf_table_voltage_mv`
+  is the deterministic apply axis, NOT a selection input. The 868→906 gap is the **Wilson confidence gate**
+  (`confidence_threshold = 0.85`): a once-validated point has confidence ~0.21 and is filtered out; the
+  deepest point that earned enough repeat confirmations wins. It is NOT a fixed mV safety margin.
+- **Part 1 — Brokkr's floor 0.98 → 0.95** (`ForgePolicy::balanced`): the efficiency knee may now sit up to
+  5% below Godforge (was 2%) for larger watt savings; Deep Calm stays 0.90, confidence gate stays 0.85.
+  Selection-only; authorizes no voltage/clock. Three floor-boundary tests decoupled to an explicit 0.98
+  literal; new test pins the 0.95 default.
+- **Part 2 — Caminho B descending ladder** (`ladder_target_descent_bounds`, gpu_f2_sweep): `run_anchored_ladder_sweep`
+  is now direction-aware. DESCENDING targets start the descent at the prior clock's last-good (a CEILING) with
+  the full BASE hardware floor, so each lower clock reaches its OWN deeper min-V; ASCENDING/first keeps today's
+  prior-as-floor behavior byte-for-byte. The confirmed loop chains the freshly-discovered last-good forward via
+  `prev_good`. (The old ascending-floor ladder over-floored a descending list — Caminho B fixes that.)
+- **Part 3 — confidence opt-in `--validation-passes N`** (default 1, hard cap `F2_MAX_VALIDATION_PASSES=20`):
+  an opt-in that re-validates ONLY the deepest validated point up to N-1 extra times in ONE session (reuses the
+  safe arm→apply→verify→dwell→reset motor + per-pass Safe Loop/blacklist precheck; stops on any non-Validated;
+  records one observation per pass so `validations_at_best`/confidence accumulate). Default 1 = strict no-op =
+  today's behavior. Lets a deep point EARN the 0.85 gate in one longer session instead of waiting days/runs —
+  WITHOUT lowering the gate. Mode 1 (accrue over runs) kept intact; idle auto-validation = FUTURE.
+- **UI**: contract request for Codex (`docs/contracts/ui-backend.md`, 2026-06-23): profiles from the multi-clock
+  frontier, Brokkr's 95%, honest collapse (Brokkr's ≡ Godforge on power-limited GPUs), confidence-is-a-gate-not-a-
+  margin messaging, "Build confidence now" opt-in (default OFF), idle-validation future.
+- **Validation**: cargo check clean; tests gpu-nvapi 38 / core 59 / service 292 pass (8 added, 1 fixed); clippy no
+  new warnings. Independent safety audit (nidavellir-safety-auditor): **GO**, all 8 items PASS — re-validation
+  reuses the safe motor + is bounded/fail-closed, descending uses the base floor under the unchanged planner
+  gates, no apply/persist/promote, `apply_vf_ceiling_monotone`/F1 untouched, ForgePolicy selection-only. Non-
+  blocking: a cosmetic synthesized stop_reason on a failed extra pass (no safety effect); the over-cap gate is
+  correct-by-inspection but only tautologically tested.
+- **State**: no `--confirm`, no hardware, no profile apply/persist/promotion, no commit/push. Observation store
+  unchanged (8 records / last_good 962 mV).
+- **Next**: operator review → commit/push; then a SUPERVISED confirmed descending multi-clock ladder (anchored at
+  the validated top) to populate the frontier so the classifier can differentiate the three profiles; later, wire
+  `validation_passes` + the F2 frontier into the live Forge IPC (still classifier-preview today).
+
 ## F2 target sweep — LEARNED OFFSET HORIZON implemented (+210 abs / +15 step); dry-run shows step-budget is today's binding limit; hardware run HELD (2026-06-22)
 - **What**: implemented the target-sweep-specific progressive absolute-offset horizon the prior entry called
   for (its "separately-reviewed algorithm change … NOT a cap widening"). Commit `c40a78d`

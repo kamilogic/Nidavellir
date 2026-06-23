@@ -3,7 +3,30 @@
 How to pick this up cold. State as of 2026-06-22, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-22) — F2 LEARNED OFFSET HORIZON implemented (+210 abs / +15 step); HW run HELD
+## Latest backend checkpoint (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — implemented, NOT committed
+- **What**: 3 approved changes toward the v0.5 multi-clock profile frontier. Implemented by the code-surgeon,
+  independently validated + safety-audited (GO). No hardware run, NOT committed (awaiting operator approval).
+- **THE margin answer**: applied-voltage conservatism (e.g. 906 mV vs the 868 the sweep reached) is the **Wilson
+  confidence gate** (0.85), NOT a margin. `synthesize_forge_profiles` selection is voltage-agnostic; a once-validated
+  deep point has confidence ~0.21 and is filtered until it earns repeat confirmations.
+- **Part 1**: `ForgePolicy::balanced` Brokkr's floor 0.98→0.95 (Deep Calm 0.90, gate 0.85 unchanged) — selection
+  only. 3 floor tests decoupled to explicit 0.98; new test pins 0.95.
+- **Part 2 (Caminho B)**: `ladder_target_descent_bounds` makes `run_anchored_ladder_sweep` direction-aware —
+  DESCENDING starts at the prior clock's last-good (ceiling) with the base floor (each lower clock finds its own
+  deeper min-V); ASCENDING unchanged. Confirmed loop chains `prev_good` forward.
+- **Part 3**: `--validation-passes N` (default 1, cap 20) confidence opt-in for `--auto-sweep` — re-validates ONLY
+  the deepest validated point up to N-1 extra times (reuses the safe motor + per-pass precheck, stops on any
+  non-Validated, records 1 obs/pass). Default 1 = no-op. Mode 1 kept; idle-validation = FUTURE.
+- **UI contract**: `docs/contracts/ui-backend.md` (2026-06-23) — multi-clock profiles, Brokkr's 95%, honest
+  collapse, confidence-is-a-gate messaging, "Build confidence now" opt-in (default OFF), idle future.
+- **Validation**: nvapi 38 / core 59 / service 292 pass; clippy no new warnings; dry-runs confirm default +30 &
+  manual-prior +250 unchanged, auto-sweep shows +210 horizon + validation-passes line, descending ladder plans
+  per target. Safety audit = GO (8/8 PASS).
+- **Files**: `crates/service/src/{gpu_power_sweep.rs, gpu_f2_sweep.rs, gpu_undervolt.rs}`, `docs/contracts/ui-backend.md`.
+- **NEXT**: operator approves → commit/push; then a SUPERVISED confirmed descending ladder to build the real
+  multi-clock frontier; wire `validation_passes` + the frontier into the live Forge IPC.
+
+## Earlier backend checkpoint (2026-06-22) — F2 LEARNED OFFSET HORIZON implemented (+210 abs / +15 step); HW run HELD
 - **What**: target-sweep-specific progressive absolute-offset horizon. Commit `c40a78d`
   (`feat(service): add f2 target sweep learned offset horizon`), pushed to `origin/master`. No hardware run executed.
 - **Change**: gpu-nvapi gains `TARGET_SWEEP_HORIZON_MAX_MHZ = +210` + `PositiveOffsetLimits::target_sweep_learning_horizon(floor, ceiling)`

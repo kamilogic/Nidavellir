@@ -434,6 +434,116 @@ No schema bump; old `forge_state.json` / `GetPowerSweepProgress` payloads load w
 
 
 
+\## Frontend request (2026-06-23): Multi-clock profile discovery + confidence opt-in (backend → Codex)
+
+
+
+Backend is building the v0.5 multi-clock frontier that finally differentiates the three
+
+profiles. Three UI-relevant changes; all backend data is additive/optional.
+
+
+
+\### 1. Profiles come from a MEASURED multi-clock frontier (not a single clock)
+
+
+
+The official sweep now descends MULTIPLE clock targets (anchored at the max sustained clock,
+
+stepping down toward the Deep Calm clock), producing a frontier of points
+
+`(target_clock, measured_clock, p5_clock, voltage_mv, watts, confidence)`. The three profiles are
+
+SELECTION POLICIES over that frontier (no new scoring):
+
+
+
+\- \*\*Godforge\*\* = highest sustained clock (top of the frontier).
+
+\- \*\*Brokkr's Best\*\* = best benefit/cost (`%power_saved ÷ %clock_lost`) keeping \*\*≥ 95%\*\* of
+
+&#x20; Godforge's clock (relaxed from 98% → 95%, so the efficiency knee may sit up to 5% below
+
+&#x20; Godforge for much larger watt savings).
+
+\- \*\*Deep Calm\*\* = best MHz/W keeping \*\*≥ 90%\*\* of Godforge's clock (lowest power, still usable).
+
+
+
+\*\*UI:\*\* present all three as distinct points (clock / mV / watts / MHz-per-watt). \*\*Honest
+
+collapse:\*\* on a hard power-limited GPU the knee can coincide with the top — when the backend
+
+flags `power_bound_collapse` (or Godforge and Brokkr's resolve to the same point), the UI should
+
+say so plainly (e.g. "Brokkr's ≡ Godforge on this GPU — power-limited, no headroom above the
+
+efficiency point") rather than imply a fake difference. Do NOT manufacture a distinction.
+
+
+
+\### 2. Confidence is a STABILITY GATE, not a voltage margin — surface it
+
+
+
+Why an applied point can sit ABOVE the deepest voltage the sweep reached (e.g. applied 906 mV
+
+while the sweep validated down to 868 mV): selection is \*\*voltage-agnostic\*\* and gates each point
+
+on accumulated \*\*Wilson stability confidence\*\* (default ≥ 0.85). A point validated only once has
+
+low confidence (~0.21) and is NOT trusted yet; the deepest point that has earned enough repeat
+
+confirmations wins. It is NOT a fixed safety margin.
+
+
+
+\*\*UI:\*\* per profile point, show its \*\*confidence\*\* and \*\*validation count\*\* (e.g. "confidence 0.84
+
+· 12 confirmations"), so the user understands a deeper point is "not yet confirmed enough" rather
+
+than "blocked by a margin".
+
+
+
+\### 3. Confidence opt-in: "Build confidence now" (longer run) — DEFAULT OFF
+
+
+
+New backend option (`validation_passes`, default 1): an OPT-IN that spends a longer single session
+
+doing extra validation passes on the deepest discovered point so it earns the confidence gate
+
+WITHIN one session, instead of waiting across days/runs. Bounded (max 20 passes). The default
+
+(`1`) is exactly today's behavior and is UNCHANGED.
+
+
+
+\- \*\*Mode 1 (default, keep)\*\*: confidence accrues across normal runs over time.
+
+\- \*\*Opt-in\*\*: user chooses a longer "build confidence now" run (more passes) to skip the wait.
+
+
+
+\*\*UI:\*\* a clear optional control (toggle + passes/time selector) labelled as a LONGER run, with a
+
+note that it re-validates the deepest point repeatedly (more GPU time/heat) and is optional.
+
+Default OFF. \*\*Future (not in this delivery):\*\* automatic confidence-building while the PC is IDLE —
+
+leave conceptual room for it but do not build it yet.
+
+
+
+\*\*Compatibility:\*\* all backend additions are optional/additive (no payload renames/removals). The
+
+`validation_passes` knob will need an IPC parameter when the Forge action is wired; until then it
+
+is a service-level option. Rationale + algorithm details: `decisions.md`, `handoff.md`.
+
+
+
 (No other active requests)
 
 

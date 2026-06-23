@@ -8,7 +8,24 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-22) — F2 LEARNED OFFSET HORIZON implemented (+210 abs / +15 step); HW run HELD
+## Latest (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — implemented, NOT committed
+- **What**: 3 approved backend changes toward the v0.5 multi-clock profile frontier. Implemented + validated +
+  safety-audited (GO). No hardware run; NOT committed (awaiting operator approval).
+- **Margin answer**: applied 906 vs reached 868 is the **Wilson confidence gate** (0.85), NOT a voltage margin —
+  `synthesize_forge_profiles` selection is voltage-agnostic; a once-validated point (~0.21 confidence) is filtered
+  until it earns repeat confirmations.
+- **Part 1**: Brokkr's floor 0.98→0.95 (`ForgePolicy::balanced`; Deep Calm 0.90, gate 0.85). Selection-only.
+- **Part 2 (Caminho B)**: `ladder_target_descent_bounds` — descending ladder starts each lower clock at the prior
+  clock's last-good (ceiling) with the base floor; ascending unchanged.
+- **Part 3**: `--validation-passes N` (default 1, cap 20) — opt-in re-validates the deepest point N-1 extra times in
+  one session to earn confidence WITHOUT lowering the gate; default = no-op; idle auto-validation = future.
+- **UI**: contract for Codex in `docs/contracts/ui-backend.md` (multi-clock profiles, 95% Brokkr's, honest collapse,
+  confidence-gate messaging, "Build confidence now" opt-in default OFF, idle future).
+- **Validation**: nvapi 38 / core 59 / service 292 pass; clippy clean; safety audit GO (8/8). No apply/persist/promote,
+  no hardware, no commit. Observation store unchanged (8 records / last_good 962 mV).
+- **Next**: operator approves → commit/push; then a supervised confirmed descending ladder to build the frontier.
+
+## Earlier (2026-06-22) — F2 LEARNED OFFSET HORIZON implemented (+210 abs / +15 step); HW run HELD
 - **What**: target-sweep-specific progressive absolute-offset horizon. Commit `c40a78d`
   (`feat(service): add f2 target sweep learned offset horizon`) + docs commit, pushed to `origin/master`.
 - **Change**: gpu-nvapi `TARGET_SWEEP_HORIZON_MAX_MHZ = +210` + `PositiveOffsetLimits::target_sweep_learning_horizon`
