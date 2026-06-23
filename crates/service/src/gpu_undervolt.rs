@@ -529,6 +529,28 @@ pub fn plan_anchored_undervolt_descent(
     }
 }
 
+/// The per-step baseline offset for candidate `i` of a CONFIRMED chained same-target descent.
+///
+/// The confirmed multi-step motor ([`run_confirmed_f2_multi_step`]) reaches candidate `i` ONLY after
+/// candidate `i-1` returned `Validated` (it stops at the first non-stable outcome), so the prior
+/// candidate's offset is a point freshly validated on THIS hardware THIS run, and is the correct
+/// per-step reference for candidate `i`'s single write-from-stock — the planner already chained the
+/// candidates so that adjacent offsets differ by at most the per-step cap. Candidate 0 has no prior
+/// candidate this run, so it uses the cross-run `baseline_offset` (the deepest prior VALIDATED
+/// same-target observation's offset, or `0` when none — unchanged first-run behavior). The ABSOLUTE
+/// offset cap still bounds every candidate's absolute offset independently inside the writer; this only
+/// moves the per-step reference from stock `+0` to the last validated point. Pure.
+pub fn chained_prev_offset(
+    candidates: &[AnchoredPositiveOffsetPlan],
+    i: usize,
+    baseline_offset: i32,
+) -> i32 {
+    match i.checked_sub(1).and_then(|p| candidates.get(p)) {
+        Some(prev) => prev.anchor.offset_mhz,
+        None => baseline_offset,
+    }
+}
+
 /// Read-only Safe Loop preflight verdict for a candidate F2 run. Pure; never mutates Safe Loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreflightVerdict {
@@ -1678,6 +1700,11 @@ struct RealF2Ops<'a> {
     mode: UndervoltMode,
     limits: PositiveOffsetLimits,
     target_mhz: u32,
+    /// The per-step reference offset for THIS candidate's bounded write (the last validated offset, or 0
+    /// for a fresh single-step). The writer enforces the per-step cap on `offset - prev_offset_mhz` and
+    /// the absolute cap on `offset` regardless. A single-step / manual-prior run always passes 0; only
+    /// the confirmed chained target-sweep motor advances it (see [`chained_prev_offset`]).
+    prev_offset_mhz: i32,
 }
 
 #[cfg(windows)]
@@ -1690,7 +1717,10 @@ impl F2Ops for RealF2Ops<'_> {
     }
 
     fn apply_positive_offset(&mut self) -> Result<(), String> {
-        // Single-step → prev_offset = 0. Each writer re-validates every bound and fails closed.
+        // The per-step cap is enforced on `offset - prev_offset_mhz` (the last validated point, or 0 for
+        // a single-step run); the absolute cap is enforced on `offset` regardless. Each writer
+        // re-validates every bound and fails closed.
+        let prev = self.prev_offset_mhz;
         match (self.mode, &self.anchored) {
             (UndervoltMode::Anchored, Some(_)) => {
                 // Anchored: write the full curve (anchor raise + plateau caps + elastic zeros). The
@@ -1699,7 +1729,7 @@ impl F2Ops for RealF2Ops<'_> {
                     &self.curve,
                     self.candidate.index,
                     self.target_mhz,
-                    0,
+                    prev,
                     &self.limits,
                 )
                 .map(|_| ())
@@ -1708,7 +1738,7 @@ impl F2Ops for RealF2Ops<'_> {
                 &self.curve,
                 self.candidate.index,
                 self.target_mhz,
-                0,
+                prev,
                 &self.limits,
             )
             .map(|_| ()),
@@ -1842,6 +1872,10 @@ struct RealF2MultiOps<'a> {
     candidates: Vec<AnchoredPositiveOffsetPlan>,
     limits: PositiveOffsetLimits,
     target_mhz: u32,
+    /// The cross-run resume baseline offset for candidate 0 (the deepest prior VALIDATED same-target
+    /// observation's offset, or 0 when none). Candidate `i>0` chains off candidate `i-1` instead (it is
+    /// only reached after `i-1` validated). See [`chained_prev_offset`].
+    baseline_offset_mhz: i32,
     /// The per-candidate motor for the currently-selected candidate (`None` until first `select`).
     cur: Option<RealF2Ops<'a>>,
 }
@@ -1894,6 +1928,10 @@ impl F2MultiStepOps for RealF2MultiOps<'_> {
         if candidate_blacklisted(&rec, self.target_mhz, &plan.anchor) {
             return Err(format!("candidate {i} intent is blacklisted"));
         }
+        // Chained descent: candidate `i` is only reached after `i-1` validated, so its single
+        // write-from-stock is bounded per-step against the last validated offset (candidate 0 uses the
+        // cross-run observation baseline). The absolute cap still bounds the absolute offset.
+        let prev_offset_mhz = chained_prev_offset(&self.candidates, i, self.baseline_offset_mhz);
         let anchor = plan.anchor;
         self.cur = Some(RealF2Ops {
             store: self.store,
@@ -1903,6 +1941,7 @@ impl F2MultiStepOps for RealF2MultiOps<'_> {
             mode: UndervoltMode::Anchored,
             limits: self.limits,
             target_mhz: self.target_mhz,
+            prev_offset_mhz,
         });
         Ok(())
     }
@@ -2054,6 +2093,7 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
                     mode: UndervoltMode::Simple,
                     limits,
                     target_mhz: focus_target,
+                    prev_offset_mhz: 0, // single-step: per-step measured from stock (unchanged)
                 };
                 let report = run_confirmed_f2_step(&mut ops);
                 for line in confirmed_report_lines(focus_target, &cand, &limits, &report) {
@@ -2163,6 +2203,7 @@ fn run_anchored_undervolt_probe(
                     mode: UndervoltMode::Anchored,
                     limits: *limits,
                     target_mhz: focus_target,
+                    prev_offset_mhz: 0, // single-step anchored: per-step measured from stock (unchanged)
                 };
                 let report = run_confirmed_f2_step(&mut ops);
                 for line in confirmed_report_lines(focus_target, &anchor, limits, &report) {
@@ -2255,6 +2296,9 @@ fn run_anchored_multi_step(
                     candidates: descent.candidates.clone(),
                     limits: *limits,
                     target_mhz: focus_target,
+                    // Explicit --steps descent: no cross-run observation resume (within-run advancement
+                    // still chains each candidate off the prior validated one via `select`).
+                    baseline_offset_mhz: 0,
                     cur: None,
                 };
                 let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
@@ -2300,10 +2344,15 @@ fn run_anchored_target_sweep(
     record: &SafeLoopRecord,
     boot_flag_armed: bool,
 ) {
-    use nidavellir_core::f2_observation::{new_run_id, now_rfc3339, F2ObsMode, F2ObservationStore};
+    use nidavellir_core::f2_observation::{
+        new_run_id, now_rfc3339, validated_descent_baseline, F2ObsMode, F2ObservationStore,
+    };
 
     let descent =
         plan_anchored_undervolt_descent(sane, focus_target, args.start_mv, limits, F2_SWEEP_DRYRUN_BUDGET);
+
+    // This GPU's identity (read-only). Scopes the resume baseline to this card and tags observations.
+    let gpu_key = nidavellir_gpu_nvapi::read_curve().ok().map(|c| c.name);
 
     // Read-only Safe Loop preflight over every planned bin (anchor + caps + elastic).
     let points: Vec<TuningPoint> = descent
@@ -2325,6 +2374,12 @@ fn run_anchored_target_sweep(
     let obs_path = obs_store.path().display().to_string();
     let frontier_preview = crate::gpu_f2_sweep::frontier_preview_for(&obs_store, focus_target);
 
+    // Observation-aware chained descent: the deepest prior VALIDATED same-target/same-GPU point is the
+    // per-step baseline for candidate 0 (the descent resumes from it instead of stock +0). Read-only.
+    let target_obs = obs_store.query_by_target(focus_target);
+    let baseline_obs = validated_descent_baseline(&target_obs, focus_target, gpu_key.as_deref());
+    let baseline_offset_mhz = baseline_obs.map(|o| o.offset_mhz).unwrap_or(0);
+
     for line in crate::gpu_f2_sweep::target_sweep_plan_lines(
         focus_target,
         &descent,
@@ -2332,6 +2387,7 @@ fn run_anchored_target_sweep(
         F2_CONFIRMED_MAX_STEPS,
         &obs_path,
         frontier_preview.as_ref(),
+        baseline_obs.map(|o| (o.anchor_mv, o.offset_mhz)),
         preflight.safe,
     ) {
         println!("{line}");
@@ -2368,6 +2424,7 @@ fn run_anchored_target_sweep(
                     candidates: descent.candidates.clone(),
                     limits: *limits,
                     target_mhz: focus_target,
+                    baseline_offset_mhz, // resume from the deepest prior validated same-target point
                     cur: None,
                 };
                 let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
@@ -2379,7 +2436,7 @@ fn run_anchored_target_sweep(
                 let ctx = crate::gpu_f2_sweep::ObsContext {
                     run_id: new_run_id("f2-target-sweep"),
                     timestamp: now_rfc3339(),
-                    gpu_key: nidavellir_gpu_nvapi::read_curve().ok().map(|c| c.name),
+                    gpu_key: gpu_key.clone(),
                     mode: F2ObsMode::TargetSweep,
                     requested_start_mv: args.start_mv,
                     positive_offset_cap_mhz: limits.abs_max_offset_mhz,
@@ -2526,6 +2583,9 @@ fn run_anchored_ladder_sweep(
                         candidates: descent.candidates.clone(),
                         limits: target_limits,
                         target_mhz: target,
+                        // Ladder keeps its conservative per-target voltage-FLOOR policy (no cross-run
+                        // offset resume); within-run advancement still chains each candidate via `select`.
+                        baseline_offset_mhz: 0,
                         cur: None,
                     };
                     let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
@@ -2670,6 +2730,7 @@ fn run_manual_prior_undervolt_probe(
                     mode: UndervoltMode::Anchored,
                     limits: manual_limits,
                     target_mhz: focus_target,
+                    prev_offset_mhz: 0, // manual-prior is single-step: per-step measured from stock (unchanged)
                 };
                 let report = run_confirmed_f2_step(&mut ops);
                 for line in confirmed_report_lines(focus_target, &anchor, &manual_limits, &report) {
@@ -2719,6 +2780,47 @@ mod tests {
 
     fn pt(freq: u32, mv: u32) -> TuningPoint {
         TuningPoint::from_axes([("gpu_freq_mhz", freq as i64), ("gpu_vf_bin_mv", mv as i64)])
+    }
+
+    // ── chained same-target descent (observation-aware baseline + within-run advancement) ────────
+    #[test]
+    fn chained_prev_offset_chains_off_prior_candidate_else_baseline() {
+        let limits = PositiveOffsetLimits::conservative(850, 1755);
+        let d = plan_anchored_undervolt_descent(&t_base(), 1755, None, &limits, F2_CONFIRMED_MAX_STEPS);
+        // Descent candidates for 1755 MHz on t_base: 1000 mV (+7), 950 mV (+15), 900 mV (+30).
+        let offs: Vec<i32> = d.candidates.iter().map(|c| c.anchor.offset_mhz).collect();
+        assert_eq!(offs, vec![7, 15, 30]);
+        // Candidate 0 uses the cross-run observation baseline (0 when none); deeper candidates chain off
+        // the prior candidate, which the motor only reaches AFTER it validated.
+        assert_eq!(chained_prev_offset(&d.candidates, 0, 0), 0);
+        assert_eq!(chained_prev_offset(&d.candidates, 0, 7), 7);
+        assert_eq!(chained_prev_offset(&d.candidates, 1, 0), 7);
+        assert_eq!(chained_prev_offset(&d.candidates, 2, 0), 15);
+        // Out-of-range index falls back to the baseline (defensive — never panics).
+        assert_eq!(chained_prev_offset(&d.candidates, 9, 3), 3);
+    }
+
+    #[test]
+    fn chained_descent_admits_plus30_after_validated_plus15() {
+        use nidavellir_gpu_nvapi::plan_bounded_anchored_positive_offset;
+        let limits = PositiveOffsetLimits::conservative(850, 1755);
+        // The 900 mV bin (index 1) needs +30 to hold 1755. A single +30 step from STOCK (+0) is rejected
+        // by the per-step +15 cap — the exact PASS-PARTIAL failure on real hardware...
+        let from_stock = plan_bounded_anchored_positive_offset(&t_base(), 1, 1755, 0, &limits);
+        assert!(from_stock.is_err());
+        assert!(from_stock.unwrap_err().contains("per-step"));
+        // ...but allowed once the prior candidate validated at +15: the chained per-step delta is +15.
+        assert!(plan_bounded_anchored_positive_offset(&t_base(), 1, 1755, 15, &limits).is_ok());
+    }
+
+    #[test]
+    fn chained_descent_still_enforces_absolute_cap_with_baseline() {
+        use nidavellir_gpu_nvapi::plan_bounded_anchored_positive_offset;
+        let limits = PositiveOffsetLimits::conservative(850, 1755);
+        // The 850 mV bin (index 0) needs +55. Even with a baseline that satisfies the per-step delta, the
+        // ABSOLUTE +30 cap still rejects it (fail closed) — chaining never widens the absolute bound.
+        let err = plan_bounded_anchored_positive_offset(&t_base(), 0, 1755, 45, &limits).unwrap_err();
+        assert!(err.contains("absolute cap"));
     }
 
     // ── parse_undervolt_args ──────────────────────────────────────────────────────────────────

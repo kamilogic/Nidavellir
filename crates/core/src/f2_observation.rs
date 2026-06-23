@@ -292,6 +292,35 @@ pub fn is_known_bad(obs: &[F2Observation], target_mhz: u32, anchor_mv: u32) -> b
         .any(|o| o.target_mhz == target_mhz && o.outcome.is_bad() && o.anchor_mv >= anchor_mv)
 }
 
+/// The validated descent baseline for chained same-target descent: the DEEPEST (lowest-voltage,
+/// largest-offset) prior `Validated` observation for `target_mhz` that left the GPU clean — reset
+/// confirmed, boot flag cleared, and no instability/crash flags — optionally scoped to `gpu_key` (a
+/// baseline learned on a DIFFERENT GPU must never bound this GPU's descent). This is the cross-run
+/// RESUME point: the official target sweep measures a candidate's per-step increase against this
+/// baseline's `offset_mhz` instead of stock `+0`, so a descent already validated to `+15` may reach a
+/// `+30` candidate in one bounded step. Returns `None` when no such point exists (the descent then
+/// starts from stock baseline `0` — unchanged first-run behavior). A no-write planner/safety-gate abort
+/// (`RejectedByPlanner` / `AbortedBySafetyGate`) is NOT validated, so it never becomes a baseline. The
+/// ABSOLUTE offset cap still bounds each candidate independently; this only relaxes the per-step delta.
+/// Pure.
+pub fn validated_descent_baseline<'a>(
+    obs: &'a [F2Observation],
+    target_mhz: u32,
+    gpu_key: Option<&str>,
+) -> Option<&'a F2Observation> {
+    obs.iter()
+        .filter(|o| o.target_mhz == target_mhz && o.outcome.is_validated())
+        // Defensive: a Validated point already implies clean cleanup, but a hand-edited/older log line
+        // could disagree — require the clean flags explicitly before trusting it as a resume baseline.
+        .filter(|o| o.reset_to_stock_ok && o.boot_flag_cleared)
+        .filter(|o| !o.device_lost && !o.unstable && !o.silent_error && !o.clock_drop)
+        .filter(|o| match gpu_key {
+            Some(k) => o.gpu_key.as_deref() == Some(k),
+            None => true,
+        })
+        .min_by_key(|o| o.anchor_mv)
+}
+
 /// Build one learned frontier entry for a target from its observations, or `None` if the target has no
 /// Validated observation. Chooses the LOWEST-voltage validated point (the deepest undervolt) and
 /// annotates it with first-bad / bracket / counts / aggregate confidence. Pure.
@@ -546,6 +575,50 @@ mod tests {
         assert!(!is_known_bad(&v, 1800, 962));
         // Different target is unaffected.
         assert!(!is_known_bad(&v, 1815, 956));
+    }
+
+    #[test]
+    fn validated_descent_baseline_picks_deepest_clean_validated() {
+        let v = vec![
+            obs(1800, 975, F2ObsOutcome::Validated),
+            obs(1800, 968, F2ObsOutcome::Validated),
+            obs(1800, 956, F2ObsOutcome::Unstable), // a real failure is not a baseline
+        ];
+        // Deepest (lowest-voltage) clean validated point — its offset is the resume baseline.
+        let b = validated_descent_baseline(&v, 1800, None).unwrap();
+        assert_eq!(b.anchor_mv, 968);
+        // A target with no validated point → None (descent then starts from stock 0).
+        assert!(validated_descent_baseline(&v, 1815, None).is_none());
+    }
+
+    #[test]
+    fn validated_descent_baseline_ignores_no_write_aborts_and_other_gpus() {
+        // A no-write safety-gate abort is NOT a baseline even at the lowest voltage.
+        let mut aborted = obs(1800, 950, F2ObsOutcome::AbortedBySafetyGate);
+        aborted.reset_to_stock_ok = true;
+        aborted.boot_flag_cleared = true;
+        aborted.unstable = false;
+        let v = vec![obs(1800, 975, F2ObsOutcome::Validated), aborted];
+        assert_eq!(validated_descent_baseline(&v, 1800, None).unwrap().anchor_mv, 975);
+        // A validated point on a DIFFERENT GPU must not bound this GPU's descent.
+        let mut other_gpu = obs(1800, 962, F2ObsOutcome::Validated);
+        other_gpu.gpu_key = Some("RTX 4090".into());
+        let v2 = vec![obs(1800, 975, F2ObsOutcome::Validated), other_gpu];
+        assert_eq!(
+            validated_descent_baseline(&v2, 1800, Some("RTX 3060 Ti")).unwrap().anchor_mv,
+            975
+        );
+        // Unfiltered (gpu_key None) sees both → deepest wins.
+        assert_eq!(validated_descent_baseline(&v2, 1800, None).unwrap().anchor_mv, 962);
+    }
+
+    #[test]
+    fn validated_descent_baseline_rejects_dirty_cleanup_flags() {
+        // A record claiming Validated but with an un-cleared boot flag is not trusted as a baseline.
+        let mut dirty = obs(1800, 962, F2ObsOutcome::Validated);
+        dirty.boot_flag_cleared = false;
+        let v = vec![obs(1800, 975, F2ObsOutcome::Validated), dirty];
+        assert_eq!(validated_descent_baseline(&v, 1800, None).unwrap().anchor_mv, 975);
     }
 
     #[test]

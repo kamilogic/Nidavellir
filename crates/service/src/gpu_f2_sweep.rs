@@ -172,6 +172,7 @@ pub fn record_target_sweep(
 /// target, the offset caps, the confirmed candidate cap, the planned descent candidates (safer/higher
 /// voltage → lower), the exact STOP rules, where observations WOULD be recorded, the current learned
 /// frontier preview (read-only), the explicit no-op/no-write line, and the no-persist line.
+#[allow(clippy::too_many_arguments)]
 pub fn target_sweep_plan_lines(
     target_mhz: u32,
     descent: &AnchoredDescentPlan,
@@ -179,6 +180,8 @@ pub fn target_sweep_plan_lines(
     confirmed_cap: usize,
     obs_path: &str,
     frontier_preview: Option<&F2FrontierEntry>,
+    // The deepest prior VALIDATED same-target/same-GPU resume point (anchor_mv, offset_mhz), if any.
+    chained_baseline: Option<(u32, i32)>,
     preflight_safe: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
@@ -231,6 +234,19 @@ pub fn target_sweep_plan_lines(
                 c.elastic_below_bins
             ));
         }
+    }
+    match chained_baseline {
+        Some((mv, off)) => out.push(format!(
+            "chained baseline   : resume from prior validated {mv} mV (+{off} MHz) for this GPU/target — \
+             each candidate's per-step +{} cap applies to the offset DELTA from the last validated point \
+             (not from stock); the absolute +{} cap still bounds each candidate's offset",
+            limits.step_max_offset_mhz, limits.abs_max_offset_mhz
+        )),
+        None => out.push(
+            "chained baseline   : none (no prior validated point for this GPU/target — the descent starts \
+             from stock +0; per-step measured from 0)"
+                .to_string(),
+        ),
     }
     out.push(format!(
         "descent stop       : {}",
@@ -591,7 +607,7 @@ mod tests {
     fn target_sweep_plan_lines_show_rules_and_no_write() {
         let d = descent(&[(975, 1785), (968, 1770), (962, 1770)], 1800);
         let limits = PositiveOffsetLimits::conservative(612, 1950);
-        let text = target_sweep_plan_lines(1800, &d, &limits, 3, "C:/ProgramData/Nidavellir/f2_observations.jsonl", None, true).join("\n");
+        let text = target_sweep_plan_lines(1800, &d, &limits, 3, "C:/ProgramData/Nidavellir/f2_observations.jsonl", None, None, true).join("\n");
         assert!(text.contains("TARGET SWEEP"));
         assert!(text.contains("AUTONOMOUS PROGRESSIVE"));
         assert!(text.contains("NOT manual-prior"));
@@ -601,6 +617,9 @@ mod tests {
         assert!(text.contains("observations       : a confirmed run records"));
         assert!(text.contains("f2_observations.jsonl"));
         assert!(text.contains("learned frontier   : none yet"));
+        // No prior baseline → the descent starts from stock +0.
+        assert!(text.contains("chained baseline   : none"));
+        assert!(text.contains("from stock +0"));
         // No-op / no-write + no-persist.
         assert!(text.contains("no Safe Loop arm"));
         assert!(text.contains("no VF write"));
@@ -608,6 +627,23 @@ mod tests {
         assert!(text.contains("none persisted, applied, or promoted"));
         // Avoid the forbidden substring the usage test guards.
         assert!(!text.contains("candidate bins"));
+    }
+
+    #[test]
+    fn target_sweep_plan_lines_show_chained_baseline_when_resuming() {
+        // A prior validated 975 mV / +15 point makes the descent resume from it: the per-step cap then
+        // bounds each candidate's DELTA from +15, so the +30 candidates become reachable.
+        let d = descent(&[(975, 1785), (968, 1770), (962, 1770)], 1800);
+        let limits = PositiveOffsetLimits::conservative(612, 1950);
+        let text = target_sweep_plan_lines(
+            1800, &d, &limits, 3, "C:/ProgramData/Nidavellir/f2_observations.jsonl", None, Some((975, 15)), true,
+        )
+        .join("\n");
+        assert!(text.contains("chained baseline   : resume from prior validated 975 mV (+15 MHz)"));
+        assert!(text.contains("offset DELTA from the last validated point"));
+        // The absolute cap is still advertised as bounding each candidate.
+        assert!(text.contains("absolute +30 cap"));
+        assert!(!text.contains("chained baseline   : none"));
     }
 
     #[test]
