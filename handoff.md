@@ -3,9 +3,10 @@
 How to pick this up cold. State as of 2026-06-22, `master` (clean). Deep NvAPI struct
 details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — implemented, NOT committed
+## Latest backend checkpoint (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — pushed
 - **What**: 3 approved changes toward the v0.5 multi-clock profile frontier. Implemented by the code-surgeon,
-  independently validated + safety-audited (GO). No hardware run, NOT committed (awaiting operator approval).
+  independently validated + safety-audited (GO). No hardware run. Committed + pushed to `origin/master`:
+  `f065d4a` (code) + `79c3081` (docs).
 - **THE margin answer**: applied-voltage conservatism (e.g. 906 mV vs the 868 the sweep reached) is the **Wilson
   confidence gate** (0.85), NOT a margin. `synthesize_forge_profiles` selection is voltage-agnostic; a once-validated
   deep point has confidence ~0.21 and is filtered until it earns repeat confirmations.
@@ -23,8 +24,23 @@ details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
   manual-prior +250 unchanged, auto-sweep shows +210 horizon + validation-passes line, descending ladder plans
   per target. Safety audit = GO (8/8 PASS).
 - **Files**: `crates/service/src/{gpu_power_sweep.rs, gpu_f2_sweep.rs, gpu_undervolt.rs}`, `docs/contracts/ui-backend.md`.
-- **NEXT**: operator approves → commit/push; then a SUPERVISED confirmed descending ladder to build the real
-  multi-clock frontier; wire `validation_passes` + the frontier into the live Forge IPC.
+- **MANUAL TEST PATH (available now, no button needed)**: everything above is in the service CLI. Read-only
+  dry-runs (safe, no hardware): `undervolt-probe --target-mhz 1800 --auto-sweep [--validation-passes N]` and
+  `undervolt-probe --ladder-sweep --targets 1830,1815,1800,1750,1700` — both print the "classifier bridge"
+  block (`synthesize_forge_profiles` with Brokkr's 0.95, read-only). On the current single-clock store it shows
+  the honest collapse. To see the 3 profiles DIFFERENTIATED you need multi-clock data → run the confirmed
+  descending ladder (`… --confirm`, HARDWARE, operator-present, never HW-run before), then re-run the dry-run.
+- **DEFERRED — Option A: wire the live forge/refine button to the multi-clock algorithm (F1b Phase 2)**. The
+  operator deferred this until usage limit returns. Goal: the button (`StartForgeAll` → the live power-sweep at
+  `crates/service/src/gpu_power_sweep.rs:3770`) should run a MULTI-CLOCK sweep (a few descending clocks anchored
+  at the validated top) and select via `synthesize_forge_profiles(&frontier, &ForgePolicy::balanced())` instead
+  of today's single-clock `select_brokkrs_v2` (line 3799) + max-voltage Godforge (3788) + Deep Calm=None (3802).
+  Key facts for resuming cold: (a) the live forge is SINGLE-CLOCK today, so a naive selector-swap would COLLAPSE
+  (`distinct_clocks<=1`) and DEGRADE the working button + change the applied/persisted profile — it must become a
+  real multi-clock sweep; (b) types match (`ForgeProfiles` fields are `Option<PowerSweepPoint>`, same as the
+  payload) → NO IPC contract change; (c) it makes the button a LONGER hardware run and touches apply/persist
+  (`ApplyGodforge`, `save_forge_state`) → needs care + a safety audit before any confirmed run. Until then, the
+  CLI manual-test path above is the way to exercise the new algorithm.
 
 ## Earlier backend checkpoint (2026-06-22) — F2 LEARNED OFFSET HORIZON implemented (+210 abs / +15 step); HW run HELD
 - **What**: target-sweep-specific progressive absolute-offset horizon. Commit `c40a78d`
