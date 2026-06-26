@@ -53,6 +53,7 @@
   });
   const safetySymbol = $derived(safetyVariant === "attention" ? "attention" : "shield");
   const currentProfile = $derived(applied?.label ?? "Stock");
+  const hasAppliedTuning = $derived(Boolean(applied?.core || applied?.mem_offset_mhz));
   const verificationText = $derived.by(() => {
     if (!verification) return "Curve verification: Not checked";
     if (verification.status === "verified_curve") return "Curve verification: Verified";
@@ -139,10 +140,12 @@
       {/if}
     </div>
 
-    <button class="btn reset" onclick={onReset}>
-      <RotateCcw size={15} strokeWidth={1.85} />
-      <span>Reset to stock</span>
-    </button>
+    {#if hasAppliedTuning}
+      <button class="btn reset" onclick={onReset}>
+        <RotateCcw size={15} strokeWidth={1.85} />
+        <span>Reset to stock</span>
+      </button>
+    {/if}
   </div>
 
   <div class="state-rail" aria-label="Forge state progression">

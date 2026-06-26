@@ -6,30 +6,44 @@
   let timer = $state(null);
 
   const STATE_LABEL = {
-    idle: "Ocioso",
-    probing: "Sondando",
-    applying: "Aplicando",
-    dwell: "Em observação (dwell)",
-    validated: "Validado",
-    unstable: "Instável",
-    safe_mode: "Modo Seguro",
+    idle: "Protected",
+    probing: "Probing",
+    applying: "Applying",
+    dwell: "Observing",
+    validated: "Validated",
+    unstable: "Needs attention",
+    safe_mode: "Safe Mode",
   };
 
   const CRASH_LABEL = {
-    oc_instability: "Instabilidade de OC",
-    unrelated: "Não relacionado",
-    unknown: "Desconhecido",
+    oc_instability: "GPU tuning instability",
+    unrelated: "Unrelated",
+    unknown: "Unknown",
+  };
+  const AXIS_LABEL = {
+    core_mhz: "Core",
+    freq_mhz: "Core",
+    voltage_mv: "Voltage",
+    mem_offset_mhz: "Memory offset",
+    power_w: "Power",
   };
 
   function stateLabel(s) {
-    return STATE_LABEL[s] ?? s ?? "—";
+    return STATE_LABEL[s] ?? s ?? "Unknown";
+  }
+
+  function axisText(key, value) {
+    const label = AXIS_LABEL[key] ?? String(key).replace(/_/g, " ");
+    const unit = key.includes("mhz") ? " MHz" : key.includes("mv") ? " mV" : key.endsWith("_w") ? " W" : "";
+    const signed = key.includes("offset") && value > 0 ? `+${value}` : value;
+    return `${label}: ${signed}${unit}`;
   }
 
   function pointText(p) {
-    if (!p || !p.axes || Object.keys(p.axes).length === 0) return "stock (sem offsets)";
+    if (!p || !p.axes || Object.keys(p.axes).length === 0) return "Stock settings";
     return Object.entries(p.axes)
-      .map(([k, v]) => `${k}: ${v > 0 ? "+" : ""}${v}`)
-      .join(" · ");
+      .map(([k, v]) => axisText(k, v))
+      .join(" / ");
   }
 
   async function refresh() {
@@ -51,12 +65,11 @@
 
 <section class="safe">
   <header class="safe-head">
-    <h2>Central de Segurança</h2>
+    <span class="eyebrow">Safety</span>
+    <h2>Safe Loop recovery</h2>
     <p class="lead">
-      O Safe Loop é o paraquedas do Nidavellir: antes de cada ajuste ele grava uma
-      boot-flag em disco e só a limpa após a validação. Se a máquina travar, no
-      próximo boot o serviço detecta a flag armada, isola a região instável e
-      recua para o último perfil estável.
+      Safe Loop is Nidavellir's recovery layer for GPU tuning. Before risky GPU steps run, it records a boot flag.
+      If the machine crashes before the flag is cleared, the service can recover on the next boot and avoid repeating the unstable region.
     </p>
   </header>
 
@@ -65,57 +78,55 @@
   {:else if status}
     {#if status.safe_mode}
       <div class="alert">
-        <strong>Modo Seguro ativo.</strong> Após {status.crash_threshold} travamentos
-        seguidos, o Nidavellir aplicou o perfil stock e parou de mexer no hardware.
+        <strong>Safe Mode is active.</strong> After {status.crash_threshold} consecutive crashes, Nidavellir returned to stock and stopped tuning actions.
       </div>
     {:else if status.boot_flag_armed}
       <div class="alert alert--warn">
-        <strong>Boot-flag armada.</strong> Um ajuste está em validação — se houver
-        travamento, a recuperação age no próximo boot.
+        <strong>Recovery is armed.</strong> A GPU tuning step is being validated. If the system crashes, recovery runs on the next boot.
       </div>
     {/if}
 
     <div class="grid">
       <article class="tile">
-        <span class="lab">Estado</span>
+        <span class="lab">Protection state</span>
         <p class="val">{stateLabel(status.state)}</p>
       </article>
       <article class="tile">
-        <span class="lab">Travamentos seguidos</span>
+        <span class="lab">Consecutive crashes</span>
         <p class="val" class:danger={status.consecutive_crashes > 0}>
           {status.consecutive_crashes} / {status.crash_threshold}
         </p>
-        <p class="sub">limite para Modo Seguro</p>
+        <p class="sub">Safe Mode threshold</p>
       </article>
       <article class="tile">
-        <span class="lab">Boot-flag</span>
-        <p class="val">{status.boot_flag_armed ? "Armada" : "Limpa"}</p>
+        <span class="lab">Boot flag</span>
+        <p class="val">{status.boot_flag_armed ? "Armed" : "Clear"}</p>
       </article>
       <article class="tile">
-        <span class="lab">Último perfil validado</span>
+        <span class="lab">Last validated point</span>
         <p class="val small">{pointText(status.last_validated)}</p>
       </article>
     </div>
 
     <div class="section">
-      <h3 class="section-head">Regiões em blacklist ({status.blacklist.length})</h3>
+      <h3 class="section-head">Blocked unstable regions ({status.blacklist.length})</h3>
       {#if status.blacklist.length}
         <ul class="list">
           {#each status.blacklist as region}
             <li>
               <span class="mono">{pointText(region.center)}</span>
-              <span class="dim">raio ±{region.radius}</span>
+              <span class="dim">radius +/-{region.radius}</span>
             </li>
           {/each}
         </ul>
       {:else}
-        <p class="empty">Nenhuma região instável registrada.</p>
+        <p class="empty">No unstable GPU tuning region is currently blocked.</p>
       {/if}
     </div>
 
     {#if status.recent_crashes?.length}
       <div class="section">
-        <h3 class="section-head">Travamentos recentes</h3>
+        <h3 class="section-head">Recent recovery signals</h3>
         <ul class="list">
           {#each status.recent_crashes as c}
             <li><span class="mono">{CRASH_LABEL[c] ?? c}</span></li>
@@ -124,7 +135,7 @@
       </div>
     {/if}
   {:else}
-    <p class="wait">Aguardando o serviço…</p>
+    <p class="wait">Waiting for the service...</p>
   {/if}
 </section>
 
@@ -136,27 +147,35 @@
     --text: var(--nord-silver);
     display: flex;
     flex-direction: column;
-    gap: 1.25rem;
+    gap: 1.05rem;
+  }
+  .eyebrow,
+  .lab {
+    display: block;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--nord-dim);
+    margin-bottom: 0.35rem;
   }
   .safe-head h2 {
-    margin: 0 0 0.5rem;
-    font-size: 0.85rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
+    margin: 0 0 0.45rem;
+    font-size: 1.05rem;
+    color: var(--text);
   }
   .lead {
     margin: 0;
     font-size: 0.88rem;
-    line-height: 1.5;
+    line-height: 1.55;
     color: var(--muted);
-    max-width: 60ch;
+    max-width: 74ch;
   }
   .alert {
-    border-radius: 12px;
-    padding: 0.85rem 1.1rem;
+    border-radius: 10px;
+    padding: 0.85rem 1rem;
     font-size: 0.88rem;
+    line-height: 1.5;
     background: rgba(191, 97, 106, 0.14);
     border: 1px solid rgba(191, 97, 106, 0.4);
     color: #f3b9bd;
@@ -174,27 +193,21 @@
   .tile {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1rem 1.1rem;
-  }
-  .lab {
-    display: block;
-    font-size: 0.68rem;
-    font-weight: 700;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--nord-dim);
-    margin-bottom: 0.4rem;
+    border-radius: 10px;
+    padding: 0.9rem 1rem;
+    box-shadow: var(--forge-panel-edge);
   }
   .val {
     margin: 0;
-    font-weight: 600;
+    font-weight: 700;
     color: var(--text);
-    font-size: 1.05rem;
+    font-size: 1.02rem;
+    font-variant-numeric: tabular-nums;
   }
   .val.small {
     font-size: 0.82rem;
-    font-weight: 500;
+    font-weight: 600;
+    overflow-wrap: anywhere;
   }
   .val.danger {
     color: var(--nord-danger);
@@ -207,7 +220,7 @@
   .section-head {
     margin: 0 0 0.5rem;
     font-size: 0.72rem;
-    font-weight: 700;
+    font-weight: 800;
     letter-spacing: 0.1em;
     text-transform: uppercase;
     color: var(--muted);
@@ -233,9 +246,11 @@
   .mono {
     font-variant-numeric: tabular-nums;
     color: var(--text);
+    overflow-wrap: anywhere;
   }
   .dim {
     color: var(--nord-dim);
+    white-space: nowrap;
   }
   .empty,
   .wait {

@@ -36,6 +36,12 @@
     return "Your applied profile will be re-applied automatically on boot with Safe Loop protection. You can refine core VF profiles at any time.";
   });
   const primaryLabel = $derived(hasProfiles ? "Refine Profiles" : "Forge GPU");
+  const firstRunSteps = [
+    "Safe Loop check",
+    "Core VF learning",
+    "Profile creation",
+    "Daily recommendation",
+  ];
 </script>
 
 <section class="next-action">
@@ -61,14 +67,16 @@
 
   {#if !hasProfiles && !applied?.core && !powerRunning}
     <div class="first-run">
-      <span>Current implemented path</span>
-      <ol>
-        <li>Check Safe Loop readiness before risky steps</li>
-        <li>Learn core VF behavior under load</li>
-        <li>Create three transparent profiles</li>
-        <li>Recommend one for daily use</li>
-      </ol>
-      <p>Planned later: VRAM optimization, VRAM validation and final whole-package validation.</p>
+      <span>Forge path</span>
+      <div class="step-chips" aria-label="Forge GPU path">
+        {#each firstRunSteps as step, index}
+          <span class="step-chip">
+            <i>{index + 1}</i>
+            <strong>{step}</strong>
+          </span>
+        {/each}
+      </div>
+      <p>VRAM optimization and final whole-package validation stay planned later, after the core curve is forged.</p>
     </div>
   {/if}
 </section>
@@ -136,15 +144,46 @@
     border-top: 1px solid var(--border);
     padding-top: 0.85rem;
   }
-  ol {
-    margin: 0.3rem 0 0;
-    padding-left: 1.25rem;
+  .step-chips {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.45rem;
+    margin-top: 0.45rem;
+  }
+  .step-chip {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 0.5rem;
+    min-height: 2.5rem;
+    border: 1px solid rgba(255, 255, 255, 0.055);
+    border-radius: 8px;
+    background: rgba(5, 7, 11, 0.24);
+    padding: 0.5rem 0.6rem;
+  }
+  .step-chip strong {
     color: var(--text);
-    line-height: 1.6;
-    font-size: 0.86rem;
+    font-size: 0.78rem;
+    line-height: 1.25;
+  }
+  .step-chip i {
+    width: 1.28rem;
+    height: 1.28rem;
+    border-radius: 999px;
+    background: rgba(214, 168, 93, 0.14);
+    color: var(--forge-gold);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.66rem;
+    font-style: normal;
+    font-weight: 800;
   }
   @media (max-width: 640px) {
     .next-action {
+      grid-template-columns: 1fr;
+    }
+    .step-chips {
       grid-template-columns: 1fr;
     }
   }

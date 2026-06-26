@@ -230,6 +230,20 @@
     }
   }
 
+  function closeMemPreflight() {
+    memPreflight = false;
+  }
+
+  function closeExpandedCurve() {
+    expanded = false;
+  }
+
+  function handleKeydown(event) {
+    if (event.key !== "Escape") return;
+    if (memPreflight) closeMemPreflight();
+    if (expanded) closeExpandedCurve();
+  }
+
   const verificationLabel = $derived.by(() => {
     if (!verification) return "Curve verification: Not checked";
     if (verification.status === "verified_curve") return "Curve verification: Verified";
@@ -244,6 +258,8 @@
     return () => clearInterval(timer);
   });
 </script>
+
+<svelte:window onkeydown={handleKeydown} />
 
 <section class="forge">
   <GpuHeroStatus
@@ -448,22 +464,25 @@
           {/if}
         </section>
       </section>
-
-      <details class="legacy-note">
-        <summary>Legacy / developer-only tools</summary>
-        <p>Forge Everything, Real Sweep, Real Sweep Fast and legacy profile apply actions are intentionally hidden here. They are legacy voltage-lock paths and are not part of the current Forge GPU product pipeline.</p>
-      </details>
     </div>
   </details>
 </section>
 
 {#if memPreflight}
-  <div class="overlay" onclick={() => (memPreflight = false)} role="presentation">
-    <div class="modal" onclick={(e) => e.stopPropagation()} role="presentation">
-      <div class="modal-head"><strong>Memory sweep (experimental)</strong></div>
+  <div class="overlay" onclick={closeMemPreflight} role="presentation">
+    <div
+      class="modal"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="memory-sweep-dialog-title"
+      tabindex="-1"
+    >
+      <div class="modal-head"><strong id="memory-sweep-dialog-title">Memory sweep (experimental)</strong></div>
       <p class="pre-body">This experimental diagnostic writes memory clocks and is not part of the current Forge GPU pipeline. VRAM optimization is planned for a later pipeline step after the core VF curve is forged and validated.</p>
       <div class="pre-actions">
-        <button class="btn ghost" onclick={() => (memPreflight = false)}>{$t("forge.preCancel")}</button>
+        <button class="btn ghost" onclick={closeMemPreflight}>{$t("forge.preCancel")}</button>
         <button class="btn go" onclick={startMem}>
           <Play size={15} strokeWidth={1.9} />
           <span>Run memory sweep (experimental)</span>
@@ -474,11 +493,19 @@
 {/if}
 
 {#if expanded && realCurve?.real}
-  <div class="overlay" onclick={() => (expanded = false)} role="presentation">
-    <div class="modal" onclick={(e) => e.stopPropagation()} role="presentation">
+  <div class="overlay" onclick={closeExpandedCurve} role="presentation">
+    <div
+      class="modal"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="vf-curve-dialog-title"
+      tabindex="-1"
+    >
       <div class="modal-head">
-        <strong>{realCurve.name}</strong>
-        <button class="btn ghost" onclick={() => (expanded = false)}>{$t("forge.close")}</button>
+        <strong id="vf-curve-dialog-title">{realCurve.name}</strong>
+        <button class="btn ghost" onclick={closeExpandedCurve}>{$t("forge.close")}</button>
       </div>
       <VfChart points={realCurve.points} overlay={curveOverlay} height={560} />
     </div>
@@ -542,7 +569,7 @@
   }
   .advanced-diagnostics > summary {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
     gap: 0.7rem;
     align-items: center;
     cursor: pointer;
@@ -550,8 +577,7 @@
     font-weight: 700;
     list-style: none;
   }
-  .advanced-diagnostics > summary::-webkit-details-marker,
-  .legacy-note > summary::-webkit-details-marker {
+  .advanced-diagnostics > summary::-webkit-details-marker {
     display: none;
   }
   .advanced-diagnostics > summary::after {
@@ -583,7 +609,6 @@
     display: inline;
   }
   .advanced-diagnostics > summary small {
-    margin-top: 0.25rem;
     color: var(--muted);
     font-size: 0.78rem;
     font-weight: 500;
@@ -598,8 +623,7 @@
     border-top: 1px solid var(--forge-line);
   }
   .diagnostic-group,
-  .diagnostic-card,
-  .legacy-note {
+  .diagnostic-card {
     border: 1px solid rgba(255, 255, 255, 0.055);
     border-radius: 10px;
     background: rgba(5, 7, 11, 0.22);
@@ -629,24 +653,6 @@
     margin: 0.35rem 0 0;
     color: var(--muted);
     font-size: 0.84rem;
-    line-height: 1.5;
-  }
-  .legacy-note {
-    padding: 0.8rem 0.9rem;
-  }
-  .legacy-note > summary {
-    cursor: pointer;
-    color: var(--muted);
-    font-size: 0.78rem;
-    font-weight: 800;
-    letter-spacing: 0.08em;
-    list-style: none;
-    text-transform: uppercase;
-  }
-  .legacy-note p {
-    margin: 0.6rem 0 0;
-    color: var(--nord-dim);
-    font-size: 0.82rem;
     line-height: 1.5;
   }
   .btn {
@@ -907,6 +913,17 @@
     color: var(--nord-ember-bright);
   }
   @media (max-width: 760px) {
+    .advanced-diagnostics > summary {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+    .advanced-diagnostics > summary small {
+      grid-column: 1 / -1;
+    }
+    .advanced-diagnostics > summary::after {
+      grid-column: 2;
+      grid-row: 1;
+      justify-self: end;
+    }
     .real-head,
     .pre-actions {
       align-items: stretch;

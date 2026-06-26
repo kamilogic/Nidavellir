@@ -3,7 +3,6 @@ import { writable, derived } from "svelte/store";
 /** Available UI languages. English is the default; more can be added later. */
 export const locales = [
   { id: "en", label: "English" },
-  { id: "pt", label: "Português (BR)" },
 ];
 
 function initialLocale() {
@@ -24,15 +23,14 @@ locale.subscribe((v) => {
 const dict = {
   en: {
     "app.tagline": "Where silicon is forged to its prime.",
-    "nav.capabilities": "Capabilities",
     "nav.forge": "Forge",
-    "nav.sensors": "Sensors",
+    "nav.sensors": "Diagnostics",
     "nav.safety": "Safety",
     "common.waiting": "Waiting for the service…",
 
     "forge.title": "GPU Forge",
     "forge.lead":
-      "Real GPU tuning on your hardware: read the V/F curve, validate stability (incl. VRAM), find the stable undervolt/OC and the memory bandwidth peak. Detects silent errors, applies a margin, and confirms with a long soak — every step through the Safe Loop.",
+      "Real GPU tuning on your hardware: read the core V/F curve, validate stability, synthesize transparent profiles, and keep risky steps behind Safe Loop protection.",
     "forge.simulated": "simulated",
     "forge.start": "Start sweep",
     "forge.stop": "Stop",
@@ -60,13 +58,13 @@ const dict = {
     "forge.result": "Result: {r}",
     "forge.stageN": "stage {n}",
 
-    "forge.realSweep": "Real sweep — finds your card's stable undervolt (writes voltage)",
-    "forge.runReal": "Run real sweep",
+    "forge.realSweep": "Legacy real sweep — developer-only path hidden from the product flow",
+    "forge.runReal": "Run legacy sweep",
     "forge.stopReal": "Stop sweep",
     "forge.realResult": "Min stable voltage per top frequency",
     "forge.preTitle": "Before the real sweep",
     "forge.preBody":
-      "This writes real voltage/clock to your GPU and pushes toward the stability limit. Brief screen flickers are possible (the driver recovers). It's reversible and protected by the Safe Loop. For best results, close all other programs (games, browsers, overlays) first.",
+      "This legacy diagnostic is hidden from the normal product flow. The current Forge GPU path uses the core VF forge and Safe Loop protection.",
     "forge.preCancel": "Cancel",
     "forge.preFast": "Quick (Bronze)",
     "forge.preThorough": "Thorough (Gold)",
@@ -88,12 +86,12 @@ const dict = {
     "forge.appliedNow": "Applied: {label}",
     "forge.appliedNone": "Nothing applied (stock)",
     "forge.applyHint": "Applied profiles are re-applied automatically on every boot (Safe Loop protected).",
-    "forge.forgeAll": "Forge everything (auto)",
-    "forge.forgeAllDesc": "Full pipeline, in order: VRAM check → core undervolt → memory bandwidth → final whole-package soak. Applies the validated profile.",
-    "forge.runForge": "Forge everything",
+    "forge.forgeAll": "Legacy full pipeline (hidden)",
+    "forge.forgeAllDesc": "Legacy full-system pipeline kept out of the current GPU-first product flow.",
+    "forge.runForge": "Run legacy pipeline",
     "forge.stopForge": "Stop",
-    "forge.forgePreBody": "Runs the whole pipeline (several minutes). Writes real core voltage and memory clock and pushes to the limit under combined load — flicker/TDR possible (recovered; Safe Loop protected). Close all other programs first.",
-    "forge.orderHint": "Or run manually, in this order: 1) Validate stability (VRAM gate) · 2) Real sweep (core) · 3) Memory sweep.",
+    "forge.forgePreBody": "The legacy full pipeline is not part of the current GPU-first product flow.",
+    "forge.orderHint": "Use Forge GPU as the primary path. Diagnostics remain available under Advanced Diagnostics.",
     "forge.benchTitle": "Benchmark — before / after",
     "forge.benchDesc": "Runs a fixed battery at stock and again with the applied profile, then reports the real gains (FPS, clock, power, perf/watt, bandwidth). Apply a profile first.",
     "forge.benchRun": "Run benchmark",
@@ -134,7 +132,6 @@ const dict = {
   },
   pt: {
     "app.tagline": "Onde o silício é forjado ao seu auge.",
-    "nav.capabilities": "Capacidades",
     "nav.forge": "Forja",
     "nav.sensors": "Sensores",
     "nav.safety": "Segurança",
@@ -142,7 +139,7 @@ const dict = {
 
     "forge.title": "Forja de GPU",
     "forge.lead":
-      "Tuning real de GPU no seu hardware: lê a curva V/F, valida estabilidade (incl. VRAM), acha o undervolt/OC estável e o pico de banda da memória. Detecta erro silencioso, aplica margem e confirma com um soak longo — cada passo pelo Safe Loop.",
+      "Tuning real de GPU no seu hardware: le a curva V/F de core, valida estabilidade, sintetiza perfis transparentes e mantem passos de risco atras da protecao do Safe Loop.",
     "forge.simulated": "simulado",
     "forge.start": "Iniciar sweep",
     "forge.stop": "Parar",
@@ -170,13 +167,13 @@ const dict = {
     "forge.result": "Resultado: {r}",
     "forge.stageN": "estágio {n}",
 
-    "forge.realSweep": "Sweep real — acha o undervolt estável da sua placa (escreve voltagem)",
-    "forge.runReal": "Rodar sweep real",
+    "forge.realSweep": "Sweep legado — caminho de desenvolvedor fora do fluxo principal",
+    "forge.runReal": "Rodar sweep legado",
     "forge.stopReal": "Parar sweep",
     "forge.realResult": "Voltagem mínima estável por frequência de topo",
     "forge.preTitle": "Antes do sweep real",
     "forge.preBody":
-      "Isto escreve voltagem/clock reais na sua GPU e empurra em direção ao limite de estabilidade. Pequenos flashes de tela são possíveis (o driver se recupera). É reversível e protegido pelo Safe Loop. Para melhores resultados, feche todos os outros programas (jogos, navegadores, overlays) antes.",
+      "Este diagnóstico legado fica fora do fluxo normal do produto. O caminho atual Forge GPU usa a forja VF de core com proteção do Safe Loop.",
     "forge.preCancel": "Cancelar",
     "forge.preFast": "Rápido (Bronze)",
     "forge.preThorough": "Longo (Gold)",
@@ -198,12 +195,12 @@ const dict = {
     "forge.appliedNow": "Aplicado: {label}",
     "forge.appliedNone": "Nada aplicado (stock)",
     "forge.applyHint": "Perfis aplicados são reaplicados automaticamente a cada boot (protegido pelo Safe Loop).",
-    "forge.forgeAll": "Forjar tudo (automático)",
-    "forge.forgeAllDesc": "Pipeline completo, em ordem: checa VRAM → undervolt de core → banda de memória → soak final do pacote. Aplica o perfil validado.",
-    "forge.runForge": "Forjar tudo",
+    "forge.forgeAll": "Pipeline legado completo (oculto)",
+    "forge.forgeAllDesc": "Pipeline legado de sistema completo mantido fora do fluxo GPU-first atual.",
+    "forge.runForge": "Rodar pipeline legado",
     "forge.stopForge": "Parar",
-    "forge.forgePreBody": "Roda o pipeline inteiro (alguns minutos). Escreve voltagem de core e clock de memória reais e empurra ao limite sob carga combinada — flicker/TDR possíveis (recuperados; protegido pelo Safe Loop). Feche todos os outros programas antes.",
-    "forge.orderHint": "Ou rode manualmente, nesta ordem: 1) Validar estabilidade (gate de VRAM) · 2) Real sweep (core) · 3) Memory sweep.",
+    "forge.forgePreBody": "O pipeline completo legado nao faz parte do fluxo GPU-first atual.",
+    "forge.orderHint": "Use Forge GPU como caminho principal. Diagnosticos continuam disponiveis em Advanced Diagnostics.",
     "forge.benchTitle": "Benchmark — antes / depois",
     "forge.benchDesc": "Roda uma bateria fixa em stock e de novo com o perfil aplicado, e reporta os ganhos reais (FPS, clock, potência, perf/watt, banda). Aplique um perfil primeiro.",
     "forge.benchRun": "Rodar benchmark",

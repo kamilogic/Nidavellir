@@ -1,18 +1,28 @@
 <script>
   import Onboarding from "./lib/views/Onboarding.svelte";
-  import CapabilityReport from "./lib/views/CapabilityReport.svelte";
   import Dashboard from "./lib/views/Dashboard.svelte";
   import SafeLoop from "./lib/views/SafeLoop.svelte";
   import Forge from "./lib/views/Forge.svelte";
   import { t, locale, locales } from "./lib/i18n.js";
 
-  let onboarded = $state(false);
+  function initialOnboarded() {
+    try {
+      return localStorage.getItem("nidavellir-gpu-onboarded") === "true";
+    } catch {
+      return false;
+    }
+  }
+
+  let onboarded = $state(initialOnboarded());
   let onboardingStep = $state(1);
   let activeTab = $state("forge");
 
   function finishOnboarding(_goal) {
     onboarded = true;
     activeTab = "forge";
+    try {
+      localStorage.setItem("nidavellir-gpu-onboarded", "true");
+    } catch {}
   }
 </script>
 
@@ -28,9 +38,6 @@
           <button class:active={activeTab === "forge"} onclick={() => (activeTab = "forge")}>
             {$t("nav.forge")}
           </button>
-          <button class:active={activeTab === "capability"} onclick={() => (activeTab = "capability")}>
-            {$t("nav.capabilities")}
-          </button>
           <button class:active={activeTab === "dashboard"} onclick={() => (activeTab = "dashboard")}>
             {$t("nav.sensors")}
           </button>
@@ -39,18 +46,18 @@
           </button>
         </nav>
       {/if}
-      <select class="lang" bind:value={$locale} aria-label="Language">
-        {#each locales as l}
-          <option value={l.id}>{l.label}</option>
-        {/each}
-      </select>
+      {#if locales.length > 1}
+        <select class="lang" bind:value={$locale} aria-label="Language">
+          {#each locales as l}
+            <option value={l.id}>{l.label}</option>
+          {/each}
+        </select>
+      {/if}
     </div>
   </header>
 
   {#if !onboarded}
     <Onboarding bind:step={onboardingStep} onComplete={finishOnboarding} />
-  {:else if activeTab === "capability"}
-    <CapabilityReport />
   {:else if activeTab === "forge"}
     <Forge />
   {:else if activeTab === "dashboard"}
@@ -117,6 +124,39 @@
       linear-gradient(180deg, rgba(255, 255, 255, 0.018) 0, transparent 14rem),
       linear-gradient(145deg, var(--forge-void) 0%, var(--forge-night) 48%, #07090d 100%);
     background-attachment: fixed;
+  }
+
+  :global(html) {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  :global(h1, h2, h3, h4) {
+    text-wrap: balance;
+  }
+
+  :global(p, li, small) {
+    text-wrap: pretty;
+  }
+
+  :global(button) {
+    min-height: 2.5rem;
+    transition-property: background-color, border-color, color, box-shadow, scale;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
+  }
+
+  :global(button:active:not(:disabled)) {
+    scale: 0.96;
+  }
+
+  :global(button:focus-visible),
+  :global(a:focus-visible),
+  :global(summary:focus-visible),
+  :global(select:focus-visible),
+  :global(input:focus-visible) {
+    outline: 2px solid rgba(214, 168, 93, 0.78);
+    outline-offset: 3px;
   }
 
   main {

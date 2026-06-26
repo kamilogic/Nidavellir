@@ -44,13 +44,13 @@
   function technical(m) {
     const pp = powerProfile(m);
     if (pp) return `${pp.clock_mhz} MHz target`;
-    return "Not forged yet";
+    return "Awaiting forge data";
   }
 
   function secondary(m) {
     const pp = powerProfile(m);
     if (pp) return `${pp.power_w.toFixed(0)} W / ${pp.perf_per_watt.toFixed(1)} MHz/W`;
-    return "Technical values appear after a completed forge run.";
+    return "Appears after the first completed Forge GPU run.";
   }
 
   function curveAnchor(point) {
@@ -203,7 +203,7 @@
         </div>
         <p class="desc">{item.summary}</p>
         <div class="expected">
-          <span>Expected Result</span>
+          <span>Expected behavior</span>
           <ul>
             {#each item.outcomes as outcome}
               <li>{outcome}</li>
