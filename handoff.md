@@ -1,17 +1,17 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-23. `master` clean EXCEPT one
-UNCOMMITTED work-in-progress file: `crates/service/src/gpu_power_sweep.rs` (Option A — see top
+How to pick this up cold. State as of 2026-06-23, `master` clean (Option A pushed — see top
 checkpoint). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-23) — OPTION A: live power-sweep BUTTON rewired to the multi-clock forge algorithm — implemented + verified, UNCOMMITTED
+## Latest backend checkpoint (2026-06-23) — OPTION A: live power-sweep BUTTON rewired to the multi-clock forge algorithm — pushed
 - **What**: the live "forjar/refinar" button (`StartPowerSweep` → `run_power_sweep`, `crates/service/src/gpu_power_sweep.rs`)
   was SINGLE-CLOCK; it now runs the MULTI-CLOCK forge algorithm (the proven `build-frontier` core) and produces the
   3 DIFFERENTIATED profiles (Godforge / Brokkr's 95% / Deep Calm 90%) via `synthesize_forge_profiles`.
-- **STATUS: NOT COMMITTED** — all changes live in the working tree (`gpu_power_sweep.rs`, +423/−380). Verified:
-  cargo check clean; tests `nvapi 38 / core 59 / service 292` pass; clippy no new warnings; `build-frontier` dry-run
-  byte-behavior-preserved (hardware-relative targets, floor discovered). Independent safety audit = GO-with-changes,
-  and BOTH flagged fixes were applied (below). NO hardware run. NO commit/push (operator deferred).
+- **STATUS: committed + pushed** — commit `ba48c7c` (code, +423/−380) on top of Codex's UI commit `837ab4c`; this
+  handoff is the follow-up docs commit. Verified: cargo check clean; tests `nvapi 38 / core 59 / service 292` pass;
+  clippy no new warnings; `build-frontier` dry-run byte-behavior-preserved (hardware-relative targets, floor
+  discovered). Independent safety audit = GO-with-changes, and BOTH flagged fixes were applied (below). NO hardware
+  run yet — the button has NOT been exercised on real hardware (see MANUAL TEST PATH).
 - **How it works**: extracted `measure_multiclock_forge(store, stop, limits) -> Option<MultiClockForgeResult>` (the
   confirmed `build-frontier` core: derive_core_seed → regime(PowerLimited) → hw_floor → `candidate_clocks` (hardware-
   relative, NO fixed MHz) → derive_descent → plan_frontier → real_probe_step probe → build_frontier_two_phase →
@@ -46,8 +46,8 @@ checkpoint). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-r
   multi-clock forge end-to-end; OR CLI `build-frontier --confirm` (discovery only, no persist). The button shows the
   duration estimate first, then 3 differentiated profiles, restores stock at the end, persists `forge_state.json` only
   on success. Capture service log lines `multiclock-forge:` / `build-frontier probe:` / `Validação árdua`.
-- **TO RESUME**: decide commit/push of the uncommitted `gpu_power_sweep.rs` first (recommended — preserves this work
-  durably), then pick up the two button modes (#1) — the smaller, higher-value next step — before IDLE (#2).
+- **TO RESUME**: pick up the two button modes (#1) — the smaller, higher-value next step — before IDLE (#2). Optional
+  before that: one supervised hardware run of the button to confirm the multi-clock flow end-to-end on the test rig.
 
 ## Earlier backend checkpoint (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — pushed
 - **What**: 3 approved changes toward the v0.5 multi-clock profile frontier. Implemented by the code-surgeon,
