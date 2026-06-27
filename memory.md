@@ -8,7 +8,17 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-27) — Forge mode split-button dropdown — implemented, NOT committed
+## Latest (2026-06-27) — F2 discovered profiles respect the Phase 1 apply gate — implemented, NOT committed
+- **Frontend only**: `PowerSweepProgress.is_undervolt` is now consumed as structured state. F2
+  Godforge / Brokkr's / Deep Calm results stay visible with a **Discovered** badge and an explicit
+  "Apply coming in Phase 2" state.
+- **Safety/compatibility**: F2 Apply controls are disabled and both card/action handlers refuse to
+  send `ApplyPower*`. Missing/false `is_undervolt` preserves the legacy F1 Apply path unchanged.
+- **Docs**: UI/backend contract checkpoint recorded; `handoff.md`, `decisions.md`, and `roadmap.md`
+  aligned with Phase 1 completion and the Phase 2 apply dependency.
+- **Validation**: `npm.cmd run build` and `git diff --check` pass.
+
+## Earlier (2026-06-27) — Forge mode split-button dropdown — implemented, committed via 9119eec
 - **Frontend only**: Forge GPU / Refine Profiles is now a compact split action. The main segment
   starts the selected mode; the mode segment opens a product-styled Fast / Standard / Long dropdown.
   Standard is the initial default; modes map to `StartPowerSweepFast`, `StartPowerSweep`, and
@@ -19,7 +29,7 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   selection, outside click/focus, or Escape.
 - **Compatibility**: stop/progress/apply paths are unchanged; the UI does not parse `note` or `log`
   for mode logic. Files: `Forge.svelte`, `RecommendedAction.svelte`, UI contract.
-- **Validation**: `npm.cmd run build` and `git diff --check` pass.
+- **Validation**: `npm.cmd run build` and `git diff --check` passed; committed via `9119eec`.
 
 ## Earlier (2026-06-26) — multi-clock/confidence UI contract pass — implemented, pushed via e60a6f7
 - **Frontend only**: Forge profile cards/progress now distinguish target vs measured/p5 clock, label

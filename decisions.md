@@ -32,14 +32,15 @@ Durable technical decisions and their rationale. Newest first.
   with `validations_at_best` (and the `--validation-passes` opt-in / future IDLE). This RESOLVES the IDLE-learning
   gap flagged in Option A (F1 was per-run telemetry only).
 - **Phased plan (each HW-validated before the next)**:
-  - **Phase 1 (in progress)** — `measure_multiclock_undervolt_forge`: reuse the F2 ladder/motor over a few
+  - **Phase 1 (DONE + pushed via `e4bd006`)** — `measure_multiclock_undervolt_forge`: reuse the F2 ladder/motor over a few
     hardware-relative candidate clocks → records observations → `learned_frontier` → `frontier_to_points` →
     `synthesize_forge_profiles` → 3 differentiated profiles → validate each pick → persist `forge_state.json`.
     Apply stays GATED/refused for F2 profiles (today's apply does F1 flatten-down — wrong for undervolt). Safe,
-    self-contained: the UI shows real differentiated profiles.
+    self-contained: the UI shows real differentiated profiles as **Discovered** and disables Apply whenever
+    `PowerSweepProgress.is_undervolt == true`; legacy F1 Apply remains unchanged.
   - **Phase 2** — F2 apply path: wire `apply_bounded_anchored_positive_offset` into the Apply IPC (Safe Loop
     arm/verify/persist/reapply-on-boot). Riskiest piece → own safety audit + HW run.
-  - **Phase 3** — polish: fold Fast/Long modes into F2 depth, reapply-on-boot, UI-contract update, retire/repurpose
+  - **Phase 3** — polish: fold Fast/Long modes into F2 depth, reapply-on-boot, retire/repurpose
     the F1 button path.
 - **Git**: branch synced to `origin/master` (`e60a6f7` = Codex UI + Fast/Long modes `3c82e96`). The abandoned F1
   knee-seeking commit (`cc8710a`, F1-specific, moot under F2) was dropped in the diagnosis session (reflog-

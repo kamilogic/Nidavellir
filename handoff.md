@@ -6,6 +6,16 @@ flatten-down can't differentiate this power-bound card; F2 can, proven −43 W).
 persist; apply GATED). **NEXT = Phase 2 (F2 apply path)**. See `decisions.md` top entry for the full
 rationale + phased plan. Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Latest frontend checkpoint (2026-06-27) — F2 profiles shown as Discovered; Apply gated in UI
+- Codex now consumes the additive `PowerSweepProgress.is_undervolt` field directly. F2 Godforge /
+  Brokkr's / Deep Calm results remain visible, carry a **Discovered** state, and explain that Apply
+  is coming in Phase 2.
+- All F2 Apply controls are disabled, with a defensive handler guard preventing accidental
+  `ApplyPower*` requests. Missing/false `is_undervolt` preserves legacy F1 Apply behavior.
+- Frontend-only files: `apps/ui/src/lib/{views/Forge.svelte,components/forge/ProfileCards.svelte}`.
+  No Rust/IPC/persistence/hardware changes. Contract checkpoint recorded in
+  `docs/contracts/ui-backend.md`.
+
 ## Latest backend checkpoint (2026-06-27) — FORGE → F2 UNDERVOLT pivot; Phase 1 DONE (e4bd006, pushed); next = Phase 2
 - **Why**: 2 supervised HW runs proved the live button's F1 multi-clock forge COLLAPSES on the RTX 3060 Ti —
   it's pinned at 200 W, and F1 flatten-down can't lower power on a power-bound card (lowering a frequency
@@ -27,8 +37,9 @@ rationale + phased plan. Deep NvAPI struct details live in `~/.claude/.../memory
   Button routed via `start_with_mode` (gpu_power_sweep.rs:253). Apply GATED: additive `is_undervolt` flag
   (ipc.rs) + `refuse_undervolt_apply` (ipc_server.rs:384) in all 3 ApplyPower* handlers. F1 `run_power_sweep`
   kept `#[allow(dead_code)]`. Mode → clock breadth only. Verified: tests core 61 / nvapi 38 / service 296;
-  safety audit GO; reset-on-every-path; no auto-apply. Contract note for Codex added (button is F2, apply
-  refused in Phase 1). **NOT hardware-tested** — a supervised button run on the rig is safe (apply gated) and
+  safety audit GO; reset-on-every-path; no auto-apply. Contract note implemented by Codex: the UI shows F2
+  profiles as Discovered and disables Apply in Phase 1. **NOT hardware-tested** — a supervised button run
+  on the rig is safe (apply gated) and
   is the recommended first check next session.
 - **Phase 2 (NEXT — start here)**: wire the F2 writer `apply_bounded_anchored_positive_offset` (gpu-nvapi,
   today called only from gpu_undervolt.rs:1792) into the Apply IPC (`apply_power_profile`/`apply_core` route

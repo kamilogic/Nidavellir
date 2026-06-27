@@ -705,6 +705,19 @@ same clock). F2 produces REAL differentiated Godforge / Brokkr's / Deep Calm pro
 
 
 
+\## Frontend implementation checkpoint (2026-06-27): F2 discovery state wired (Codex)
+
+\- `PowerSweepProgress.is_undervolt` now drives a structured frontend state; the UI does not infer
+&#x20; F2/apply availability from `note`, `log`, or error text.
+
+\- When `is_undervolt == true`, all three profiles remain visible and are labelled \*\*Discovered\*\*.
+&#x20; Apply controls are disabled with clear "Apply coming in Phase 2" copy, plus a defensive action
+&#x20; guard prevents accidental `ApplyPower*` requests.
+
+\- When `is_undervolt == false` or the field is missing, the existing F1 Apply behavior is unchanged.
+&#x20; No Rust, IPC, persistence, profile synthesis, or hardware logic changed.
+
+
 \## Frontend implementation checkpoint (2026-06-26): Forge modes wired (Codex)
 
 

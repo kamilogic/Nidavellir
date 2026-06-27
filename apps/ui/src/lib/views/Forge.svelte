@@ -222,6 +222,10 @@
     deep_calm: "ApplyPowerDeepCalm",
   };
   const applyPower = async (which) => {
+    if (powerSweep?.is_undervolt) {
+      error = "This F2 undervolt profile is discovered and saved. Apply is coming in Phase 2.";
+      return;
+    }
     verification = null;
     await call(POWER_APPLY[which], setApplied);
   };

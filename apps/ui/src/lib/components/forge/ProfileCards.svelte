@@ -11,6 +11,11 @@
     onApplyPower,
   } = $props();
   let applyingKey = $state(null);
+  const isUndervolt = $derived(Boolean(powerSweep?.is_undervolt));
+  const hasAnyProfile = $derived(
+    Boolean(powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm),
+  );
+  const applyPending = $derived(isUndervolt && hasAnyProfile);
 
   const meta = [
     {
@@ -154,7 +159,7 @@
 
   async function applyPowerCard(key, p) {
     const state = profileState(powerName(key), p);
-    if (!p || state.active || applyingKey) return;
+    if (isUndervolt || !p || state.active || applyingKey) return;
     applyingKey = key;
     try {
       await onApplyPower?.(key);
@@ -165,7 +170,7 @@
 
   async function applyProfile(m) {
     const state = profileState(m.name, powerProfile(m));
-    if (!hasData(m) || state.active || applyingKey) return;
+    if (isUndervolt || !hasData(m) || state.active || applyingKey) return;
     applyingKey = m.key;
     try {
       await onApplyPower?.(m.key);
@@ -179,6 +184,13 @@
   <div class="collapse-note" role="status">
     <strong>Honest profile result</strong>
     <span>{collapseMessage}</span>
+  </div>
+{/if}
+
+{#if applyPending}
+  <div class="collapse-note pending-apply" role="status">
+    <strong>Profiles discovered</strong>
+    <span>These F2 undervolt profiles are saved and ready for review. Apply is coming in Phase 2; this forge result has not been applied.</span>
   </div>
 {/if}
 
@@ -205,13 +217,18 @@
             {#if confidenceSummary(p)}
               <div class="prof-sub confidence">{confidenceSummary(p)}</div>
             {/if}
+            {#if isUndervolt}
+              <div class="prof-sub availability">Discovered · Apply coming in Phase 2</div>
+            {/if}
             <button
               class="btn small"
-              class:go={!state.active}
-              disabled={state.active || applyingKey === key}
+              class:go={!state.active && !isUndervolt}
+              disabled={isUndervolt || state.active || applyingKey === key}
               onclick={() => applyPowerCard(key, p)}
             >
-              {#if applyingKey === key}
+              {#if isUndervolt}
+                Apply coming in Phase 2
+              {:else if applyingKey === key}
                 Applying...
               {:else if state.active}
                 Applied ✓
@@ -245,7 +262,9 @@
             {#if item.recommended}
               <StatusBadge label="Recommended" variant="recommended" symbol="check" compact />
             {/if}
-            {#if state.active}
+            {#if isUndervolt && point}
+              <StatusBadge label="Discovered" variant="forged" symbol="knowledge" compact />
+            {:else if state.active}
               <StatusBadge label="Active" variant="active" symbol="check" compact />
             {:else if state.updated}
               <StatusBadge label="Updated" variant="tempered" symbol="activity" compact />
@@ -288,11 +307,13 @@
         {#if hasData(item)}
           <button
             class="btn small"
-            class:go={!state.active}
-            disabled={state.active || applyingKey === item.key}
+            class:go={!state.active && !isUndervolt}
+            disabled={isUndervolt || state.active || applyingKey === item.key}
             onclick={() => applyProfile(item)}
           >
-            {#if applyingKey === item.key}
+            {#if isUndervolt}
+              Apply coming in Phase 2
+            {:else if applyingKey === item.key}
               Applying...
             {:else if state.active}
               Applied ✓
@@ -332,6 +353,16 @@
     font-size: 0.68rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
+  }
+  .pending-apply {
+    background: rgba(126, 173, 190, 0.08);
+    box-shadow:
+      0 0 0 1px rgba(126, 173, 190, 0.24),
+      0 8px 22px rgba(0, 0, 0, 0.14);
+  }
+  .pending-apply strong,
+  .availability {
+    color: var(--forge-blue);
   }
   .profiles {
     display: grid;
