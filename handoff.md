@@ -1,9 +1,55 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-22, `master` (clean). Deep NvAPI struct
-details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+How to pick this up cold. State as of 2026-06-23. `master` clean EXCEPT one
+UNCOMMITTED work-in-progress file: `crates/service/src/gpu_power_sweep.rs` (Option A — see top
+checkpoint). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — pushed
+## Latest backend checkpoint (2026-06-23) — OPTION A: live power-sweep BUTTON rewired to the multi-clock forge algorithm — implemented + verified, UNCOMMITTED
+- **What**: the live "forjar/refinar" button (`StartPowerSweep` → `run_power_sweep`, `crates/service/src/gpu_power_sweep.rs`)
+  was SINGLE-CLOCK; it now runs the MULTI-CLOCK forge algorithm (the proven `build-frontier` core) and produces the
+  3 DIFFERENTIATED profiles (Godforge / Brokkr's 95% / Deep Calm 90%) via `synthesize_forge_profiles`.
+- **STATUS: NOT COMMITTED** — all changes live in the working tree (`gpu_power_sweep.rs`, +423/−380). Verified:
+  cargo check clean; tests `nvapi 38 / core 59 / service 292` pass; clippy no new warnings; `build-frontier` dry-run
+  byte-behavior-preserved (hardware-relative targets, floor discovered). Independent safety audit = GO-with-changes,
+  and BOTH flagged fixes were applied (below). NO hardware run. NO commit/push (operator deferred).
+- **How it works**: extracted `measure_multiclock_forge(store, stop, limits) -> Option<MultiClockForgeResult>` (the
+  confirmed `build-frontier` core: derive_core_seed → regime(PowerLimited) → hw_floor → `candidate_clocks` (hardware-
+  relative, NO fixed MHz) → derive_descent → plan_frontier → real_probe_step probe → build_frontier_two_phase →
+  synthesize). `run_build_frontier` refactored to call it (dry-run output byte-identical). `run_power_sweep` calls it
+  with BUTTON-default `FrontierLimits` (`BUTTON_MAX_PROBES=24`, `BUTTON_MAX_PROBES_PER_TARGET=3`, all else off),
+  surfaces `est_wall_s` BEFORE the run (~8–12 min), maps the 3 profiles, validates each pick, persists on success.
+- **Two safety fixes applied after the audit**:
+  1. APPLY-AXIS: picks come from `probe_to_point` with `voltage_mv=0` (undervolt is in `vf_table_voltage_mv`); the
+     Apply path keys on `voltage_mv` → `choose_ceiling_mv(curve,0)` = LOWEST bin = WRONG deepest undervolt. FIX:
+     backfill `voltage_mv = vf_table_voltage_mv` on the 3 picks before validate/persist (`run_power_sweep` ~3814).
+  2. VALIDATION FIDELITY: new `validate_pick_at_ceiling` (~3613) soaks each pick AT ITS DISCOVERED CEILING (arm Safe
+     Loop → `apply_vf_ceiling_monotone(vbin, clk)` → read-only verify → 35 s game-power soak → reset+clear on EVERY
+     path → fail-closed DROP the pick on any instability; no back-off). Multi-clock picks route here; `None`-ceiling
+     legacy picks keep `arduous_validate`.
+- **Safety invariants (verified)**: reset-to-stock on EVERY exit path (start / fail-closed `None` / post-validate);
+  persist (`save_forge_state`) ONLY when `godforge.is_some()`; NO auto-apply (apply stays the separate `ApplyPower*`
+  IPC, "confirme em jogo"); NO IPC contract change (`deep_calm` becoming `Some` is additive); `apply_vf_ceiling_monotone`
+  / F1 / Safe Loop untouched.
+- **HONEST CORRECTION on IDLE / learn-over-time**: the multi-clock frontier confidence is PER-RUN (in-run telemetry
+  quality `s.confidence`), NOT cross-run. The single-clock `GpuKnowledge` (cross-run trials → `gpu_knowledge.json`)
+  was the only cross-run learner and was REMOVED from the button (offset-keyed, single-clock-specific; struct kept
+  test-only). So the button does NOT learn across runs today; cross-run/IDLE accumulation for the multi-clock
+  frontier is a FUTURE item (operator confirmed IDLE = later, not priority).
+- **DEFERRED — next-session work (operator's plan)**:
+  1. TWO BUTTON MODES: a **LONG** run (everything + the bigger validations in ONE session — skip IDLE, for users who
+     want it all up front) and a **FAST** run (quick discovery; leave confidence-building to IDLE / later manual runs).
+     This is the multi-clock analogue of the `--validation-passes` depth knob; needs a UI toggle (→ Codex contract) +
+     a backend depth parameter (likely vary `BUTTON_MAX_PROBES`/`max_probes_per_target` + per-pick soak passes).
+  2. IDLE / cross-run learning: accumulate stability confidence across runs on the multi-clock frontier (keyed by
+     clock+voltage, persisted), feeding the Wilson gate — the future auto-runs-when-idle scheduler builds on this.
+- **MANUAL TEST PATH (hardware, operator-present)**: click the live power-sweep button (`StartPowerSweep`) to run the
+  multi-clock forge end-to-end; OR CLI `build-frontier --confirm` (discovery only, no persist). The button shows the
+  duration estimate first, then 3 differentiated profiles, restores stock at the end, persists `forge_state.json` only
+  on success. Capture service log lines `multiclock-forge:` / `build-frontier probe:` / `Validação árdua`.
+- **TO RESUME**: decide commit/push of the uncommitted `gpu_power_sweep.rs` first (recommended — preserves this work
+  durably), then pick up the two button modes (#1) — the smaller, higher-value next step — before IDLE (#2).
+
+## Earlier backend checkpoint (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — pushed
 - **What**: 3 approved changes toward the v0.5 multi-clock profile frontier. Implemented by the code-surgeon,
   independently validated + safety-audited (GO). No hardware run. Committed + pushed to `origin/master`:
   `f065d4a` (code) + `79c3081` (docs).
