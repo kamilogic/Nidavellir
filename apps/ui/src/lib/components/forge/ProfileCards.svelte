@@ -43,7 +43,7 @@
 
   function technical(m) {
     const pp = powerProfile(m);
-    if (pp) return `${pp.clock_mhz} MHz target`;
+    if (pp) return `${pp.target_clock_mhz ?? pp.clock_mhz} MHz target`;
     return "Awaiting forge data";
   }
 
@@ -54,8 +54,14 @@
   }
 
   function curveAnchor(point) {
-    if (point?.vf_table_voltage_mv != null) return `Curve anchor: ${point.vf_table_voltage_mv} mV`;
+    if (point?.vf_table_voltage_mv != null) return `VF bin: ${point.vf_table_voltage_mv} mV`;
     return null;
+  }
+
+  function achievedClock(point) {
+    if (point?.target_clock_mhz == null || point?.clock_mhz == null) return null;
+    const p5 = point.p5_clock_mhz != null ? ` · p5 ${point.p5_clock_mhz} MHz` : "";
+    return `Measured: ${point.clock_mhz} MHz${p5}`;
   }
 
   function measuredVoltage(point) {
@@ -68,6 +74,22 @@
     }
     if (point.measured_voltage_mv != null) return `Measured voltage under load: ${point.measured_voltage_mv} mV`;
     return null;
+  }
+
+  function confidenceSummary(point) {
+    if (!point) return null;
+    const parts = [];
+    if (point.confidence != null) {
+      const confidence = Number(point.confidence);
+      if (Number.isFinite(confidence)) parts.push(`Stability confidence ${confidence.toFixed(2)}`);
+    }
+    if (point.validation_count != null) {
+      const validationCount = Number(point.validation_count);
+      if (Number.isFinite(validationCount)) {
+        parts.push(`${validationCount} ${validationCount === 1 ? "confirmation" : "confirmations"}`);
+      }
+    }
+    return parts.length ? parts.join(" · ") : null;
   }
 
   function hasData(m) {
@@ -88,6 +110,25 @@
   function sameNumber(a, b) {
     return a != null && b != null && Number(a) === Number(b);
   }
+
+  function sameProfilePoint(a, b) {
+    if (!a || !b) return false;
+    const aTarget = a.target_clock_mhz ?? a.clock_mhz;
+    const bTarget = b.target_clock_mhz ?? b.clock_mhz;
+    const aBin = a.vf_table_voltage_mv ?? a.voltage_mv;
+    const bBin = b.vf_table_voltage_mv ?? b.voltage_mv;
+    return sameNumber(aTarget, bTarget) && sameNumber(a.clock_mhz, b.clock_mhz) && sameNumber(aBin, bBin);
+  }
+
+  const collapseMessage = $derived.by(() => {
+    if (powerSweep?.power_bound_collapse) {
+      return "Brokkr's ≡ Godforge on this GPU — the measured frontier is power-limited, with no headroom above the efficiency point.";
+    }
+    if (sameProfilePoint(powerSweep?.godforge, powerSweep?.brokkrs)) {
+      return "Brokkr's currently resolves to the same measured point as Godforge. Nidavellir will not manufacture a difference.";
+    }
+    return null;
+  });
 
   function voltageMatches(p) {
     if (!p || !applied?.core) return false;
@@ -134,16 +175,26 @@
   }
 </script>
 
+{#if collapseMessage}
+  <div class="collapse-note" role="status">
+    <strong>Honest profile result</strong>
+    <span>{collapseMessage}</span>
+  </div>
+{/if}
+
 {#if mode === "power"}
-  {#if !powerSweep?.running && (powerSweep?.godforge || powerSweep?.brokkrs)}
+  {#if !powerSweep?.running && (powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm)}
     <div class="profiles">
-      {#each [["godforge", powerSweep.godforge], ["brokkrs", powerSweep.brokkrs]] as [key, p]}
+      {#each [["godforge", powerSweep.godforge], ["brokkrs", powerSweep.brokkrs], ["deep_calm", powerSweep.deep_calm]] as [key, p]}
         {@const state = profileState(powerName(key), p)}
         <div class={`profile profile-${key}`} class:active={state.active} class:stale={state.stale}>
           <div class="prof-name">{$t("forge.prof_" + key)}</div>
           {#if p}
-            <div class="prof-val">{p.clock_mhz} MHz target</div>
+            <div class="prof-val">{p.target_clock_mhz ?? p.clock_mhz} MHz target</div>
             <div class="prof-sub">Optimized boost curve</div>
+            {#if achievedClock(p)}
+              <div class="prof-sub">{achievedClock(p)}</div>
+            {/if}
             {#if curveAnchor(p)}
               <div class="prof-sub">{curveAnchor(p)}</div>
             {/if}
@@ -151,6 +202,9 @@
               <div class="prof-sub">{measuredVoltage(p)}</div>
             {/if}
             <div class="prof-sub">{p.power_w.toFixed(0)} W / {p.perf_per_watt.toFixed(1)} MHz/W</div>
+            {#if confidenceSummary(p)}
+              <div class="prof-sub confidence">{confidenceSummary(p)}</div>
+            {/if}
             <button
               class="btn small"
               class:go={!state.active}
@@ -216,6 +270,9 @@
           {#if hasData(item)}
             <small>Optimized boost curve</small>
           {/if}
+          {#if achievedClock(point)}
+            <small>{achievedClock(point)}</small>
+          {/if}
           {#if curveAnchor(point)}
             <small>{curveAnchor(point)}</small>
             <small>Not a hard voltage cap. Measured voltage can vary by workload.</small>
@@ -224,6 +281,9 @@
             <small>{measuredVoltage(point)}</small>
           {/if}
           <small>{secondary(item)}</small>
+          {#if confidenceSummary(point)}
+            <small class="confidence">{confidenceSummary(point)}</small>
+          {/if}
         </div>
         {#if hasData(item)}
           <button
@@ -251,6 +311,28 @@
 {/if}
 
 <style>
+  .collapse-note {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0.45rem 0.7rem;
+    align-items: baseline;
+    margin-top: 0.75rem;
+    border-radius: 10px;
+    padding: 0.68rem 0.78rem;
+    background: rgba(214, 168, 93, 0.08);
+    box-shadow:
+      0 0 0 1px rgba(214, 168, 93, 0.24),
+      0 8px 22px rgba(0, 0, 0, 0.14);
+    color: var(--muted);
+    font-size: 0.78rem;
+    line-height: 1.45;
+  }
+  .collapse-note strong {
+    color: var(--forge-gold);
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
   .profiles {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
@@ -392,6 +474,10 @@
     font-variant-numeric: tabular-nums;
     font-size: 0.86rem;
   }
+  .confidence {
+    color: var(--forge-green) !important;
+    font-variant-numeric: tabular-nums;
+  }
   .btn {
     border: 1px solid var(--border);
     border-radius: 9px;
@@ -426,6 +512,9 @@
     color: var(--forge-green);
   }
   @media (max-width: 640px) {
+    .collapse-note {
+      grid-template-columns: 1fr;
+    }
     .profiles {
       grid-template-columns: 1fr;
     }

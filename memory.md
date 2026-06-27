@@ -8,7 +8,19 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — implemented, NOT committed
+## Latest (2026-06-26) — multi-clock/confidence UI contract pass — implemented, NOT committed
+- **Frontend only**: Forge profile cards/progress now distinguish target vs measured/p5 clock, label
+  the deterministic VF bin separately, show all 3 profile points, and surface optional Wilson
+  confidence + exact-point confirmation count when the backend provides them.
+- **Honest collapse**: structured `power_bound_collapse` is preferred; identical Godforge/Brokkr's
+  points remain a backward-compatible fallback. The UI explicitly refuses to invent a difference.
+- **IPC blocker documented**: `docs/contracts/ui-backend.md` requests optional `confidence`,
+  `validation_count`, `power_bound_collapse`, and an additive start request carrying bounded
+  `validation_passes`. "Build confidence now" remains unsurfaced until it can be functional.
+- **Scope/validation**: no backend/Rust/IPC implementation changed. `npm.cmd run build` and
+  `git diff --check` pass. Working tree intentionally uncommitted.
+
+## Earlier (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — implemented, NOT committed
 - **What**: 3 approved backend changes toward the v0.5 multi-clock profile frontier. Implemented + validated +
   safety-audited (GO). No hardware run; NOT committed (awaiting operator approval).
 - **Margin answer**: applied 906 vs reached 868 is the **Wilson confidence gate** (0.85), NOT a voltage margin —

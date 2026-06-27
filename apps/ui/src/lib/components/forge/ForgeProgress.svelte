@@ -67,12 +67,18 @@
 
   function targetLabel(point) {
     if (!point) return "Not available";
-    return `${point.clock_mhz} MHz target`;
+    return `${point.target_clock_mhz ?? point.clock_mhz} MHz target`;
   }
 
   function curveAnchor(point) {
-    if (point?.vf_table_voltage_mv != null) return `Curve anchor: ${point.vf_table_voltage_mv} mV`;
+    if (point?.vf_table_voltage_mv != null) return `VF bin: ${point.vf_table_voltage_mv} mV`;
     return null;
+  }
+
+  function achievedClock(point) {
+    if (point?.target_clock_mhz == null || point?.clock_mhz == null) return null;
+    const p5 = point.p5_clock_mhz != null ? ` · p5 ${point.p5_clock_mhz} MHz` : "";
+    return `Measured: ${point.clock_mhz} MHz${p5}`;
   }
 
   function measuredVoltage(point) {
@@ -85,6 +91,22 @@
     }
     if (point.measured_voltage_mv != null) return `Measured voltage under load: ${point.measured_voltage_mv} mV`;
     return null;
+  }
+
+  function confidenceSummary(point) {
+    if (!point) return null;
+    const parts = [];
+    if (point.confidence != null) {
+      const confidence = Number(point.confidence);
+      if (Number.isFinite(confidence)) parts.push(`Stability confidence ${confidence.toFixed(2)}`);
+    }
+    if (point.validation_count != null) {
+      const validationCount = Number(point.validation_count);
+      if (Number.isFinite(validationCount)) {
+        parts.push(`${validationCount} ${validationCount === 1 ? "confirmation" : "confirmations"}`);
+      }
+    }
+    return parts.length ? parts.join(" · ") : null;
   }
 </script>
 
@@ -138,6 +160,9 @@
       <strong>{targetLabel(latestPoint)}</strong>
       {#if latestPoint}
         <small>Optimized boost curve</small>
+        {#if achievedClock(latestPoint)}
+          <small>{achievedClock(latestPoint)}</small>
+        {/if}
         {#if curveAnchor(latestPoint)}
           <small>{curveAnchor(latestPoint)}</small>
         {/if}
@@ -145,6 +170,9 @@
           <small>{measuredVoltage(latestPoint)}</small>
         {/if}
         <small>{fixed(latestPoint.power_w)} W / {fixed(latestPoint.perf_per_watt, 1)} MHz/W / {latestPoint.stable ? "stable" : "failed"}</small>
+        {#if confidenceSummary(latestPoint)}
+          <small class="confidence">{confidenceSummary(latestPoint)}</small>
+        {/if}
       {:else}
         <small>Appears after the first measured point.</small>
       {/if}
@@ -181,6 +209,9 @@
             <strong>{name}</strong>
             <span>{targetLabel(point)}</span>
             <small>Optimized boost curve</small>
+            {#if achievedClock(point)}
+              <small>{achievedClock(point)}</small>
+            {/if}
             {#if curveAnchor(point)}
               <small>{curveAnchor(point)}</small>
             {/if}
@@ -188,6 +219,9 @@
               <small>{measuredVoltage(point)}</small>
             {/if}
             <small>{fixed(point.power_w)} W / {fixed(point.perf_per_watt, 1)} MHz/W</small>
+            {#if confidenceSummary(point)}
+              <small class="confidence">{confidenceSummary(point)}</small>
+            {/if}
           </article>
         {/each}
       </div>
@@ -333,6 +367,10 @@
     color: var(--muted);
     font-size: 0.8rem;
     line-height: 1.4;
+  }
+  .confidence {
+    color: var(--forge-green) !important;
+    font-variant-numeric: tabular-nums;
   }
   .progress-grid {
     display: grid;

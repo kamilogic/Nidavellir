@@ -544,7 +544,57 @@ is a service-level option. Rationale + algorithm details: `decisions.md`, `hando
 
 
 
-(No other active requests)
+\## Frontend implementation checkpoint (2026-06-26): UI ready, IPC additions requested (Codex → backend)
+
+
+
+Codex applied the frontend-only parts of the 2026-06-23 request:
+
+
+
+\- Profile cards and Forge Progress use `target_clock_mhz` when available and keep measured
+
+&#x20; `clock_mhz` / `p5_clock_mhz` separate.
+
+\- All three profiles show clock, VF bin, watts and MHz/W.
+
+\- Honest collapse copy uses structured `power_bound_collapse` when available, with equality of the
+
+&#x20; Godforge/Brokkr's points as a backward-compatible fallback.
+
+\- Per-profile stability evidence renders when the optional `confidence` and `validation_count`
+
+&#x20; fields are present. Missing fields remain silent; the UI does not fabricate values.
+
+
+
+The remaining "Build confidence now" control is intentionally NOT surfaced as a non-functional
+
+toggle. It needs the following additive backend contract:
+
+
+
+\- `PowerSweepPoint.confidence: Option<f64>` — Wilson lower-bound stability confidence (0–1) for
+
+&#x20; the selected point.
+
+\- `PowerSweepPoint.validation_count: Option<u32>` — successful confirmations at that exact selected
+
+&#x20; point. This is NOT the total observation count across other voltages or outcomes.
+
+\- `PowerSweepProgress.power_bound_collapse: Option<bool>` (or a backward-compatible defaulted bool)
+
+&#x20; — structured synthesis result; the UI must not infer it from logs or notes.
+
+\- An additive start request that accepts `validation_passes` in `1..=20`, preserving the existing
+
+&#x20; parameterless `StartPowerSweep` as the default-one-pass compatibility path. Once available,
+
+&#x20; Codex will wire the default-OFF toggle + bounded selector and send the explicit value.
+
+
+
+(No other active frontend requests)
 
 
 

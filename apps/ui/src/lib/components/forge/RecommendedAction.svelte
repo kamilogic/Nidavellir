@@ -38,9 +38,9 @@
   const primaryLabel = $derived(hasProfiles ? "Refine Profiles" : "Forge GPU");
   const firstRunSteps = [
     "Safe Loop check",
-    "Core VF learning",
+    "Multi-clock discovery",
+    "Stability confidence",
     "Profile creation",
-    "Daily recommendation",
   ];
 </script>
 
@@ -76,7 +76,7 @@
           </span>
         {/each}
       </div>
-      <p>VRAM optimization and final whole-package validation stay planned later, after the core curve is forged.</p>
+      <p>Confidence builds across normal runs as stable points earn repeat confirmations. VRAM optimization and final whole-package validation stay planned later.</p>
     </div>
   {/if}
 </section>
