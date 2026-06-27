@@ -26,6 +26,7 @@
   let verifying = $state(false);
   let benchmark = $state(null);
   let powerSweep = $state(null);
+  let forgeMode = $state("standard");
   let hardwareLoaded = $state(false);
 
   const powerRunning = $derived(Boolean(powerSweep?.running));
@@ -204,7 +205,16 @@
   const startBench = () => call("StartBenchmark", setBench);
   const stopBench = () => call("StopBenchmark", setBench);
   const setPower = (r) => (powerSweep = r?.data?.type === "PowerSweep" ? r.data : powerSweep);
-  const startPower = () => call("StartPowerSweep", setPower);
+  const POWER_START = {
+    fast: "StartPowerSweepFast",
+    standard: "StartPowerSweep",
+    long: "StartPowerSweepLong",
+  };
+  const selectForgeMode = (mode) => {
+    forgeMode = mode;
+  };
+  const startPower = (mode = forgeMode) =>
+    call(POWER_START[mode] ?? POWER_START.standard, setPower);
   const stopPower = () => call("StopPowerSweep", setPower);
   const POWER_APPLY = {
     godforge: "ApplyPowerGodforge",
@@ -304,7 +314,9 @@
       {powerSweep}
       {powerRunning}
       {safeLoop}
+      {forgeMode}
       onStartPower={startPower}
+      onForgeModeChange={selectForgeMode}
       onStopPower={stopPower}
     />
 

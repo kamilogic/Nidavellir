@@ -705,6 +705,28 @@ same clock). F2 produces REAL differentiated Godforge / Brokkr's / Deep Calm pro
 
 
 
+\## Frontend implementation checkpoint (2026-06-26): Forge modes wired (Codex)
+
+
+
+\- Added a compact, product-styled Fast / Standard / Long dropdown inside the Forge GPU /
+
+&#x20; Refine Profiles split action.
+
+\- The main segment starts the selected mode; the compact mode segment opens the selector.
+
+\- Standard is the initial default and continues to call `StartPowerSweep`.
+
+\- Fast calls `StartPowerSweepFast`; Long calls `StartPowerSweepLong`.
+
+\- Stop, progress polling and profile apply paths remain unchanged.
+
+\- Mode copy reflects discovery depth, confidence behavior, relative duration and the shared
+
+&#x20; fail-closed supervised safety model. The UI does not parse `note` or `log` for mode state.
+
+
+
 (No other active backend → frontend requests)
 
 

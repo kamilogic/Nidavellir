@@ -8,7 +8,20 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-26) — multi-clock/confidence UI contract pass — implemented, NOT committed
+## Latest (2026-06-27) — Forge mode split-button dropdown — implemented, NOT committed
+- **Frontend only**: Forge GPU / Refine Profiles is now a compact split action. The main segment
+  starts the selected mode; the mode segment opens a product-styled Fast / Standard / Long dropdown.
+  Standard is the initial default; modes map to `StartPowerSweepFast`, `StartPowerSweep`, and
+  `StartPowerSweepLong`.
+- **UX/safety**: each mode explains depth, relative duration, and confidence behavior. All copy keeps
+  the run supervised and fail-closed, states that nothing is auto-applied, and leaves profile apply
+  as a separate confirm-in-game step. The dropdown uses the existing forge tokens and closes on
+  selection, outside click/focus, or Escape.
+- **Compatibility**: stop/progress/apply paths are unchanged; the UI does not parse `note` or `log`
+  for mode logic. Files: `Forge.svelte`, `RecommendedAction.svelte`, UI contract.
+- **Validation**: `npm.cmd run build` and `git diff --check` pass.
+
+## Earlier (2026-06-26) — multi-clock/confidence UI contract pass — implemented, pushed via e60a6f7
 - **Frontend only**: Forge profile cards/progress now distinguish target vs measured/p5 clock, label
   the deterministic VF bin separately, show all 3 profile points, and surface optional Wilson
   confidence + exact-point confirmation count when the backend provides them.
@@ -18,7 +31,7 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   `validation_count`, `power_bound_collapse`, and an additive start request carrying bounded
   `validation_passes`. "Build confidence now" remains unsurfaced until it can be functional.
 - **Scope/validation**: no backend/Rust/IPC implementation changed. `npm.cmd run build` and
-  `git diff --check` pass. Working tree intentionally uncommitted.
+  `git diff --check` passed; merged and pushed via `e60a6f7`.
 
 ## Earlier (2026-06-23) — F2 multi-clock profile package (Brokkr's 0.95 + descending ladder + confidence opt-in) — implemented, NOT committed
 - **What**: 3 approved backend changes toward the v0.5 multi-clock profile frontier. Implemented + validated +

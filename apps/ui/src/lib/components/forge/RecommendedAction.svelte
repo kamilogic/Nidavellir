@@ -1,5 +1,5 @@
 <script>
-  import { Play, Square } from "@lucide/svelte";
+  import { Check, ChevronDown, Play, Square } from "@lucide/svelte";
   import StatusBadge from "./StatusBadge.svelte";
 
   let {
@@ -7,9 +7,12 @@
     powerSweep = null,
     powerRunning = false,
     safeLoop = null,
+    forgeMode = "standard",
     onStartPower,
     onStopPower,
+    onForgeModeChange,
   } = $props();
+  let modePicker = $state(null);
 
   const hasProfiles = $derived(Boolean(powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm));
   const needsAttention = $derived(Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable"));
@@ -42,6 +45,78 @@
     "Stability confidence",
     "Profile creation",
   ];
+  const forgeModes = [
+    {
+      id: "fast",
+      label: "Fast",
+      summaryLabel: "Fast",
+      meta: "Quick",
+      title: "Quicker supervised discovery",
+      description: "Fewer probes and a shallower per-clock search, with one ceiling validation per profile. Confidence continues across later runs.",
+    },
+    {
+      id: "standard",
+      label: "Standard",
+      summaryLabel: "Std",
+      meta: "Default",
+      title: "Balanced, hardware-validated default",
+      description: "The proven Nidavellir forge path: balanced discovery depth and validation with no behavior change from the current default.",
+    },
+    {
+      id: "long",
+      label: "Long",
+      summaryLabel: "Long",
+      meta: "Thorough",
+      title: "Build deeper confidence now",
+      description: "Broader, deeper discovery with repeated ceiling validations. It uses more GPU time and heat, and can reject a marginal point but never widen it.",
+    },
+  ];
+  const selectedMode = $derived(forgeModes.find((mode) => mode.id === forgeMode) ?? forgeModes[1]);
+
+  function selectMode(mode) {
+    if (needsAttention || powerRunning) return;
+    onForgeModeChange?.(mode);
+    modePicker?.removeAttribute("open");
+  }
+
+  function startSelectedMode() {
+    onStartPower?.(forgeMode);
+  }
+
+  function handlePickerKeydown(event) {
+    if (event.key === "Escape" && modePicker?.open) {
+      event.preventDefault();
+      modePicker.open = false;
+      modePicker.querySelector("summary")?.focus();
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const items = Array.from(modePicker?.querySelectorAll(".mode-item") ?? []);
+    if (!modePicker.open) modePicker.open = true;
+    const current = items.indexOf(document.activeElement);
+    const next =
+      current < 0 ? (["ArrowUp", "End"].includes(event.key) ? items.length - 1 : 0) :
+      event.key === "Home" ? 0 :
+      event.key === "End" ? items.length - 1 :
+      event.key === "ArrowDown" ? (current + 1) % items.length :
+      (current - 1 + items.length) % items.length;
+    queueMicrotask(() => items[next]?.focus());
+  }
+
+  function dismissPicker(node) {
+    const dismiss = (event) => {
+      if (!node.contains(event.target)) modePicker?.removeAttribute("open");
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("focusin", dismiss);
+    return {
+      destroy() {
+        document.removeEventListener("pointerdown", dismiss);
+        document.removeEventListener("focusin", dismiss);
+      },
+    };
+  }
 </script>
 
 <section class="next-action">
@@ -59,10 +134,47 @@
   {:else if needsAttention}
     <StatusBadge label="Review Safety" variant="attention" symbol="attention" />
   {:else}
-    <button class="btn go" onclick={onStartPower}>
-      <Play size={15} strokeWidth={1.9} />
-      <span>{primaryLabel}</span>
-    </button>
+    <div class="action-group" use:dismissPicker>
+      <button class="btn action-primary" onclick={startSelectedMode}>
+        <Play size={15} strokeWidth={1.9} />
+        <span>{primaryLabel}</span>
+      </button>
+      <details
+        class="mode-picker"
+        bind:this={modePicker}
+      >
+        <summary
+          class="mode-summary"
+          aria-label={`Select forge mode. Current mode: ${selectedMode.label}`}
+          title={`${selectedMode.title}. ${selectedMode.description}`}
+          onkeydown={handlePickerKeydown}
+        >
+          <span>{selectedMode.summaryLabel}</span>
+          <ChevronDown size={14} strokeWidth={2} />
+        </summary>
+        <div class="mode-menu" role="menu" tabindex="-1" onkeydown={handlePickerKeydown}>
+          {#each forgeModes as mode}
+            <button
+              type="button"
+              class="mode-item"
+              class:selected={forgeMode === mode.id}
+              role="menuitemradio"
+              aria-checked={forgeMode === mode.id}
+              onclick={() => selectMode(mode.id)}
+            >
+              <span class="mode-copy">
+                <strong>{mode.label}<small>{mode.meta}</small></strong>
+                <span>{mode.title}</span>
+              </span>
+              <span class="mode-check" class:visible={forgeMode === mode.id}>
+                <Check size={14} strokeWidth={2.1} />
+              </span>
+            </button>
+          {/each}
+          <p class="mode-safety">Supervised and fail-closed · Nothing is auto-applied</p>
+        </div>
+      </details>
+    </div>
   {/if}
 
   {#if !hasProfiles && !applied?.core && !powerRunning}
@@ -129,15 +241,148 @@
     color: var(--text);
     white-space: nowrap;
   }
-  .btn.go {
-    background: rgba(214, 168, 93, 0.13);
-    color: var(--forge-gold);
-    border-color: rgba(214, 168, 93, 0.42);
-  }
   .btn.stop {
     background: rgba(191, 97, 106, 0.16);
     color: #f3b9bd;
     border-color: rgba(191, 97, 106, 0.45);
+  }
+  .action-group {
+    display: inline-grid;
+    grid-template-columns: auto auto;
+    border-radius: 10px;
+    box-shadow:
+      0 0 0 1px rgba(214, 168, 93, 0.42),
+      0 8px 20px rgba(0, 0, 0, 0.16);
+  }
+  .action-group .btn {
+    min-height: 2.5rem;
+    border: 0;
+    padding-inline: 0.82rem;
+    background: rgba(214, 168, 93, 0.13);
+  }
+  .action-primary {
+    border-radius: 9px 0 0 9px;
+    color: var(--forge-gold);
+  }
+  .action-primary :global(svg) {
+    margin-left: 1px;
+  }
+  .mode-picker {
+    position: relative;
+  }
+  .mode-summary {
+    display: flex;
+    justify-content: center;
+    min-width: 3.25rem;
+    min-height: 2.5rem;
+    align-items: center;
+    gap: 0.22rem;
+    border-left: 1px solid rgba(214, 168, 93, 0.28);
+    border-radius: 0 9px 9px 0;
+    padding: 0.5rem;
+    background: rgba(214, 168, 93, 0.13);
+    color: var(--forge-text);
+    font-size: 0.72rem;
+    font-weight: 700;
+    cursor: pointer;
+    list-style: none;
+    transition-property: background-color, color;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
+  }
+  .mode-summary::-webkit-details-marker {
+    display: none;
+  }
+  .mode-summary:hover,
+  .mode-picker[open] .mode-summary {
+    background: rgba(214, 168, 93, 0.19);
+  }
+  .mode-summary :global(svg) {
+    transition: rotate 150ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  .mode-picker[open] .mode-summary :global(svg) {
+    rotate: 180deg;
+  }
+  .mode-menu {
+    position: absolute;
+    z-index: 10;
+    top: calc(100% + 0.45rem);
+    right: 0;
+    width: 19rem;
+    border-radius: 12px;
+    padding: 4px;
+    background: rgba(14, 19, 27, 0.98);
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.09),
+      0 18px 42px rgba(0, 0, 0, 0.42);
+  }
+  .mode-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.6rem;
+    width: 100%;
+    min-height: 3.1rem;
+    border: 0;
+    border-radius: 8px;
+    padding: 0.52rem 0.62rem;
+    text-align: left;
+    color: var(--muted);
+    background: transparent;
+    cursor: pointer;
+    transition-property: background-color, color, scale;
+    transition-duration: 150ms;
+    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  }
+  .mode-item:hover,
+  .mode-item:focus-visible {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.055);
+  }
+  .mode-item.selected {
+    color: var(--forge-gold);
+    background: rgba(214, 168, 93, 0.1);
+  }
+  .mode-copy strong,
+  .mode-copy > span {
+    display: block;
+  }
+  .mode-copy strong {
+    font-size: 0.8rem;
+  }
+  .mode-copy small {
+    margin-left: 0.36rem;
+    color: var(--nord-dim);
+    font-size: 0.58rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .mode-copy > span {
+    margin-top: 0.14rem;
+    color: var(--nord-dim);
+    font-size: 0.66rem;
+  }
+  .mode-check {
+    display: inline-flex;
+    opacity: 0;
+    scale: 0.25;
+    filter: blur(4px);
+    transition-property: opacity, scale, filter;
+    transition-duration: 200ms;
+    transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  }
+  .mode-check.visible {
+    opacity: 1;
+    scale: 1;
+    filter: blur(0);
+  }
+  .mode-safety {
+    margin: 4px 0 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+    padding: 0.48rem 0.62rem 0.42rem;
+    color: var(--nord-dim);
+    font-size: 0.65rem;
+    line-height: 1.4;
   }
   .first-run {
     grid-column: 1 / -1;
@@ -185,6 +430,14 @@
     }
     .step-chips {
       grid-template-columns: 1fr;
+    }
+    .action-group {
+      justify-self: start;
+    }
+    .mode-menu {
+      right: auto;
+      left: 0;
+      width: min(19rem, calc(100vw - 3rem));
     }
   }
 </style>
