@@ -676,6 +676,35 @@ wired" noted in the 2026-06-23 entry — delivered as a bounded MODE, not a free
 
 
 
+\## Backend → Frontend (2026-06-27): forge button is now F2 undervolt; Apply is REFUSED in Phase 1
+
+The forge button's backend method PIVOTED from F1 flatten-down to \*\*F2 anchored undervolt\*\*. Reason:
+the RTX 3060 Ti is power-bound (pinned at its 200 W limit), and F1 flatten-down cannot lower power on
+a power-bound card. F2 holds the clock at a lower voltage and drops power directly (proven −43 W at the
+same clock). F2 produces REAL differentiated Godforge / Brokkr's / Deep Calm profiles.
+
+\- \*\*No IPC method changes.\*\* `StartPowerSweep` / `StartPowerSweepFast` / `StartPowerSweepLong`,
+&#x20; `GetPowerSweepProgress`, and `ApplyPowerGodforge` / `ApplyPowerBrokkrs` / `ApplyPowerDeepCalm`
+&#x20; are all unchanged in name/shape. The forge button keeps using exactly these.
+
+\- \*\*New additive field\*\*: `PowerSweepProgress.is_undervolt: bool` (`#[serde(default)]`, false on legacy /
+&#x20; pre-pivot payloads). `true` means the current forge result is an F2 undervolt profile.
+
+\- \*\*Apply is GATED in Phase 1\*\*: when `is_undervolt == true`, the three `ApplyPower*` requests RETURN A
+&#x20; FAILURE — `"F2 undervolt apply not yet wired (Phase 2) — profile discovered but not applicable"`.
+&#x20; The profiles are DISCOVERED + persisted and safe to display, but cannot be applied yet (the F2 apply
+&#x20; path lands in Phase 2). Until then the UI should, when `is_undervolt` is true:
+&#x20; surface the 3 profiles as DISCOVERED, and either hide/disable the Apply action or show a clear
+&#x20; "apply coming soon (Phase 2)" state instead of letting Apply fail silently.
+
+\- \*\*Legacy F1 unchanged\*\*: with `is_undervolt == false` (old `real_sweep`/F1 payloads), Apply behaves
+&#x20; exactly as before. This is additive + backward-compatible; no migration needed.
+
+\- \*\*Migration / compatibility\*\*: additive field only; no renames/removals. Backend does not edit
+&#x20; `apps/ui/**`. Rationale + phased plan: `decisions.md` top entry ("FORGE PIVOTS TO F2 UNDERVOLT").
+
+
+
 (No other active backend → frontend requests)
 
 

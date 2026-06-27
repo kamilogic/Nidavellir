@@ -1,12 +1,12 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-27: FORGE PIVOTING TO F2 UNDERVOLT (the button's F1
-flatten-down can't differentiate this power-bound card; F2 can, proven −43 W). Branch synced to
-`origin/master` (`e60a6f7`). Phase 1 (F2 forge entry) IN PROGRESS — see top checkpoint + `decisions.md`
-top entry for the full rationale + phased plan. Deep NvAPI struct details live in
-`~/.claude/.../memory/gpu-forge-real-v031.md`.
+How to pick this up cold. State as of 2026-06-27: FORGE PIVOTED TO F2 UNDERVOLT (the button's F1
+flatten-down can't differentiate this power-bound card; F2 can, proven −43 W). **Phase 1 DONE + pushed**
+(`e4bd006` code, `53597c6` plan, contract note for Codex) — the button now runs F2 (measure/synthesize/
+persist; apply GATED). **NEXT = Phase 2 (F2 apply path)**. See `decisions.md` top entry for the full
+rationale + phased plan. Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-27) — FORGE → F2 UNDERVOLT pivot; Phase 1 (F2 forge entry) in progress
+## Latest backend checkpoint (2026-06-27) — FORGE → F2 UNDERVOLT pivot; Phase 1 DONE (e4bd006, pushed); next = Phase 2
 - **Why**: 2 supervised HW runs proved the live button's F1 multi-clock forge COLLAPSES on the RTX 3060 Ti —
   it's pinned at 200 W, and F1 flatten-down can't lower power on a power-bound card (lowering a frequency
   ceiling does nothing when already power-capped). F2 anchored undervolt CAN: 1800 MHz @ 875 mV = 157 W vs
@@ -21,12 +21,21 @@ top entry for the full rationale + phased plan. Deep NvAPI struct details live i
 - **F2 brings learning/memory F1 lacked**: observation store records every sweep across runs; learned_frontier
   accumulates; descent resumes from deepest validated; confidence grows with validations (resolves the Option-A
   IDLE gap).
-- **Phase 1 (THIS work)**: a new F2 forge entry (`measure_multiclock_undervolt_forge`) that drives the F2
-  ladder/motor over a few hardware-relative clocks → records observations → learned_frontier → frontier_to_points
-  → synthesize_forge_profiles → 3 differentiated profiles → validate each pick → persist `forge_state.json`. Apply
-  stays GATED for F2 profiles (today's apply does F1 flatten-down — wrong for undervolt). No hardware run yet.
-- **Phase 2** (next): wire the F2 writer into the Apply IPC (Safe Loop arm/verify/persist/reapply-on-boot) — own
-  audit + HW run. **Phase 3**: fold Fast/Long modes into F2 depth, reapply-on-boot, UI contract, retire F1 button.
+- **Phase 1 — DONE + pushed (`e4bd006`)**: `measure_multiclock_undervolt_forge` (gpu_power_sweep.rs:4100)
+  drives the F2 motor per clock via `run_confirmed_f2_clock_descent` (gpu_undervolt.rs:2863, reuses the motor
+  unchanged) → `learned_frontier` → `frontier_to_points` → `synthesize_forge_profiles` → 3 profiles → persist.
+  Button routed via `start_with_mode` (gpu_power_sweep.rs:253). Apply GATED: additive `is_undervolt` flag
+  (ipc.rs) + `refuse_undervolt_apply` (ipc_server.rs:384) in all 3 ApplyPower* handlers. F1 `run_power_sweep`
+  kept `#[allow(dead_code)]`. Mode → clock breadth only. Verified: tests core 61 / nvapi 38 / service 296;
+  safety audit GO; reset-on-every-path; no auto-apply. Contract note for Codex added (button is F2, apply
+  refused in Phase 1). **NOT hardware-tested** — a supervised button run on the rig is safe (apply gated) and
+  is the recommended first check next session.
+- **Phase 2 (NEXT — start here)**: wire the F2 writer `apply_bounded_anchored_positive_offset` (gpu-nvapi,
+  today called only from gpu_undervolt.rs:1792) into the Apply IPC (`apply_power_profile`/`apply_core` route
+  F2 picks to the anchored-offset writer instead of the F1 `apply_vf_ceiling`), with Safe Loop arm/verify/
+  persist/reapply-on-boot; then flip `refuse_undervolt_apply` to allow F2. RISKIEST piece → own safety audit +
+  supervised HW run before shipping. **Phase 3**: fold Fast/Long modes into F2 depth, reapply-on-boot, retire
+  F1 button path.
 - **Git note**: abandoned F1 knee-seeking commit `cc8710a` dropped (F1-specific, moot under F2; reflog-recoverable
   in the diagnosis worktree). The F2-pivot decision/plan is re-recorded here + `decisions.md` (the diagnosis
   session's local plan commit `02e07c2` was not pushed; its substance is preserved here).
