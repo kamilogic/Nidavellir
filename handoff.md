@@ -1,10 +1,37 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-26: BUTTON MODES (Fast/Standard/Long) committed (`3c82e96`)
-+ pushed to master on top of Option A (`ba48c7c`); one supervised hardware test of the button is still
-pending. Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+How to pick this up cold. State as of 2026-06-27: FORGE PIVOTING TO F2 UNDERVOLT (the button's F1
+flatten-down can't differentiate this power-bound card; F2 can, proven −43 W). Branch synced to
+`origin/master` (`e60a6f7`). Phase 1 (F2 forge entry) IN PROGRESS — see top checkpoint + `decisions.md`
+top entry for the full rationale + phased plan. Deep NvAPI struct details live in
+`~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-26) — F1b BUTTON MODES (Fast / Standard / Long) — committed 3c82e96 + pushed; HW test pending
+## Latest backend checkpoint (2026-06-27) — FORGE → F2 UNDERVOLT pivot; Phase 1 (F2 forge entry) in progress
+- **Why**: 2 supervised HW runs proved the live button's F1 multi-clock forge COLLAPSES on the RTX 3060 Ti —
+  it's pinned at 200 W, and F1 flatten-down can't lower power on a power-bound card (lowering a frequency
+  ceiling does nothing when already power-capped). F2 anchored undervolt CAN: 1800 MHz @ 875 mV = 157 W vs
+  200 W (−43 W, same clock). Operator call: forge's PRIMARY method pivots to F2. Full rationale + the verified
+  gap analysis = top entry of `decisions.md`.
+- **Reuse map (don't reinvent)**: motor `run_confirmed_f2_multi_step` (gpu_undervolt.rs:1362); ladder
+  `run_anchored_ladder_sweep` (gpu_undervolt.rs:2657); synthesis bridge `learned_frontier` →
+  `frontier_to_points`/`to_power_sweep_point` (f2_observation.rs:371/394) → `synthesize_forge_profiles`
+  (gpu_power_sweep.rs:1284); persist `save_forge_state` (gpu_power_sweep.rs:340). F2 writer for Phase 2 apply:
+  `apply_bounded_anchored_positive_offset` (gpu-nvapi). The GAP: F2 wired only to the CLI (gpu_undervolt.rs:1792);
+  the button (`run_power_sweep`:3811) + Apply IPC (`apply_core`→`apply_vf_ceiling`, gpu_apply.rs:99) are F1.
+- **F2 brings learning/memory F1 lacked**: observation store records every sweep across runs; learned_frontier
+  accumulates; descent resumes from deepest validated; confidence grows with validations (resolves the Option-A
+  IDLE gap).
+- **Phase 1 (THIS work)**: a new F2 forge entry (`measure_multiclock_undervolt_forge`) that drives the F2
+  ladder/motor over a few hardware-relative clocks → records observations → learned_frontier → frontier_to_points
+  → synthesize_forge_profiles → 3 differentiated profiles → validate each pick → persist `forge_state.json`. Apply
+  stays GATED for F2 profiles (today's apply does F1 flatten-down — wrong for undervolt). No hardware run yet.
+- **Phase 2** (next): wire the F2 writer into the Apply IPC (Safe Loop arm/verify/persist/reapply-on-boot) — own
+  audit + HW run. **Phase 3**: fold Fast/Long modes into F2 depth, reapply-on-boot, UI contract, retire F1 button.
+- **Git note**: abandoned F1 knee-seeking commit `cc8710a` dropped (F1-specific, moot under F2; reflog-recoverable
+  in the diagnosis worktree). The F2-pivot decision/plan is re-recorded here + `decisions.md` (the diagnosis
+  session's local plan commit `02e07c2` was not pushed; its substance is preserved here).
+
+## Earlier backend checkpoint (2026-06-26) — F1b BUTTON MODES (Fast / Standard / Long) — committed 3c82e96 + pushed; HW test pending
 - **What**: DEFERRED #1 from the Option-A checkpoint — the live power-sweep button gains TWO new modes
   around the proven Standard run. FAST = quick discovery (fewer probes, shallower); LONG = broader+deeper
   discovery + repeated per-pick ceiling soaks (confidence built in ONE session, no IDLE wait). The

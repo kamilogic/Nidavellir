@@ -2,6 +2,49 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## FORGE PIVOTS TO F2 UNDERVOLT — F1 flatten-down cannot differentiate a power-bound card; F2 can (proven −43 W) (2026-06-27)
+- **HW finding (2 supervised runs, RTX 3060 Ti)**: the live button's F1 multi-clock forge (Option A +
+  knee-seeking) COLLAPSES on this card. The card is hard-pinned at its **200 W power limit**; F1 flatten-down
+  only caps FREQUENCY at/above a voltage ceiling, but the card runs at ~990 mV — below every ceiling placed —
+  so lowering the ceiling 1150→1031 mV changed NOTHING: every frontier point stayed `pcf=1.000`, ~200 W,
+  ~1790–1808 MHz. Phase-B knee-seeking descended 17 probes to 1031 mV and hit a `LiveMismatch` →
+  `SoftUnverified` just shy of the knee. **Not a budget bug** — physics: lowering a frequency ceiling cannot
+  lower power when the card is already at its power limit. Clean exit: no TDR/crash, GPU reset to stock,
+  nothing persisted.
+- **Decision (operator call)**: the forge's PRIMARY method becomes **F2 anchored undervolt**, not F1
+  flatten-down. F2 holds the clock at a LOWER VOLTAGE and drops power directly — proven on THIS exact GPU:
+  **1800 MHz @ 875 mV = 157 W vs the 200 W power-bound point (−43 W, same clock)** — a real Godforge/Brokkr's/
+  Deep Calm spread. F1 stays valid only for cards where it CAN differentiate (not power-bound).
+- **Not a rebuild — F2 building blocks exist + HW-proven (reuse, don't reinvent)**:
+  - motor: `run_confirmed_f2_multi_step` (gpu_undervolt.rs:1362) — anchored write→verify→dwell→reset→clear
+  - ladder: `run_anchored_ladder_sweep` (gpu_undervolt.rs:2657) — descend voltage per clock for min-stable
+  - synthesis bridge: `learned_frontier` → `frontier_to_points`/`to_power_sweep_point` (f2_observation.rs:371/394)
+    → the SAME `synthesize_forge_profiles` (gpu_power_sweep.rs:1284) the button already uses
+  - F2 writer (Phase 2 apply): `apply_bounded_anchored_positive_offset` (gpu-nvapi)
+- **The real GAP (verified)**: F2 is wired ONLY to the CLI `undervolt-probe` — the F2 writer is called from a
+  SINGLE site (gpu_undervolt.rs:1792, the CLI motor). The BUTTON runs F1 (`run_power_sweep`→build_frontier), and
+  the Apply IPC (`ApplyPowerGodforge/Brokkrs` → `apply_power_profile` → `apply_core`) writes **F1**
+  `apply_vf_ceiling` (gpu_apply.rs:99). So F2 was finalized as a CLI CAPABILITY but NEVER wired into the
+  button or the apply path. The missing work is WIRING, not rebuilding.
+- **Big plus — F2 brings the cross-run LEARNING/MEMORY F1 lacked**: the F2 observation store
+  (`f2_observations.jsonl`) records every sweep candidate across runs; `learned_frontier` (last_good/first_bad/
+  bracket per clock) accumulates; the descent resumes from the deepest prior VALIDATED point; confidence grows
+  with `validations_at_best` (and the `--validation-passes` opt-in / future IDLE). This RESOLVES the IDLE-learning
+  gap flagged in Option A (F1 was per-run telemetry only).
+- **Phased plan (each HW-validated before the next)**:
+  - **Phase 1 (in progress)** — `measure_multiclock_undervolt_forge`: reuse the F2 ladder/motor over a few
+    hardware-relative candidate clocks → records observations → `learned_frontier` → `frontier_to_points` →
+    `synthesize_forge_profiles` → 3 differentiated profiles → validate each pick → persist `forge_state.json`.
+    Apply stays GATED/refused for F2 profiles (today's apply does F1 flatten-down — wrong for undervolt). Safe,
+    self-contained: the UI shows real differentiated profiles.
+  - **Phase 2** — F2 apply path: wire `apply_bounded_anchored_positive_offset` into the Apply IPC (Safe Loop
+    arm/verify/persist/reapply-on-boot). Riskiest piece → own safety audit + HW run.
+  - **Phase 3** — polish: fold Fast/Long modes into F2 depth, reapply-on-boot, UI-contract update, retire/repurpose
+    the F1 button path.
+- **Git**: branch synced to `origin/master` (`e60a6f7` = Codex UI + Fast/Long modes `3c82e96`). The abandoned F1
+  knee-seeking commit (`cc8710a`, F1-specific, moot under F2) was dropped in the diagnosis session (reflog-
+  recoverable there); nothing of value lost — the modes are on master and the insight is recorded here.
+
 ## F1b live-forge BUTTON MODES — Fast / Standard / Long; Standard byte-identical; `validation_passes` delivered as a bounded MODE (2026-06-26)
 - **What**: implemented DEFERRED #1 (two button modes) for the live multi-clock forge. Three modes around
   the proven button — FAST (quick discovery), STANDARD (unchanged default), LONG (everything up-front).
