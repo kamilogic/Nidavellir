@@ -319,6 +319,28 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                 IpcResponse::failure("Power sweep already running")
             }
         }
+        IpcRequest::StartPowerSweepFast => {
+            let store = guard.safe_store.clone();
+            if guard
+                .power_sweep
+                .start_with_mode(store, crate::gpu_power_sweep::PowerSweepMode::Fast)
+            {
+                IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
+            } else {
+                IpcResponse::failure("Power sweep already running")
+            }
+        }
+        IpcRequest::StartPowerSweepLong => {
+            let store = guard.safe_store.clone();
+            if guard
+                .power_sweep
+                .start_with_mode(store, crate::gpu_power_sweep::PowerSweepMode::Long)
+            {
+                IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
+            } else {
+                IpcResponse::failure("Power sweep already running")
+            }
+        }
         IpcRequest::StopPowerSweep => {
             guard.power_sweep.stop();
             IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))

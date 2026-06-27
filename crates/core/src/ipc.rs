@@ -40,6 +40,12 @@ pub enum IpcRequest {
     StopBenchmark,
     GetBenchmarkProgress,
     StartPowerSweep,
+    /// Quick-discovery variant of `StartPowerSweep` (FAST mode): fewer discovery probes / shallower
+    /// per-target depth, one ceiling soak per pick. Additive — `StartPowerSweep` keeps its behavior.
+    StartPowerSweepFast,
+    /// Everything-up-front variant of `StartPowerSweep` (LONG mode): broader + deeper discovery and
+    /// repeated ceiling soaks per pick (confidence built in one session). Additive.
+    StartPowerSweepLong,
     StopPowerSweep,
     GetPowerSweepProgress,
     ApplyPowerGodforge,
