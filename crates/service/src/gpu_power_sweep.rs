@@ -164,6 +164,47 @@ fn idle() -> PowerSweepProgress {
     PowerSweepProgress { phase: "idle".into(), ..Default::default() }
 }
 
+/// Live power-sweep BUTTON mode. Selects how aggressively the multi-clock forge measures and how many
+/// times each pick is re-soaked at its ceiling. `Standard` is the proven default exercised by the
+/// plain `StartPowerSweep` IPC (behavior UNCHANGED). `Fast` trims DISCOVERY only — fewer probes /
+/// shallower depth — for a quicker supervised run, leaving cross-run confidence to IDLE / later manual
+/// runs. `Long` widens + deepens discovery AND repeats the per-pick ceiling soak so a deep point earns
+/// confidence in a SINGLE session. INVARIANT: the per-pick fail-closed ceiling soak
+/// (`validate_pick_at_ceiling`, ~35 s arduous duration) runs at least once in EVERY mode — modes never
+/// weaken that safety floor, never auto-apply, and never persist except on a usable profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PowerSweepMode {
+    Fast,
+    #[default]
+    Standard,
+    Long,
+}
+
+impl PowerSweepMode {
+    /// Human label for the UI-facing note / logs.
+    #[cfg(windows)]
+    fn label(self) -> &'static str {
+        match self {
+            PowerSweepMode::Fast => "rápida",
+            PowerSweepMode::Standard => "padrão",
+            PowerSweepMode::Long => "longa",
+        }
+    }
+    /// Mode tuning knobs `(max_probes, max_probes_per_target, validation_passes)`. These are
+    /// hardware-relative PROBE counts (not fixed MHz); the per-probe verifier/dwell/Safe-Loop guards
+    /// inside the shared core remain the safety net regardless of these values.
+    #[cfg(windows)]
+    fn tuning(self) -> (u32, u32, u32) {
+        match self {
+            PowerSweepMode::Fast => (FAST_MAX_PROBES, FAST_MAX_PROBES_PER_TARGET, 1),
+            PowerSweepMode::Standard => (BUTTON_MAX_PROBES, BUTTON_MAX_PROBES_PER_TARGET, 1),
+            PowerSweepMode::Long => {
+                (LONG_MAX_PROBES, LONG_MAX_PROBES_PER_TARGET, LONG_VALIDATION_PASSES)
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PowerSweepHandle {
     progress: Arc<Mutex<PowerSweepProgress>>,
@@ -188,7 +229,15 @@ impl PowerSweepHandle {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
+    /// Start the live multi-clock forge in the proven `Standard` mode (the plain `StartPowerSweep`
+    /// IPC). Behavior is unchanged from before button modes existed.
     pub fn start(&self, store: SafeLoopStore) -> bool {
+        self.start_with_mode(store, PowerSweepMode::Standard)
+    }
+    /// Start the live multi-clock forge in a specific button `mode` (Fast / Standard / Long). All
+    /// modes run the same supervised, fail-closed core; the mode only varies discovery breadth/depth
+    /// and per-pick ceiling-soak passes (see [`PowerSweepMode`]).
+    pub fn start_with_mode(&self, store: SafeLoopStore, mode: PowerSweepMode) -> bool {
         if self.running.swap(true, Ordering::SeqCst) {
             return false;
         }
@@ -198,10 +247,10 @@ impl PowerSweepHandle {
         let running = Arc::clone(&self.running);
         std::thread::spawn(move || {
             #[cfg(windows)]
-            run_power_sweep(progress, stop, store);
+            run_power_sweep(progress, stop, store, mode);
             #[cfg(not(windows))]
             {
-                let _ = (&progress, &stop, &store);
+                let _ = (&progress, &stop, &store, mode);
             }
             running.store(false, Ordering::SeqCst);
         });
@@ -2585,6 +2634,28 @@ const FRONTIER_PHASE_B_PROBES: u32 = 12;
 const BUTTON_MAX_PROBES: u32 = 24;
 #[cfg(windows)]
 const BUTTON_MAX_PROBES_PER_TARGET: u32 = 3;
+/// FAST button mode: trimmed discovery (~half of `BUTTON_MAX_PROBES`, one bin shallower per target)
+/// for a quicker supervised run. Reaches fewer clocks; each surviving pick STILL gets one full
+/// fail-closed ceiling soak. Cross-run confidence is intentionally left to IDLE / later manual runs.
+#[cfg(windows)]
+const FAST_MAX_PROBES: u32 = 12;
+#[cfg(windows)]
+const FAST_MAX_PROBES_PER_TARGET: u32 = 2;
+/// LONG button mode: broader (more clocks) + deeper (one extra bin/target) discovery so the three
+/// profiles can differentiate, PLUS repeated per-pick ceiling soaks (`LONG_VALIDATION_PASSES`) so a
+/// deep point earns its confidence in ONE session instead of over later runs. `LONG_MAX_PROBES`
+/// stays a hard global cap; every probe/soak is the same fail-closed verifier/dwell/Safe-Loop motor.
+#[cfg(windows)]
+const LONG_MAX_PROBES: u32 = 40;
+#[cfg(windows)]
+const LONG_MAX_PROBES_PER_TARGET: u32 = 4;
+/// LONG mode: re-soak each pick at its DISCOVERED ceiling this many times before accepting it. Any
+/// non-Stable pass DROPS the pick (fail-closed) — extra passes can only reject, never widen exposure.
+#[cfg(windows)]
+const LONG_VALIDATION_PASSES: u32 = 3;
+/// Defensive hard cap on per-pick ceiling-soak passes (mode values stay well below this).
+#[cfg(windows)]
+const POWER_SWEEP_MAX_VALIDATION_PASSES: u32 = 5;
 
 // ── Phase 2B.2-b.3: graphics-core SANITY-DOMAIN guards ──────────────────────────────
 // NOT tuning targets — only safety guards to reject non-core / memory-domain / implausible
@@ -3699,16 +3770,54 @@ fn validate_pick_at_ceiling(
     }
 }
 
+/// Run the fail-closed ceiling soak (`validate_pick_at_ceiling`) `passes` times for ONE pick. The
+/// caller has already locked the pick's clock. Each pass independently arms → applies → verifies →
+/// soaks → resets at the discovered ceiling; ANY non-Stable pass DROPS the pick (`None`). Extra
+/// passes (LONG mode) only let a deep point ACCUMULATE in-session confirmations — they can never
+/// widen exposure or rescue a failed pass. `passes == 1` is exactly the single-soak Fast/Standard
+/// behavior. A mid-run stop keeps the last good pick (no further soaks).
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn validate_pick_ceiling_passes(
+    store: &SafeLoopStore,
+    clk: u32,
+    pick: PowerSweepPoint,
+    stop: &Arc<AtomicBool>,
+    label: &str,
+    progress: &Arc<Mutex<PowerSweepProgress>>,
+    prog: &mut PowerSweepProgress,
+    passes: u32,
+) -> Option<PowerSweepPoint> {
+    let mut current = pick;
+    for pass in 1..=passes {
+        if stop.load(Ordering::SeqCst) {
+            return Some(current);
+        }
+        if passes > 1 {
+            prog.log.push(format!(
+                "Validação árdua {label}: passagem {pass}/{passes} (confiança em sessão)…"
+            ));
+            set(progress, prog.clone());
+        }
+        match validate_pick_at_ceiling(store, clk, current, stop, label, progress, prog) {
+            Some(p) => current = p,
+            None => return None, // fail-closed: any failed pass drops the pick
+        }
+    }
+    Some(current)
+}
+
 #[cfg(windows)]
 fn run_power_sweep(
     progress: Arc<Mutex<PowerSweepProgress>>,
     stop: Arc<AtomicBool>,
     store: SafeLoopStore,
+    mode: PowerSweepMode,
 ) {
     use nidavellir_gpu_nvapi as gpu;
     use nidavellir_gpu_stress::GpuCtx;
 
-    info!("Power sweep starting (voltage → max-stable-clock → power)");
+    info!("Power sweep starting (voltage → max-stable-clock → power) — mode {}", mode.label());
     let mut prog = idle();
     prog.running = true;
     prog.phase = "power".into();
@@ -3718,7 +3827,8 @@ fn run_power_sweep(
         .and_then(|r| r.power_limit_w)
         .unwrap_or(0.0);
     prog.log.push(format!(
-        "Power sweep — cap {:.0} W. Mapeando tensão → clock estável → potência…",
+        "Power sweep ({}) — cap {:.0} W. Mapeando tensão → clock estável → potência…",
+        mode.label(),
         prog.power_limit_w
     ));
     set(&progress, prog.clone());
@@ -3743,16 +3853,20 @@ fn run_power_sweep(
         .map(|c| c.name)
         .unwrap_or_else(|_| "unknown-gpu".into());
 
-    // BUTTON-DEFAULT multi-clock limits: bounded/quick supervised measurement with NO CLI args and
-    // NO fixed MHz — everything stays hardware-relative (candidate clocks + real VF bins are derived
-    // from the live curve inside `measure_multiclock_forge`). The per-target depth cap turns on the
-    // coverage-bounded scheduler (reach several clocks before deepening one) so the three profiles can
-    // differentiate; the global probe cap bounds total dwell time. Knee-seeking and warm-start stay
-    // OFF (default) to keep the live run conservative and predictable.
+    // BUTTON multi-clock limits: bounded supervised measurement with NO CLI args and NO fixed MHz —
+    // everything stays hardware-relative (candidate clocks + real VF bins are derived from the live
+    // curve inside `measure_multiclock_forge`). The per-target depth cap turns on the coverage-bounded
+    // scheduler (reach several clocks before deepening one) so the three profiles can differentiate;
+    // the global probe cap bounds total dwell time. The probe/depth caps come from the selected MODE
+    // (Fast = trimmed, Standard = the proven default, Long = broader+deeper); `validation_passes` sets
+    // how many times each pick is re-soaked at its ceiling. Knee-seeking and warm-start stay OFF
+    // (default) in all modes to keep the live run conservative and predictable.
+    let (max_probes, max_probes_per_target, validation_passes) = mode.tuning();
+    let validation_passes = validation_passes.clamp(1, POWER_SWEEP_MAX_VALIDATION_PASSES);
     let limits = FrontierLimits {
         max_targets: None,
-        max_probes: Some(BUTTON_MAX_PROBES),
-        max_probes_per_target: Some(BUTTON_MAX_PROBES_PER_TARGET),
+        max_probes: Some(max_probes),
+        max_probes_per_target: Some(max_probes_per_target),
         safe_start_cap_mv: None,
         warm_start_brackets: false,
         bind_seeking: false,
@@ -3787,8 +3901,14 @@ fn run_power_sweep(
 
     let detected = result.detected_clock_mhz;
     prog.stock_clock_mhz = detected;
+    let val_note = if validation_passes > 1 {
+        format!(", validação {validation_passes}× por perfil")
+    } else {
+        String::new()
+    };
     prog.note = Some(format!(
-        "Forja multi-clock — ~{} s estimados (cap {cap:.0} W, clock base ~{detected} MHz).",
+        "Forja multi-clock ({}) — ~{} s estimados (cap {cap:.0} W, clock base ~{detected} MHz{val_note}).",
+        mode.label(),
         result.est_wall_s
     ));
     prog.log.push(format!(
@@ -3848,7 +3968,11 @@ fn run_power_sweep(
         let _ = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(clk);
         let validated = if p.vf_table_voltage_mv.is_some() {
             // Multi-clock pick: long soak AT THE DISCOVERED CEILING (mirrors the real probe write).
-            validate_pick_at_ceiling(&store, clk, p, &stop, label, &progress, &mut prog)
+            // LONG mode repeats the soak (`validation_passes`) so a deep point earns in-session
+            // confidence; Fast/Standard run a single pass. Any failed pass drops the pick (fail-closed).
+            validate_pick_ceiling_passes(
+                &store, clk, p, &stop, label, &progress, &mut prog, validation_passes,
+            )
         } else {
             // Legacy / single-clock fallback: offset-based long soak + back-off within this clock.
             let same_clock: Vec<PowerSweepPoint> = match p.target_clock_mhz {
@@ -3915,6 +4039,31 @@ mod tests {
         assert!((fifty - 0.93).abs() < 0.01, "50/50 ≈ 0.93, got {fifty}");
         // A failure must drag confidence below a perfect record of the same size.
         assert!(wilson_lower_bound(9, 10, 1.96) < wilson_lower_bound(10, 10, 1.96));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn power_sweep_mode_tuning_preserves_standard_and_bounds_fast_long() {
+        // INVARIANT: Standard stays byte-identical to the pre-modes (proven, HW-validated) button —
+        // same probe/depth caps and a single ceiling soak. The plain `StartPowerSweep` maps here.
+        assert_eq!(PowerSweepMode::default(), PowerSweepMode::Standard);
+        assert_eq!(
+            PowerSweepMode::Standard.tuning(),
+            (BUTTON_MAX_PROBES, BUTTON_MAX_PROBES_PER_TARGET, 1)
+        );
+        // Fast: trimmed discovery (fewer probes, no deeper than Standard), still ONE fail-closed soak.
+        let (fp, fpt, fpass) = PowerSweepMode::Fast.tuning();
+        assert!(fp < BUTTON_MAX_PROBES, "fast must reduce the global probe budget");
+        assert!(fpt <= BUTTON_MAX_PROBES_PER_TARGET, "fast must not deepen per-target descent");
+        assert_eq!(fpass, 1, "fast keeps a single ceiling soak per pick");
+        // Long: broader + deeper discovery and >1 confidence passes, within the defensive hard cap.
+        let (lp, lpt, lpass) = PowerSweepMode::Long.tuning();
+        assert!(lp > BUTTON_MAX_PROBES, "long must widen the global probe budget");
+        assert!(lpt >= BUTTON_MAX_PROBES_PER_TARGET, "long must not shrink per-target descent");
+        assert!(
+            (2..=POWER_SWEEP_MAX_VALIDATION_PASSES).contains(&lpass),
+            "long passes must exceed 1 yet stay within the defensive cap"
+        );
     }
 
     #[cfg(windows)]

@@ -1,9 +1,51 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-23, `master` clean (Option A pushed — see top
-checkpoint). Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+How to pick this up cold. State as of 2026-06-26: BUTTON MODES (Fast/Standard/Long) committed (`3c82e96`)
++ pushed to master on top of Option A (`ba48c7c`); one supervised hardware test of the button is still
+pending. Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-23) — OPTION A: live power-sweep BUTTON rewired to the multi-clock forge algorithm — pushed
+## Latest backend checkpoint (2026-06-26) — F1b BUTTON MODES (Fast / Standard / Long) — committed 3c82e96 + pushed; HW test pending
+- **What**: DEFERRED #1 from the Option-A checkpoint — the live power-sweep button gains TWO new modes
+  around the proven Standard run. FAST = quick discovery (fewer probes, shallower); LONG = broader+deeper
+  discovery + repeated per-pick ceiling soaks (confidence built in ONE session, no IDLE wait). The
+  multi-clock analogue of F2's `--validation-passes` depth knob.
+- **STATUS: committed `3c82e96` + pushed to master** — cargo check clean; `core 59 / nvapi 38 / service 293`
+  tests pass (+1 new); clippy ZERO new warnings (the two `too_many_arguments` are pre-existing
+  `build_frontier_two_phase` / `real_probe_step`). NO hardware run yet — one supervised test of the button is
+  pending (see MANUAL TEST PATH).
+- **Design — Standard is byte-identical to the just-HW-validated button** (pinned by a new test
+  `power_sweep_mode_tuning_preserves_standard_and_bounds_fast_long`): the plain `StartPowerSweep` IPC still
+  maps to `BUTTON_MAX_PROBES=24` / per-target `3` / one 35 s ceiling soak. FAST = `12 / 2 / 1` (≈half the
+  discovery). LONG = `40 / 4 / 3` (more clocks + one deeper bin + 3× ceiling soaks per pick). All knobs are
+  named consts in `gpu_power_sweep.rs` (easy to tune).
+- **Backend**: `PowerSweepMode {Fast,Standard,Long}` enum + `mode.tuning() -> (max_probes,per_target,passes)`;
+  `PowerSweepHandle::start_with_mode` (plain `start` delegates to Standard); `run_power_sweep(.., mode)` builds
+  `FrontierLimits` from the mode and loops the ceiling soak via new `validate_pick_ceiling_passes` (fail-closed
+  on ANY pass; passes clamped to `POWER_SWEEP_MAX_VALIDATION_PASSES=5`). Mode label + per-profile pass count
+  surfaced in `note`/`log` text only (no payload change).
+- **IPC (additive, backward-compatible)**: two NEW unit methods `StartPowerSweepFast` / `StartPowerSweepLong`
+  in `core/ipc.rs` + dispatch arms in `ipc_server.rs`. `StartPowerSweep` UNCHANGED (= Standard). No payload/
+  field change → no contract break. UI toggle documented for Codex in `docs/contracts/ui-backend.md` (2026-06-26
+  request), realising the `validation_passes` "IPC parameter when wired" the 2026-06-23 entry anticipated —
+  delivered as a BOUNDED mode, not a free-form integer.
+- **Safety (self-audit)**: `apply_vf_ceiling_monotone` / Safe Loop arm-clear / `reset_to_stock` / verifier /
+  the probe + soak motor are all UNTOUCHED. The per-pick fail-closed 35 s ceiling soak runs ≥1× in EVERY mode
+  (no weakening). FAST only REDUCES exposure. LONG adds MORE probes/soaks of the SAME bounded fail-closed
+  motor — a longer supervised run, no new risk class; the global `max_probes` stays a hard cap; extra passes
+  can only REJECT a marginal pick, never widen it. NO auto-apply (apply stays the separate `ApplyPower*` IPC,
+  "confirme em jogo"); persist still only when `godforge.is_some()`. An independent `nidavellir-safety-auditor`
+  pass is recommended before any confirmed LONG hardware run.
+- **Files**: `crates/core/src/ipc.rs`, `crates/service/src/{gpu_power_sweep.rs, ipc_server.rs}`,
+  `docs/contracts/ui-backend.md`.
+- **DEFERRED (unchanged)**: #2 IDLE / cross-run multi-clock confidence accumulation (operator: later).
+- **MANUAL TEST PATH (hardware, operator-present)**: send `StartPowerSweepFast` or `StartPowerSweepLong` (or
+  plain `StartPowerSweep` for Standard). Watch `note`/`log` for the mode label, `est_wall_s`, and (LONG)
+  `passagem i/N` lines. Restores stock at the end; persists `forge_state.json` only on a usable profile.
+- **TO RESUME**: code is committed + pushed; remaining = (a) one supervised hardware test of the button on the
+  test rig (confirm multi-clock button → 3 profiles → apply end-to-end; LONG also exercises multi-pass ceiling
+  validation), then (b) DEFERRED #2 (IDLE / cross-run). Optional independent safety audit before the HW run.
+
+## Earlier backend checkpoint (2026-06-23) — OPTION A: live power-sweep BUTTON rewired to the multi-clock forge algorithm — pushed
 - **What**: the live "forjar/refinar" button (`StartPowerSweep` → `run_power_sweep`, `crates/service/src/gpu_power_sweep.rs`)
   was SINGLE-CLOCK; it now runs the MULTI-CLOCK forge algorithm (the proven `build-frontier` core) and produces the
   3 DIFFERENTIATED profiles (Godforge / Brokkr's 95% / Deep Calm 90%) via `synthesize_forge_profiles`.

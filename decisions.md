@@ -2,6 +2,37 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F1b live-forge BUTTON MODES — Fast / Standard / Long; Standard byte-identical; `validation_passes` delivered as a bounded MODE (2026-06-26)
+- **What**: implemented DEFERRED #1 (two button modes) for the live multi-clock forge. Three modes around
+  the proven button — FAST (quick discovery), STANDARD (unchanged default), LONG (everything up-front).
+  Implemented + validated + committed (`3c82e96`, pushed to master); no hardware run yet (one supervised
+  test of the button pending).
+- **Decision — keep Standard byte-identical, ADD Fast/Long (3 modes, not a 2-mode replacement)**: the plain
+  `StartPowerSweep` still runs the exact just-HW-validated path (24 probes / per-target 3 / one 35 s ceiling
+  soak), pinned by a new test. Rationale: do NOT degrade or alter a freshly hardware-validated default;
+  additive modes are strictly safer than mutating the proven one. Alternatives rejected — replacing the
+  button with only Fast/Long would change the proven default's behavior; shortening the FAST soak would
+  weaken the per-pick safety floor (the fail-closed 35 s ceiling soak must run ≥1× in EVERY mode).
+- **Knobs (named consts; hardware-relative PROBE counts, NOT fixed MHz)**: FAST `12/2/1`, STANDARD `24/3/1`,
+  LONG `40/4/3` (max_probes / max_probes_per_target / ceiling-soak passes). Passes clamped to a defensive
+  `POWER_SWEEP_MAX_VALIDATION_PASSES=5`. LONG's repeated soak is the multi-clock analogue of F2's
+  `--validation-passes`: it lets a deep point earn in-session confidence; any failed pass DROPS the pick
+  (fail-closed), so extra passes can only REJECT, never widen exposure.
+- **IPC — additive**: two NEW unit methods `StartPowerSweepFast` / `StartPowerSweepLong`; `StartPowerSweep`
+  unchanged (= Standard). No payload/field change → no contract break. This realises the `validation_passes`
+  "IPC parameter when the Forge action is wired" the 2026-06-23 entry anticipated — delivered as a BOUNDED
+  mode rather than a free-form integer (smaller, safer surface; values can't be widened by the caller). UI
+  toggle requested from Codex in `docs/contracts/ui-backend.md`.
+- **Safety**: `apply_vf_ceiling_monotone` / Safe Loop / `reset_to_stock` / verifier / the probe+soak motor
+  all untouched; no auto-apply; persist only when `godforge.is_some()`. FAST reduces exposure; LONG is a
+  longer supervised run of the SAME bounded fail-closed motor (global `max_probes` stays the hard cap), no
+  new risk class. Recommend an independent `nidavellir-safety-auditor` pass before any confirmed LONG run.
+- **Validation**: cargo check clean; `core 59 / nvapi 38 / service 293` (+1) tests pass; clippy zero new
+  warnings. Files: `crates/core/src/ipc.rs`, `crates/service/src/{gpu_power_sweep.rs, ipc_server.rs}`,
+  `docs/contracts/ui-backend.md`.
+- **Next**: optional independent safety audit → one supervised LONG hardware run (confirm multi-pass ceiling
+  validation end-to-end) → DEFERRED #2 (IDLE / cross-run multi-clock confidence).
+
 ## F2 multi-clock profile package — Brokkr's 0.95 + descending ladder (Caminho B) + confidence opt-in; "906 vs 868" is the CONFIDENCE GATE, not a margin (2026-06-23)
 - **What**: three approved backend changes toward the v0.5 multi-clock profile frontier — implemented +
   validated + safety-audited, NOT yet committed (awaiting operator approval). No hardware run.

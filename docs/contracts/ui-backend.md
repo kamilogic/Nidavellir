@@ -568,9 +568,9 @@ Codex applied the frontend-only parts of the 2026-06-23 request:
 
 
 
-The remaining "Build confidence now" control is intentionally NOT surfaced as a non-functional
+The profile evidence remains optional and silent until the backend provides structured fields.
 
-toggle. It needs the following additive backend contract:
+The following additive backend fields are still requested:
 
 
 
@@ -586,15 +586,97 @@ toggle. It needs the following additive backend contract:
 
 &#x20; — structured synthesis result; the UI must not infer it from logs or notes.
 
-\- An additive start request that accepts `validation_passes` in `1..=20`, preserving the existing
+The start-control dependency is now delivered by the fixed Fast / Standard / Long modes documented
 
-&#x20; parameterless `StartPowerSweep` as the default-one-pass compatibility path. Once available,
+below. That bounded mode contract supersedes the earlier free-form `validation_passes` UI request;
 
-&#x20; Codex will wire the default-OFF toggle + bounded selector and send the explicit value.
+Codex should wire the three explicit start methods rather than expose a numeric pass selector.
 
 
 
-(No other active frontend requests)
+\## Frontend request (2026-06-26): Forge GPU button MODES — Fast / Standard / Long (backend → Codex)
+
+
+
+The live multi-clock forge (`StartPowerSweep`) now supports three MODES. Two NEW additive IPC methods
+
+select the non-default modes; the existing `StartPowerSweep` is UNCHANGED and means the proven
+
+\*\*Standard\*\* mode. This realises the `validation_passes` "IPC parameter when the Forge action is
+
+wired" noted in the 2026-06-23 entry — delivered as a bounded MODE, not a free-form integer.
+
+
+
+\- \*\*New IPC methods\*\* (unit methods, no params, same shape as `StartPowerSweep`):
+
+
+
+&#x20; `StartPowerSweepFast` and `StartPowerSweepLong`. Wire: `{"method":"StartPowerSweepFast"}`.
+
+&#x20; Response + progress (`GetPowerSweepProgress`) + stop (`StopPowerSweep`) + apply
+
+&#x20; (`ApplyPowerGodforge` / `ApplyPowerBrokkrs` / `ApplyPowerDeepCalm`) are all UNCHANGED.
+
+
+
+\- \*\*Expected UI\*\*: a 3-way mode selector on the Forge GPU / Refine Profiles action. Default =
+
+&#x20; \*\*Standard\*\* → keep sending the plain `StartPowerSweep` (no behavior change). \*\*Fast\*\* →
+
+&#x20; `StartPowerSweepFast`. \*\*Long\*\* → `StartPowerSweepLong`. Only the START method changes per mode;
+
+&#x20; stop / progress / apply are identical across modes.
+
+
+
+\- \*\*Mode semantics\*\* (for toggle copy / tooltips):
+
+
+
+&#x20; \*\*Fast\*\* — quicker discovery (fewer probes, shallower per-clock depth); ONE ceiling soak per
+
+&#x20; profile. Cross-run confidence is left to IDLE / later manual runs. Shortest supervised run.
+
+
+
+&#x20; \*\*Standard\*\* — today's proven, hardware-validated default. Unchanged.
+
+
+
+&#x20; \*\*Long\*\* — broader + deeper discovery AND repeated ceiling soaks per profile, so a deep point
+
+&#x20; earns its confidence in ONE session (no waiting for IDLE). Longest supervised run.
+
+
+
+\- \*\*Progress payload UNCHANGED\*\*: `PowerSweepProgress` gains NO fields. The selected mode and the
+
+&#x20; per-profile validation count appear in the `note` / `log` TEXT only (display — do NOT parse for
+
+&#x20; logic). If a structured `mode` field is wanted, request it separately (additive).
+
+
+
+\- \*\*Safety (reflect in copy)\*\*: all three modes run the SAME fail-closed supervised motor; every
+
+&#x20; applied profile is validated at its discovered ceiling at least once; NOTHING is auto-applied —
+
+&#x20; apply stays the separate `ApplyPower*` step ("confirme em jogo"). Fast only REDUCES exposure;
+
+&#x20; Long's extra passes can only REJECT a marginal pick, never widen it.
+
+
+
+\- \*\*Migration / compatibility\*\*: purely additive. `StartPowerSweep` keeps current behavior; no
+
+&#x20; payload field renames/removals. Backend does not edit `apps/ui/**`. Rationale + knob values:
+
+&#x20; `decisions.md`, `handoff.md`.
+
+
+
+(No other active backend → frontend requests)
 
 
 
