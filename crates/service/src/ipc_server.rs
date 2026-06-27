@@ -349,17 +349,45 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
         }
         IpcRequest::ApplyPowerGodforge => {
-            let pt = guard.power_sweep.progress().godforge;
-            apply_power_profile(&guard.safe_store, pt, "Godforge")
+            let prog = guard.power_sweep.progress();
+            if let Some(r) = refuse_undervolt_apply(&prog) {
+                r
+            } else {
+                apply_power_profile(&guard.safe_store, prog.godforge, "Godforge")
+            }
         }
         IpcRequest::ApplyPowerBrokkrs => {
-            let pt = guard.power_sweep.progress().brokkrs;
-            apply_power_profile(&guard.safe_store, pt, "Brokkr's Best")
+            let prog = guard.power_sweep.progress();
+            if let Some(r) = refuse_undervolt_apply(&prog) {
+                r
+            } else {
+                apply_power_profile(&guard.safe_store, prog.brokkrs, "Brokkr's Best")
+            }
         }
         IpcRequest::ApplyPowerDeepCalm => {
-            let pt = guard.power_sweep.progress().deep_calm;
-            apply_power_profile(&guard.safe_store, pt, "Deep Calm")
+            let prog = guard.power_sweep.progress();
+            if let Some(r) = refuse_undervolt_apply(&prog) {
+                r
+            } else {
+                apply_power_profile(&guard.safe_store, prog.deep_calm, "Deep Calm")
+            }
         }
+    }
+}
+
+/// Fail-closed apply GATE for F2 anchored-undervolt forge results. The Apply path writes an F1
+/// flatten-down ceiling (`apply_core` → `apply_vf_ceiling`), which is the WRONG operation for an F2
+/// undervolt point (F2 RAISES a lower-voltage bin; F1 caps frequency down). Until the dedicated F2 apply
+/// is wired (Phase 2), REFUSE the apply when the active forge produced an F2 undervolt profile. Returns
+/// `Some(refusal)` to refuse, or `None` to fall through to the legacy F1 apply (default — backward
+/// compatible: a non-undervolt or legacy/restored payload has `is_undervolt = false`).
+fn refuse_undervolt_apply(prog: &nidavellir_core::ipc::PowerSweepProgress) -> Option<IpcResponse> {
+    if prog.is_undervolt {
+        Some(IpcResponse::failure(
+            "F2 undervolt apply not yet wired (Phase 2) — profile discovered but not applicable",
+        ))
+    } else {
+        None
     }
 }
 
@@ -437,5 +465,33 @@ fn refine_cpu_max_clock(
         if mhz > cpu.base_freq_mhz {
             cpu.max_freq_mhz = mhz;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nidavellir_core::ipc::PowerSweepProgress;
+
+    #[test]
+    fn apply_gate_refuses_f2_undervolt_profiles() {
+        // An F2 undervolt forge result must REFUSE the F1 ceiling apply (Phase 2 wires the real F2
+        // apply). The refusal carries the agreed message so the UI can explain it.
+        let prog = PowerSweepProgress { is_undervolt: true, ..Default::default() };
+        let r = refuse_undervolt_apply(&prog).expect("F2 undervolt apply must be refused");
+        assert!(!r.ok);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("F2 undervolt apply not yet wired (Phase 2) — profile discovered but not applicable")
+        );
+    }
+
+    #[test]
+    fn apply_gate_passes_through_legacy_f1_profiles() {
+        // Backward-compatible: a non-undervolt (legacy F1 / restored) payload defaults `is_undervolt`
+        // to false → the gate falls through (`None`) to the unchanged F1 apply path.
+        let prog = PowerSweepProgress::default();
+        assert!(!prog.is_undervolt, "default must keep the legacy F1 apply behavior");
+        assert!(refuse_undervolt_apply(&prog).is_none());
     }
 }

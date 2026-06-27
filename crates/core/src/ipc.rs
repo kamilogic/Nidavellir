@@ -168,6 +168,14 @@ pub struct PowerSweepProgress {
     /// Stock baseline sustained clock (MHz) under the same load, for reference.
     pub stock_clock_mhz: u32,
     pub note: Option<String>,
+    /// True when the forged profiles came from the F2 ANCHORED UNDERVOLT path
+    /// (a lower-voltage operating point), NOT the F1 flatten-down ceiling. The
+    /// Apply IPC writes an F1 ceiling, which is the WRONG operation for an F2
+    /// undervolt point, so it REFUSES to apply when this is set (Phase 2 wires
+    /// the real F2 apply). Additive + backward-compatible: `default = false`
+    /// preserves the legacy F1 apply behavior for every existing payload.
+    #[serde(default)]
+    pub is_undervolt: bool,
 }
 
 /// One benchmark run's measured metrics (stock or tuned).
@@ -542,5 +550,28 @@ mod tests {
         let p: PowerSweepPoint = serde_json::from_str(legacy).unwrap();
         assert_eq!(p.target_clock_mhz, None);
         assert_eq!(p.clock_mhz, 1785);
+    }
+
+    #[test]
+    fn power_sweep_progress_is_undervolt_roundtrips() {
+        let p = PowerSweepProgress { is_undervolt: true, ..Default::default() };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: PowerSweepProgress = serde_json::from_str(&json).unwrap();
+        assert!(back.is_undervolt);
+    }
+
+    #[test]
+    fn legacy_power_sweep_progress_json_defaults_is_undervolt_false() {
+        // A payload produced before the F2 pivot has no `is_undervolt` key → defaults false, so the
+        // Apply gate falls through to the unchanged legacy F1 apply behavior (backward-compatible).
+        let legacy = r#"{
+            "running": false, "phase": "done", "log": [], "points": [],
+            "power_limit_w": 200.0, "target_w": 180.0,
+            "recommended": null, "godforge": null, "brokkrs": null, "deep_calm": null,
+            "stock_clock_mhz": 1800, "note": "ok"
+        }"#;
+        let p: PowerSweepProgress = serde_json::from_str(legacy).unwrap();
+        assert!(!p.is_undervolt, "missing key must default to legacy F1 behavior");
+        assert_eq!(p.stock_clock_mhz, 1800);
     }
 }

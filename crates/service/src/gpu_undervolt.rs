@@ -80,7 +80,7 @@ const F2_MAX_VALIDATION_PASSES: usize = 20;
 /// caps stop the descent earlier anyway — so the preview shows the full natural descent. The CONFIRMED
 /// auto-sweep stays bounded by [`F2_CONFIRMED_MAX_STEPS`] regardless (no infinite search).
 #[cfg(windows)]
-const F2_SWEEP_DRYRUN_BUDGET: usize = 6;
+pub(crate) const F2_SWEEP_DRYRUN_BUDGET: usize = 6;
 
 /// Hard cap (MHz) on the bounded POSITIVE offset for the explicit MANUAL-PRIOR development path ONLY.
 /// The default/autonomous discovery keeps the conservative +30 absolute / +15 per-step caps and NEVER
@@ -2806,6 +2806,121 @@ fn run_anchored_ladder_sweep(
          no VF write, no observation.",
         args.targets
     );
+}
+
+/// Read-only F2 forge inputs (see [`f2_forge_inputs`]). The static VF base curve sanity-filtered to
+/// plausible core points, the hardware voltage floor (lowest sane bin), the stock boost top (highest
+/// sane clock = the clock ceiling), and the CONSERVATIVE positive-offset limits.
+#[cfg(windows)]
+pub(crate) struct F2ForgeInputs {
+    pub sane_base_curve: Vec<(usize, u32, u32)>,
+    pub floor_mv: u32,
+    #[allow(dead_code)] // the clock ceiling lives inside `limits`; exposed for caller diagnostics
+    pub boost_top_mhz: u32,
+    pub limits: PositiveOffsetLimits,
+}
+
+/// Read-only F2 forge inputs derived the SAME way [`run_undervolt_probe`] derives them: the static VF
+/// base curve sanity-filtered to plausible core points, the hardware voltage floor (lowest sane bin),
+/// the stock boost top (highest sane clock = the clock ceiling), and the CONSERVATIVE positive-offset
+/// limits (`+30` absolute / `+15` per-step — NOT CLI-widenable). Returns `None` (fail-closed) when no
+/// sane static base points are available, mirroring the CLI's refusal. Pure read-only — no Safe Loop
+/// arm, no apply, no dwell, no VF write. Shared so the LIVE F2 forge button reuses the EXACT same input
+/// derivation as the CLI motor instead of duplicating it.
+#[cfg(windows)]
+pub(crate) fn f2_forge_inputs() -> Option<F2ForgeInputs> {
+    use nidavellir_gpu_nvapi as gpu;
+    let sane: Vec<(usize, u32, u32)> = gpu::read_vf_base_curve_modern()
+        .into_iter()
+        .filter(|&(_, mv, f)| is_f2_sane_point(mv, f))
+        .collect();
+    if sane.is_empty() {
+        warn!("f2-forge: no sane static VF base points available — fail closed (no hardware touched)");
+        return None;
+    }
+    let floor_mv = sane.iter().map(|&(_, mv, _)| mv).min().unwrap();
+    let boost_top = sane.iter().map(|&(_, _, f)| f).max().unwrap();
+    // Clock ceiling = stock boost top: F2 may hold an existing clock at lower voltage but NEVER
+    // overclocks above stock. Conservative offset caps (not CLI-widenable) — identical to the CLI path.
+    let limits = PositiveOffsetLimits::conservative(floor_mv, boost_top);
+    Some(F2ForgeInputs { sane_base_curve: sane, floor_mv, boost_top_mhz: boost_top, limits })
+}
+
+/// Run ONE clock's CONFIRMED F2 anchored-undervolt descent — the SAME motor sequence as the confirmed
+/// branch of [`run_anchored_ladder_sweep`], factored out so the LIVE F2 forge button reuses the proven
+/// motor without duplicating it (and without changing the CLI ladder's output). For the given target
+/// clock it: derives direction-aware descent bounds from the prior clock's last-good
+/// ([`crate::gpu_f2_sweep::ladder_target_descent_bounds`]), plans the anchored descent
+/// ([`plan_anchored_undervolt_descent`]), runs the fail-closed confirmed gate
+/// ([`confirmed_f2_multi_refusal`]), then drives the validated write→verify→dwell→reset→clear motor
+/// ([`RealF2MultiOps`] + [`run_confirmed_f2_multi_step`], capped at [`F2_CONFIRMED_MAX_STEPS`] — the
+/// per-clock safety bound is UNCHANGED), and RECORDS one observation per executed candidate
+/// ([`crate::gpu_f2_sweep::record_target_sweep`], with the Safe Loop + crash-floor guards intact). The
+/// motor resets to stock + clears the boot flag after EACH candidate. Returns the per-clock
+/// [`SweepSummary`] on a run, or `None` when the confirmed gate REFUSED (caller stops the forge).
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_confirmed_f2_clock_descent(
+    store: &SafeLoopStore,
+    obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
+    run_id: &str,
+    sane: &[(usize, u32, u32)],
+    base_floor_mv: u32,
+    base_limits: &PositiveOffsetLimits,
+    target_mhz: u32,
+    prev_target_mhz: Option<u32>,
+    prior_last_good_mv: Option<u32>,
+    descent_budget: usize,
+) -> Option<crate::gpu_f2_sweep::SweepSummary> {
+    use nidavellir_core::f2_observation::{now_rfc3339, F2ObsMode};
+
+    let rec = store.load_record();
+    let armed = store.is_boot_flag_armed();
+    // Direction-aware: descending uses the prior last-good as a START ceiling (full base floor);
+    // ascending/first uses it as a conservative FLOOR (today's behavior). Same as the CLI ladder.
+    let (start_mv, floor_mv) = crate::gpu_f2_sweep::ladder_target_descent_bounds(
+        base_floor_mv,
+        prior_last_good_mv,
+        target_mhz,
+        prev_target_mhz,
+        None,
+    );
+    let target_limits = PositiveOffsetLimits { hw_floor_mv: floor_mv, ..*base_limits };
+    let descent =
+        plan_anchored_undervolt_descent(sane, target_mhz, start_mv, &target_limits, descent_budget);
+    // Fail-closed confirmed gate (Safe Mode / armed flag / crash-floor / capped candidate count).
+    if confirmed_f2_multi_refusal(
+        &rec,
+        armed,
+        Some(F2_CONFIRMED_MAX_STEPS),
+        descent.candidates.len(),
+        F2_CONFIRMED_MAX_STEPS,
+    )
+    .is_some()
+    {
+        return None;
+    }
+    let mut ops = RealF2MultiOps {
+        store,
+        curve: sane.to_vec(),
+        candidates: descent.candidates.clone(),
+        limits: target_limits,
+        target_mhz,
+        // Per-clock conservative voltage-FLOOR policy (no cross-run offset resume); within-run
+        // advancement still chains each candidate via `select`. Identical to the CLI ladder.
+        baseline_offset_mhz: 0,
+        cur: None,
+    };
+    let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
+    let ctx = crate::gpu_f2_sweep::ObsContext {
+        run_id: run_id.to_string(),
+        timestamp: now_rfc3339(),
+        gpu_key: nidavellir_gpu_nvapi::read_curve().ok().map(|c| c.name),
+        mode: F2ObsMode::LadderSweep,
+        requested_start_mv: None,
+        positive_offset_cap_mhz: target_limits.abs_max_offset_mhz,
+    };
+    Some(crate::gpu_f2_sweep::record_target_sweep(&ctx, target_mhz, &descent, &report, obs_store))
 }
 
 /// MANUAL-PRIOR anchored probe (`--manual-prior`, explicit development / known-GPU shortcut). DRY-RUN

@@ -246,8 +246,11 @@ impl PowerSweepHandle {
         let stop = Arc::clone(&self.stop);
         let running = Arc::clone(&self.running);
         std::thread::spawn(move || {
+            // The live forge button now runs the F2 ANCHORED UNDERVOLT forge (the proven method for
+            // power-bound cards F1 flatten-down cannot differentiate). The F1 `run_power_sweep` is kept
+            // intact (Phase 3 decides its fate) but is no longer routed here.
             #[cfg(windows)]
-            run_power_sweep(progress, stop, store, mode);
+            measure_multiclock_undervolt_forge(&progress, &stop, &store, mode);
             #[cfg(not(windows))]
             {
                 let _ = (&progress, &stop, &store, mode);
@@ -2657,6 +2660,25 @@ const LONG_VALIDATION_PASSES: u32 = 3;
 #[cfg(windows)]
 const POWER_SWEEP_MAX_VALIDATION_PASSES: u32 = 5;
 
+/// LIVE F2 anchored-undervolt forge depth, mapped from the button MODE. F2 maps mode primarily to the
+/// number of candidate CLOCKS swept (descending), NOT to the per-clock descent depth: the per-clock
+/// confirmed motor stays bounded by the F2 confirmed-step cap (`F2_CONFIRMED_MAX_STEPS = 3`) in EVERY
+/// mode — that per-clock safety bound is NEVER widened. `STANDARD` is the default breadth; `FAST` trims to
+/// fewer clocks (quicker supervised run); `LONG` widens to MORE clocks. The per-clock descent budget is
+/// the SAME in every mode (the constant planner budget the CLI ladder uses); modes vary clock BREADTH
+/// only, never per-clock exposure. Hardware-relative: the clocks themselves come from
+/// `candidate_clocks(seed.stock_sustained, seed.stock_boost, …)`, never fixed MHz.
+#[cfg(windows)]
+const F2_FORGE_STANDARD_CLOCKS: usize = 4;
+#[cfg(windows)]
+const F2_FORGE_FAST_CLOCKS: usize = 2;
+#[cfg(windows)]
+const F2_FORGE_LONG_CLOCKS: usize = 6;
+/// Defensive hard cap on how many candidate clocks the live F2 forge will sweep in one run — bounds
+/// total supervised hardware time regardless of mode (each clock is its own bounded confirmed descent).
+#[cfg(windows)]
+const F2_FORGE_MAX_CLOCKS: usize = 8;
+
 // ── Phase 2B.2-b.3: graphics-core SANITY-DOMAIN guards ──────────────────────────────
 // NOT tuning targets — only safety guards to reject non-core / memory-domain / implausible
 // VF points so seeding can never derive a target like 7001 MHz or a safe_start like 1237 mV.
@@ -3807,7 +3829,13 @@ fn validate_pick_ceiling_passes(
     Some(current)
 }
 
+/// F1 MULTI-CLOCK flatten-down forge — kept INTACT but no longer routed to the live button (the button
+/// now runs the F2 anchored-undervolt forge, which can differentiate power-bound cards F1 cannot).
+/// Phase 3 decides this path's fate (retire vs repurpose for cards where F1 CAN differentiate). Retained
+/// so its proven logic + tests stay available; `#[allow(dead_code)]` because the only caller (the button
+/// spawn) now targets the F2 forge.
 #[cfg(windows)]
+#[allow(dead_code)]
 fn run_power_sweep(
     progress: Arc<Mutex<PowerSweepProgress>>,
     stop: Arc<AtomicBool>,
@@ -4024,6 +4052,282 @@ fn run_power_sweep(
     info!("Power sweep finished");
 }
 
+/// Map a button MODE to `(candidate_clocks, per_clock_descent_budget)` for the LIVE F2 forge. The
+/// clock count is the primary breadth knob (Fast = fewer, Long = more, both clamped to
+/// [`F2_FORGE_MAX_CLOCKS`]). The descent budget only shapes how many candidates the PLANNER offers per
+/// clock; the confirmed motor still clamps to its hard `F2_CONFIRMED_MAX_STEPS` safety bound, so the
+/// per-clock exposure is identical in every mode regardless of this budget (it reuses the same dry-run
+/// budget the CLI ladder uses, so the planner can present the natural descent). Pure + testable.
+#[cfg(windows)]
+fn f2_forge_depth(mode: PowerSweepMode) -> (usize, usize) {
+    let clocks = match mode {
+        PowerSweepMode::Fast => F2_FORGE_FAST_CLOCKS,
+        PowerSweepMode::Standard => F2_FORGE_STANDARD_CLOCKS,
+        PowerSweepMode::Long => F2_FORGE_LONG_CLOCKS,
+    }
+    .clamp(1, F2_FORGE_MAX_CLOCKS);
+    (clocks, crate::gpu_undervolt::F2_SWEEP_DRYRUN_BUDGET)
+}
+
+/// LIVE F2 ANCHORED-UNDERVOLT forge — the new primary method behind the live forge button (replaces the
+/// F1 flatten-down `run_power_sweep` for the button; F1 stays intact for cards it can differentiate).
+///
+/// F1 flatten-down cannot lower power on a power-bound card (lowering a frequency ceiling does nothing
+/// once the card is at its power limit). F2 holds the clock at a LOWER VOLTAGE and drops power directly
+/// (HW-proven on the RTX 3060 Ti: 1800 MHz @ 875 mV = 157 W vs the 200 W power-bound point, −43 W).
+///
+/// This is Phase 1: MEASURE + SYNTHESIZE + PERSIST via the proven F2 motor. APPLY stays GATED (the
+/// Apply IPC writes an F1 ceiling, wrong for an F2 undervolt point — Phase 2 wires the real F2 apply).
+///
+/// It REUSES, never reinvents:
+/// - hardware-relative candidate CLOCKS via [`derive_core_seed`] + [`candidate_clocks`] (the SAME
+///   derivation the F1 forge uses — no fixed MHz);
+/// - the F2 INPUT derivation + per-clock CONFIRMED motor via
+///   [`crate::gpu_undervolt::f2_forge_inputs`] + [`crate::gpu_undervolt::run_confirmed_f2_clock_descent`]
+///   (each candidate = anchored write→verify→dwell→reset→clear, recorded as an observation, with the
+///   Safe Loop arm/clear + crash-floor guards intact — the motor already VALIDATED each recorded
+///   candidate, so there is NO separate re-validation step here);
+/// - the F2→profiles synthesis bridge: [`F2ObservationStore::learned_frontier`] →
+///   [`frontier_to_points`] → [`synthesize_forge_profiles`].
+///
+/// Safety: STOPS the whole forge on a per-clock safety failure ([`crate::gpu_f2_sweep::ladder_should_continue`])
+/// or a confirmed-gate refusal; resets to stock + clears the boot flag on EVERY exit path (success,
+/// fail-closed, safety-stop); persists `forge_state.json` ONLY when a usable Godforge profile exists;
+/// applies NOTHING. `mode` selects breadth (candidate-clock count) only — the per-clock motor's safety
+/// bound is identical in every mode.
+#[cfg(windows)]
+fn measure_multiclock_undervolt_forge(
+    progress: &Arc<Mutex<PowerSweepProgress>>,
+    stop: &Arc<AtomicBool>,
+    store: &SafeLoopStore,
+    mode: PowerSweepMode,
+) {
+    use nidavellir_core::f2_observation::{new_run_id, F2ObservationStore};
+    use nidavellir_gpu_nvapi as gpu;
+
+    info!("F2 undervolt forge starting (anchored min-stable-voltage per clock) — mode {}", mode.label());
+    let mut prog = idle();
+    prog.running = true;
+    prog.phase = "power".into();
+    prog.is_undervolt = true; // F2 path → Apply IPC must REFUSE the F1 ceiling write (Phase 1 gate).
+    prog.power_limit_w = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()
+        .into_iter()
+        .next()
+        .and_then(|r| r.power_limit_w)
+        .unwrap_or(0.0);
+    let cap = prog.power_limit_w;
+    prog.log.push(format!(
+        "Forja F2 (undervolt anchorado, {}) — cap {cap:.0} W. Descendo a tensão mínima estável por clock…",
+        mode.label()
+    ));
+    set(progress, prog.clone());
+
+    // Identity for forge-state persistence (single source of truth across restarts).
+    let gpu_key = nidavellir_gpu_nvapi::read_curve()
+        .map(|c| c.name)
+        .unwrap_or_else(|_| "unknown-gpu".into());
+
+    // Final reset helper — runs on EVERY exit path (success / fail-closed / safety-stop). The motor
+    // already resets per candidate; this is the belt-and-suspenders final restore.
+    let final_reset = |store: &SafeLoopStore| {
+        let _ = gpu::reset_all();
+        let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+        let _ = store.clear_boot_flag();
+    };
+
+    // ── Derive hardware-relative candidate clocks (REUSE the F1 forge derivation; no fixed MHz) ──
+    if !gpu::vf_curve_supported() {
+        final_reset(store);
+        prog.running = false;
+        prog.phase = "done".into();
+        prog.note = Some(
+            "Forja F2 abortada com segurança — API de curva V/F moderna não suportada neste GPU/driver. GPU no stock, nada aplicado."
+                .into(),
+        );
+        set(progress, prog);
+        warn!("f2-forge: modern VF curve API unsupported — fail closed");
+        return;
+    }
+    let live = gpu::read_vf_curve_modern();
+    let seed = match derive_core_seed(&live) {
+        Ok(s) => s,
+        Err(e) => {
+            final_reset(store);
+            prog.running = false;
+            prog.phase = "done".into();
+            prog.note = Some(format!(
+                "Forja F2 abortada com segurança (curva V/F sem cluster de núcleo sano): {e} — GPU no stock, nada aplicado."
+            ));
+            set(progress, prog);
+            warn!("f2-forge: {e}");
+            return;
+        }
+    };
+
+    // F2 motor inputs (static VF base curve + conservative offset limits) — derived the SAME way the
+    // CLI motor derives them. Fail-closed if no sane static base points.
+    let Some(f2_inputs) = crate::gpu_undervolt::f2_forge_inputs() else {
+        final_reset(store);
+        prog.running = false;
+        prog.phase = "done".into();
+        prog.note = Some(
+            "Forja F2 abortada com segurança — sem pontos de curva V/F base sãos. GPU no stock, nada aplicado."
+                .into(),
+        );
+        set(progress, prog);
+        return;
+    };
+
+    // One NON-LOAD telemetry snapshot for regime context; CLAMP idle Unconstrained → PowerLimited so a
+    // first supervised run never explores ABOVE stock (identical clamp to the F1 forge).
+    let snap = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml().into_iter().next();
+    let (cap_frac, power_w, limit_w, temp_c) = match &snap {
+        Some(r) => (
+            if r.power_capped == Some(true) { 1.0 } else { 0.0 },
+            r.power_w.unwrap_or(0.0),
+            r.power_limit_w.unwrap_or(0.0),
+            r.temperature_c,
+        ),
+        None => (0.0, 0.0, 0.0, None),
+    };
+    let regime_raw = classify_regime(cap_frac, power_w, limit_w, temp_c);
+    let regime = if matches!(regime_raw, Regime::Unconstrained) {
+        Regime::PowerLimited
+    } else {
+        regime_raw
+    };
+
+    let (max_clocks, descent_budget) = f2_forge_depth(mode);
+    // Hardware-relative candidate clocks (descending). REUSE the SAME derivation as the F1 forge; then
+    // trim to the mode's breadth (the top `max_clocks`, descending).
+    let mut targets = candidate_clocks(
+        seed.stock_sustained_mhz,
+        seed.stock_boost_max_mhz,
+        regime,
+        FRONTIER_CLOCK_STEP_MHZ,
+        FRONTIER_FLOOR_FRAC,
+    );
+    targets.truncate(max_clocks);
+    if targets.is_empty() {
+        final_reset(store);
+        prog.running = false;
+        prog.phase = "done".into();
+        prog.note = Some(
+            "Forja F2 abortada com segurança — nenhum clock candidato derivável. GPU no stock, nada aplicado."
+                .into(),
+        );
+        set(progress, prog);
+        warn!("f2-forge: no candidate clocks derived — fail closed");
+        return;
+    }
+    prog.stock_clock_mhz = seed.stock_sustained_mhz;
+    prog.log.push(format!(
+        "Frontier F2: {} clock(s) candidato(s) ({:?} MHz), clock base ~{} MHz, regime {:?}.",
+        targets.len(), targets, seed.stock_sustained_mhz, regime
+    ));
+    set(progress, prog.clone());
+
+    warn!("f2-forge: CONFIRMED — supervised hardware run begins (anchored undervolt per clock; can TDR/reboot).");
+
+    // ── Per-clock confirmed F2 descent (REUSE the proven motor; stop on safety failure) ──
+    let obs_store = F2ObservationStore::system();
+    let run_id = new_run_id("f2-forge");
+    let mut prev_good: Option<u32> = None;
+    let mut prev_target: Option<u32> = None;
+    for (i, &target) in targets.iter().enumerate() {
+        if stop.load(Ordering::SeqCst) {
+            prog.log.push("Parada solicitada — encerrando a forja F2.".into());
+            break;
+        }
+        prog.phase = "descend".into();
+        prog.log.push(format!("Clock {}/{}: {target} MHz — descendo tensão (motor F2 confirmado)…", i + 1, targets.len()));
+        set(progress, prog.clone());
+
+        match crate::gpu_undervolt::run_confirmed_f2_clock_descent(
+            store,
+            &obs_store,
+            &run_id,
+            &f2_inputs.sane_base_curve,
+            f2_inputs.floor_mv,
+            &f2_inputs.limits,
+            target,
+            prev_target,
+            prev_good,
+            descent_budget,
+        ) {
+            None => {
+                // Confirmed gate REFUSED (Safe Mode / armed flag / crash-floor / no candidates) — stop.
+                prog.log.push(format!(
+                    "Clock {target} MHz RECUSADO pelo gate de segurança F2 — encerrando a forja."
+                ));
+                warn!("f2-forge: confirmed gate refused at {target} MHz — stopping forge");
+                break;
+            }
+            Some(summary) => {
+                prog.log.push(format!(
+                    "Clock {} MHz → tensão mínima estável {:?} mV, primeira falha {:?} mV, seguro {}, motivo {}.",
+                    target, summary.last_good_mv, summary.first_bad_mv, summary.safe, summary.stop_reason
+                ));
+                set(progress, prog.clone());
+                if !crate::gpu_f2_sweep::ladder_should_continue(summary.safe) {
+                    prog.log.push(format!(
+                        "Clock {target} MHz terminou em estado INSEGURO — encerrando a forja (sem mais clocks)."
+                    ));
+                    warn!("f2-forge: unsafe end at {target} MHz — stopping forge");
+                    break;
+                }
+                prev_good = summary.last_good_mv;
+                prev_target = Some(target);
+            }
+        }
+    }
+
+    // ── Synthesize the three profiles from the LEARNED FRONTIER (the SAME bridge the CLI preview uses).
+    // NO separate re-validation step: the F2 motor already validated (write→verify→dwell) every recorded
+    // candidate, so the learned frontier holds only validated points.
+    prog.phase = "synthesize".into();
+    set(progress, prog.clone());
+    let frontier = obs_store.learned_frontier();
+    let pts = nidavellir_core::f2_observation::frontier_to_points(&frontier);
+    let profiles = synthesize_forge_profiles(&pts, &ForgePolicy::balanced());
+    prog.log.extend(profiles.log.clone());
+    prog.godforge = profiles.godforge;
+    prog.brokkrs = profiles.brokkrs;
+    prog.deep_calm = profiles.deep_calm;
+    prog.points = pts.into_iter().map(|(p, _)| p).collect();
+    prog.recommended = prog.brokkrs;
+
+    // ALWAYS restore stock + clear the boot flag (the motor reset per candidate; this is the final belt).
+    final_reset(store);
+
+    if prog.godforge.is_some() {
+        let fmt = |o: Option<PowerSweepPoint>| match o {
+            Some(p) => format!(
+                "{} MHz @ {} mV ({:.0} W)",
+                p.clock_mhz,
+                p.vf_table_voltage_mv.unwrap_or(p.voltage_mv),
+                p.power_w
+            ),
+            None => "—".into(),
+        };
+        prog.note = Some(format!(
+            "Forja F2 · cap {cap:.0} W · Godforge {} · Brokkr's {} · Deep Calm {} — perfil descoberto (aplicar F2 chega na Fase 2).",
+            fmt(prog.godforge), fmt(prog.brokkrs), fmt(prog.deep_calm)
+        ));
+    } else {
+        prog.note = Some("Nenhum perfil F2 estável encontrado.".into());
+    }
+    prog.running = false;
+    prog.phase = "done".into();
+    // Persist the completed result ONLY when there is a usable profile (a failed/empty run never
+    // overwrites a previously good snapshot). NO auto-apply.
+    if prog.godforge.is_some() {
+        save_forge_state(&gpu_key, &prog);
+    }
+    set(progress, prog);
+    info!("F2 undervolt forge finished");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4064,6 +4368,27 @@ mod tests {
             (2..=POWER_SWEEP_MAX_VALIDATION_PASSES).contains(&lpass),
             "long passes must exceed 1 yet stay within the defensive cap"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_forge_depth_breadth_is_bounded_and_mode_ordered() {
+        // F2 maps MODE to candidate-clock BREADTH (Fast < Standard < Long), each clamped to the hard
+        // F2_FORGE_MAX_CLOCKS bound. The per-clock descent budget is identical across modes (the motor's
+        // F2_CONFIRMED_MAX_STEPS safety bound governs per-clock exposure regardless of this budget).
+        let (fast_clk, fast_budget) = f2_forge_depth(PowerSweepMode::Fast);
+        let (std_clk, std_budget) = f2_forge_depth(PowerSweepMode::Standard);
+        let (long_clk, long_budget) = f2_forge_depth(PowerSweepMode::Long);
+        // Breadth ordering: Fast fewer, Long more.
+        assert!(fast_clk < std_clk, "fast must sweep fewer clocks than standard");
+        assert!(long_clk > std_clk, "long must sweep more clocks than standard");
+        // Every mode stays within [1, F2_FORGE_MAX_CLOCKS].
+        for c in [fast_clk, std_clk, long_clk] {
+            assert!((1..=F2_FORGE_MAX_CLOCKS).contains(&c), "clock breadth {c} out of bounds");
+        }
+        // Per-clock budget is the same across modes (breadth, not per-clock depth, is the F2 mode knob).
+        assert_eq!(fast_budget, std_budget);
+        assert_eq!(std_budget, long_budget);
     }
 
     #[cfg(windows)]
