@@ -345,6 +345,20 @@ fn select_anchor_bin(
         .map(|&(idx, _, _)| idx)
 }
 
+/// Resolve a persisted F2 apply anchor against the live static table. Apply/reapply must use the
+/// exact validated VF-table voltage; silently falling to a lower bin would deepen the undervolt
+/// beyond the forged point. If the table changed and the exact anchor is unavailable, fail closed.
+fn select_exact_apply_anchor_bin(
+    static_base_curve: &[(usize, u32, u32)],
+    target_mhz: u32,
+    anchor_mv: u32,
+) -> Option<usize> {
+    static_base_curve
+        .iter()
+        .find(|&&(_, mv, base)| mv == anchor_mv && base < target_mhz)
+        .map(|&(idx, _, _)| idx)
+}
+
 /// The result of planning an ANCHORED undervolt probe: the single anchored curve plan when a valid
 /// anchor exists and the bounded raise + plateau caps all pass, or a `note` explaining why none was
 /// produced (no candidate bin, or a fail-closed rejection). Single-target, single anchored curve.
@@ -2846,6 +2860,87 @@ pub(crate) fn f2_forge_inputs() -> Option<F2ForgeInputs> {
     Some(F2ForgeInputs { sane_base_curve: sane, floor_mv, boost_top_mhz: boost_top, limits })
 }
 
+/// Apply ONE F2 anchored undervolt point to hardware and LEAVE it applied — the APPLY path (not a probe).
+/// Reads the live static VF base curve, plans+writes the bounded anchored offset for `target_mhz` anchored
+/// at the exact validated `anchor_mv` bin, then verifies the write. FAIL-CLOSED: a missing anchor, a writer
+/// rejection, or any non-`AnchoredRaiseVerified` verdict resets to stock (confirming every touched bin
+/// reads ~0) and returns `Err` WITHOUT leaving an offset applied. On success the anchored curve stays
+/// resident (that is the apply). Reuses the SAME primitives as the confirmed motor ([`RealF2Ops`]) with
+/// `prev_offset = 0`. Owns NO Safe Loop arm / persist — the caller
+/// ([`crate::gpu_apply::apply_and_persist_undervolt`]) owns the boot-flag + persistence lifecycle.
+#[cfg(windows)]
+pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Result<(), String> {
+    use nidavellir_gpu_nvapi as gpu;
+
+    // Read-only static VF base, sanity-filtered — identical envelope to the forge motor.
+    let sane: Vec<(usize, u32, u32)> = gpu::read_vf_base_curve_modern()
+        .into_iter()
+        .filter(|&(_, mv, f)| is_f2_sane_point(mv, f))
+        .collect();
+    if sane.is_empty() {
+        return Err("F2 apply: no sane static VF base points — fail closed (no write)".into());
+    }
+    let floor_mv = sane.iter().map(|&(_, mv, _)| mv).min().unwrap();
+    let boost_top = sane.iter().map(|&(_, _, f)| f).max().unwrap();
+    // Conservative caps + clock ceiling = stock boost top (never overclock, never CLI-widenable).
+    let limits = PositiveOffsetLimits::conservative(floor_mv, boost_top);
+
+    let Some(anchor_idx) = select_exact_apply_anchor_bin(&sane, target_mhz, anchor_mv) else {
+        return Err(format!(
+            "F2 apply: exact validated VF bin {anchor_mv} mV is unavailable or cannot raise to {target_mhz} MHz — fail closed (no write)"
+        ));
+    };
+
+    // Fail-closed reset helper: reset to stock, then CONFIRM every given bin reads ~0 (a positive offset
+    // must NEVER survive an error — including a mid-loop PARTIAL write). Returns `reason` on a confirmed
+    // clean reset, or a more-severe reset-not-confirmed message if any bin cannot be confirmed cleared.
+    let reset_and_confirm = |indices: &[usize], reason: String| -> String {
+        crate::gpu_power_sweep::reset_to_stock();
+        for &idx in indices {
+            match gpu::vf_get_point_khz(idx) {
+                Some(khz) if khz.abs() <= F2_RESET_TOL_KHZ => {}
+                Some(khz) => return format!("{reason}; reset readback {khz} kHz NOT cleared at idx {idx}"),
+                None => {
+                    return format!(
+                        "{reason}; reset readback unavailable at idx {idx} — cannot confirm cleared"
+                    )
+                }
+            }
+        }
+        reason
+    };
+
+    // Plan + write the anchored curve (anchor raise + plateau caps + elastic below). prev_offset = 0: a
+    // fresh single-point apply. A writer rejection may have PARTIALLY written, so reset + confirm EVERY
+    // sane bin (the full set the writer could have touched) cleared before returning Err.
+    let plan = match gpu::apply_bounded_anchored_positive_offset(&sane, anchor_idx, target_mhz, 0, &limits)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            let all: Vec<usize> = sane.iter().map(|&(i, _, _)| i).collect();
+            return Err(reset_and_confirm(&all, format!("F2 apply: anchored write rejected ({e})")));
+        }
+    };
+
+    // Verify: read back every touched bin's offset and run the anchored verifier (offset readback is
+    // primary — idle GetStatus under-reports). Only AnchoredRaiseVerified leaves the curve applied.
+    let observed: Vec<(usize, Option<i32>)> = plan
+        .entries
+        .iter()
+        .map(|e| (e.index, gpu::vf_get_point_khz(e.index).map(|khz| khz / 1000)))
+        .collect();
+    let verdict = crate::gpu_verify::verify_anchored_positive_offset(&plan, &observed, F2_VERIFY_TOL_MHZ);
+    if verdict == AnchoredOffsetVerification::AnchoredRaiseVerified {
+        info!("F2 apply: anchored undervolt verified ({target_mhz} MHz @ {anchor_mv} mV bin)");
+        return Ok(());
+    }
+
+    // Fail-closed: undo the write and confirm every touched bin cleared before returning the error.
+    warn!("F2 apply: anchored verify {verdict:?} — resetting to stock (fail closed)");
+    let touched: Vec<usize> = plan.entries.iter().map(|e| e.index).collect();
+    Err(reset_and_confirm(&touched, format!("F2 apply: anchored verify failed ({verdict:?})")))
+}
+
 /// Run ONE clock's CONFIRMED F2 anchored-undervolt descent — the SAME motor sequence as the confirmed
 /// branch of [`run_anchored_ladder_sweep`], factored out so the LIVE F2 forge button reuses the proven
 /// motor without duplicating it (and without changing the CLI ladder's output). For the given target
@@ -3268,6 +3363,21 @@ mod tests {
         assert_eq!(select_anchor_bin(&a_base(), 1755, Some(875)), Some(0));
         // Target at/below every base → nothing to anchor.
         assert_eq!(select_anchor_bin(&a_base(), 1600, None), None);
+    }
+
+    #[test]
+    fn apply_anchor_requires_exact_validated_bin() {
+        assert_eq!(select_exact_apply_anchor_bin(&a_base(), 1755, 900), Some(1));
+        assert_eq!(
+            select_exact_apply_anchor_bin(&a_base(), 1755, 925),
+            None,
+            "apply must not silently fall to a lower-voltage bin"
+        );
+        assert_eq!(
+            select_exact_apply_anchor_bin(&a_base(), 1700, 900),
+            None,
+            "an anchor already above the target does not need a positive raise"
+        );
     }
 
     #[test]

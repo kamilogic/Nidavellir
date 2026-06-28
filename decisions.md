@@ -2,6 +2,44 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 PHASE 2 — Apply path wired to F2 anchored undervolt; F1 KEPT (not removed); code-complete, not HW-tested (2026-06-27)
+- **Decision**: implement Phase 2 of the F2 pivot — make `ApplyPowerGodforge/Brokkrs/DeepCalm` actually
+  APPLY the F2 anchored undervolt. Before this, the forge produced F2 profiles but the apply path was still
+  attached to F1 flatten-down (`apply_core`→`apply_vf_ceiling`, the WRONG op for an undervolt point), so
+  Phase 1 had GATED apply behind a refusal. Phase 2 removes the refusal and routes apply to the F2 writer.
+- **Scope call (operator)**: F2 is the main algorithm, but **F1 is NOT removed in this pass** — it stays the
+  live apply path for legacy `is_undervolt==false` payloads, and removing it would be a large, separately-
+  reviewable change. Advisory recorded: `synthesize_forge_profiles` + `ForgePolicy` are SHARED by F2 and must
+  stay; the now-dead F1 apply/forge code is retained for a future Phase 3 cleanup. This keeps the safety-
+  critical apply change small and reviewable (the project's surgical-change rule).
+- **Design (reuse the proven F2 motor, do not duplicate)**: a one-shot apply
+  `gpu_undervolt::apply_anchored_undervolt(target_mhz, anchor_mv)` reuses the SAME primitives the confirmed
+  `RealF2Ops` motor uses (read live VF base → `select_anchor_bin` → `apply_bounded_anchored_positive_offset`
+  with prev_offset=0 → `verify_anchored_positive_offset`). FAIL-CLOSED: only `AnchoredRaiseVerified` leaves the
+  curve applied; any missing anchor / writer rejection / non-verified verdict resets to stock, confirms every
+  touched bin reads ~0, and returns Err with nothing applied. `apply_vf_ceiling*` / F1 / the verifier are
+  untouched.
+- **Persistence + reapply-on-boot**: `AppliedProfile` gains `undervolt: Option<UndervoltApply{target_mhz,
+  anchor_mv}>` (`#[serde(default)]` → legacy `gpu_applied.json` loads as `None`). `apply_and_persist_undervolt`
+  mirrors the F1 `apply_and_persist` lifecycle (arm Safe Loop boot-flag → write → persist → clear flag after
+  the 8 s survival window; a crash leaves it armed → not re-applied). `reapply_on_boot` branches on the
+  descriptor: F2 RE-DERIVES the anchored curve from the LIVE VF table each boot (never replays a stale
+  absolute curve); F1 path byte-identical. Why store target+anchor (not the raw plan): the live curve can
+  shift between sessions, so the deterministic axes are re-resolved against the current table. Reapply
+  requires the exact validated anchor voltage; if that bin is absent it fails closed rather than silently
+  selecting a lower-voltage (deeper) anchor.
+- **Apply axes**: resolved from the forge point via `undervolt_apply_params` — `target_clock_mhz ?? clock_mhz`,
+  `vf_table_voltage_mv ?? voltage_mv` (deterministic forge fields preferred; measured fallback for legacy
+  points). The router `apply_forge_profile` keys on the STRUCTURED `prog.is_undervolt` (never text).
+- **Safety invariants preserved**: fail-closed write+verify+reset; boot-flag armed before the write; conservative
+  caps + clock-ceiling = stock boost top (never overclock, never CLI-widenable); NO auto-apply (apply stays the
+  explicit user step); reversible via the existing GPU reset (already zeros the modern VF curve). F1 untouched.
+- **Validation (no hardware)**: cargo check clean; tests core 61 / nvapi 38 / service 300; clippy zero new
+  warnings. NOT run: any apply / VF write / `--confirm` / hardware.
+- **Next**: independent `nidavellir-safety-auditor` pass on the diff, then ONE supervised manual apply on the
+  rig (forge F2 → Apply → confirm verify+persist+reapply-on-boot; reset clears). Phase 3 =
+  retire/repurpose the dead F1 code + fold Fast/Long modes into F2 depth.
+
 ## FORGE PIVOTS TO F2 UNDERVOLT — F1 flatten-down cannot differentiate a power-bound card; F2 can (proven −43 W) (2026-06-27)
 - **HW finding (2 supervised runs, RTX 3060 Ti)**: the live button's F1 multi-clock forge (Option A +
   knee-seeking) COLLAPSES on this card. The card is hard-pinned at its **200 W power limit**; F1 flatten-down

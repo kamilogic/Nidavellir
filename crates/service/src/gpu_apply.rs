@@ -12,12 +12,29 @@ use nidavellir_core::safe_loop::{default_data_dir, BootFlag, SafeLoopStore, Tuni
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+/// An F2 anchored-undervolt apply descriptor (persisted so apply-on-boot re-derives the same anchored
+/// curve from the LIVE VF table). When present on an [`AppliedProfile`], the applied profile is an F2
+/// undervolt and `core` is status metadata only — apply routes to [`apply_anchored_undervolt`], not
+/// the F1 ceiling.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UndervoltApply {
+    /// Target clock to hold (anchor raised to this; higher-voltage bins capped down to it).
+    pub target_mhz: u32,
+    /// The VF-table bin voltage to anchor at (the deterministic apply key, `vf_table_voltage_mv`).
+    pub anchor_mv: u32,
+}
+
 /// The profile currently applied (persisted to disk for apply-on-boot).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppliedProfile {
     pub label: String,
     pub core: Option<VfPoint>,
     pub mem_offset_mhz: Option<i32>,
+    /// F2 anchored-undervolt descriptor. `Some` ⇒ this profile is an F2 undervolt (apply routes to the
+    /// anchored writer; `core` remains status metadata). `#[serde(default)]` ⇒ legacy F1 payloads load
+    /// as `None`.
+    #[serde(default)]
+    pub undervolt: Option<UndervoltApply>,
 }
 
 fn applied_path() -> PathBuf {
@@ -145,7 +162,63 @@ pub fn apply_and_persist(
         nidavellir_gpu_nvapi::set_mem_offset_mhz(m)?;
     }
 
-    save_applied(&AppliedProfile { label, core, mem_offset_mhz });
+    save_applied(&AppliedProfile { label, core, mem_offset_mhz, undervolt: None });
+
+    // Clear the boot-flag after a short survival window on a background thread.
+    let store = store.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        let _ = store.clear_boot_flag();
+    });
+    Ok(())
+}
+
+/// Apply an F2 anchored-undervolt profile (`target_mhz` held at the `anchor_mv` VF bin) and persist it.
+/// Mirrors [`apply_and_persist`] but writes the anchored undervolt instead of the F1 ceiling: arms the
+/// Safe Loop boot-flag around the write (a crash leaves it armed → not re-applied next boot), writes via
+/// the fail-closed [`crate::gpu_undervolt::apply_anchored_undervolt`] (which resets to stock on any
+/// non-verified outcome), persists `gpu_applied.json` with the [`UndervoltApply`] descriptor, then clears
+/// the boot-flag after a short survival window. Preserves any existing memory offset.
+#[cfg(windows)]
+pub fn apply_and_persist_undervolt(
+    label: String,
+    target_mhz: u32,
+    anchor_mv: u32,
+    mem_offset_mhz: Option<i32>,
+    store: &SafeLoopStore,
+) -> Result<(), String> {
+    let mut intent = TuningPoint::default();
+    intent.axes.insert("gpu_freq_mhz".into(), target_mhz as i64);
+    intent.axes.insert("gpu_voltage_mv".into(), anchor_mv as i64);
+    if let Some(m) = mem_offset_mhz {
+        intent.axes.insert("gpu_mem_offset_mhz".into(), m as i64);
+    }
+    let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_apply_undervolt"));
+
+    // Fail-closed: a non-verified write has already reset to stock inside this call, so nothing is left
+    // applied. The boot-flag stays armed on the error path (same as the F1 apply) — safe; reset clears it.
+    crate::gpu_undervolt::apply_anchored_undervolt(target_mhz, anchor_mv)?;
+    if let Some(m) = mem_offset_mhz {
+        if let Err(e) = nidavellir_gpu_nvapi::set_mem_offset_mhz(m) {
+            crate::gpu_power_sweep::reset_to_stock();
+            let reset = nidavellir_gpu_nvapi::reset_all();
+            return Err(match reset {
+                Ok(()) => format!("F2 apply: memory offset failed ({e}); GPU reset to stock"),
+                Err(reset_err) => format!(
+                    "F2 apply: memory offset failed ({e}); stock reset also failed ({reset_err})"
+                ),
+            });
+        }
+    }
+
+    save_applied(&AppliedProfile {
+        label,
+        // Existing IPC/UI status shape: expose the deterministic target + anchor while the
+        // `undervolt` descriptor remains the authoritative apply-on-boot route.
+        core: Some(VfPoint { freq_mhz: target_mhz, voltage_mv: anchor_mv }),
+        mem_offset_mhz,
+        undervolt: Some(UndervoltApply { target_mhz, anchor_mv }),
+    });
 
     // Clear the boot-flag after a short survival window on a background thread.
     let store = store.clone();
@@ -182,6 +255,17 @@ pub fn apply_and_persist(
 }
 
 #[cfg(not(windows))]
+pub fn apply_and_persist_undervolt(
+    _label: String,
+    _target_mhz: u32,
+    _anchor_mv: u32,
+    _mem: Option<i32>,
+    _store: &SafeLoopStore,
+) -> Result<(), String> {
+    Err("GPU apply is Windows-only".into())
+}
+
+#[cfg(not(windows))]
 pub fn reset(_store: &SafeLoopStore) -> Result<(), String> {
     Err("GPU apply is Windows-only".into())
 }
@@ -202,7 +286,19 @@ pub fn reapply_on_boot(store: &SafeLoopStore) {
         return;
     };
     info!("GPU apply-on-boot: re-applying '{}'", ap.label);
-    if let Err(e) = apply_and_persist(ap.label, ap.core, ap.mem_offset_mhz, store) {
+    let res = match ap.undervolt {
+        // F2 undervolt: re-derive + re-write the anchored curve from the LIVE VF table (fail-closed).
+        Some(uv) => apply_and_persist_undervolt(
+            ap.label,
+            uv.target_mhz,
+            uv.anchor_mv,
+            ap.mem_offset_mhz,
+            store,
+        ),
+        // Legacy F1 flatten-down profile.
+        None => apply_and_persist(ap.label, ap.core, ap.mem_offset_mhz, store),
+    };
+    if let Err(e) = res {
         warn!("GPU apply-on-boot failed: {e}");
     }
 }
@@ -212,7 +308,32 @@ pub fn reapply_on_boot(_store: &SafeLoopStore) {}
 
 #[cfg(test)]
 mod tests {
-    use super::choose_ceiling_mv;
+    use super::{choose_ceiling_mv, AppliedProfile, UndervoltApply};
+    use nidavellir_core::gpu_sweep::VfPoint;
+
+    #[test]
+    fn applied_profile_roundtrips_undervolt_descriptor() {
+        let p = AppliedProfile {
+            label: "Godforge".into(),
+            core: Some(VfPoint { freq_mhz: 1800, voltage_mv: 875 }),
+            mem_offset_mhz: None,
+            undervolt: Some(UndervoltApply { target_mhz: 1800, anchor_mv: 875 }),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: AppliedProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.undervolt, Some(UndervoltApply { target_mhz: 1800, anchor_mv: 875 }));
+        assert_eq!(back.core, Some(VfPoint { freq_mhz: 1800, voltage_mv: 875 }));
+    }
+
+    #[test]
+    fn legacy_applied_profile_json_defaults_undervolt_none() {
+        // A profile persisted before Phase 2 has no `undervolt` key → defaults None, so apply-on-boot
+        // keeps the legacy F1 flatten path. Backward-compatible.
+        let legacy = r#"{"label":"Brokkr's Best","core":{"freq_mhz":1800,"voltage_mv":906},"mem_offset_mhz":null}"#;
+        let p: AppliedProfile = serde_json::from_str(legacy).unwrap();
+        assert!(p.undervolt.is_none(), "missing key must default to legacy F1 behavior");
+        assert!(p.core.is_some());
+    }
 
     // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
     fn curve() -> Vec<(usize, u32, u32)> {

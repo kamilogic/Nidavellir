@@ -568,21 +568,22 @@ Codex applied the frontend-only parts of the 2026-06-23 request:
 
 
 
-The profile evidence remains optional and silent until the backend provides structured fields.
+The profile evidence remains optional and silent on legacy payloads. The additive backend fields
+requested here were delivered in the 2026-06-27 Phase 2 contract closeout.
 
-The following additive backend fields are still requested:
+The delivered fields are:
 
 
 
-\- `PowerSweepPoint.confidence: Option<f64>` — Wilson lower-bound stability confidence (0–1) for
+\- `PowerSweepPoint.confidence: Option<f64>` — structured stability confidence (0–1) for
 
-&#x20; the selected point.
+&#x20; the selected point. F1 uses its Wilson model; F2 uses its learned-frontier confidence model.
 
 \- `PowerSweepPoint.validation_count: Option<u32>` — successful confirmations at that exact selected
 
 &#x20; point. This is NOT the total observation count across other voltages or outcomes.
 
-\- `PowerSweepProgress.power_bound_collapse: Option<bool>` (or a backward-compatible defaulted bool)
+\- `PowerSweepProgress.power_bound_collapse: bool` (`#[serde(default)]`)
 
 &#x20; — structured synthesis result; the UI must not infer it from logs or notes.
 
@@ -716,6 +717,43 @@ same clock). F2 produces REAL differentiated Godforge / Brokkr's / Deep Calm pro
 
 \- When `is_undervolt == false` or the field is missing, the existing F1 Apply behavior is unchanged.
 &#x20; No Rust, IPC, persistence, profile synthesis, or hardware logic changed.
+
+\- \*\*SUPERSEDED by the Phase 2 backend note below\*\* — Apply is now WIRED; the UI should un-gate.
+
+\## Backend → Frontend (2026-06-27): F2 apply is WIRED (Phase 2) — Apply now applies; un-gate the UI
+
+Phase 2 supersedes the Phase 1 "Apply is REFUSED" note above. The three apply methods now APPLY the F2
+anchored undervolt when `is_undervolt == true` — they no longer return the
+*"F2 undervolt apply not yet wired (Phase 2)"* failure.
+
+\- \*\*No IPC method changes.\*\* `ApplyPowerGodforge` / `ApplyPowerBrokkrs` / `ApplyPowerDeepCalm`,
+&#x20; `GetPowerSweepProgress`, `StopPowerSweep` and the Fast/Standard/Long start methods are all unchanged
+&#x20; in name/shape. The response stays `ResponseData::GpuApply(GpuApplyStatus)` as before. The existing
+&#x20; `core` status point carries the deterministic F2 target/anchor for UI compatibility.
+
+\- \*\*UI action required\*\*: REMOVE the Phase-1 "apply coming soon / disabled" state for `is_undervolt`
+&#x20; results. When `is_undervolt == true`, Apply Godforge/Brokkr's/Deep Calm is a normal, enabled action.
+&#x20; On success the status message reads e.g. `Applied Godforge: 1800 MHz @ 875 mV VF bin (undervolt)`;
+&#x20; on a fail-closed write it reads `Apply failed: …` (the GPU is reset to stock — nothing left applied).
+
+\- \*\*Behavior\*\*: apply arms the Safe Loop, writes the anchored undervolt, VERIFIES it, persists it
+&#x20; (`gpu_applied.json`, re-applied on every boot, fail-closed: a crash leaves it un-re-applied), and is
+&#x20; reversible via the existing GPU reset. Still NO auto-apply — apply remains the explicit user step.
+
+\- \*\*Legacy F1 unchanged\*\*: `is_undervolt == false` payloads still apply the F1 flatten ceiling exactly
+&#x20; as before. The persisted-profile shape gains an internal `undervolt` descriptor (service-side only;
+&#x20; NOT an IPC payload field). Additive + backward-compatible; no migration. Rationale: `decisions.md`
+&#x20; top entry + `handoff.md`.
+
+\## Frontend implementation checkpoint (2026-06-27): Phase 2 Apply un-gated (Codex)
+
+\- Removed the Phase-1 disabled/"Apply coming in Phase 2" state and its defensive action guard.
+\- F2 profile actions now call the unchanged `ApplyPower*` methods normally.
+\- Applied-state matching uses the deterministic F2 target clock and anchor exposed through the existing
+&#x20; `GpuApplyStatus.core` point; legacy F1 matching remains measured-clock based.
+\- The Discovered badge remains until a profile is applied, then yields to the existing Active state.
+\- Structured `confidence`, `validation_count`, and `power_bound_collapse` evidence is now delivered;
+&#x20; legacy payloads continue to render without fabricated values.
 
 
 \## Frontend implementation checkpoint (2026-06-26): Forge modes wired (Codex)

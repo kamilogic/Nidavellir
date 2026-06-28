@@ -1,22 +1,58 @@
 # Nidavellir — Session Handoff
 
 How to pick this up cold. State as of 2026-06-27: FORGE PIVOTED TO F2 UNDERVOLT (the button's F1
-flatten-down can't differentiate this power-bound card; F2 can, proven −43 W). **Phase 1 DONE + pushed**
-(`e4bd006` code, `53597c6` plan, contract note for Codex) — the button now runs F2 (measure/synthesize/
-persist; apply GATED). **NEXT = Phase 2 (F2 apply path)**. See `decisions.md` top entry for the full
-rationale + phased plan. Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+flatten-down can't differentiate this power-bound card; F2 can, proven −43 W). Phase 1 DONE + pushed
+(button runs F2; apply was gated). **Phase 2 DONE (code-complete, NOT yet HW-tested)** — the F2 apply
+path is wired: `ApplyPower*` now APPLY the F2 anchored undervolt (arm→write→verify→persist→reapply-on-boot,
+fail-closed); the Phase-1 refusal gate is gone. **NEXT = ONE supervised manual apply on the rig** (forge
+F2 → Apply → confirm anchored VF write verifies + persists + reapplies on boot; reversible via reset).
+F1 untouched (legacy `is_undervolt==false` path). See `decisions.md` top entry for rationale + phased plan.
+Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest frontend checkpoint (2026-06-27) — F2 profiles shown as Discovered; Apply gated in UI
-- Codex now consumes the additive `PowerSweepProgress.is_undervolt` field directly. F2 Godforge /
-  Brokkr's / Deep Calm results remain visible, carry a **Discovered** state, and explain that Apply
-  is coming in Phase 2.
-- All F2 Apply controls are disabled, with a defensive handler guard preventing accidental
-  `ApplyPower*` requests. Missing/false `is_undervolt` preserves legacy F1 Apply behavior.
-- Frontend-only files: `apps/ui/src/lib/{views/Forge.svelte,components/forge/ProfileCards.svelte}`.
-  No Rust/IPC/persistence/hardware changes. Contract checkpoint recorded in
-  `docs/contracts/ui-backend.md`.
+## Latest backend checkpoint (2026-06-27) — F2 PHASE 2: Apply path wired to F2 anchored undervolt (code-complete, NOT HW-tested)
+- **What**: the three Apply actions (`ApplyPowerGodforge/Brokkrs/DeepCalm`) now APPLY the F2 undervolt
+  instead of refusing it. Closes the Phase-1 gap (forge produced F2 profiles that could not be applied —
+  apply was attached to F1 flatten-down, the wrong op for an undervolt point).
+- **Scope (operator-confirmed)**: WIRE the apply only; F2 is the main algorithm but **F1 was NOT removed**
+  (still the live path for legacy `is_undervolt==false`). Advisory: `synthesize_forge_profiles` + `ForgePolicy`
+  are SHARED by F2 — must stay; the now-dead F1 apply/forge code (`apply_core`/`apply_vf_ceiling`,
+  `run_power_sweep`/`build_frontier`) is kept for a separate Phase 3 cleanup.
+- **How (reuse, not reinvent)**: new `gpu_undervolt::apply_anchored_undervolt(target_mhz, anchor_mv)` reuses
+  the proven `RealF2Ops` primitives for a one-shot apply (prev_offset=0): read live VF base →
+  `select_anchor_bin` → `apply_bounded_anchored_positive_offset` → `verify_anchored_positive_offset`. ONLY
+  `AnchoredRaiseVerified` leaves the curve applied; any miss/anchor-fail/writer-reject → `reset_to_stock` +
+  per-bin readback confirm + `Err` (fail-closed, nothing left applied). `gpu_apply::apply_and_persist_undervolt`
+  mirrors `apply_and_persist` (arm boot flag → write → persist → clear flag after 8 s survival window) and
+  persists a new `AppliedProfile.undervolt: Option<UndervoltApply{target_mhz, anchor_mv}>` (`#[serde(default)]`,
+  legacy JSON → None). `reapply_on_boot` branches on `undervolt` (F2 re-derives the anchored curve from the
+  LIVE table and requires the exact validated anchor bin (missing bin → fail closed; never silently deeper);
+  F1 unchanged). IPC: `ApplyPower*` route via `apply_forge_profile` on `prog.is_undervolt`
+  (F2) else `apply_power_profile` (F1, unchanged); `refuse_undervolt_apply` removed.
+- **Files**: `crates/service/src/{gpu_undervolt.rs, gpu_apply.rs, ipc_server.rs}`,
+  `docs/contracts/ui-backend.md` (Backend→Frontend 2026-06-27: apply WIRED, UI must un-gate).
+- **Apply axes from the forge point**: `target = target_clock_mhz ?? clock_mhz`,
+  `anchor = vf_table_voltage_mv ?? voltage_mv` (`undervolt_apply_params`, unit-tested). Survives restart:
+  whole `PowerSweepProgress` incl. `is_undervolt` round-trips through `forge_state.json` + seeds the handle.
+- **Validation (no hardware)**: cargo check clean; tests **core 61 / nvapi 38 / service 300**; clippy
+  ZERO new service warnings (the 3 introduced clone-on-Copy fixed;
+  remaining 21 are pre-existing). NOT run: any apply / VF write / `--confirm` / hardware.
+- **NEXT**: independent `nidavellir-safety-auditor` pass on the diff (recommended), then ONE supervised
+  manual apply on the rig — forge F2, click Apply, confirm: anchored VF write verifies, `gpu_applied.json`
+  carries `undervolt`, survives the 8 s window, reapplies on next service start; reset clears it.
+- Integrated into the master closeout; final validation and publish proof are recorded in `memory.md`.
 
-## Latest backend checkpoint (2026-06-27) — FORGE → F2 UNDERVOLT pivot; Phase 1 DONE (e4bd006, pushed); next = Phase 2
+## Latest frontend checkpoint (2026-06-27) — Phase 2 F2 Apply un-gated; contract evidence wired
+- F2 Godforge / Brokkr's / Deep Calm remain visible as **Discovered** until applied; Apply is now enabled
+  and calls the unchanged `ApplyPower*` methods. The existing Active state takes over after success.
+- Applied-state matching uses the F2 target clock + anchor carried by `GpuApplyStatus.core`; legacy F1
+  matching remains unchanged. The read-only legacy curve verifier reports F2 as metadata-only rather than
+  running the F1 flatten-down classifier against an anchored curve.
+- `PowerSweepPoint.confidence` / `validation_count` and
+  `PowerSweepProgress.power_bound_collapse` are now structured, backward-compatible payload fields.
+- The Phase 2 safety closeout also resets to stock if memory-offset application fails after the F2 core
+  write, preserving the contract that a failed apply leaves no F2 curve resident.
+
+## Earlier backend checkpoint (2026-06-27) — FORGE → F2 UNDERVOLT pivot; Phase 1 DONE (e4bd006, pushed); next = Phase 2
 - **Why**: 2 supervised HW runs proved the live button's F1 multi-clock forge COLLAPSES on the RTX 3060 Ti —
   it's pinned at 200 W, and F1 flatten-down can't lower power on a power-bound card (lowering a frequency
   ceiling does nothing when already power-capped). F2 anchored undervolt CAN: 1800 MHz @ 875 mV = 157 W vs

@@ -350,45 +350,71 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         }
         IpcRequest::ApplyPowerGodforge => {
             let prog = guard.power_sweep.progress();
-            if let Some(r) = refuse_undervolt_apply(&prog) {
-                r
-            } else {
-                apply_power_profile(&guard.safe_store, prog.godforge, "Godforge")
-            }
+            apply_forge_profile(&guard.safe_store, &prog, prog.godforge, "Godforge")
         }
         IpcRequest::ApplyPowerBrokkrs => {
             let prog = guard.power_sweep.progress();
-            if let Some(r) = refuse_undervolt_apply(&prog) {
-                r
-            } else {
-                apply_power_profile(&guard.safe_store, prog.brokkrs, "Brokkr's Best")
-            }
+            apply_forge_profile(&guard.safe_store, &prog, prog.brokkrs, "Brokkr's Best")
         }
         IpcRequest::ApplyPowerDeepCalm => {
             let prog = guard.power_sweep.progress();
-            if let Some(r) = refuse_undervolt_apply(&prog) {
-                r
-            } else {
-                apply_power_profile(&guard.safe_store, prog.deep_calm, "Deep Calm")
-            }
+            apply_forge_profile(&guard.safe_store, &prog, prog.deep_calm, "Deep Calm")
         }
     }
 }
 
-/// Fail-closed apply GATE for F2 anchored-undervolt forge results. The Apply path writes an F1
-/// flatten-down ceiling (`apply_core` → `apply_vf_ceiling`), which is the WRONG operation for an F2
-/// undervolt point (F2 RAISES a lower-voltage bin; F1 caps frequency down). Until the dedicated F2 apply
-/// is wired (Phase 2), REFUSE the apply when the active forge produced an F2 undervolt profile. Returns
-/// `Some(refusal)` to refuse, or `None` to fall through to the legacy F1 apply (default — backward
-/// compatible: a non-undervolt or legacy/restored payload has `is_undervolt = false`).
-fn refuse_undervolt_apply(prog: &nidavellir_core::ipc::PowerSweepProgress) -> Option<IpcResponse> {
+/// Route a forge-profile apply to the correct writer (Phase 2). When the active forge produced an F2
+/// anchored-undervolt result (`is_undervolt == true`), apply the F2 anchored undervolt; otherwise apply
+/// the legacy F1 flatten-down ceiling. F2 RAISES a lower-voltage bin to hold the clock (dropping power);
+/// F1 caps frequency down — applying the wrong one is unsafe, so the route keys on the structured flag,
+/// never on text. Backward-compatible: a legacy/restored payload defaults `is_undervolt = false` → F1.
+fn apply_forge_profile(
+    store: &nidavellir_core::safe_loop::SafeLoopStore,
+    prog: &nidavellir_core::ipc::PowerSweepProgress,
+    pt: Option<nidavellir_core::ipc::PowerSweepPoint>,
+    label: &str,
+) -> IpcResponse {
     if prog.is_undervolt {
-        Some(IpcResponse::failure(
-            "F2 undervolt apply not yet wired (Phase 2) — profile discovered but not applicable",
-        ))
+        apply_undervolt_profile(store, pt, label)
     } else {
-        None
+        apply_power_profile(store, pt, label)
     }
+}
+
+/// Resolve the F2 apply axes from a forge point: the TARGET clock to hold and the anchor VF-table bin.
+/// Prefers the deterministic forge fields (`target_clock_mhz`, `vf_table_voltage_mv`) and falls back to
+/// the measured `clock_mhz` / `voltage_mv` for legacy points. Pure — unit-tested without hardware.
+fn undervolt_apply_params(p: &nidavellir_core::ipc::PowerSweepPoint) -> (u32, u32) {
+    let target = p.target_clock_mhz.unwrap_or(p.clock_mhz);
+    let anchor = p.vf_table_voltage_mv.unwrap_or(p.voltage_mv);
+    (target, anchor)
+}
+
+/// Apply an F2 anchored-undervolt forge point (`target MHz` held at the anchor VF bin) and persist it.
+/// Writes via the fail-closed [`crate::gpu_apply::apply_and_persist_undervolt`] (arm Safe Loop → anchored
+/// write → verify → persist `undervolt` descriptor → clear flag after the survival window; any non-verified
+/// outcome resets to stock and returns an error). Keeps any existing memory offset.
+fn apply_undervolt_profile(
+    store: &nidavellir_core::safe_loop::SafeLoopStore,
+    pt: Option<nidavellir_core::ipc::PowerSweepPoint>,
+    label: &str,
+) -> IpcResponse {
+    let Some(p) = pt else {
+        return IpcResponse::failure("Run the forge first (no point for this profile)");
+    };
+    let (target_mhz, anchor_mv) = undervolt_apply_params(&p);
+    let mem = crate::gpu_apply::load_applied().unwrap_or_default().mem_offset_mhz;
+    let msg = match crate::gpu_apply::apply_and_persist_undervolt(
+        label.into(),
+        target_mhz,
+        anchor_mv,
+        mem,
+        store,
+    ) {
+        Ok(()) => format!("Applied {label}: {target_mhz} MHz @ {anchor_mv} mV VF bin (undervolt)"),
+        Err(e) => format!("Apply failed: {e}"),
+    };
+    IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
 }
 
 /// Apply a power-sweep profile point (core voltage + clock, with the hard clock
@@ -473,25 +499,46 @@ mod tests {
     use super::*;
     use nidavellir_core::ipc::PowerSweepProgress;
 
+    use nidavellir_core::ipc::PowerSweepPoint;
+
     #[test]
-    fn apply_gate_refuses_f2_undervolt_profiles() {
-        // An F2 undervolt forge result must REFUSE the F1 ceiling apply (Phase 2 wires the real F2
-        // apply). The refusal carries the agreed message so the UI can explain it.
-        let prog = PowerSweepProgress { is_undervolt: true, ..Default::default() };
-        let r = refuse_undervolt_apply(&prog).expect("F2 undervolt apply must be refused");
-        assert!(!r.ok);
-        assert_eq!(
-            r.error.as_deref(),
-            Some("F2 undervolt apply not yet wired (Phase 2) — profile discovered but not applicable")
-        );
+    fn undervolt_apply_params_prefer_deterministic_forge_fields() {
+        // F2 apply axes: TARGET clock + anchor VF bin come from the deterministic forge fields, NOT the
+        // measured clock/voltage (which differ by boost behavior).
+        let p = PowerSweepPoint {
+            clock_mhz: 1815,
+            voltage_mv: 910,
+            target_clock_mhz: Some(1800),
+            vf_table_voltage_mv: Some(875),
+            ..Default::default()
+        };
+        assert_eq!(undervolt_apply_params(&p), (1800, 875));
     }
 
     #[test]
-    fn apply_gate_passes_through_legacy_f1_profiles() {
-        // Backward-compatible: a non-undervolt (legacy F1 / restored) payload defaults `is_undervolt`
-        // to false → the gate falls through (`None`) to the unchanged F1 apply path.
-        let prog = PowerSweepProgress::default();
-        assert!(!prog.is_undervolt, "default must keep the legacy F1 apply behavior");
-        assert!(refuse_undervolt_apply(&prog).is_none());
+    fn undervolt_apply_params_fall_back_to_measured_for_legacy_points() {
+        // A legacy point without the deterministic fields falls back to measured clock/voltage.
+        let p = PowerSweepPoint { clock_mhz: 1800, voltage_mv: 906, ..Default::default() };
+        assert_eq!(undervolt_apply_params(&p), (1800, 906));
+    }
+
+    #[test]
+    fn apply_route_selects_f2_for_undervolt_and_f1_otherwise() {
+        // The router keys on the structured `is_undervolt` flag: F2 forge → undervolt apply; a legacy
+        // (default) payload → the unchanged F1 apply path. Both with no point yield a clear failure
+        // (nothing applied), which is the safe observable here without touching hardware.
+        let f2 = PowerSweepProgress { is_undervolt: true, ..Default::default() };
+        assert!(f2.is_undervolt);
+        let f1 = PowerSweepProgress::default();
+        assert!(!f1.is_undervolt, "default must keep the legacy F1 apply behavior");
+
+        let r_f2 = apply_forge_profile(&dummy_store(), &f2, None, "Godforge");
+        assert!(!r_f2.ok, "no forge point → failure");
+        let r_f1 = apply_forge_profile(&dummy_store(), &f1, None, "Godforge");
+        assert!(!r_f1.ok, "no sweep point → failure");
+    }
+
+    fn dummy_store() -> nidavellir_core::safe_loop::SafeLoopStore {
+        nidavellir_core::safe_loop::SafeLoopStore::new(std::env::temp_dir().join("nidavellir-test-ipc"))
     }
 }

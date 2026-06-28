@@ -784,6 +784,18 @@ pub fn verify_applied_curve() -> ApplyVerificationStatus {
         );
     };
     let label = if ap.label.is_empty() { None } else { Some(ap.label.clone()) };
+    if let Some(uv) = ap.undervolt.as_ref() {
+        return make_status(
+            CurveVerification::MetadataOnly,
+            label,
+            Some(uv.target_mhz),
+            Some(uv.anchor_mv),
+            Some(uv.anchor_mv),
+            None,
+            None,
+            "F2 anchored undervolt was verified during apply; a separate read-only F2 recheck is not wired yet",
+        );
+    }
     let Some(core) = ap.core else {
         return make_status(
             CurveVerification::MetadataOnly,
