@@ -76,7 +76,10 @@
       const point = powerSweep?.[slot.key];
       if (!point) continue;
       const labelMatches = normalizeProfile(applied.label) === normalizeProfile(slot.label);
-      const clockMatches = sameNumber(applied.core.freq_mhz, point.clock_mhz);
+      const profileClock = powerSweep?.is_undervolt
+        ? (point.target_clock_mhz ?? point.clock_mhz)
+        : point.clock_mhz;
+      const clockMatches = sameNumber(applied.core.freq_mhz, profileClock);
       if (labelMatches && clockMatches) return { ...slot, point };
     }
     return null;
@@ -118,7 +121,9 @@
 
     if (appliedPowerPoint?.point?.vf_table_voltage_mv != null) {
       return buildCurveOverlay({
-        targetMhz: appliedPowerPoint.point.clock_mhz,
+        targetMhz: powerSweep?.is_undervolt
+          ? (appliedPowerPoint.point.target_clock_mhz ?? appliedPowerPoint.point.clock_mhz)
+          : appliedPowerPoint.point.clock_mhz,
         anchorMv: appliedPowerPoint.point.vf_table_voltage_mv,
         anchorSource: "profile_vf_bin",
         anchorPrecise: true,
@@ -222,10 +227,6 @@
     deep_calm: "ApplyPowerDeepCalm",
   };
   const applyPower = async (which) => {
-    if (powerSweep?.is_undervolt) {
-      error = "This F2 undervolt profile is discovered and saved. Apply is coming in Phase 2.";
-      return;
-    }
     verification = null;
     await call(POWER_APPLY[which], setApplied);
   };

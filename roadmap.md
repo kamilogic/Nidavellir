@@ -15,11 +15,10 @@
 
 ## Now — Product model (see product.md)
 Reframed around 3 profiles forged from a clock×power frontier. Phases:
-- **Current F2 pivot (2026-06-27)** — Phase 1 is complete: the live Forge button measures,
-  synthesizes and persists F2 anchored-undervolt profiles. The UI presents them as **Discovered**
-  and disables Apply via structured `is_undervolt` state. **Next: Phase 2 F2 Apply**, wiring the
-  anchored-offset writer through Safe Loop verification, persistence and reapply-on-boot before
-  the frontend enables Apply.
+- **Current F2 pivot (2026-06-27)** — Phases 1 and 2 are code-complete: the live Forge button measures,
+  synthesizes and persists F2 anchored-undervolt profiles, and the explicit Apply action routes them
+  through the verified anchored writer. Legacy F1 remains intact. **Next: one supervised hardware Apply
+  validation**, then separately review any Phase 3 F1 retirement/repurposing.
 - **F1 — Profile model**: 3-profile synthesis (Godforge=clock / Brokkr's=R / Deep
   Calm=MHz/W) + V2 confidence gate.
   - **F1a (DONE)** — pure `synthesize_forge_profiles` + unit tests. Not yet wired.

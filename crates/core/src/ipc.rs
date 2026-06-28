@@ -142,6 +142,13 @@ pub struct PowerSweepPoint {
     /// (Added: F1b Phase 2B.1.)
     #[serde(default)]
     pub target_clock_mhz: Option<u32>,
+    /// Structured stability confidence for this exact point (0–1). The producer defines the
+    /// confidence model; `None` keeps legacy payloads backward-compatible.
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    /// Successful confirmations accumulated at this exact target/anchor point.
+    #[serde(default)]
+    pub validation_count: Option<u32>,
 }
 
 /// Power-target sweep: for a range of locked voltages, the max stable clock and
@@ -176,6 +183,10 @@ pub struct PowerSweepProgress {
     /// preserves the legacy F1 apply behavior for every existing payload.
     #[serde(default)]
     pub is_undervolt: bool,
+    /// Structured synthesis result. `true` means the measured frontier could not honestly
+    /// differentiate the profiles because it remained power-bound.
+    #[serde(default)]
+    pub power_bound_collapse: bool,
 }
 
 /// One benchmark run's measured metrics (stock or tuned).
@@ -533,10 +544,17 @@ mod tests {
 
     #[test]
     fn power_sweep_point_target_clock_roundtrips() {
-        let p = PowerSweepPoint { target_clock_mhz: Some(1830), ..Default::default() };
+        let p = PowerSweepPoint {
+            target_clock_mhz: Some(1830),
+            confidence: Some(0.92),
+            validation_count: Some(4),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&p).unwrap();
         let back: PowerSweepPoint = serde_json::from_str(&json).unwrap();
         assert_eq!(back.target_clock_mhz, Some(1830));
+        assert_eq!(back.confidence, Some(0.92));
+        assert_eq!(back.validation_count, Some(4));
     }
 
     #[test]
@@ -549,6 +567,8 @@ mod tests {
         }"#;
         let p: PowerSweepPoint = serde_json::from_str(legacy).unwrap();
         assert_eq!(p.target_clock_mhz, None);
+        assert_eq!(p.confidence, None);
+        assert_eq!(p.validation_count, None);
         assert_eq!(p.clock_mhz, 1785);
     }
 
@@ -558,6 +578,7 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let back: PowerSweepProgress = serde_json::from_str(&json).unwrap();
         assert!(back.is_undervolt);
+        assert!(!back.power_bound_collapse);
     }
 
     #[test]
@@ -572,6 +593,7 @@ mod tests {
         }"#;
         let p: PowerSweepProgress = serde_json::from_str(legacy).unwrap();
         assert!(!p.is_undervolt, "missing key must default to legacy F1 behavior");
+        assert!(!p.power_bound_collapse, "missing key must default to no structured collapse");
         assert_eq!(p.stock_clock_mhz, 1800);
     }
 }

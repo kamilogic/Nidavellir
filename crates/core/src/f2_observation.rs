@@ -210,6 +210,9 @@ pub struct F2FrontierEntry {
     pub sustained_clock_mhz: Option<u32>,
     /// Aggregate confidence (0–1) from repeat validations at `best_anchor_mv`.
     pub confidence: f64,
+    /// Successful confirmations at this exact target/anchor point.
+    #[serde(default)]
+    pub validation_count: usize,
     #[serde(default)]
     pub first_bad_mv: Option<u32>,
     #[serde(default)]
@@ -342,6 +345,7 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
         avg_clock_mhz: best.avg_clock_mhz,
         sustained_clock_mhz: best.sustained_clock_mhz,
         confidence: frontier_confidence(validations_at_best),
+        validation_count: validations_at_best,
         first_bad_mv: first_bad_for_target(obs, target_mhz).map(|o| o.anchor_mv),
         bracket_width_mv: bracket.map(|b| b.width_mv),
         observation_count,
@@ -384,6 +388,8 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
         vf_table_voltage_mv: Some(entry.best_anchor_mv),
         p5_clock_mhz: entry.sustained_clock_mhz,
         target_clock_mhz: Some(entry.target_mhz),
+        confidence: Some(entry.confidence),
+        validation_count: Some(entry.validation_count as u32),
         ..Default::default()
     };
     (point, entry.confidence)
@@ -647,6 +653,7 @@ mod tests {
         assert_eq!(e1800.first_bad_mv, Some(956));
         assert_eq!(e1800.bracket_width_mv, Some(6));
         assert_eq!(e1800.observation_count, 4);
+        assert_eq!(e1800.validation_count, 1);
         assert!(e1800.confidence >= 0.85);
     }
 
@@ -662,6 +669,8 @@ mod tests {
         assert_eq!(p.target_clock_mhz, Some(1800));
         assert_eq!(p.clock_mhz, 1815);
         assert_eq!(p.p5_clock_mhz, Some(1815));
+        assert_eq!(p.confidence, Some(conf));
+        assert_eq!(p.validation_count, Some(1));
         assert!(p.perf_per_watt > 0.0);
         assert!(conf >= 0.85); // passes the balanced confidence gate
         // Whole-frontier bridge preserves count.

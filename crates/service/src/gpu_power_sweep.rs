@@ -3948,6 +3948,7 @@ fn run_power_sweep(
     // Map the three multi-clock profiles (godforge / Brokkr's Best / Deep Calm) and frontier points.
     // `deep_calm` is now populated by the multi-clock synthesis (additive — the existing apply handler
     // already reads it).
+    prog.power_bound_collapse = result.profiles.power_bound_collapse;
     prog.godforge = result.profiles.godforge;
     prog.brokkrs = result.profiles.brokkrs;
     prog.deep_calm = result.profiles.deep_calm;
@@ -4291,6 +4292,7 @@ fn measure_multiclock_undervolt_forge(
     let pts = nidavellir_core::f2_observation::frontier_to_points(&frontier);
     let profiles = synthesize_forge_profiles(&pts, &ForgePolicy::balanced());
     prog.log.extend(profiles.log.clone());
+    prog.power_bound_collapse = profiles.power_bound_collapse;
     prog.godforge = profiles.godforge;
     prog.brokkrs = profiles.brokkrs;
     prog.deep_calm = profiles.deep_calm;
@@ -4311,7 +4313,7 @@ fn measure_multiclock_undervolt_forge(
             None => "—".into(),
         };
         prog.note = Some(format!(
-            "Forja F2 · cap {cap:.0} W · Godforge {} · Brokkr's {} · Deep Calm {} — perfil descoberto (aplicar F2 chega na Fase 2).",
+            "Forja F2 · cap {cap:.0} W · Godforge {} · Brokkr's {} · Deep Calm {} — perfis descobertos, prontos para aplicação explícita.",
             fmt(prog.godforge), fmt(prog.brokkrs), fmt(prog.deep_calm)
         ));
     } else {

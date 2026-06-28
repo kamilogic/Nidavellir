@@ -8,15 +8,21 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-27) — F2 discovered profiles respect the Phase 1 apply gate — implemented, NOT committed
-- **Frontend only**: `PowerSweepProgress.is_undervolt` is now consumed as structured state. F2
-  Godforge / Brokkr's / Deep Calm results stay visible with a **Discovered** badge and an explicit
-  "Apply coming in Phase 2" state.
-- **Safety/compatibility**: F2 Apply controls are disabled and both card/action handlers refuse to
-  send `ApplyPower*`. Missing/false `is_undervolt` preserves the legacy F1 Apply path unchanged.
-- **Docs**: UI/backend contract checkpoint recorded; `handoff.md`, `decisions.md`, and `roadmap.md`
-  aligned with Phase 1 completion and the Phase 2 apply dependency.
-- **Validation**: `npm.cmd run build` and `git diff --check` pass.
+## Latest (2026-06-27) — F2 Phase 2 Apply contract closed — implemented and validated
+- **Backend**: `ApplyPower*` routes F2 profiles to the anchored-undervolt writer and preserves legacy F1.
+  Apply is Safe-Loop armed, verified, persisted, reapplied on boot, reversible, and fail-closed.
+- **Frontend**: F2 profile Apply is enabled; Discovered yields to Active after success. Matching uses the
+  deterministic target/anchor carried in the existing `GpuApplyStatus.core` point.
+- **Contract evidence**: `PowerSweepPoint.confidence` / `validation_count` and
+  `PowerSweepProgress.power_bound_collapse` are structured, backward-compatible payload fields.
+- **Safety closeout**: a memory-offset failure after the F2 core write now resets the GPU to stock before
+  returning an error. Apply/reapply also requires the exact validated VF anchor bin; a changed table fails
+  closed instead of silently selecting a deeper undervolt. The legacy read-only F1 curve verifier reports
+  F2 profiles as metadata-only.
+- **Hardware status**: code/tests only. No Apply click, VF write, `--confirm`, reboot, or hardware run was
+  performed during this closeout; one supervised manual apply remains the next operational validation.
+- **Validation**: workspace `cargo check`; core 61 / NVAPI 38 / service 300 tests; UI production build;
+  clippy completed with no new warnings (repository baseline warnings remain); `git diff --check` clean.
 
 ## Earlier (2026-06-27) — Forge mode split-button dropdown — implemented, committed via 9119eec
 - **Frontend only**: Forge GPU / Refine Profiles is now a compact split action. The main segment
