@@ -49,6 +49,7 @@ fn map_verifier(v: Option<PositiveOffsetVerification>) -> F2ObsVerifier {
 fn map_dwell(d: Option<F2DwellOutcome>) -> F2ObsDwell {
     match d {
         Some(F2DwellOutcome::Stable) => F2ObsDwell::Stable,
+        Some(F2DwellOutcome::SilentError) => F2ObsDwell::SilentError,
         Some(F2DwellOutcome::Unstable) => F2ObsDwell::Unstable,
         Some(F2DwellOutcome::DeviceLost) => F2ObsDwell::DeviceLost,
         Some(F2DwellOutcome::ClockDrop) => F2ObsDwell::ClockDrop,
@@ -63,8 +64,10 @@ fn map_outcome(o: &F2Outcome) -> F2ObsOutcome {
     match o {
         F2Outcome::Validated => F2ObsOutcome::Validated,
         F2Outcome::VerifyFailed => F2ObsOutcome::VerifierFailed,
+        F2Outcome::SilentError => F2ObsOutcome::SilentError,
         F2Outcome::Unstable => F2ObsOutcome::Unstable,
         F2Outcome::DeviceLost => F2ObsOutcome::DeviceLost,
+        F2Outcome::PowerBoundClockDrop => F2ObsOutcome::PowerBoundClockDrop,
         F2Outcome::ClockDrop => F2ObsOutcome::ClockDrop,
         F2Outcome::ResetFailed => F2ObsOutcome::ResetFailed,
         F2Outcome::ArmFailed(_) | F2Outcome::ApplyFailed(_) => F2ObsOutcome::AbortedBySafetyGate,
@@ -98,7 +101,10 @@ pub fn observation_from_anchored_step(
         avg_clock_mhz: report.avg_clock_mhz,
         sustained_clock_mhz: report.p5_clock_mhz,
         watts: report.power_w,
-        silent_error: matches!(report.dwell, Some(F2DwellOutcome::Unstable)),
+        power_capped_frac: report.power_capped_frac,
+        dwell_duration_ms: report.dwell_duration_ms,
+        sample_count: report.sample_count,
+        silent_error: matches!(report.dwell, Some(F2DwellOutcome::SilentError)),
         device_lost: matches!(report.outcome, F2Outcome::DeviceLost),
         unstable: matches!(report.outcome, F2Outcome::Unstable),
         clock_drop: matches!(report.outcome, F2Outcome::ClockDrop),
@@ -190,16 +196,15 @@ pub fn target_sweep_plan_lines(
             .to_string(),
     );
     out.push(
-        "mode               : AUTONOMOUS PROGRESSIVE (official unknown-GPU path — anchored, learned offset horizon; NOT manual-prior)"
+        "mode               : AUTONOMOUS PROGRESSIVE (official unknown-GPU path — anchored, physical VF frontier; NOT manual-prior)"
             .to_string(),
     );
     out.push(format!(
         "focus target       : {target_mhz} MHz (single target; discover the minimum stable anchor voltage)"
     ));
     out.push(format!(
-        "offset caps        : abs +{} MHz (TARGET-SWEEP LEARNING HORIZON — reachable ONLY via validated \
-         chained per-step increments; NOT the +30 default and NOT the manual-prior known-point cap), \
-         per-step +{} MHz (each chained increment stays bounded)",
+        "offset envelope    : abs +{} MHz, step +{} MHz (derived from the physical VF clock domain; \
+         no arbitrary discovery cap, target never exceeds stock clock ceiling)",
         limits.abs_max_offset_mhz, limits.step_max_offset_mhz
     ));
     out.push(format!(
@@ -211,7 +216,7 @@ pub fn target_sweep_plan_lines(
         limits.clock_ceiling_mhz
     ));
     out.push(format!(
-        "confirmed cap      : up to {confirmed_cap} candidate(s) per --confirm run (fail closed beyond it; no infinite search)"
+        "confirmed span     : {confirmed_cap} physical candidate(s) in this plan; no arbitrary step cap"
     ));
     if descent.candidates.is_empty() {
         out.push(
@@ -399,7 +404,7 @@ pub fn ladder_plan_lines(plans: &[LadderTargetPlan], confirmed_cap: usize, obs_p
             .to_string(),
     );
     out.push(format!(
-        "confirmed cap      : up to {confirmed_cap} candidate(s) PER target (fail closed beyond it; no infinite search)"
+        "confirmed span     : up to {confirmed_cap} physical candidate(s) in the shown target plans; no arbitrary step cap"
     ));
     for p in plans {
         out.push(format!("--- target {} MHz ---", p.target_mhz));
@@ -508,7 +513,8 @@ mod tests {
         }
     }
 
-    fn step(outcome: F2Outcome, verify: Option<PositiveOffsetVerification>, dwell: Option<F2DwellOutcome>) -> F2StepReport {
+    fn step(outcome: F2Outcome, verify: Option<PositiveOffsetVerification>, dwell: Option<F2DwellOutcome>,
+    ) -> F2StepReport {
         F2StepReport {
             outcome,
             armed: true,
@@ -518,6 +524,9 @@ mod tests {
             avg_clock_mhz: Some(1815),
             p5_clock_mhz: Some(1815),
             power_w: Some(180),
+            power_capped_frac: Some(0.5),
+            dwell_duration_ms: Some(15_000),
+            sample_count: Some(300),
             reset_ok: Some(true),
             boot_flag_cleared: true,
             blacklisted: false,
@@ -526,14 +535,16 @@ mod tests {
     }
 
     fn validated_step() -> F2StepReport {
-        let mut s = step(F2Outcome::Validated, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Stable));
+        let mut s = step(F2Outcome::Validated, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Stable),
+        );
         s.validated = true;
         s
     }
 
     #[test]
     fn mapper_captures_validated_point() {
-        let o = observation_from_anchored_step(&ctx(), 1800, &anchored(975, 1785, 1800), &validated_step());
+        let o = observation_from_anchored_step(&ctx(), 1800, &anchored(975, 1785, 1800), &validated_step(),
+        );
         assert_eq!(o.target_mhz, 1800);
         assert_eq!((o.anchor_mv, o.base_mhz, o.offset_mhz), (975, 1785, 15));
         assert_eq!(o.positive_offset_cap_mhz, 30);
@@ -552,17 +563,45 @@ mod tests {
             &ctx(),
             1800,
             &anchored(956, 1785, 1800),
-            &step(F2Outcome::Unstable, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Unstable)),
+            &step(F2Outcome::Unstable, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Unstable),
+            ),
         );
         assert_eq!(u.outcome, F2ObsOutcome::Unstable);
-        assert!(u.unstable && u.silent_error);
+        assert!(u.unstable && !u.silent_error);
         assert!(u.outcome.is_bad() && !u.outcome.is_safety_failure());
+
+        let silent = observation_from_anchored_step(
+            &ctx(),
+            1800,
+            &anchored(950, 1785, 1800),
+            &step(
+                F2Outcome::SilentError,
+                Some(PositiveOffsetVerification::RaiseVerified),
+                Some(F2DwellOutcome::SilentError),
+            ),
+        );
+        assert_eq!(silent.outcome, F2ObsOutcome::SilentError);
+        assert!(silent.silent_error && !silent.unstable);
+
+        let lost = observation_from_anchored_step(
+            &ctx(),
+            1800,
+            &anchored(950, 1785, 1800),
+            &step(
+                F2Outcome::DeviceLost,
+                Some(PositiveOffsetVerification::RaiseVerified),
+                Some(F2DwellOutcome::DeviceLost),
+            ),
+        );
+        assert_eq!(lost.outcome, F2ObsOutcome::DeviceLost);
+        assert!(lost.outcome.is_safety_failure());
 
         let r = observation_from_anchored_step(
             &ctx(),
             1800,
             &anchored(950, 1785, 1800),
-            &step(F2Outcome::ResetFailed, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Unstable)),
+            &step(F2Outcome::ResetFailed, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Unstable),
+            ),
         );
         assert_eq!(r.outcome, F2ObsOutcome::ResetFailed);
         assert!(r.outcome.is_safety_failure());
@@ -579,7 +618,8 @@ mod tests {
         }
     }
 
-    fn multi_report(steps: Vec<F2StepReport>, last_good: Option<usize>, stop: crate::gpu_undervolt::F2MultiStopReason) -> F2MultiStepReport {
+    fn multi_report(steps: Vec<F2StepReport>, last_good: Option<usize>, stop: crate::gpu_undervolt::F2MultiStopReason,
+    ) -> F2MultiStepReport {
         F2MultiStepReport {
             planned: steps.len(),
             executed: steps.len(),
@@ -602,7 +642,8 @@ mod tests {
             vec![
                 validated_step(),
                 validated_step(),
-                step(F2Outcome::Unstable, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Unstable)),
+                step(F2Outcome::Unstable, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Unstable),
+                ),
             ],
             Some(1), // last validated index
             F2MultiStopReason::Unstable,
@@ -629,7 +670,8 @@ mod tests {
         let rep = multi_report(
             vec![
                 validated_step(),
-                step(F2Outcome::ResetFailed, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Unstable)),
+                step(F2Outcome::ResetFailed, Some(PositiveOffsetVerification::RaiseVerified), Some(F2DwellOutcome::Unstable),
+                ),
             ],
             Some(0),
             F2MultiStopReason::ResetFailed,
@@ -644,11 +686,12 @@ mod tests {
     fn target_sweep_plan_lines_show_rules_and_no_write() {
         let d = descent(&[(975, 1785), (968, 1770), (962, 1770)], 1800);
         let limits = PositiveOffsetLimits::conservative(612, 1950);
-        let text = target_sweep_plan_lines(1800, &d, &limits, 3, "C:/ProgramData/Nidavellir/f2_observations.jsonl", None, None, true).join("\n");
+        let text = target_sweep_plan_lines(1800, &d, &limits, 3, "C:/ProgramData/Nidavellir/f2_observations.jsonl", None, None, true,
+        ).join("\n");
         assert!(text.contains("TARGET SWEEP"));
         assert!(text.contains("AUTONOMOUS PROGRESSIVE"));
         assert!(text.contains("NOT manual-prior"));
-        assert!(text.contains("confirmed cap      : up to 3"));
+        assert!(text.contains("confirmed span     : 3 physical candidate(s)"));
         assert!(text.contains("#1  anchor  975 mV"));
         assert!(text.contains("stop rules"));
         assert!(text.contains("observations       : a confirmed run records"));
@@ -684,23 +727,19 @@ mod tests {
     }
 
     #[test]
-    fn target_sweep_plan_lines_show_learning_horizon_cap_and_step_delta() {
-        // The official sweep runs with the TARGET-SWEEP LEARNING HORIZON envelope (abs +210, per-step
-        // +15). The dry-run must name that hard cap explicitly (NOT the +30 default, NOT manual-prior)
-        // and show each candidate's per-step delta so the chained descent is transparent.
+    fn target_sweep_plan_lines_show_physical_envelope_and_step_delta() {
         let d = descent(&[(975, 1785), (900, 1755), (850, 1740)], 1800); // +15, +45, +60
-        let limits = PositiveOffsetLimits::target_sweep_learning_horizon(612, 1950);
+        let limits = PositiveOffsetLimits::hardware_frontier(612, 1950, 1740);
         let text = target_sweep_plan_lines(
             1800, &d, &limits, 3, "C:/ProgramData/Nidavellir/f2_observations.jsonl", None, None, true,
         )
         .join("\n");
-        assert!(text.contains("learned offset horizon"));
-        assert!(text.contains("TARGET-SWEEP LEARNING HORIZON"));
-        assert!(text.contains("abs +210 MHz"));
+        assert!(text.contains("physical VF frontier"));
+        assert!(text.contains("physical VF clock domain"));
+        assert!(text.contains("no arbitrary discovery cap"));
         // Per-candidate step delta is surfaced (chained-increment transparency).
         assert!(text.contains("step Δ+"));
-        // Still explicitly NOT the manual-prior known-point cap.
-        assert!(text.contains("NOT the manual-prior known-point cap"));
+        assert!(text.contains("target never exceeds stock clock ceiling"));
     }
 
     #[test]
@@ -766,7 +805,8 @@ mod tests {
         // Empty frontier.
         assert!(frontier_report_lines(&[]).join("\n").contains("frontier is empty"));
         // One entry (a validated point at 962 mV for 1800 MHz).
-        let v = vec![observation_from_anchored_step(&ctx(), 1800, &anchored(962, 1785, 1800), &validated_step())];
+        let v = vec![observation_from_anchored_step(&ctx(), 1800, &anchored(962, 1785, 1800), &validated_step(),
+        )];
         let fr = nidavellir_core::f2_observation::learned_frontier(&v);
         let text = frontier_report_lines(&fr).join("\n");
         assert!(text.contains("F2 LEARNED FRONTIER"));

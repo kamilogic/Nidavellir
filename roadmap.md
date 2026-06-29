@@ -15,10 +15,15 @@
 
 ## Now — Product model (see product.md)
 Reframed around 3 profiles forged from a clock×power frontier. Phases:
-- **Current F2 pivot (2026-06-27)** — Phases 1 and 2 are code-complete: the live Forge button measures,
-  synthesizes and persists F2 anchored-undervolt profiles, and the explicit Apply action routes them
-  through the verified anchored writer. Legacy F1 remains intact. **Next: one supervised hardware Apply
-  validation**, then separately review any Phase 3 F1 retirement/repurposing.
+- **Current F2 frontier (2026-06-28)** — code-complete: the live Forge starts at the highest real
+  clock, discovers Cmax through power-bound voltage descent, and characterizes every real bin through
+  90% Cmax. Autonomous descent has no arbitrary step budget; Fast is provisional discovery,
+  Standard qualifies with 2×60 s passes, and Long qualifies with 3×120 s passes;
+  observations checkpoint/resume by GPU UUID; partial UI progress is durable; adjacent clocks reuse
+  one bin above the prior minimum and fall back to the prior power-bound boundary; deployable synthesis
+  still requires the complete range and successful qualification.
+  The explicit F2 Apply path remains verified and legacy F1 remains intact. **Next: one supervised
+  hardware Forge validation**, then Apply/reboot validation and separate Phase 3 F1 cleanup review.
 - **F1 — Profile model**: 3-profile synthesis (Godforge=clock / Brokkr's=R / Deep
   Calm=MHz/W) + V2 confidence gate.
   - **F1a (DONE)** — pure `synthesize_forge_profiles` + unit tests. Not yet wired.
@@ -37,8 +42,8 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
     points if the real path needs it. Hardware-risky → supervised.
   - **F1b Phase 3** — knowledge keying by (target_clock, vf_table_voltage_bin) + global
     voltage-floor crash boundary; backward-compatible `gpu_knowledge.json` migration.
-- **F2** transparency (clock/power deltas) · **F3** Forge modes (Quick/Deep/
-  Continuous; breadth = #clock levels) · **F4** reboot→knowledge + limits 1/2/3 ·
+- **F2** transparency (clock/power deltas) · **F3** Forge modes (Fast/Standard/
+  Long; dwell/evidence only, identical frontier) · **F4** reboot→knowledge ·
   **F5** lifecycle (Forged→Legendary) · **F6** passive monitoring · **F7** UI
   (Forge GPU / Refine / Forge Progress).
 - **V2** (Wilson gate) shipped — reused as the confidence axis for all 3 profiles.

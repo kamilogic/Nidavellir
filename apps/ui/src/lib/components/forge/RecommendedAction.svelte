@@ -15,12 +15,14 @@
   let modePicker = $state(null);
 
   const hasProfiles = $derived(Boolean(powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm));
+  const profilesQualified = $derived(!powerSweep?.is_undervolt || Boolean(powerSweep?.profiles_qualified));
   const needsAttention = $derived(Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable"));
   const currentPhase = $derived(powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : null);
   const title = $derived.by(() => {
     if (needsAttention) return "Needs Attention";
     if (powerRunning) return "Core VF forge in progress";
     if (!hasProfiles && !applied?.core) return "Raw GPU Detected";
+    if (hasProfiles && !profilesQualified && !applied?.core) return "Profiles need qualification";
     if (hasProfiles && !applied?.core) return "Profiles are ready";
     if (hasProfiles) return "Profile applied";
     return "Ready to forge";
@@ -32,6 +34,9 @@
     }
     if (!hasProfiles && !applied?.core) {
       return "Nidavellir has detected your NVIDIA GPU. The current Forge GPU action runs the implemented core VF forge and profile generation path.";
+    }
+    if (hasProfiles && !profilesQualified && !applied?.core) {
+      return "Fast found provisional profile points. Run Standard or Long to qualify their sustained stability before Apply is unlocked.";
     }
     if (hasProfiles && !applied?.core) {
       return "Nidavellir has generated profiles. Choose one below, or refine the core VF profiles by running the forge again.";
@@ -50,25 +55,25 @@
       id: "fast",
       label: "Fast",
       summaryLabel: "Fast",
-      meta: "Quick",
-      title: "Quicker supervised discovery",
-      description: "Fewer probes and a shallower per-clock search, with one ceiling validation per profile. Confidence continues across later runs.",
+      meta: "≈20–30m fresh",
+      title: "10 s discovery · preview only",
+      description: "Traverses the full physical frontier with short 10-second dwells. It discovers provisional points quickly, but Apply stays locked until Standard or Long qualifies them.",
     },
     {
       id: "standard",
       label: "Standard",
       summaryLabel: "Std",
-      meta: "Default",
-      title: "Balanced, hardware-validated default",
-      description: "The proven Nidavellir forge path: balanced discovery depth and validation with no behavior change from the current default.",
+      meta: "≈55–75m fresh",
+      title: "10 s discovery + 2 × 60 s qualification",
+      description: "Traverses the same full frontier, then requires two independent 60-second reset/reapply passes at every selected boundary. Learned GPUs usually resume faster.",
     },
     {
       id: "long",
       label: "Long",
       summaryLabel: "Long",
-      meta: "Thorough",
-      title: "Build deeper confidence now",
-      description: "Broader, deeper discovery with repeated ceiling validations. It uses more GPU time and heat, and can reject a marginal point but never widen it.",
+      meta: "≈90–120m fresh",
+      title: "10 s discovery + 3 × 120 s qualification",
+      description: "Traverses the same full frontier, then runs three independent two-minute passes per selected boundary for the strongest initial confidence.",
     },
   ];
   const selectedMode = $derived(forgeModes.find((mode) => mode.id === forgeMode) ?? forgeModes[1]);
@@ -188,7 +193,7 @@
           </span>
         {/each}
       </div>
-      <p>Confidence builds across normal runs as stable points earn repeat confirmations. VRAM optimization and final whole-package validation stay planned later.</p>
+      <p>Fast creates a provisional map. Standard or Long qualifies the selected boundaries before Apply is unlocked. VRAM optimization and final whole-package validation stay planned later.</p>
     </div>
   {/if}
 </section>

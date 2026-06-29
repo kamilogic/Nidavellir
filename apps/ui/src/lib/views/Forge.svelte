@@ -289,14 +289,14 @@
     onReset={resetTuning}
   />
 
-  {#if powerRunning}
-    <ForgeProgress
-      {powerSweep}
-      {powerRunning}
-      {safeLoop}
-      onStopPower={stopPower}
-    />
+  <ForgeProgress
+    {powerSweep}
+    {powerRunning}
+    {safeLoop}
+    onStopPower={stopPower}
+  />
 
+  {#if powerRunning}
     <ForgeKnowledge summary compact {powerSweep} {validation} />
 
     <section class="home-section profile-section active-forging">
