@@ -22,6 +22,49 @@ use crate::safe_loop::default_data_dir;
 
 /// The append-only F2 observation log filename under `default_data_dir()`.
 pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
+/// Current homogeneous PowerRender discovery contract.
+pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 1;
+/// Current FailureSeekingGameLoop qualification contract.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 2;
+
+/// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
+/// guide discovery, but can never satisfy the current qualification gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum F2EvidenceKind {
+    #[default]
+    Legacy,
+    Discovery,
+    Qualification,
+}
+
+/// Whether a stable qualification dwell exercised every required phase strongly enough to count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum F2QualificationVerdict {
+    Pass,
+    Fail,
+    Inconclusive,
+}
+
+/// Compact, append-only qualification coverage summary. Phase details remain service-internal; this
+/// carries the durable facts needed to decide whether a validation may qualify Apply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct F2QualificationCoverage {
+    pub verdict: F2QualificationVerdict,
+    pub phases_completed: u32,
+    pub phases_expected: u32,
+    pub checksum_count: u32,
+    pub sample_count: u32,
+    #[serde(default)]
+    pub target_residency_frac: Option<f32>,
+    #[serde(default)]
+    pub heavy_light_power_delta_w: Option<f32>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
 
 /// Which F2 path produced an observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +102,9 @@ pub enum F2ObsDwell {
     Unstable,
     DeviceLost,
     ClockDrop,
+    /// Dwell completed reset-clean, but the qualification did not collect enough current-contract
+    /// coverage to prove the point.
+    QualificationInconclusive,
     /// No dwell ran (arm/apply/verify failed first, or the candidate was refused before any write).
     NotRun,
 }
@@ -85,6 +131,9 @@ pub enum F2ObsOutcome {
     PowerBoundClockDrop,
     /// The clock sagged below tolerance under load (held the dwell but not the clock).
     ClockDrop,
+    /// The qualification workload ran reset-clean, but coverage was too weak to qualify or reject the
+    /// point. This is not a voltage failure and must not become a bad-boundary veto.
+    QualificationInconclusive,
     /// `reset_to_stock` could not be confirmed — a SAFETY failure (boot flag retained, fail closed).
     ResetFailed,
     /// The candidate intent was blacklisted (known-bad).
@@ -140,6 +189,14 @@ pub struct F2Observation {
     /// GPU identity (the NVAPI curve name), when available.
     #[serde(default)]
     pub gpu_key: Option<String>,
+    #[serde(default)]
+    pub evidence_kind: F2EvidenceKind,
+    #[serde(default)]
+    pub discovery_contract_version: Option<u32>,
+    #[serde(default)]
+    pub qualification_contract_version: Option<u32>,
+    #[serde(default)]
+    pub qualification_coverage: Option<F2QualificationCoverage>,
     pub mode: F2ObsMode,
     pub target_mhz: u32,
     #[serde(default)]
@@ -310,6 +367,47 @@ pub fn last_good_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<&F
         .min_by_key(|o| o.anchor_mv)
 }
 
+/// True when an observation can define the current PowerRender discovery frontier. Legacy evidence
+/// remains usable because the discovery workload is intentionally unchanged; explicitly versioned
+/// evidence must match the current contract.
+pub fn is_current_discovery_evidence(o: &F2Observation) -> bool {
+    match o.evidence_kind {
+        F2EvidenceKind::Legacy => true,
+        F2EvidenceKind::Discovery => {
+            o.discovery_contract_version == Some(F2_DISCOVERY_CONTRACT_VERSION)
+        }
+        F2EvidenceKind::Qualification => false,
+    }
+}
+
+/// True only for a fully-covered pass from the current qualification contract. Legacy positives and
+/// passes from older qualifiers can guide a start point but can never unlock Apply.
+pub fn is_current_qualification_pass(o: &F2Observation) -> bool {
+    o.evidence_kind == F2EvidenceKind::Qualification
+        && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
+        && o.outcome.is_validated()
+        && o.qualification_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.verdict == F2QualificationVerdict::Pass)
+}
+
+/// Lowest-voltage stable point proven by the current, homogeneous discovery contract. Negative
+/// observations remain version-independent and invalidate the same/deeper voltage as before.
+pub fn last_discovery_good_for_target(
+    obs: &[F2Observation],
+    target_mhz: u32,
+) -> Option<&F2Observation> {
+    let first_bad_mv = first_bad_for_target(obs, target_mhz).map(|o| o.anchor_mv);
+    obs.iter()
+        .filter(|o| {
+            o.target_mhz == target_mhz
+                && o.outcome.is_validated()
+                && is_current_discovery_evidence(o)
+        })
+        .filter(|o| first_bad_mv.is_none_or(|bad| o.anchor_mv > bad))
+        .min_by_key(|o| o.anchor_mv)
+}
+
 /// The first bad anchor for a target: the HIGHEST-voltage real-failure observation — the shallowest
 /// undervolt that already failed (the closest failure below the validated region). `None` if none bad.
 pub fn first_bad_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<&F2Observation> {
@@ -377,13 +475,20 @@ pub fn validated_descent_baseline<'a>(
 /// Validated observation. Chooses the LOWEST-voltage validated point (the deepest undervolt) and
 /// annotates it with first-bad / bracket / counts / aggregate confidence. Pure.
 pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<F2FrontierEntry> {
-    let best = last_good_for_target(obs, target_mhz)?;
-    let validations_at_best: Vec<&F2Observation> = obs
+    let best = last_discovery_good_for_target(obs, target_mhz)?;
+    let evidence_at_best: Vec<&F2Observation> = obs
         .iter()
         .filter(|o| {
-            o.target_mhz == target_mhz && o.outcome.is_validated() && o.anchor_mv == best.anchor_mv
+            o.target_mhz == target_mhz
+                && o.outcome.is_validated()
+                && o.anchor_mv == best.anchor_mv
+                && (is_current_discovery_evidence(o) || is_current_qualification_pass(o))
         })
         .collect();
+    let qualification_count = evidence_at_best
+        .iter()
+        .filter(|o| is_current_qualification_pass(o))
+        .count();
     let observation_count = obs.iter().filter(|o| o.target_mhz == target_mhz).count();
     let bracket = bracket_for_target(obs, target_mhz);
     Some(F2FrontierEntry {
@@ -396,8 +501,8 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
         power_capped_frac: best.power_capped_frac,
         dwell_duration_ms: best.dwell_duration_ms,
         sample_count: best.sample_count,
-        confidence: frontier_confidence_from_evidence(&validations_at_best),
-        validation_count: validations_at_best.len(),
+        confidence: frontier_confidence_from_evidence(&evidence_at_best),
+        validation_count: qualification_count,
         first_bad_mv: first_bad_for_target(obs, target_mhz).map(|o| o.anchor_mv),
         bracket_width_mv: bracket.map(|b| b.width_mv),
         observation_count,
@@ -547,6 +652,10 @@ mod tests {
             run_id: "run-test".into(),
             timestamp: "2026-06-21T00:00:00Z".into(),
             gpu_key: Some("RTX 3060 Ti".into()),
+            evidence_kind: F2EvidenceKind::Discovery,
+            discovery_contract_version: Some(F2_DISCOVERY_CONTRACT_VERSION),
+            qualification_contract_version: None,
+            qualification_coverage: None,
             mode: F2ObsMode::TargetSweep,
             target_mhz: target,
             requested_start_mv: None,
@@ -588,6 +697,50 @@ mod tests {
         }
     }
 
+    fn qualification_pass(mut o: F2Observation) -> F2Observation {
+        o.evidence_kind = F2EvidenceKind::Qualification;
+        o.discovery_contract_version = None;
+        o.qualification_contract_version = Some(F2_QUALIFICATION_CONTRACT_VERSION);
+        o.qualification_coverage = Some(F2QualificationCoverage {
+            verdict: F2QualificationVerdict::Pass,
+            phases_completed: 8,
+            phases_expected: 8,
+            checksum_count: 8,
+            sample_count: 100,
+            target_residency_frac: Some(1.0),
+            heavy_light_power_delta_w: Some(20.0),
+            retry_count: 0,
+            reason: None,
+        });
+        o
+    }
+
+    #[test]
+    fn interleaved_qualification_failure_selects_shallower_qualified_point() {
+        // Mirrors the interleaved Cmax descent: PowerRender validates 975→968→962, qualification
+        // PASSES at 975 and 968, then FAILS at 962. The deeper failure records a bad observation, so
+        // the frontier must select 968 (the deepest QUALIFIED bin), never the rejected 962, and report
+        // it as qualified. This is the downstream invariant the per-bin interleaved discovery relies on.
+        let t = 1935;
+        let mut v = vec![
+            obs(t, 975, F2ObsOutcome::Validated),
+            qualification_pass(obs(t, 975, F2ObsOutcome::Validated)),
+            obs(t, 968, F2ObsOutcome::Validated),
+            qualification_pass(obs(t, 968, F2ObsOutcome::Validated)),
+            obs(t, 962, F2ObsOutcome::Validated),
+        ];
+        let mut deeper_qual_fail = obs(t, 962, F2ObsOutcome::Unstable);
+        deeper_qual_fail.evidence_kind = F2EvidenceKind::Qualification;
+        deeper_qual_fail.discovery_contract_version = None;
+        deeper_qual_fail.qualification_contract_version = Some(F2_QUALIFICATION_CONTRACT_VERSION);
+        v.push(deeper_qual_fail);
+
+        let entry = frontier_entry_for_target(&v, t).expect("a qualified frontier point exists");
+        assert_eq!(entry.best_anchor_mv, 968, "deepest QUALIFIED bin, not the rejected 962");
+        assert!(entry.validation_count >= 1, "selected point carries its qualification pass");
+        assert_eq!(entry.first_bad_mv, Some(962), "the rejected deeper bin bounds the frontier");
+    }
+
     #[test]
     fn outcome_classification() {
         assert!(F2ObsOutcome::Validated.is_validated());
@@ -606,6 +759,7 @@ mod tests {
         // Planner/gate refusals performed no write → NOT "bad" (no instability learned).
         assert!(!F2ObsOutcome::RejectedByPlanner.is_bad());
         assert!(!F2ObsOutcome::AbortedBySafetyGate.is_bad());
+        assert!(!F2ObsOutcome::QualificationInconclusive.is_bad());
         // Only reset-failure and unrecovered crash are SAFETY failures.
         assert!(F2ObsOutcome::ResetFailed.is_safety_failure());
         assert!(F2ObsOutcome::DeviceLost.is_safety_failure());
@@ -775,8 +929,28 @@ mod tests {
         assert_eq!(e1800.first_bad_mv, Some(956));
         assert_eq!(e1800.bracket_width_mv, Some(6));
         assert_eq!(e1800.observation_count, 4);
-        assert_eq!(e1800.validation_count, 1);
+        assert_eq!(e1800.validation_count, 0);
         assert!(e1800.confidence >= 0.85);
+    }
+
+    #[test]
+    fn learned_frontier_counts_only_current_qualification_passes() {
+        let discovery = obs(1800, 962, F2ObsOutcome::Validated);
+        let mut inconclusive = qualification_pass(discovery.clone());
+        inconclusive.outcome = F2ObsOutcome::QualificationInconclusive;
+        inconclusive.qualification_coverage.as_mut().unwrap().verdict =
+            F2QualificationVerdict::Inconclusive;
+        let mut old_pass = qualification_pass(discovery.clone());
+        old_pass.qualification_contract_version = Some(F2_QUALIFICATION_CONTRACT_VERSION - 1);
+        let current_pass = qualification_pass(discovery.clone());
+
+        let entry = frontier_entry_for_target(
+            &[discovery, inconclusive, old_pass, current_pass],
+            1800,
+        )
+        .unwrap();
+        assert_eq!(entry.best_anchor_mv, 962);
+        assert_eq!(entry.validation_count, 1);
     }
 
     #[test]
@@ -796,7 +970,7 @@ mod tests {
         assert_eq!(p.clock_mhz, 1815);
         assert_eq!(p.p5_clock_mhz, Some(1815));
         assert_eq!(p.confidence, Some(conf));
-        assert_eq!(p.validation_count, Some(1));
+        assert_eq!(p.validation_count, Some(0));
         assert!(p.perf_per_watt > 0.0);
         assert!(conf >= 0.85); // passes the balanced confidence gate
         // Whole-frontier bridge preserves count.

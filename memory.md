@@ -8,6 +8,30 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-06-29) — F2 FailureSeekingGameLoop qualification
+- Discovery remains the proven steady `PowerRender`; its power-limit, p5-clock and `ClockDrop`
+  semantics are unchanged in Fast, Standard and Long.
+- Standard/Long qualification now uses the versioned `FailureSeekingGameLoop`: PowerOpening,
+  BoostEdge, HeavySpike, TextureRop, ComputeBurst, IdlePulse, MixedGame and PowerClosing.
+  Each phase carries its own checksum/coverage evidence.
+- Current Apply qualification counts only current-contract qualification passes. Legacy/discovery
+  evidence can seed the frontier but cannot unlock Apply; inconclusive coverage is neither good nor
+  bad boundary evidence.
+- If qualification rejects a boundary, the service automatically moves one physical VF bin upward,
+  runs a fresh `PowerRender` discovery there, then restarts all qualification passes. No manual bad
+  points or operator priors are encoded.
+- Standard/Long no longer qualify an old `prior_good` directly. Previous positives can guide resume,
+  but a deployable boundary must be rediscovered by the current run before qualification begins.
+- `ResetGpuTuning` is now an explicit recovery path outside the normal start/apply lease: after a
+  TDR/interrupted Forge it can stop marked-running work, reset to stock, clear Safe Loop, and release
+  the Forge handle. It also clears the visible `forge_state.json` checkpoint so the UI can start from
+  an idle run state again, without deleting automatic F2 observation history.
+- UI recovery now separates the normal path from destructive reset: post-TDR Needs Attention /
+  Interrupted offers **Recover & continue** (ResetGpuTuning, then selected StartPowerSweep mode,
+  preserving F2 observations) and a clearly separate **Full reset** for `ResetGpuTuningFull`.
+- No IPC or frontend payload changed. No hardware Forge was run; next checkpoint is supervised
+  stock/conservative calibration followed by Standard qualification and real-game comparison.
+
 ## Latest (2026-06-28) — F2 qualification refinement
 - Fast traverses the full physical frontier with 10 s discovery dwells but remains provisional;
   frontend and backend block F2 Apply until `profiles_qualified`.

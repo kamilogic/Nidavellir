@@ -31,6 +31,11 @@ pub enum IpcRequest {
     ApplyDeepCalm,
     ApplyMemPeak,
     ResetGpuTuning,
+    /// Deep reset: same emergency recovery as [`IpcRequest::ResetGpuTuning`] (stock GPU, Safe Loop
+    /// latch released, run checkpoint cleared) but ALSO discards all learning — the Safe Loop
+    /// blacklist, the F2 observation frontier, and legacy knowledge. Additive; the UI offers it as a
+    /// separate, stronger-confirmation "forget everything" control.
+    ResetGpuTuningFull,
     GetAppliedProfile,
     VerifyAppliedProfile,
     StartForgeAll,

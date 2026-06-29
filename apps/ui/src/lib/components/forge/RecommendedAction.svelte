@@ -1,5 +1,5 @@
 <script>
-  import { Check, ChevronDown, Play, Square } from "@lucide/svelte";
+  import { Check, ChevronDown, Play, RotateCcw, Square } from "@lucide/svelte";
   import StatusBadge from "./StatusBadge.svelte";
 
   let {
@@ -11,6 +11,9 @@
     onStartPower,
     onStopPower,
     onForgeModeChange,
+    onReset,
+    onFullReset,
+    onRecoverContinue,
   } = $props();
   let modePicker = $state(null);
 
@@ -18,7 +21,14 @@
   const profilesQualified = $derived(!powerSweep?.is_undervolt || Boolean(powerSweep?.profiles_qualified));
   const needsAttention = $derived(Boolean(safeLoop?.safe_mode || safeLoop?.state === "unstable"));
   const currentPhase = $derived(powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : null);
+  const isInterrupted = $derived(powerSweep?.phase === "interrupted");
+  const hasAppliedTuning = $derived(Boolean(applied?.core || applied?.mem_offset_mhz));
+  const hasForgeRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
+  const canResetState = $derived(Boolean(onReset) && (needsAttention || hasAppliedTuning || hasProfiles || hasForgeRun));
+  const canFullResetState = $derived(Boolean(onFullReset) && (needsAttention || hasAppliedTuning || hasProfiles || hasForgeRun));
+  const canRecoverContinue = $derived(Boolean(onRecoverContinue) && (needsAttention || isInterrupted) && !powerRunning);
   const title = $derived.by(() => {
+    if (isInterrupted) return "Forge interrupted";
     if (needsAttention) return "Needs Attention";
     if (powerRunning) return "Core VF forge in progress";
     if (!hasProfiles && !applied?.core) return "Raw GPU Detected";
@@ -28,7 +38,15 @@
     return "Ready to forge";
   });
   const body = $derived.by(() => {
-    if (needsAttention) return "Nidavellir detected a safety condition that should be reviewed before more tuning.";
+    if (isInterrupted && needsAttention) {
+      return "The previous Forge was interrupted and recovery is latched. Recover & continue resets to stock, clears recovery, preserves learned observations, then starts the selected Forge mode.";
+    }
+    if (isInterrupted) {
+      return "The previous Forge run did not finish cleanly. Continue with the selected mode to reuse saved learning, or use Full reset only if you want to discard it.";
+    }
+    if (needsAttention) {
+      return "Nidavellir detected a safety condition. Recover & continue clears the recovery latch while keeping Forge learning available for the next run.";
+    }
     if (powerRunning) {
       return `Nidavellir is running the implemented core VF forge and profile generation path${currentPhase ? `: ${currentPhase}` : ""}.`;
     }
@@ -43,7 +61,7 @@
     }
     return "Your applied profile will be re-applied automatically on boot with Safe Loop protection. You can refine core VF profiles at any time.";
   });
-  const primaryLabel = $derived(hasProfiles ? "Refine Profiles" : "Forge GPU");
+  const primaryLabel = $derived(isInterrupted ? "Continue Forge" : hasProfiles ? "Refine Profiles" : "Forge GPU");
   const firstRunSteps = [
     "Safe Loop check",
     "Multi-clock discovery",
@@ -79,13 +97,19 @@
   const selectedMode = $derived(forgeModes.find((mode) => mode.id === forgeMode) ?? forgeModes[1]);
 
   function selectMode(mode) {
-    if (needsAttention || powerRunning) return;
+    if (powerRunning) return;
     onForgeModeChange?.(mode);
     modePicker?.removeAttribute("open");
   }
 
   function startSelectedMode() {
+    if (needsAttention || powerRunning) return;
     onStartPower?.(forgeMode);
+  }
+
+  function recoverSelectedMode() {
+    if (!canRecoverContinue) return;
+    onRecoverContinue?.(forgeMode);
   }
 
   function handlePickerKeydown(event) {
@@ -137,48 +161,120 @@
       <span>Stop forging</span>
     </button>
   {:else if needsAttention}
-    <StatusBadge label="Review Safety" variant="attention" symbol="attention" />
-  {:else}
-    <div class="action-group" use:dismissPicker>
-      <button class="btn action-primary" onclick={startSelectedMode}>
-        <Play size={15} strokeWidth={1.9} />
-        <span>{primaryLabel}</span>
-      </button>
-      <details
-        class="mode-picker"
-        bind:this={modePicker}
-      >
-        <summary
-          class="mode-summary"
-          aria-label={`Select forge mode. Current mode: ${selectedMode.label}`}
-          title={`${selectedMode.title}. ${selectedMode.description}`}
-          onkeydown={handlePickerKeydown}
-        >
-          <span>{selectedMode.summaryLabel}</span>
-          <ChevronDown size={14} strokeWidth={2} />
-        </summary>
-        <div class="mode-menu" role="menu" tabindex="-1" onkeydown={handlePickerKeydown}>
-          {#each forgeModes as mode}
-            <button
-              type="button"
-              class="mode-item"
-              class:selected={forgeMode === mode.id}
-              role="menuitemradio"
-              aria-checked={forgeMode === mode.id}
-              onclick={() => selectMode(mode.id)}
+    <div class="action-stack">
+      {#if canRecoverContinue}
+        <div class="action-group" use:dismissPicker>
+          <button class="btn action-primary" onclick={recoverSelectedMode}>
+            <Play size={15} strokeWidth={1.9} />
+            <span>Recover & continue</span>
+          </button>
+          <details
+            class="mode-picker"
+            bind:this={modePicker}
+          >
+            <summary
+              class="mode-summary"
+              aria-label={`Select forge mode for recovery. Current mode: ${selectedMode.label}`}
+              title={`${selectedMode.title}. ${selectedMode.description}`}
+              onkeydown={handlePickerKeydown}
             >
-              <span class="mode-copy">
-                <strong>{mode.label}<small>{mode.meta}</small></strong>
-                <span>{mode.title}</span>
-              </span>
-              <span class="mode-check" class:visible={forgeMode === mode.id}>
-                <Check size={14} strokeWidth={2.1} />
-              </span>
-            </button>
-          {/each}
-          <p class="mode-safety">Supervised and fail-closed · Nothing is auto-applied</p>
+              <span>{selectedMode.summaryLabel}</span>
+              <ChevronDown size={14} strokeWidth={2} />
+            </summary>
+            <div class="mode-menu" role="menu" tabindex="-1" onkeydown={handlePickerKeydown}>
+              {#each forgeModes as mode}
+                <button
+                  type="button"
+                  class="mode-item"
+                  class:selected={forgeMode === mode.id}
+                  role="menuitemradio"
+                  aria-checked={forgeMode === mode.id}
+                  onclick={() => selectMode(mode.id)}
+                >
+                  <span class="mode-copy">
+                    <strong>{mode.label}<small>{mode.meta}</small></strong>
+                    <span>{mode.title}</span>
+                  </span>
+                  <span class="mode-check" class:visible={forgeMode === mode.id}>
+                    <Check size={14} strokeWidth={2.1} />
+                  </span>
+                </button>
+              {/each}
+              <p class="mode-safety">Clears recovery first · preserves learned observations</p>
+            </div>
+          </details>
         </div>
-      </details>
+      {:else}
+        <StatusBadge label="Review Safety" variant="attention" symbol="attention" />
+      {/if}
+      {#if canResetState}
+        <button class="btn reset-all" onclick={onReset}>
+          <RotateCcw size={14} strokeWidth={1.9} />
+          <span>Reset all</span>
+        </button>
+      {/if}
+      {#if canFullResetState}
+        <button class="btn full-reset" onclick={onFullReset}>
+          <RotateCcw size={14} strokeWidth={1.9} />
+          <span>Full reset</span>
+        </button>
+      {/if}
+    </div>
+  {:else}
+    <div class="action-stack">
+      <div class="action-group" use:dismissPicker>
+        <button class="btn action-primary" onclick={startSelectedMode}>
+          <Play size={15} strokeWidth={1.9} />
+          <span>{primaryLabel}</span>
+        </button>
+        <details
+          class="mode-picker"
+          bind:this={modePicker}
+        >
+          <summary
+            class="mode-summary"
+            aria-label={`Select forge mode. Current mode: ${selectedMode.label}`}
+            title={`${selectedMode.title}. ${selectedMode.description}`}
+            onkeydown={handlePickerKeydown}
+          >
+            <span>{selectedMode.summaryLabel}</span>
+            <ChevronDown size={14} strokeWidth={2} />
+          </summary>
+          <div class="mode-menu" role="menu" tabindex="-1" onkeydown={handlePickerKeydown}>
+            {#each forgeModes as mode}
+              <button
+                type="button"
+                class="mode-item"
+                class:selected={forgeMode === mode.id}
+                role="menuitemradio"
+                aria-checked={forgeMode === mode.id}
+                onclick={() => selectMode(mode.id)}
+              >
+                <span class="mode-copy">
+                  <strong>{mode.label}<small>{mode.meta}</small></strong>
+                  <span>{mode.title}</span>
+                </span>
+                <span class="mode-check" class:visible={forgeMode === mode.id}>
+                  <Check size={14} strokeWidth={2.1} />
+                </span>
+              </button>
+            {/each}
+            <p class="mode-safety">Supervised and fail-closed · Nothing is auto-applied</p>
+          </div>
+        </details>
+      </div>
+      {#if canResetState}
+        <button class="btn reset-all" onclick={onReset}>
+          <RotateCcw size={14} strokeWidth={1.9} />
+          <span>Reset all</span>
+        </button>
+      {/if}
+      {#if canFullResetState}
+        <button class="btn full-reset" onclick={onFullReset}>
+          <RotateCcw size={14} strokeWidth={1.9} />
+          <span>Full reset</span>
+        </button>
+      {/if}
     </div>
   {/if}
 
@@ -200,6 +296,7 @@
 
 <style>
   .next-action {
+    --action-button-height: 2.5rem;
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 1rem;
@@ -233,12 +330,14 @@
   }
   .btn {
     display: inline-flex;
+    box-sizing: border-box;
     align-items: center;
     justify-content: center;
     gap: 0.42rem;
+    height: var(--action-button-height);
     border: 1px solid var(--border);
     border-radius: 9px;
-    padding: 0.55rem 1.1rem;
+    padding: 0 1.1rem;
     font-weight: 600;
     font-size: 0.85rem;
     cursor: pointer;
@@ -254,13 +353,21 @@
   .action-group {
     display: inline-grid;
     grid-template-columns: auto auto;
+    height: var(--action-button-height);
     border-radius: 10px;
     box-shadow:
       0 0 0 1px rgba(214, 168, 93, 0.42),
       0 8px 20px rgba(0, 0, 0, 0.16);
   }
+  .action-stack {
+    display: flex;
+    justify-content: flex-end;
+    align-items: flex-start;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
   .action-group .btn {
-    min-height: 2.5rem;
+    height: var(--action-button-height);
     border: 0;
     padding-inline: 0.82rem;
     background: rgba(214, 168, 93, 0.13);
@@ -272,19 +379,44 @@
   .action-primary :global(svg) {
     margin-left: 1px;
   }
+  .btn.reset-all {
+    height: var(--action-button-height);
+    color: #f3c9a6;
+    border-color: rgba(214, 168, 93, 0.36);
+    background: rgba(214, 124, 93, 0.11);
+  }
+  .btn.reset-all:hover,
+  .btn.reset-all:focus-visible {
+    color: var(--forge-gold);
+    border-color: rgba(214, 168, 93, 0.58);
+    background: rgba(214, 168, 93, 0.15);
+  }
+  .btn.full-reset {
+    height: var(--action-button-height);
+    color: #f3b9bd;
+    border-color: rgba(191, 97, 106, 0.4);
+    background: rgba(191, 97, 106, 0.11);
+  }
+  .btn.full-reset:hover,
+  .btn.full-reset:focus-visible {
+    color: #ffd1d5;
+    border-color: rgba(191, 97, 106, 0.62);
+    background: rgba(191, 97, 106, 0.17);
+  }
   .mode-picker {
     position: relative;
   }
   .mode-summary {
     display: flex;
+    box-sizing: border-box;
     justify-content: center;
     min-width: 3.25rem;
-    min-height: 2.5rem;
+    height: var(--action-button-height);
     align-items: center;
     gap: 0.22rem;
     border-left: 1px solid rgba(214, 168, 93, 0.28);
     border-radius: 0 9px 9px 0;
-    padding: 0.5rem;
+    padding: 0 0.5rem;
     background: rgba(214, 168, 93, 0.13);
     color: var(--forge-text);
     font-size: 0.72rem;
@@ -438,6 +570,9 @@
     }
     .action-group {
       justify-self: start;
+    }
+    .action-stack {
+      justify-content: flex-start;
     }
     .mode-menu {
       right: auto;

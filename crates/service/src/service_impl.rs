@@ -54,7 +54,7 @@ pub fn run_service() -> windows_service::Result<()> {
         driver: DriverManager::new(),
         sensor_engine: nidavellir_core::sensors::SensorEngine::new(),
         motherboard: hw.motherboard,
-        safe_store,
+        safe_store: safe_store.clone(),
         gpu_validation: crate::gpu_real::GpuValidationHandle::default(),
         real_sweep: crate::gpu_sweep_real::RealSweepHandle::default(),
         mem_sweep: crate::gpu_mem_sweep::MemSweepHandle::default(),
@@ -73,6 +73,12 @@ pub fn run_service() -> windows_service::Result<()> {
     });
 
     let _ = shutdown_rx.recv();
+
+    // This stop is graceful (Windows sent Stop/Shutdown — e.g. a user-initiated restart). Record a
+    // one-shot marker so startup recovery does not mistake an armed boot-flag for a crash.
+    if let Err(e) = safe_store.write_clean_shutdown() {
+        tracing::warn!("Safe Loop: failed to record clean shutdown: {e}");
+    }
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,

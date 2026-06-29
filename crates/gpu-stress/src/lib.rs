@@ -11,7 +11,7 @@
 //! Every stage has a bit-exact CPU reference; any divergence ⇒ `SilentError`,
 //! a device-lost ⇒ `Crash`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use nidavellir_core::gpu_sweep::StabilityResult;
@@ -51,11 +51,121 @@ pub struct StageReport {
 
 /// Result of a render-pipeline run: the stability verdict plus the rendered
 /// frame count and FPS (the benchmark's performance metric).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RenderResult {
     pub result: StabilityResult,
     pub frames: u64,
     pub fps: f64,
+    /// Present only when the transient VF qualifier failed inside a named phase.
+    pub failure_phase: Option<VfQualifierPhase>,
+    pub phase_reports: Vec<VfPhaseReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VfPhaseReport {
+    pub phase: VfQualifierPhase,
+    pub result: StabilityResult,
+    pub frames: u64,
+    pub checksum_count: u32,
+    pub elapsed_ms: u64,
+}
+
+/// Deterministic failure-seeking phases used only by F2 qualification. Discovery keeps using the
+/// unchanged steady power render so its clock/power statistics remain comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfQualifierPhase {
+    PowerOpening,
+    BoostEdge,
+    HeavySpike,
+    TextureRop,
+    ComputeBurst,
+    IdlePulse,
+    MixedGame,
+    PowerClosing,
+}
+
+impl VfQualifierPhase {
+    pub const NONE_CODE: u8 = u8::MAX;
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VfQualifierPhase::PowerOpening => "power-opening",
+            VfQualifierPhase::BoostEdge => "boost-edge",
+            VfQualifierPhase::HeavySpike => "heavy-spike",
+            VfQualifierPhase::TextureRop => "texture-rop",
+            VfQualifierPhase::ComputeBurst => "compute-burst",
+            VfQualifierPhase::IdlePulse => "idle-pulse",
+            VfQualifierPhase::MixedGame => "mixed-game",
+            VfQualifierPhase::PowerClosing => "power-closing",
+        }
+    }
+
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::PowerOpening),
+            1 => Some(Self::BoostEdge),
+            2 => Some(Self::HeavySpike),
+            3 => Some(Self::TextureRop),
+            4 => Some(Self::ComputeBurst),
+            5 => Some(Self::IdlePulse),
+            6 => Some(Self::MixedGame),
+            7 => Some(Self::PowerClosing),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VfWorkload {
+    PowerRender,
+    BoostEdge,
+    HeavySpike,
+    TextureRop,
+    ComputeBurst,
+    IdlePulse,
+    MixedGame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VfQualifierSegment {
+    phase: VfQualifierPhase,
+    workload: VfWorkload,
+    duration_ms: u64,
+}
+
+/// One cycle crosses distinct graphics/compute profiles and deliberate idle→heavy transitions. The
+/// weights describe the approved 60-second Standard pass and scale exactly for Long.
+fn vf_qualifier_plan(target_ms: u64) -> Vec<VfQualifierSegment> {
+    const TEMPLATE: [(VfQualifierPhase, VfWorkload, u64); 8] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 6),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 8),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 4),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 12),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 10),
+    ];
+    const TOTAL_WEIGHT: u64 = 60;
+
+    let mut assigned = 0u64;
+    TEMPLATE
+        .iter()
+        .enumerate()
+        .map(|(index, &(phase, workload, weight))| {
+            let duration_ms = if index + 1 == TEMPLATE.len() {
+                target_ms.saturating_sub(assigned)
+            } else {
+                target_ms.saturating_mul(weight) / TOTAL_WEIGHT
+            };
+            assigned = assigned.saturating_add(duration_ms);
+            VfQualifierSegment { phase, workload, duration_ms }
+        })
+        .collect()
 }
 
 const ALU_SHADER: &str = r#"
@@ -289,6 +399,65 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     }
     let v = fract(abs(a + b + c + d + t.x + t.z) * 0.00037);
     return vec4<f32>(v, fract(v * 7.0), fract(v * 13.0), 1.0);
+}
+"#;
+
+// High-FPS / medium-power graphics path: same deterministic target, but a much cheaper fragment
+// shader and one instance. It keeps boost high without pinning the board at its power limit.
+const BOOST_EDGE_SHADER: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) seed: f32 };
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var o: VOut;
+    o.pos = vec4<f32>(p[vi], 0.0, 1.0);
+    o.uv = (p[vi] + vec2<f32>(1.0, 1.0)) * 0.5;
+    o.seed = f32(ii);
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    var a = in.uv.x * 11.0 + 0.17;
+    var b = in.uv.y * 13.0 + 0.29;
+    for (var k = 0; k < 12; k = k + 1) {
+        a = fma(a, 1.001, b * 0.003);
+        b = fma(b, 0.999, a * 0.002);
+    }
+    let t = textureSampleLevel(tex, samp, fract(in.uv * 2.0 + vec2<f32>(a, b) * 0.001), 0.0);
+    let v = fract(abs(a + b + t.x + t.y) * 0.031);
+    return vec4<f32>(v, fract(v * 3.0), fract(v * 5.0), 1.0);
+}
+"#;
+
+// Texture/ROP-biased path: dependent texture sampling and alpha blending dominate while the ALU
+// chain stays deliberately lighter than PowerRender.
+const TEXTURE_ROP_SHADER: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) seed: f32 };
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var o: VOut;
+    o.pos = vec4<f32>(p[vi] * (0.997 - f32(ii) * 0.0005), 0.0, 1.0);
+    o.uv = (p[vi] + vec2<f32>(1.0, 1.0)) * 0.5;
+    o.seed = f32(ii) * 0.071;
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    var uv = fract(in.uv * 3.0 + in.seed);
+    var t = vec4<f32>(0.0);
+    for (var k = 0; k < 48; k = k + 1) {
+        uv = fract(uv * vec2<f32>(1.013, 0.991) + vec2<f32>(0.017, 0.029));
+        t = t + textureSampleLevel(tex, samp, uv, 0.0);
+        t = t + textureSampleLevel(tex, samp, fract(uv.yx * 1.7), 0.0);
+        t = t + textureSampleLevel(tex, samp, fract(uv * 4.1 + t.xy * 0.0001), 0.0);
+    }
+    let v = fract((t.x + t.y + t.z) * 0.0031);
+    return vec4<f32>(v, fract(v * 7.0), fract(v * 11.0), 0.55);
 }
 "#;
 
@@ -1153,6 +1322,108 @@ impl GpuCtx {
     /// compute-only validation passes. Returns the verdict plus the rendered
     /// frame count / FPS — the benchmark uses the FPS as its performance metric.
     pub fn run_render_stress(&self, target_ms: u64) -> RenderResult {
+        self.run_render_profile(target_ms, VfWorkload::PowerRender, None, false, false)
+    }
+
+    /// Failure-seeking F2 qualification loop. Discovery must keep calling
+    /// [`Self::run_render_stress`]; this method is only for Standard/Long reset/reapply passes.
+    pub fn run_vf_qualifier_stress(&self, target_ms: u64) -> RenderResult {
+        let phase = AtomicU8::new(VfQualifierPhase::NONE_CODE);
+        self.run_vf_qualifier_stress_with_phase(target_ms, &phase)
+    }
+
+    /// Same qualifier with an observable phase id for the service's concurrent NVML sampler.
+    pub fn run_vf_qualifier_stress_with_phase(
+        &self,
+        target_ms: u64,
+        phase_state: &AtomicU8,
+    ) -> RenderResult {
+        let started = std::time::Instant::now();
+        let mut frames = 0u64;
+        let mut reports = Vec::new();
+        let plan = vf_qualifier_plan(target_ms);
+
+        for segment in plan {
+            phase_state.store(segment.phase.code(), Ordering::SeqCst);
+            let single = [segment.workload];
+            let mixed = [
+                VfWorkload::BoostEdge,
+                VfWorkload::TextureRop,
+                VfWorkload::PowerRender,
+            ];
+            let workloads: &[VfWorkload] =
+                if segment.workload == VfWorkload::MixedGame { &mixed } else { &single };
+            let workload_ms = segment.duration_ms / workloads.len() as u64;
+            let mut assigned = 0u64;
+
+            for (index, &workload) in workloads.iter().enumerate() {
+                let duration_ms = if index + 1 == workloads.len() {
+                    segment.duration_ms.saturating_sub(assigned)
+                } else {
+                    workload_ms
+                };
+                assigned = assigned.saturating_add(duration_ms);
+                let result = match workload {
+                    VfWorkload::ComputeBurst => {
+                        let stage = self.run_alu("VF qualifier compute burst", 262_144, 256, duration_ms);
+                        RenderResult {
+                            result: stage.result,
+                            frames: 0,
+                            fps: 0.0,
+                            failure_phase: (stage.result != StabilityResult::Stable)
+                                .then_some(segment.phase),
+                            phase_reports: vec![VfPhaseReport {
+                                phase: segment.phase,
+                                result: stage.result,
+                                frames: 0,
+                                checksum_count: 1,
+                                elapsed_ms: stage.elapsed_ms,
+                            }],
+                        }
+                    }
+                    other => self.run_render_profile(
+                        duration_ms,
+                        other,
+                        Some(segment.phase),
+                        matches!(other, VfWorkload::IdlePulse),
+                        true,
+                    ),
+                };
+                frames = frames.saturating_add(result.frames);
+                reports.extend(result.phase_reports);
+                if result.result != StabilityResult::Stable {
+                    phase_state.store(VfQualifierPhase::NONE_CODE, Ordering::SeqCst);
+                    let secs = started.elapsed().as_secs_f64().max(0.001);
+                    return RenderResult {
+                        result: result.result,
+                        frames,
+                        fps: frames as f64 / secs,
+                        failure_phase: result.failure_phase.or(Some(segment.phase)),
+                        phase_reports: reports,
+                    };
+                }
+            }
+        }
+
+        phase_state.store(VfQualifierPhase::NONE_CODE, Ordering::SeqCst);
+        let secs = started.elapsed().as_secs_f64().max(0.001);
+        RenderResult {
+            result: StabilityResult::Stable,
+            frames,
+            fps: frames as f64 / secs,
+            failure_phase: None,
+            phase_reports: reports,
+        }
+    }
+
+    fn run_render_profile(
+        &self,
+        target_ms: u64,
+        profile: VfWorkload,
+        phase: Option<VfQualifierPhase>,
+        idle_pulses: bool,
+        full_workload_duration: bool,
+    ) -> RenderResult {
         let start = std::time::Instant::now();
         let mut frames: u64 = 0;
         const DIM: u32 = 1536; // 1536*4 = 6144 B/row (256-aligned for copy)
@@ -1164,8 +1435,6 @@ impl GpuCtx {
         // cap throttled the clock a frame crossed 2s and the driver reset (device
         // lost). Keeping per-frame work bounded (many short frames, not one giant
         // one — like a real game) is what makes the load safely repeatable.
-        const INSTANCES: u32 = 8; // heavy overdraw, but bounded per-frame work
-
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("render-target"),
             size: wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
@@ -1211,8 +1480,16 @@ impl GpuCtx {
             ..Default::default()
         });
 
+        let (shader_source, instances, blend) = match profile {
+            VfWorkload::PowerRender | VfWorkload::HeavySpike | VfWorkload::IdlePulse => {
+                (RENDER_SHADER, 8, wgpu::BlendState::REPLACE)
+            }
+            VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
+            VfWorkload::TextureRop => (TEXTURE_ROP_SHADER, 4, wgpu::BlendState::ALPHA_BLENDING),
+            VfWorkload::ComputeBurst | VfWorkload::MixedGame => unreachable!("non-render workload"),
+        };
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("render"), source: wgpu::ShaderSource::Wgsl(RENDER_SHADER.into()),
+            label: Some("render"), source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("render"), layout: None,
@@ -1224,7 +1501,7 @@ impl GpuCtx {
                 module: &shader, entry_point: "fs",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -1268,11 +1545,20 @@ impl GpuCtx {
             ],
         });
 
-        let mut reference: Option<u32> = None;
+        let mut reference = None;
         let mut diverged = false;
+        let mut checksum_count = 0u32;
         let mut last_check = std::time::Instant::now();
+        let workload_start =
+            if full_workload_duration { std::time::Instant::now() } else { start };
+        let mut last_idle = workload_start;
 
-        while (start.elapsed().as_millis() as u64) < target_ms {
+        while (workload_start.elapsed().as_millis() as u64) < target_ms {
+            if idle_pulses && last_idle.elapsed().as_millis() >= 750 {
+                self.device.poll(wgpu::Maintain::Wait);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                last_idle = std::time::Instant::now();
+            }
             let mut enc = self.device.create_command_encoder(&Default::default());
             {
                 let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1285,7 +1571,7 @@ impl GpuCtx {
                 });
                 rp.set_pipeline(&pipeline);
                 rp.set_bind_group(0, &tex_bind, &[]);
-                rp.draw(0..3, 0..INSTANCES);
+                rp.draw(0..3, 0..instances);
             }
             self.queue.submit(Some(enc.finish()));
             frames += 1;
@@ -1322,6 +1608,7 @@ impl GpuCtx {
                 self.queue.submit(Some(enc.finish()));
                 self.device.poll(wgpu::Maintain::Wait);
                 let sum = self.read_u32(&sum_buf);
+                checksum_count = checksum_count.saturating_add(1);
                 match reference {
                     None => reference = Some(sum),
                     Some(r) => {
@@ -1343,7 +1630,24 @@ impl GpuCtx {
             StabilityResult::Stable
         };
         let secs = start.elapsed().as_secs_f64().max(0.001);
-        RenderResult { result, frames, fps: frames as f64 / secs }
+        let phase_reports = phase
+            .map(|phase| {
+                vec![VfPhaseReport {
+                    phase,
+                    result,
+                    frames,
+                    checksum_count,
+                    elapsed_ms: workload_start.elapsed().as_millis() as u64,
+                }]
+            })
+            .unwrap_or_default();
+        RenderResult {
+            result,
+            frames,
+            fps: frames as f64 / secs,
+            failure_phase: (result != StabilityResult::Stable).then_some(phase).flatten(),
+            phase_reports,
+        }
     }
 
     /// Measure sustained memory bandwidth (GB/s) over ~`target_ms` by streaming
@@ -1529,5 +1833,20 @@ mod tests {
             }
             assert_eq!(lcg_jump(seed, n), x, "seed={seed} n={n}");
         }
+    }
+
+    #[test]
+    fn vf_qualifier_plan_preserves_duration_and_crosses_load_amplitudes() {
+        let plan = vf_qualifier_plan(60_000);
+        assert_eq!(plan.iter().map(|segment| segment.duration_ms).sum::<u64>(), 60_000);
+        assert_eq!(plan.first().map(|segment| segment.phase), Some(VfQualifierPhase::PowerOpening));
+        assert_eq!(plan.last().map(|segment| segment.phase), Some(VfQualifierPhase::PowerClosing));
+        assert!(plan.iter().any(|segment| segment.workload == VfWorkload::BoostEdge));
+        assert!(plan.iter().any(|segment| segment.workload == VfWorkload::TextureRop));
+        assert!(plan.iter().any(|segment| segment.workload == VfWorkload::ComputeBurst));
+        assert!(plan.iter().any(|segment| segment.workload == VfWorkload::IdlePulse));
+        assert!(plan.iter().all(|segment| segment.duration_ms > 0));
+        assert_eq!(VfQualifierPhase::from_code(VfQualifierPhase::TextureRop.code()),
+                   Some(VfQualifierPhase::TextureRop));
     }
 }

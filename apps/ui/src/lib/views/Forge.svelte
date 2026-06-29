@@ -203,8 +203,22 @@
   const stopMem = () => call("StopMemSweep", setMem);
   const setApplied = (r) => (applied = r?.data?.type === "GpuApply" ? r.data : applied);
   const resetTuning = async () => {
+    const confirmed = globalThis.confirm?.(
+      "Reset GPU tuning latch? This returns the GPU to stock, clears recovery, and preserves learned Forge observations.",
+    ) ?? true;
+    if (!confirmed) return;
     verification = null;
     await call("ResetGpuTuning", setApplied);
+    await refresh();
+  };
+  const fullResetTuning = async () => {
+    const confirmed = globalThis.confirm?.(
+      "Full reset will return the GPU to stock AND delete learned Forge observations, legacy GPU knowledge, and the Safe Loop blacklist. Use this only when you want to start this GPU from zero. Continue?",
+    ) ?? true;
+    if (!confirmed) return;
+    verification = null;
+    await call("ResetGpuTuningFull", setApplied);
+    await refresh();
   };
   const setBench = (r) => (benchmark = r?.data?.type === "Benchmark" ? r.data : benchmark);
   const startBench = () => call("StartBenchmark", setBench);
@@ -220,6 +234,24 @@
   };
   const startPower = (mode = forgeMode) =>
     call(POWER_START[mode] ?? POWER_START.standard, setPower);
+  const recoverAndStartPower = async (mode = forgeMode) => {
+    const confirmed = globalThis.confirm?.(
+      "Continue Forge from saved learning? Nidavellir will reset the GPU to stock, clear recovery, preserve learned observations, then start the selected Forge mode.",
+    ) ?? true;
+    if (!confirmed) return;
+    verification = null;
+    try {
+      const reset = await serviceCall("ResetGpuTuning");
+      setApplied(reset);
+      const started = await serviceCall(POWER_START[mode] ?? POWER_START.standard);
+      setPower(started);
+      error = null;
+      await refresh();
+    } catch (e) {
+      error = String(e);
+      await refresh();
+    }
+  };
   const stopPower = () => call("StopPowerSweep", setPower);
   const POWER_APPLY = {
     godforge: "ApplyPowerGodforge",
@@ -281,12 +313,14 @@
     {error}
     {applied}
     {hardware}
+    {powerSweep}
     {safeLoop}
     {powerRunning}
     {hasProfiles}
     {hasKnowledge}
     {verification}
     onReset={resetTuning}
+    onFullReset={fullResetTuning}
   />
 
   <ForgeProgress
@@ -323,6 +357,9 @@
       onStartPower={startPower}
       onForgeModeChange={selectForgeMode}
       onStopPower={stopPower}
+      onReset={resetTuning}
+      onFullReset={fullResetTuning}
+      onRecoverContinue={recoverAndStartPower}
     />
 
     <section class="home-section profile-section">

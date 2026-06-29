@@ -2,6 +2,103 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Cmax descent interleaves qualification per VF bin (2026-06-29)
+- **Problem**: per clock, discovery descended `PowerRender` PAST the first sustained point to the
+  deepest PowerRender-survivable bin, THEN qualified that deepest bin with the failure-seeking
+  `FailureSeekingGameLoop`. PowerRender tolerates more than the failure-seeking qualifier (and than real
+  games), so the deepest PowerRender point is often too aggressive — qualifying it risks a TDR, and the
+  descent below the bin that ultimately qualifies is wasted. The old code then climbed back UP one bin
+  at a time on qualification failure (`f2_discovery_decision` returned `ContinueVoltage` on every
+  post-sustain `Validated`; qualification ran on `deepest_good_candidate` with upward back-off).
+- **Decision (operator-approved, "completa, sem teto")**: interleave the two workloads. For Standard/Long
+  the per-clock loop now stops the `PowerRender` descent at the FIRST sustained (under-cap `Validated`)
+  bin, qualifies THAT bin with the full N passes, and only then descends one real VF bin lower —
+  `PowerRender` there measures its power and gates whether to even attempt qualification. Each deeper bin
+  is fully qualified before going lower; the first qualification failure stops the descent and keeps the
+  last qualified bin as the boundary. The heavy qualifier therefore never runs more than ONE bin below an
+  already-proven point, so an over-aggressive synthetic discovery point can no longer TDR during
+  qualification. Fast (no qualification) keeps the old descend-to-PowerRender-floor behavior (provisional).
+- **Why no upward back-off anymore**: descending top-down and qualifying each bin means the bin one step
+  up is already qualified when a deeper bin fails — there is nothing to climb back to. The only
+  not-qualifiable case is the first sustained bin failing (the most stable under-cap point), which is a
+  genuine fail-closed for that clock.
+- **Downstream is unchanged and already correct**: a failed qualification records an `is_bad()`
+  observation at that bin, so `first_bad_for_target` bounds the frontier and `last_discovery_good_for_target`
+  selects the deepest QUALIFIED bin automatically. Locked by a new core test
+  (`interleaved_qualification_failure_selects_shallower_qualified_point`). `synthesize_forge_profiles`,
+  `learned_frontier`, Cmax/90%-floor, Safe Loop arm/verify/reset per dwell, and resume/warm-start are
+  untouched.
+- **Trade-off (accepted)**: more qualification dwells per clock (N passes × each qualified bin) → longer
+  Standard/Long. The initial ETA estimate under-counts and self-corrects upward as deeper bins qualify.
+  Justified by Stability/Safety over Performance.
+- **Status**: code-complete; `nidavellir-core` 69 + `nidavellir-service` 319 tests pass; clippy no new
+  warnings. NOT yet re-run on hardware with the new flow — a supervised Standard run is the recommended
+  next check. The change is localized to `run_confirmed_f2_clock_discovery` (+ new helper
+  `qualify_anchored_candidate`) in `crates/service/src/gpu_undervolt.rs`.
+
+## Reset releases the Safe Mode latch; clean restart ≠ crash; deep reset (2026-06-29)
+- **Problem**: once Safe Mode tripped, it could never be cleared. `safe_mode`/`consecutive_crashes`
+  live in `safe_loop.json`, but `gpu_apply::reset` (the only caller is `ResetGpuTuning`) only reset
+  hardware + boot-flag + applied profile and **never rewrote the record**. `safe_mode` was a one-way
+  latch — nothing in the codebase set it `false` (not even `mark_validated`). The UI's Needs Attention
+  branch then hid the forge controls, leaving "no option," and the latch survived reboots. Worse, every
+  clean reboot while latched re-ran `EnterSafeMode` and **incremented `consecutive_crashes`**, and a
+  manual PC restart during an armed boot-flag was indistinguishable from a crash — both inflated the
+  streak.
+- **Decision (Fix A)**: `gpu_apply::reset` now also clears the recovery latch via
+  `SafeLoopRecord::clear_recovery_latch()` (safe_mode→false, consecutive_crashes→0, state→idle) while
+  PRESERVING learning (blacklist, last_validated, crash_log) and the F2 observation frontier. So the
+  existing "Reset all" button finally releases Safe Mode. No UI change required.
+- **Decision (Fix B)**: re-entering Safe Mode on a *clean* boot is a new `RecoveryAction::RemainSafeMode`
+  that stays hands-off **without** incrementing the crash streak. `EnterSafeMode` (which increments) is
+  now reached only via the armed-flag threshold trip — an actual crash.
+- **Decision (Fix C)**: the service writes a one-shot `clean_shutdown.txt` marker on graceful
+  Stop/Shutdown. Startup recovery consumes it once; an armed boot-flag + marker is treated as a clean
+  interruption (disarm, no crash counted). A real crash leaves no marker, so the parachute still fires.
+  Fail-closed: a missing marker counts as a crash.
+- **Decision (deep reset)**: new additive IPC `ResetGpuTuningFull` does everything `ResetGpuTuning` does
+  AND wipes all learning (Safe Loop record → default incl. blacklist, `f2_observations.jsonl`,
+  `gpu_knowledge.json`) for users who want a true clean slate. Normal Reset all preserves learning; the
+  deep reset is the rare destructive option (UI control requested from Codex; see contract 2026-06-29).
+- **Status**: code-complete; `nidavellir-core` 68 + `nidavellir-service` 319 tests pass; clippy no new
+  warnings. NOT hardware-tested — a supervised check of the stuck-Safe-Mode → Reset all path is the
+  recommended next step. An independent `nidavellir-safety-auditor` pass on Fix C is recommended before
+  commit.
+
+## F2 qualification freshness and recovery reset (2026-06-29)
+- **Decision**: Standard/Long may reuse prior observations as hints, but must not qualify a boundary
+  that exists only as old `prior_good` evidence. Qualification now requires the current run to
+  rediscover a candidate with `PowerRender` before the FailureSeekingGameLoop can validate it.
+- **Rationale**: a stronger/newer qualifier exposed that old aggressive points could TDR during
+  validation. Those points should be discarded by discovery first, not promoted directly into the
+  qualification workload.
+- **Recovery**: `ResetGpuTuning` is an emergency recovery path, not a normal competing tuning run. It
+  no longer waits for the service-wide start/apply lease; it best-effort stops marked-running work,
+  resets to stock, clears the Safe Loop flag, removes the visible `forge_state.json` checkpoint and
+  returns the F2 Forge handle to idle after a confirmed reset. It intentionally does not erase the
+  automatic F2 observation history.
+- **Worker robustness**: the live F2 Forge worker catches panic/unwind and marks progress idle with
+  Apply locked, so a TDR/interrupted stress path cannot leave `running=true` forever.
+
+## F2 discovery and qualification use orthogonal, versioned workloads (2026-06-29)
+- **Decision**: keep the existing steady, eight-instance textured `PowerRender` as the exclusive F2
+  discovery workload. Cmax, near-power-limit behavior, p5 and `ClockDrop` remain based on one
+  homogeneous load, preserving the meaning of the learned frontier.
+- **Qualification**: Standard/Long reset/reapply passes use a deterministic
+  `FailureSeekingGameLoop` with PowerOpening, BoostEdge, HeavySpike, TextureRop, ComputeBurst,
+  IdlePulse, MixedGame and PowerClosing. The loop crosses render, ROP/texture, compute and idle→spike
+  transitions; every phase contributes checksum/coverage evidence.
+- **Evidence versioning**: `f2_observations.jsonl` distinguishes discovery vs qualification evidence.
+  Current Apply qualification counts only current-contract qualification passes; legacy/discovery
+  positives can seed search but cannot unlock Apply. `Pass`, `Fail` and `Inconclusive` coverage are
+  explicit; inconclusive coverage does not become a bad-boundary veto.
+- **Classification/backoff**: crash, device loss, checksum divergence and unstable results remain
+  fail-closed. Aggregate p5 from the mixed qualifier cannot produce `ClockDrop`; discovery still owns
+  the 30 MHz p5 boundary. A rejected qualification automatically backs off one physical VF bin upward,
+  runs fresh `PowerRender` discovery there, then restarts all qualification passes.
+- **Compatibility**: Fast remains discovery-only/provisional; pass counts and durations are unchanged;
+  no IPC or frontend field changes. No manual bad-point registry or operator prior is encoded.
+
 ## F2 qualification contract — Fast provisional, 90% domain, bounded warm-start fallback (2026-06-28)
 - **Decision**: Fast remains full-frontier discovery but is preview-only. Standard adds two independent
   60 s reset/reapply passes per discovered boundary; Long adds three 120 s passes. A failed pass moves

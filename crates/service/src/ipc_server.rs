@@ -271,8 +271,72 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             }
         }
         IpcRequest::ResetGpuTuning => {
+            // Reset is the emergency recovery path after a TDR/interrupted forge. It must remain
+            // available even if a worker is still marked running, so it is intentionally outside the
+            // service-wide start/apply lease. Best-effort stop first; reset then clears Safe Loop.
+            guard.real_sweep.stop();
+            guard.mem_sweep.stop();
+            guard.forge_all.stop();
+            guard.benchmark.stop();
+            guard.power_sweep.stop();
             let msg = match crate::gpu_apply::reset(&guard.safe_store) {
-                Ok(()) => "Reset to stock".to_string(),
+                Ok(()) => {
+                    let cleanup_error = crate::gpu_power_sweep::clear_persisted_forge_state().err();
+                    let recovery_note = cleanup_error.as_ref().map_or_else(
+                        || {
+                            "Reset geral concluído; Safe Loop desarmado, checkpoint da Forge limpo e nova execução liberada."
+                                .to_string()
+                        },
+                        |e| {
+                            format!(
+                                "Reset manual concluído; GPU em stock e Safe Loop desarmado, mas o checkpoint da Forge não pôde ser removido: {e}"
+                            )
+                        },
+                    );
+                    guard.power_sweep.recover_after_reset(recovery_note);
+                    cleanup_error.map_or_else(
+                        || "Reset all to stock".to_string(),
+                        |e| format!("Reset to stock; {e}"),
+                    )
+                }
+                Err(e) => format!("Reset failed: {e}"),
+            };
+            IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
+        }
+        IpcRequest::ResetGpuTuningFull => {
+            // Deep "forget everything" reset. Same emergency recovery as ResetGpuTuning (outside the
+            // start/apply lease), but additionally wipes ALL learning: the Safe Loop blacklist (by
+            // replacing the record with the default), the F2 observation frontier, and legacy
+            // knowledge. Hardware → stock and the latch are handled by gpu_apply::reset first.
+            guard.real_sweep.stop();
+            guard.mem_sweep.stop();
+            guard.forge_all.stop();
+            guard.benchmark.stop();
+            guard.power_sweep.stop();
+            let msg = match crate::gpu_apply::reset(&guard.safe_store) {
+                Ok(()) => {
+                    let mut problems: Vec<String> = Vec::new();
+                    // Replace the whole Safe Loop record with the default — this is what additionally
+                    // drops the blacklist that the latch-only reset preserves.
+                    if let Err(e) = guard
+                        .safe_store
+                        .save_record(&nidavellir_core::safe_loop::SafeLoopRecord::default())
+                    {
+                        problems.push(format!("safe loop record: {e}"));
+                    }
+                    problems.extend(crate::gpu_apply::clear_all_learning());
+                    if let Err(e) = crate::gpu_power_sweep::clear_persisted_forge_state() {
+                        problems.push(format!("forge checkpoint: {e}"));
+                    }
+                    guard.power_sweep.recover_after_reset(
+                        "Reset completo concluído; GPU em stock, Safe Loop desarmado e todo o aprendizado apagado.",
+                    );
+                    if problems.is_empty() {
+                        "Full reset to stock; all learning cleared".to_string()
+                    } else {
+                        format!("Full reset to stock; some state could not be cleared: {}", problems.join("; "))
+                    }
+                }
                 Err(e) => format!("Reset failed: {e}"),
             };
             IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
@@ -394,7 +458,6 @@ fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
             | IpcRequest::ApplyBrokkrs
             | IpcRequest::ApplyDeepCalm
             | IpcRequest::ApplyMemPeak
-            | IpcRequest::ResetGpuTuning
             | IpcRequest::StartForgeAll
             | IpcRequest::StartBenchmark
             | IpcRequest::StartPowerSweep
@@ -609,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn service_wide_gpu_lease_covers_starts_applies_and_reset() {
+    fn service_wide_gpu_lease_covers_starts_and_applies_but_not_recovery_reset() {
         for request in [
             IpcRequest::StartGpuValidation,
             IpcRequest::StartRealSweep,
@@ -622,13 +685,13 @@ mod tests {
             IpcRequest::ApplyPowerGodforge,
             IpcRequest::ApplyPowerBrokkrs,
             IpcRequest::ApplyPowerDeepCalm,
-            IpcRequest::ResetGpuTuning,
         ] {
             assert!(
                 gpu_write_requires_idle(&request),
                 "{request:?} must require the GPU lease"
             );
         }
+        assert!(!gpu_write_requires_idle(&IpcRequest::ResetGpuTuning));
         assert!(!gpu_write_requires_idle(&IpcRequest::GetPowerSweepProgress));
         assert!(!gpu_write_requires_idle(&IpcRequest::StopPowerSweep));
         assert!(!gpu_write_requires_idle(&IpcRequest::ReadSensors));

@@ -6,6 +6,7 @@
     error = null,
     applied = null,
     hardware = null,
+    powerSweep = null,
     safeLoop = null,
     powerRunning = false,
     hasProfiles = false,
@@ -54,6 +55,8 @@
   const safetySymbol = $derived(safetyVariant === "attention" ? "attention" : "shield");
   const currentProfile = $derived(applied?.label ?? "Stock");
   const hasAppliedTuning = $derived(Boolean(applied?.core || applied?.mem_offset_mhz));
+  const hasForgeRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
+  const hasResettableState = $derived(powerRunning || hasAppliedTuning || hasProfiles || hasForgeRun);
   const verificationText = $derived.by(() => {
     if (!verification) return "Curve verification: Not checked";
     if (verification.status === "verified_curve") return "Curve verification: Verified";
@@ -140,10 +143,10 @@
       {/if}
     </div>
 
-    {#if hasAppliedTuning}
+    {#if hasResettableState}
       <button class="btn reset" onclick={onReset}>
         <RotateCcw size={15} strokeWidth={1.85} />
-        <span>Reset to stock</span>
+        <span>Reset all</span>
       </button>
     {/if}
   </div>

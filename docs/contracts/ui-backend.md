@@ -857,6 +857,106 @@ Safe Loop semantics are also corrected: reset-clean `SilentError`/`Unstable` poi
 as frontier knowledge but do not increment `consecutive_crashes`. Only `DeviceLost`/TDR counts as a
 crash and retains recovery state.
 
+\## Backend → Frontend (2026-06-29): F2 qualification uses FailureSeekingGameLoop evidence
+
+No IPC method, payload field, mode duration, pass count or Apply rule changes.
+
+\- Fast and every discovery candidate continue using the steady power-heavy render. Cmax,
+  near-power-limit behavior, p5 and `ClockDrop` semantics are unchanged.
+
+\- Standard and Long reset/reapply qualification passes now use the versioned
+  `FailureSeekingGameLoop`: PowerOpening, BoostEdge, HeavySpike, TextureRop, ComputeBurst,
+  IdlePulse, MixedGame and PowerClosing. Each phase has independent checksum/coverage evidence.
+
+\- Aggregate p5 from the mixed qualifier is diagnostic only and cannot produce `ClockDrop`, because
+  its light phases intentionally do not represent the sustained discovery load.
+
+\- Apply qualification now counts only current-contract qualification `Pass` evidence. Legacy or
+  discovery positives may seed discovery but cannot unlock Apply. `Inconclusive` coverage does not
+  mark the point bad; it retries once and then leaves the run unqualified/fail-closed.
+
+\- A qualification `Fail` backs off automatically to the next higher physical VF bin, runs fresh
+  steady `PowerRender` discovery there, and restarts all qualification passes. No manual bad-point
+  registry or UI-provided prior is involved.
+
+\- Standard/Long do not qualify old `prior_good` boundaries directly. The backend requires a fresh
+  current-run `PowerRender` rediscovery before qualification can produce deployable evidence.
+
+\- `ResetGpuTuning` remains the recovery escape hatch after TDR/interruption and is intentionally not
+  blocked by the normal start/apply tuning lease. On success it resets stock, clears Safe Loop, clears
+  the visible Forge checkpoint (`forge_state.json`) and returns the run view to `idle`; it does not
+  erase the automatic F2 observation history. The frontend should keep Reset reachable when a run is
+  stuck or Safe Loop recovery is pending.
+
+\- Frontend action required: none. Existing Fast provisional copy, Standard/Long durations,
+  `profiles_qualified` gate, progress polling and Apply behavior remain correct.
+
+
+
+\## Backend → Frontend (2026-06-29): Reset all releases Safe Mode; new deep "forget everything" reset
+
+Fixes the reported state where the app gets stuck in Needs Attention / Interrupted with no usable
+option, persisting across manual PC restarts. Two related items — the first needs NO frontend change,
+the second is a small additive request.
+
+\- \*\*`ResetGpuTuning` now actually releases the Safe Loop latch.\*\* Previously it reset the GPU to
+  stock and cleared the boot-flag + applied profile, but never rewrote `safe_loop.json`, so `safe_mode`
+  and `consecutive_crashes` were effectively a one-way latch — "Reset all" could not clear a Needs
+  Attention / Safe Mode state, and it survived reboots. Reset now also clears `safe_mode`, zeroes
+  `consecutive_crashes` and returns Safe Loop `state` to `idle`, while PRESERVING learning (the
+  unstable-region blacklist, `last_validated`, crash history) and the F2 observation frontier. UI
+  effect: pressing the existing \*\*Reset all\*\* while `safe_loop.safe_mode` (or `state == "unstable"`)
+  now returns the card to a normal, forgeable state. \*\*Frontend action required: none\*\* — just keep
+  Reset all reachable in the Needs Attention / Interrupted branches (it already is).
+
+\- \*\*New IPC `ResetGpuTuningFull` (additive, no params).\*\* A deeper "forget everything / start the GPU
+  from zero" reset, requested alongside the normal Reset all. It does everything `ResetGpuTuning` does
+  AND wipes all learning: the Safe Loop blacklist (whole record reset to default), the F2 observation
+  frontier (`f2_observations.jsonl`) and legacy `gpu_knowledge.json`. Returns the same `GpuApply`
+  status shape as `ResetGpuTuning`. \*\*Frontend request:\*\* add a second, clearly-secondary control near
+  Reset all — e.g. "Full reset" / "Reset completo (apagar aprendizado)" — behind a stronger confirm
+  dialog that spells out that learned profiles/observations are discarded. Normal Reset all stays the
+  default; Full reset is the rare, destructive option.
+
+\## Frontend implementation checkpoint (2026-06-29): post-TDR continuation wired (Codex)
+
+\- In Needs Attention / Interrupted, the recommended action now offers \*\*Recover & continue\*\* as the
+  primary path. It calls `ResetGpuTuning` to return stock and release the Safe Loop latch while
+  preserving learning, then starts the selected Forge mode so the backend can continue from saved F2
+  observations.
+
+\- The existing mode picker remains available in that recovery branch, because selecting Fast/Standard/
+  Long is harmless UI state and does not touch hardware until the combined recovery/start action runs.
+
+\- `Reset all` remains a non-destructive recovery control. `Full reset` is now wired separately to
+  `ResetGpuTuningFull` with a stronger confirmation that learned observations/knowledge/blacklist are
+  discarded.
+
+\- \*\*Crash accounting no longer inflated by clean restarts (informational, no payload change).\*\* A
+  clean boot while already in Safe Mode no longer increments `consecutive_crashes`, and a user-initiated
+  PC restart while a forge/apply was in flight is now recorded as a clean interruption (via a
+  graceful-stop marker) instead of a phantom crash. `GetSafeLoopStatus.consecutive_crashes` therefore
+  reads more truthfully; no field changed.
+
+
+
+\## Backend → Frontend (2026-06-29): Cmax descent interleaves qualification (ETA may grow; no IPC change)
+
+No IPC method or payload field changes. Standard/Long F2 discovery now qualifies each VF bin as it
+descends (instead of qualifying only the deepest PowerRender point at the end), so the failure-seeking
+qualifier never runs more than one bin below a proven point. Two frontend-visible effects:
+
+\- \*\*Longer Standard/Long runs\*\* — qualification dwells now scale with the number of bins that qualify,
+  not a single boundary. The existing "supervised, can take a while" framing still holds.
+
+\- \*\*`estimated_remaining_ms` / `total_steps_estimate` start low and grow\*\* as deeper bins qualify, then
+  settle. The progress bar may step backward early in a clock. These were already documented as
+  estimates; no UI change is required, but avoid presenting the ETA as a firm countdown. `completed_steps`
+  and the per-candidate log lines remain accurate.
+
+\- \*\*Frontend action required: none.\*\* `profiles_qualified`, Apply gating and progress polling are
+  unchanged.
+
 
 
 (No other active backend → frontend requests)

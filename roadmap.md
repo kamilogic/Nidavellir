@@ -15,10 +15,13 @@
 
 ## Now — Product model (see product.md)
 Reframed around 3 profiles forged from a clock×power frontier. Phases:
-- **Current F2 frontier (2026-06-28)** — code-complete: the live Forge starts at the highest real
+- **Current F2 frontier (2026-06-29)** — code-complete: the live Forge starts at the highest real
   clock, discovers Cmax through power-bound voltage descent, and characterizes every real bin through
   90% Cmax. Autonomous descent has no arbitrary step budget; Fast is provisional discovery,
   Standard qualifies with 2×60 s passes, and Long qualifies with 3×120 s passes;
+  discovery keeps the homogeneous game-power render while Standard/Long qualification uses a
+  versioned FailureSeekingGameLoop with per-phase checksums/coverage and physical-bin backoff plus
+  fresh discovery after a rejected boundary;
   observations checkpoint/resume by GPU UUID; partial UI progress is durable; adjacent clocks reuse
   one bin above the prior minimum and fall back to the prior power-bound boundary; deployable synthesis
   still requires the complete range and successful qualification.

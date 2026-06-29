@@ -13,7 +13,11 @@
   const points = $derived(powerSweep?.points ?? []);
   const isUndervolt = $derived(Boolean(powerSweep?.is_undervolt));
   const profilesQualified = $derived(!isUndervolt || Boolean(powerSweep?.profiles_qualified));
-  const phase = $derived(powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : "Not running");
+  const isInterrupted = $derived(powerSweep?.phase === "interrupted");
+  const phase = $derived.by(() => {
+    if (isInterrupted) return "Interrupted";
+    return powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : "Not running";
+  });
   const hasRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
   const latestPoint = $derived(points.length ? points[points.length - 1] : null);
   const latestLogLine = $derived.by(() => {
@@ -37,9 +41,12 @@
     if (hasRun) return "The latest core VF forge run is available for review.";
     return "No core VF forge run is active yet. Start Forge GPU when you are ready to let Nidavellir learn this card.";
   });
-  const title = $derived(powerRunning ? "Forge in Progress" : "Forge Progress");
+  const title = $derived(isInterrupted ? "Forge Interrupted" : powerRunning ? "Forge in Progress" : "Forge Progress");
   const intro = $derived.by(() => {
     if (powerRunning) return "Nidavellir is learning this GPU's stable core curve.";
+    if (isInterrupted) {
+      return "The previous core VF forge did not finish cleanly. Recover & continue can resume from saved learning after clearing recovery.";
+    }
     if (hasRun && (powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm) && !profilesQualified) {
       return "The latest Fast result is provisional. Standard or Long qualification is required before Apply.";
     }
@@ -54,6 +61,7 @@
     ].filter(([, point]) => point),
   );
   const nextStep = $derived.by(() => {
+    if (isInterrupted) return "Next: recover and continue with saved Forge learning, or use Full reset only to start from zero.";
     if (!powerRunning && profileRows.length && !profilesQualified) {
       return "Next: run Standard or Long to qualify these boundaries and unlock Apply.";
     }
@@ -158,7 +166,9 @@
           compact
         />
       {/if}
-      <span class="run-state" class:live={powerRunning}>{powerRunning ? "Running" : hasRun ? "Stopped" : "Idle"}</span>
+      <span class="run-state" class:live={powerRunning} class:interrupted={isInterrupted}>
+        {powerRunning ? "Running" : isInterrupted ? "Interrupted" : hasRun ? "Stopped" : "Idle"}
+      </span>
       {#if powerRunning}
         <button class="btn stop" onclick={onStopPower}>
           <Square size={14} strokeWidth={1.9} />
@@ -405,6 +415,11 @@
     border-color: rgba(214, 168, 93, 0.42);
     background: rgba(214, 168, 93, 0.1);
     color: var(--forge-gold);
+  }
+  .run-state.interrupted {
+    border-color: rgba(191, 97, 106, 0.42);
+    background: rgba(191, 97, 106, 0.12);
+    color: #f3b9bd;
   }
   .progress-summary,
   .sweep-progress,

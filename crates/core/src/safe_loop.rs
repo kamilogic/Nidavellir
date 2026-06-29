@@ -231,6 +231,20 @@ impl SafeLoopRecord {
     pub fn recovery_target(&self) -> TuningPoint {
         self.last_validated.clone().unwrap_or_else(TuningPoint::stock)
     }
+
+    /// Clear the recovery *latch* after an operator reset: leave Safe Mode and zero the crash
+    /// streak so tuning is allowed again, returning to [`SafeLoopState::Idle`]. Learning is
+    /// PRESERVED — the unstable-region `blacklist`, `last_validated`, and `crash_log` history are
+    /// kept. (A full "forget everything" reset replaces the whole record with the default instead.)
+    ///
+    /// This is the missing piece that lets "Reset all" actually release a latched Safe Mode: the
+    /// hardware/boot-flag reset never wrote this record, so `safe_mode` could only ever be set, not
+    /// cleared.
+    pub fn clear_recovery_latch(&mut self) {
+        self.safe_mode = false;
+        self.consecutive_crashes = 0;
+        self.state = SafeLoopState::Idle;
+    }
 }
 
 /// The boot-flag: written to disk *before* an apply, deleted *after* a clean
@@ -269,6 +283,11 @@ pub enum RecoveryAction {
     },
     /// Crash threshold tripped — apply stock and stop touching anything.
     EnterSafeMode { stock: TuningPoint },
+    /// A clean boot while already latched in Safe Mode: stay hands-off (stock), but do
+    /// NOT count a new crash — no apply armed a boot-flag this cycle, so nothing actually
+    /// crashed. Distinct from [`RecoveryAction::EnterSafeMode`], which is the crash that
+    /// *trips* Safe Mode (and increments the streak).
+    RemainSafeMode { stock: TuningPoint },
 }
 
 /// Pure recovery decision. `bugcheck` is the classification from the post-reboot
@@ -299,7 +318,9 @@ pub fn decide_recovery(
         }
         None => {
             if record.safe_mode {
-                RecoveryAction::EnterSafeMode {
+                // Already latched — re-enter Safe Mode without counting a crash. The boot-flag
+                // is clear, so no apply was in flight; a clean reboot must not inflate the streak.
+                RecoveryAction::RemainSafeMode {
                     stock: TuningPoint::stock(),
                 }
             } else if let Some(point) = record.last_validated.clone() {
@@ -342,6 +363,13 @@ pub fn apply_recovery(record: &mut SafeLoopRecord, action: &RecoveryAction) -> T
             record.state = SafeLoopState::SafeMode;
             stock.clone()
         }
+        RecoveryAction::RemainSafeMode { stock } => {
+            // Re-assert the latched Safe Mode on a clean boot. Deliberately does NOT touch
+            // `consecutive_crashes` — nothing crashed this cycle.
+            record.safe_mode = true;
+            record.state = SafeLoopState::SafeMode;
+            stock.clone()
+        }
     }
 }
 
@@ -360,6 +388,7 @@ fn push_capped<T>(v: &mut Vec<T>, item: T, cap: usize) {
 const BOOT_FLAG_FILE: &str = "boot_flag.json";
 const RECORD_FILE: &str = "safe_loop.json";
 const HEARTBEAT_FILE: &str = "heartbeat.txt";
+const CLEAN_SHUTDOWN_FILE: &str = "clean_shutdown.txt";
 
 /// Filesystem-backed store for the Safe Loop. Default location is
 /// `%ProgramData%\Nidavellir` (writable by the SYSTEM/admin service and
@@ -445,6 +474,33 @@ impl SafeLoopStore {
     pub fn write_heartbeat(&self) -> std::io::Result<()> {
         self.ensure_dir()?;
         std::fs::write(self.heartbeat_path(), chrono::Utc::now().to_rfc3339())
+    }
+
+    pub fn clean_shutdown_path(&self) -> PathBuf {
+        self.base.join(CLEAN_SHUTDOWN_FILE)
+    }
+
+    /// Record that the service stopped *gracefully* (a clean OS shutdown/restart, or an explicit
+    /// service stop). Startup recovery consumes this once so an armed boot-flag left behind by a
+    /// user-initiated restart is NOT mistaken for a crash. Best-effort.
+    pub fn write_clean_shutdown(&self) -> std::io::Result<()> {
+        self.ensure_dir()?;
+        std::fs::write(self.clean_shutdown_path(), chrono::Utc::now().to_rfc3339())
+    }
+
+    /// True when a graceful-shutdown marker is present. Consumed exactly once at startup so it can
+    /// never mask a later, genuine crash.
+    pub fn is_clean_shutdown_present(&self) -> bool {
+        self.clean_shutdown_path().exists()
+    }
+
+    /// Remove the graceful-shutdown marker. Idempotent (absent ⇒ `Ok`).
+    pub fn clear_clean_shutdown(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(self.clean_shutdown_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -621,10 +677,73 @@ mod tests {
         rec.safe_mode = true;
         assert_eq!(
             decide_recovery(None, CrashClass::Unknown, &rec),
-            RecoveryAction::EnterSafeMode {
+            RecoveryAction::RemainSafeMode {
                 stock: TuningPoint::stock()
             }
         );
+    }
+
+    #[test]
+    fn clean_reboot_in_safe_mode_does_not_inflate_crash_streak() {
+        // Reproduces the "every manual reboot adds a crash" bug: re-entering Safe Mode on a clean
+        // boot (no boot-flag) must keep the streak fixed, not climb on each restart.
+        let mut rec = SafeLoopRecord::default();
+        rec.safe_mode = true;
+        rec.consecutive_crashes = 3;
+        for _ in 0..5 {
+            let action = decide_recovery(None, CrashClass::Unknown, &rec);
+            assert_eq!(
+                action,
+                RecoveryAction::RemainSafeMode {
+                    stock: TuningPoint::stock()
+                }
+            );
+            let applied = apply_recovery(&mut rec, &action);
+            assert!(applied.is_stock());
+        }
+        assert_eq!(rec.consecutive_crashes, 3, "streak must not grow on clean reboots");
+        assert!(rec.safe_mode);
+        assert_eq!(rec.state, SafeLoopState::SafeMode);
+    }
+
+    #[test]
+    fn clear_recovery_latch_releases_safe_mode_but_keeps_learning() {
+        let mut rec = SafeLoopRecord::default();
+        let good = TuningPoint::from_axes([("vcore", -40)]);
+        rec.mark_validated(good.clone());
+        rec.blacklist
+            .push(BlacklistRegion::around(TuningPoint::from_axes([("vcore", -80)]), 1));
+        rec.crash_log.push(CrashClass::OcInstability);
+        rec.safe_mode = true;
+        rec.consecutive_crashes = 4;
+        rec.state = SafeLoopState::SafeMode;
+
+        rec.clear_recovery_latch();
+
+        // Latch released…
+        assert!(!rec.safe_mode);
+        assert_eq!(rec.consecutive_crashes, 0);
+        assert_eq!(rec.state, SafeLoopState::Idle);
+        // …learning preserved.
+        assert_eq!(rec.last_validated, Some(good));
+        assert_eq!(rec.blacklist.len(), 1);
+        assert_eq!(rec.crash_log, vec![CrashClass::OcInstability]);
+    }
+
+    #[test]
+    fn clean_shutdown_marker_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("nidavellir-sl-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SafeLoopStore::new(&dir);
+
+        assert!(!store.is_clean_shutdown_present());
+        store.write_clean_shutdown().unwrap();
+        assert!(store.is_clean_shutdown_present());
+        store.clear_clean_shutdown().unwrap();
+        assert!(!store.is_clean_shutdown_present());
+        store.clear_clean_shutdown().unwrap(); // idempotent
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -33,7 +33,26 @@ fn retain_boot_flag_until_reapply(action: &RecoveryAction) -> bool {
 /// the intent so the safety scaffold is observable end to end.
 pub fn run_startup_recovery(store: &SafeLoopStore) -> SafeLoopRecord {
     let mut record = store.load_record();
-    let boot_flag = store.read_boot_flag();
+    let mut boot_flag = store.read_boot_flag();
+
+    // A graceful service stop (clean OS shutdown/restart, or an explicit stop) writes a one-shot
+    // marker. If a boot-flag was still armed at that moment, the apply/forge it guarded was
+    // interrupted by a *user-initiated restart*, not a crash — so disarm it without counting a
+    // crash. The marker is always consumed here so it can never mask a later, genuine crash.
+    let clean_shutdown = store.is_clean_shutdown_present();
+    if let Err(e) = store.clear_clean_shutdown() {
+        warn!("Safe Loop: failed to clear clean-shutdown marker: {e}");
+    }
+    if boot_flag.is_some() && clean_shutdown {
+        info!(
+            "Safe Loop: boot-flag was armed but the previous service stop was graceful — \
+             treating as a clean interruption, not a crash"
+        );
+        if let Err(e) = store.clear_boot_flag() {
+            warn!("Safe Loop: failed to disarm boot-flag after a clean shutdown: {e}");
+        }
+        boot_flag = None;
+    }
 
     let bugcheck = if boot_flag.is_some() {
         read_last_bugcheck_class()
@@ -66,6 +85,13 @@ pub fn run_startup_recovery(store: &SafeLoopStore) -> SafeLoopRecord {
         RecoveryAction::EnterSafeMode { .. } => {
             warn!(
                 "Safe Loop: {} consecutive crashes — entering SAFE MODE (stock profile, hands off)",
+                record.consecutive_crashes
+            );
+        }
+        RecoveryAction::RemainSafeMode { .. } => {
+            info!(
+                "Safe Loop: clean boot while in Safe Mode — staying hands off (no new crash counted, \
+                 {} on record). Use Reset all to release.",
                 record.consecutive_crashes
             );
         }

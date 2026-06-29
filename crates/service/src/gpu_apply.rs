@@ -57,6 +57,29 @@ fn clear_applied() {
     let _ = std::fs::remove_file(applied_path());
 }
 
+/// Remove all persisted *learning* files for a full "forget everything" reset: the F2 observation
+/// frontier and the legacy single-clock knowledge. Best-effort — a missing file is success. Returns
+/// human-readable errors for files that existed but could not be removed (empty ⇒ all clear).
+///
+/// Deliberately does NOT touch `gpu_applied.json`, the boot-flag, `safe_loop.json`, or
+/// `forge_state.json`; those are handled by [`reset`] / the caller so each concern stays explicit.
+pub fn clear_all_learning() -> Vec<String> {
+    let base = default_data_dir();
+    let targets = [
+        base.join(nidavellir_core::f2_observation::F2_OBSERVATIONS_FILE),
+        base.join("gpu_knowledge.json"),
+    ];
+    let mut errors = Vec::new();
+    for path in targets {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => errors.push(format!("{}: {e}", path.display())),
+        }
+    }
+    errors
+}
+
 #[cfg(windows)]
 fn curve_freq_at(voltage_mv: u32) -> Option<u32> {
     let c = nidavellir_gpu_nvapi::read_curve().ok()?;
@@ -244,9 +267,21 @@ pub fn reset(store: &SafeLoopStore) -> Result<(), String> {
         ));
     }
     clear_applied();
-    store
+    // Release the Safe Loop latch so tuning is allowed again: leave Safe Mode and zero the crash
+    // streak, while PRESERVING learning (blacklist, last_validated, crash history). Without this the
+    // operator's "Reset all" cannot clear a latched Safe Mode — the reset only ever touched the
+    // boot-flag and hardware, never this record, so `safe_mode` was a one-way latch.
+    let mut record = store.load_record();
+    record.clear_recovery_latch();
+    let record_err = store
+        .save_record(&record)
+        .err()
+        .map(|e| format!("GPU reset completed but Safe Loop record could not be cleared: {e}"));
+    let flag_err = store
         .clear_boot_flag()
-        .map_err(|e| format!("GPU reset completed but Safe Loop flag could not be cleared: {e}"))
+        .err()
+        .map(|e| format!("GPU reset completed but Safe Loop flag could not be cleared: {e}"));
+    record_err.or(flag_err).map_or(Ok(()), Err)
 }
 
 #[cfg(not(windows))]

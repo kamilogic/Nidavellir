@@ -15,8 +15,8 @@
 
 use nidavellir_core::f2_observation::{
     bracket_for_target, first_bad_for_target, frontier_confidence, frontier_entry_for_target,
-    last_good_for_target, F2FrontierEntry, F2Observation, F2ObsDwell, F2ObsMode, F2ObsOutcome,
-    F2ObsVerifier, F2ObservationStore, VoltageBracket,
+    last_good_for_target, F2EvidenceKind, F2FrontierEntry, F2Observation, F2ObsDwell, F2ObsMode,
+    F2ObsOutcome, F2ObsVerifier, F2ObservationStore, F2QualificationCoverage, VoltageBracket,
 };
 use nidavellir_gpu_nvapi::{AnchoredPositiveOffsetPlan, PositiveOffsetLimits};
 
@@ -29,6 +29,10 @@ pub struct ObsContext {
     pub run_id: String,
     pub timestamp: String,
     pub gpu_key: Option<String>,
+    pub evidence_kind: F2EvidenceKind,
+    pub discovery_contract_version: Option<u32>,
+    pub qualification_contract_version: Option<u32>,
+    pub qualification_coverage: Option<F2QualificationCoverage>,
     pub mode: F2ObsMode,
     pub requested_start_mv: Option<u32>,
     pub positive_offset_cap_mhz: i32,
@@ -53,6 +57,7 @@ fn map_dwell(d: Option<F2DwellOutcome>) -> F2ObsDwell {
         Some(F2DwellOutcome::Unstable) => F2ObsDwell::Unstable,
         Some(F2DwellOutcome::DeviceLost) => F2ObsDwell::DeviceLost,
         Some(F2DwellOutcome::ClockDrop) => F2ObsDwell::ClockDrop,
+        Some(F2DwellOutcome::Inconclusive) => F2ObsDwell::QualificationInconclusive,
         None => F2ObsDwell::NotRun,
     }
 }
@@ -69,6 +74,7 @@ fn map_outcome(o: &F2Outcome) -> F2ObsOutcome {
         F2Outcome::DeviceLost => F2ObsOutcome::DeviceLost,
         F2Outcome::PowerBoundClockDrop => F2ObsOutcome::PowerBoundClockDrop,
         F2Outcome::ClockDrop => F2ObsOutcome::ClockDrop,
+        F2Outcome::Inconclusive => F2ObsOutcome::QualificationInconclusive,
         F2Outcome::ResetFailed => F2ObsOutcome::ResetFailed,
         F2Outcome::ArmFailed(_) | F2Outcome::ApplyFailed(_) => F2ObsOutcome::AbortedBySafetyGate,
     }
@@ -86,6 +92,13 @@ pub fn observation_from_anchored_step(
         run_id: ctx.run_id.clone(),
         timestamp: ctx.timestamp.clone(),
         gpu_key: ctx.gpu_key.clone(),
+        evidence_kind: ctx.evidence_kind,
+        discovery_contract_version: ctx.discovery_contract_version,
+        qualification_contract_version: ctx.qualification_contract_version,
+        qualification_coverage: report
+            .qualification_coverage
+            .clone()
+            .or_else(|| ctx.qualification_coverage.clone()),
         mode: ctx.mode,
         target_mhz,
         requested_start_mv: ctx.requested_start_mv,
@@ -484,6 +497,12 @@ mod tests {
             run_id: "f2-sweep-1".into(),
             timestamp: "2026-06-21T00:00:00Z".into(),
             gpu_key: Some("RTX 3060 Ti".into()),
+            evidence_kind: F2EvidenceKind::Discovery,
+            discovery_contract_version: Some(
+                nidavellir_core::f2_observation::F2_DISCOVERY_CONTRACT_VERSION,
+            ),
+            qualification_contract_version: None,
+            qualification_coverage: None,
             mode: F2ObsMode::TargetSweep,
             requested_start_mv: None,
             positive_offset_cap_mhz: 30,
@@ -527,6 +546,7 @@ mod tests {
             power_capped_frac: Some(0.5),
             dwell_duration_ms: Some(15_000),
             sample_count: Some(300),
+            qualification_coverage: None,
             reset_ok: Some(true),
             boot_flag_cleared: true,
             blacklisted: false,

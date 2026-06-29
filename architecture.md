@@ -14,9 +14,11 @@ over a named pipe; the service does all hardware access (NVAPI, NVML, PawnIO).
   `gpu_apply.rs`, `gpu_benchmark.rs`, `gpu_sweep_real.rs`, `gpu_real.rs`.
 - **crates/gpu-nvapi**: NVAPI access — read the V/F curve, set offsets, and the
   modern **ClkVfPoints** FFI (the VF ceiling). Most `unsafe` lives here.
-- **crates/gpu-stress**: wgpu (Vulkan/DX12) loads — `run_render_stress` (FurMark-
-  class textured render = game power), `run_power_load` (compute), `run_combined`,
-  bandwidth. Each load returns a `StabilityResult` (Stable / SilentError / Crash).
+- **crates/gpu-stress**: wgpu (Vulkan/DX12) loads — `run_render_stress` (steady
+  FurMark-class textured render = game power), `run_vf_qualifier_stress`
+  (FailureSeekingGameLoop: render/ROP/texture/compute/idle transients with per-phase checksums),
+  `run_power_load` (compute), `run_combined`, bandwidth. Each load returns a
+  `StabilityResult` (Stable / SilentError / Crash).
 - **crates/driver-pawnio**: MSR / SuperIO access via the PawnIO driver (CPU/RAM
   factory-clock detection, fan/sensor reads).
 
@@ -38,7 +40,11 @@ headless client used for sweeps/benchmarks. Requests/responses are the
   Power-bound clock drops before sustain continue the same clock; the first sustained
   clock is Cmax. The complete profile frontier spans Cmax→90% Cmax so Deep Calm is selected from
   measured data. Fast produces a provisional map; Standard qualifies each boundary with 2×60 s
-  reset/reapply passes and Long with 3×120 s. F2 Apply fails closed until qualification succeeds.
+  reset/reapply passes and Long with 3×120 s. Discovery uses the homogeneous power render so p5,
+  power-limit and `ClockDrop` stay comparable; qualification uses the orthogonal FailureSeekingGameLoop
+  and records `Pass`/`Fail`/`Inconclusive` coverage without treating light-phase aggregate p5 as a
+  boundary. A rejected qualification backs off one physical bin, reruns fresh `PowerRender` discovery
+  there, and restarts qualification. F2 Apply fails closed until current-contract qualification succeeds.
 - **Anchored VF undervolt** (`gpu-nvapi`): raises exactly one real lower-voltage
   anchor and caps higher-voltage bins to the target via per-point ClkVfPoints
   offsets — no voltage lock / no NVML clock pin, so lower bins retain elasticity.
@@ -53,8 +59,8 @@ headless client used for sweeps/benchmarks. Requests/responses are the
 - `safe_loop.json` — Safe Loop record (state, consecutive_crashes, blacklist).
 - `gpu_applied.json` — the currently applied profile (re-applied on boot).
 - `gpu_knowledge.json` — per-GPU stability knowledge (frontier + per-point stats).
-- `f2_observations.jsonl` — append-only, GPU-UUID-scoped F2 candidate evidence and
-  crash-safe resume checkpoints.
+- `f2_observations.jsonl` — append-only, GPU-UUID-scoped F2 discovery/qualification evidence,
+  contract versions, coverage summaries and crash-safe resume checkpoints.
 - `forge_state.json` — last complete usable forged profile snapshot; partial F2 runs
   never overwrite it.
 - `boot_flag.json` / `heartbeat.txt` — Safe Loop liveness/boot detection.

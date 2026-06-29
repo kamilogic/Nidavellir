@@ -1,13 +1,94 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-28: the F2 live Forge algorithm has been corrected in
+How to pick this up cold. State as of 2026-06-29: the F2 live Forge algorithm has been corrected in
 code. It starts at the highest real clock, uses power-bound voltage descent to discover the first
 sustainable Cmax, then characterizes every real clock through 90% Cmax. Autonomous voltage discovery
 has no arbitrary step cap. Fast is provisional; Standard qualifies boundaries with 2×60 s passes and
-Long with 3×120 s. Every candidate checkpoints by physical GPU UUID. The F2 Apply path remains wired
+Long with 3×120 s. Discovery retains the steady power render; Standard/Long qualification uses a
+versioned FailureSeekingGameLoop with phase coverage/checksums. Standard/Long must redescobrir a
+boundary no run atual antes de qualificar; prior_good antigo é só dica, não passe direto para Apply.
+Every candidate checkpoints by physical GPU UUID. The F2 Apply path remains wired
 but fails closed until `profiles_qualified`; F1 remains available for legacy payloads. **NEXT = supervised real Forge
 checkpoint; no hardware was run in this implementation session.** See `decisions.md` top entry.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## Latest backend checkpoint (2026-06-29) — Cmax descent interleaves qualification per VF bin (code-complete, NOT HW-tested with new flow)
+- **Why**: discovery descended `PowerRender` to the deepest survivable bin then qualified THAT (most
+  aggressive) bin with the failure-seeking loop — risking a TDR during qualification and wasting the
+  descent below the bin that ultimately qualifies. Operator asked to interleave: qualify the first
+  sustained point, then descend one bin at a time, gating each step by qualification.
+- **What** (`crates/service/src/gpu_undervolt.rs`, `run_confirmed_f2_clock_discovery`): for Standard/Long,
+  the per-clock loop now PowerRender-descends to the first under-cap `Validated` bin, qualifies it with the
+  full N passes (new helper `qualify_anchored_candidate` returning `F2QualificationOutcome`), and only then
+  steps one real VF bin lower (PowerRender measures its power and gates the next qualify). First
+  qualification failure stops the descent, keeping the last qualified bin. The heavy qualifier never runs
+  more than one bin below a proven point. The old descend-to-floor-then-qualify-deepest + upward back-off
+  is removed. Fast (qualification_passes==0) is unchanged (provisional descend-to-PowerRender-floor).
+- **Downstream unchanged**: a failed qualification writes an `is_bad()` observation, so
+  `last_discovery_good_for_target`/`first_bad_for_target` already select the deepest QUALIFIED bin. Locked
+  by new core test `interleaved_qualification_failure_selects_shallower_qualified_point`. Cmax/90% floor,
+  synthesis, Safe Loop arm/verify/reset per dwell, resume/warm-start untouched.
+- **Trade-off**: N passes × each qualified bin → longer Standard/Long; initial ETA under-counts and
+  self-corrects upward (contract note added for Codex).
+- **Validation**: `cargo check` clean; core 69 + service 319 tests; clippy no new warnings in touched
+  files. **No hardware run with the new flow.** NEXT = one supervised Standard run; inspect that the
+  qualifier only runs at/one-bin-below proven points and that a deeper rejection keeps the bin above.
+  Recommended `nidavellir-safety-auditor` pass on the diff before commit.
+
+## Latest backend checkpoint (2026-06-29) — Safe Mode unstick: Reset clears the latch + deep reset (Fix A/B/C HW-CONFIRMED by operator)
+- **HW update**: operator rebuilt + ran in console; logs show a prior armed boot-flag recovered
+  (blacklist+recede, consecutive_crashes accounted) and "Reset all" then cleared `forge_state` and a
+  fresh F2 forge ran — "funcionou perfeitamente". The stuck-Safe-Mode / Needs-Attention dead-end is
+  resolved on the rig. (Fix C clean-shutdown marker not separately stress-tested.)
+- **Why**: operator reported the app stuck in Needs Attention / Interrupted with "no option," surviving
+  manual PC restarts; the new Reset all did not release Safe Mode. Root cause: `safe_mode` is a one-way
+  latch — `gpu_apply::reset` (the `ResetGpuTuning` body, gpu_apply.rs:236) reset hardware + boot-flag +
+  applied profile but **never rewrote `safe_loop.json`**, and nothing anywhere set `safe_mode=false`.
+  Plus each clean reboot in Safe Mode re-ran `EnterSafeMode` and incremented `consecutive_crashes`, and
+  a manual restart during an armed boot-flag was counted as a crash.
+- **Fix A** (`crates/core/src/safe_loop.rs` + `crates/service/src/gpu_apply.rs`): new
+  `SafeLoopRecord::clear_recovery_latch()` (safe_mode→false, consecutive_crashes→0, state→idle, PRESERVES
+  blacklist/last_validated/crash_log); `reset()` now load→clear_recovery_latch→save before clearing the
+  boot-flag. The existing Reset all button now releases Safe Mode (no UI change).
+- **Fix B** (`safe_loop.rs` + `safe_loop_runtime.rs`): new `RecoveryAction::RemainSafeMode` for a clean
+  boot already in Safe Mode — stays hands-off without incrementing the streak. `EnterSafeMode` (the
+  incrementing path) is now only the armed-flag threshold trip.
+- **Fix C** (`safe_loop.rs` store + `safe_loop_runtime.rs` + `service_impl.rs`): graceful service
+  Stop/Shutdown writes a one-shot `clean_shutdown.txt`; startup consumes it and treats armed-flag +
+  marker as a clean interruption (no crash). Fail-closed: no marker ⇒ crash, parachute intact.
+- **Deep reset** (`crates/core/src/ipc.rs` + `ipc_server.rs` + `gpu_apply::clear_all_learning`): new
+  additive IPC `ResetGpuTuningFull` = `ResetGpuTuning` + wipe blacklist (record→default), F2
+  `f2_observations.jsonl` and `gpu_knowledge.json`. UI button requested from Codex (contract 2026-06-29).
+- **Validation**: `cargo check` clean; `nidavellir-core` 68 + `nidavellir-service` 319 tests pass; clippy
+  no new warnings in touched files. **No hardware / VF write / apply / stress / reboot exercised.**
+- **NEXT**: (1) supervised manual check — force Safe Mode, confirm Reset all returns to a forgeable state
+  and survives a reboot; confirm a clean restart mid-forge no longer adds a crash; (2) Codex wires the
+  Full reset button; (3) recommended `nidavellir-safety-auditor` pass on Fix C before commit. Nothing
+  committed or pushed.
+
+## Latest backend checkpoint (2026-06-29) — FailureSeekingGameLoop VF qualification
+- `run_render_stress` remains the unchanged eight-instance `PowerRender` used by discovery, benchmark
+  and legacy callers.
+- `run_vf_qualifier_stress` executes PowerOpening, BoostEdge, HeavySpike, TextureRop, ComputeBurst,
+  IdlePulse, MixedGame and PowerClosing. Each phase has independent checksum/coverage evidence; the
+  failing phase is logged.
+- Only the Standard/Long reset/reapply qualification motor selects the transient workload. Fast,
+  CLI probes and all discovery candidates keep the steady workload.
+- Mixed qualifier p5 cannot create `ClockDrop`; `Pass`/`Fail`/`Inconclusive` coverage is persisted in
+  `f2_observations.jsonl`. Current Apply qualification counts only current-contract qualification
+  passes, not discovery/legacy positives.
+- Qualification rejection backs off to the next physical VF bin and performs fresh `PowerRender`
+  discovery before restarting all passes. No manual bad-point registry was added.
+- `ResetGpuTuning` is an explicit recovery escape hatch after TDR/interruption: it bypasses the normal
+  start/apply lease, stops marked-running work, resets stock, clears Safe Loop, and releases the F2
+  Forge handle after reset succeeds. It also removes the visible `forge_state.json` checkpoint so the
+  UI can return to an idle/new-run state without deleting automatic F2 observation history. The Forge
+  worker also catches panic/unwind so `running` is not left true forever.
+- UI recovery is wired: after TDR/Needs Attention/Interrupted, **Recover & continue** calls
+  `ResetGpuTuning` and then starts the selected Forge mode, preserving F2 observations for backend
+  resume. **Full reset** is separate and maps to `ResetGpuTuningFull` with destructive confirmation.
+- Crash, `SilentError`, `Unstable`, reset and Safe Loop behavior remain fail-closed.
+- Code/unit validation only. No VF write, confirmed Forge, apply, reboot or GPU stress was executed.
 
 ## Latest backend/UI checkpoint (2026-06-28) — durable learning and visible progress
 - Qualification refinement: frontier extended to 90% Cmax; next-clock warm-start is one real bin above
