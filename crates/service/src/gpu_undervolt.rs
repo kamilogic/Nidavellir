@@ -20,9 +20,9 @@
 //!   with `--confirm` — the real CONFIRMED hardware branch ([`run_confirmed_f2_step`] over the
 //!   [`F2Ops`] trait): arm Safe Loop → apply ONE bounded positive offset → verify → dwell once →
 //!   `reset_to_stock` on EVERY exit path → clear the boot flag ONLY after a confirmed reset; and
-//! - a bounded same-target ANCHORED MULTI-STEP descent ([`plan_anchored_undervolt_descent`] +
-//!   [`run_confirmed_f2_multi_step`] over the [`F2MultiStepOps`] trait): `--steps 2..=`[`F2_CONFIRMED_MAX_STEPS`]
-//!   executes a SHORT sequence of anchored candidates at ONE target (safer/higher voltage → lower
+//! - a same-target ANCHORED MULTI-STEP descent ([`plan_anchored_undervolt_descent`] +
+//!   [`run_confirmed_f2_multi_step`] over the [`F2MultiStepOps`] trait): `--steps N`
+//!   executes the requested sequence of anchored candidates at ONE target (safer/higher voltage → lower
 //!   voltage), running the SAME per-step motor and STOPPING at the first non-stable candidate; and
 //! - an explicit MANUAL-PRIOR development/known-GPU shortcut ([`plan_manual_prior_undervolt`] +
 //!   `run_manual_prior_undervolt_probe`, gated by [`confirmed_manual_prior_refusal`]): `--manual-prior`
@@ -32,8 +32,8 @@
 //!
 //! Safety invariants: no profile apply/persist/promotion, no MULTI-TARGET automation (the multi-step
 //! descent stays on a single target), no autonomous crash-seeking, no power-limit/TDP/clock-lock
-//! change; the confirmed multi-step branch is bounded by [`F2_CONFIRMED_MAX_STEPS`] (a larger request
-//! fails closed); the MANUAL-PRIOR larger offset cap is OPT-IN ONLY (it never changes the
+//! change; discovery depth is bounded only by the real VF table / requested manual steps and the first
+//! terminal detection; the MANUAL-PRIOR larger offset cap is OPT-IN ONLY (it never changes the
 //! default/autonomous discovery caps) and still fail-closed (an offset above it is REFUSED, never
 //! clamped, and the stock clock ceiling still caps the effective clock); the dry-run reads Safe Loop
 //! state READ-ONLY (it never arms the boot flag, mutates the record, applies, dwells, or writes VF);
@@ -63,24 +63,17 @@ use crate::gpu_verify::PositiveOffsetVerification;
 /// F2 v1 is a single focus target with a small bounded raise.
 const F2_DEFAULT_STEPS: usize = 4;
 
-/// Maximum confirmed ANCHORED multi-step candidates per `--confirm` run. The first bounded
-/// multi-step implementation stays small on purpose: a confirmed run may descend AT MOST this many
-/// anchored candidates at ONE target (safer/higher voltage → lower voltage), stopping at the first
-/// non-stable candidate. A larger `--steps` request FAILS CLOSED in confirmed mode; the read-only
-/// dry-run may still preview a longer plan. Single-step (`--steps 1`) keeps its own validated path.
-const F2_CONFIRMED_MAX_STEPS: usize = 3;
-
 /// Hard upper bound on `--validation-passes` for the `--auto-sweep` confidence opt-in. A request above
 /// this is REFUSED (fail closed), never clamped silently — extra validations are real hardware time
 /// (arm→apply→verify→dwell→reset per pass), so the total is bounded so it can never run unbounded.
 #[cfg(windows)]
 const F2_MAX_VALIDATION_PASSES: usize = 20;
 
-/// Candidate budget for the AUTO-SWEEP dry-run preview. Generous on purpose — the conservative offset
-/// caps stop the descent earlier anyway — so the preview shows the full natural descent. The CONFIRMED
-/// auto-sweep stays bounded by [`F2_CONFIRMED_MAX_STEPS`] regardless (no infinite search).
+/// AUTO-SWEEP traverses the complete physical candidate domain. `usize::MAX` is only the planner's
+/// "no arbitrary budget" sentinel; the real VF table, hardware floor, and first terminal detection
+/// still bound execution.
 #[cfg(windows)]
-pub(crate) const F2_SWEEP_DRYRUN_BUDGET: usize = 6;
+pub(crate) const F2_SWEEP_DRYRUN_BUDGET: usize = usize::MAX;
 
 /// Hard cap (MHz) on the bounded POSITIVE offset for the explicit MANUAL-PRIOR development path ONLY.
 /// The default/autonomous discovery keeps the conservative +30 absolute / +15 per-step caps and NEVER
@@ -101,6 +94,11 @@ const F2_VERIFY_TOL_MHZ: u32 = 15;
 /// crash or silent error. ~two boost bins (mirrors the load verifier's p5 tolerance).
 #[cfg(windows)]
 const F2_CLOCK_DROP_TOL_MHZ: u32 = 30;
+
+/// Proven Standard dwell duration. The live Forge modes may select another duration, but the CLI
+/// paths keep this baseline unless they opt in explicitly.
+#[cfg(windows)]
+const F2_STANDARD_DWELL_MS: u64 = 15_000;
 
 /// Residual offset (kHz) at or below which a post-reset readback counts as "cleared". F2 must NEVER
 /// leave a positive offset applied; a larger residual makes the confirmed path treat the reset as
@@ -197,18 +195,21 @@ pub fn parse_undervolt_args(args: &[OsString]) -> Result<UndervoltArgs, String> 
             "--target-mhz" => {
                 let v = strs.get(i + 1).ok_or_else(|| "--target-mhz needs a value".to_string())?;
                 out.target_mhz =
-                    Some(v.parse().map_err(|_| format!("--target-mhz: invalid number '{v}'"))?);
+                    Some(v.parse().map_err(|_| format!("--target-mhz: invalid number '{v}'"))?,
+                );
                 i += 2;
             }
             "--start-mv" => {
                 let v = strs.get(i + 1).ok_or_else(|| "--start-mv needs a value".to_string())?;
                 out.start_mv =
-                    Some(v.parse().map_err(|_| format!("--start-mv: invalid number '{v}'"))?);
+                    Some(v.parse().map_err(|_| format!("--start-mv: invalid number '{v}'"))?,
+                );
                 i += 2;
             }
             "--steps" => {
                 let v = strs.get(i + 1).ok_or_else(|| "--steps needs a value".to_string())?;
-                out.steps = Some(v.parse().map_err(|_| format!("--steps: invalid number '{v}'"))?);
+                out.steps = Some(v.parse().map_err(|_| format!("--steps: invalid number '{v}'"))?,
+                );
                 i += 2;
             }
             "--validation-passes" => {
@@ -241,7 +242,8 @@ pub fn parse_undervolt_args(args: &[OsString]) -> Result<UndervoltArgs, String> 
                 let v = strs.get(i + 1).ok_or_else(|| "--targets needs a value".to_string())?;
                 let mut targets = Vec::new();
                 for t in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    targets.push(t.parse().map_err(|_| format!("--targets: invalid number '{t}'"))?);
+                    targets.push(t.parse().map_err(|_| format!("--targets: invalid number '{t}'"))?,
+                    );
                 }
                 out.targets = targets;
                 i += 2;
@@ -304,7 +306,8 @@ pub fn plan_undervolt_probe(
             skipped_above_target += 1;
             continue;
         }
-        match plan_bounded_positive_offset(static_base_curve, idx, focus_target_mhz, prev_offset, limits) {
+        match plan_bounded_positive_offset(static_base_curve, idx, focus_target_mhz, prev_offset, limits,
+        ) {
             Ok(plan) => {
                 prev_offset = plan.offset_mhz;
                 points.push(plan);
@@ -401,7 +404,8 @@ pub fn plan_anchored_undervolt(
         .find(|(i, _, _)| *i == anchor_idx)
         .map(|&(_, mv, _)| mv);
     // Single-step anchored: prev_offset = 0. The planner is fail-closed and never silently clamps.
-    match plan_bounded_anchored_positive_offset(static_base_curve, anchor_idx, focus_target_mhz, 0, limits)
+    match plan_bounded_anchored_positive_offset(static_base_curve, anchor_idx, focus_target_mhz, 0, limits,
+    )
     {
         Ok(plan) => AnchoredProbePlan {
             focus_target_mhz,
@@ -463,18 +467,23 @@ pub fn plan_manual_prior_undervolt(
     requested_start_mv: u32,
     manual_limits: &PositiveOffsetLimits,
 ) -> ManualPriorPlan {
-    let selected_idx = select_anchor_bin(static_base_curve, focus_target_mhz, Some(requested_start_mv));
+    let selected_idx = select_anchor_bin(static_base_curve, focus_target_mhz, Some(requested_start_mv),
+    );
     let (selected_mv, base_mhz, required_offset_mhz) = match selected_idx {
         Some(idx) => static_base_curve
             .iter()
             .find(|(i, _, _)| *i == idx)
-            .map(|&(_, mv, base)| (Some(mv), Some(base), Some(focus_target_mhz as i32 - base as i32)))
+            .map(|&(_, mv, base)| {
+                (Some(mv), Some(base), Some(focus_target_mhz as i32 - base as i32),
+                )
+            })
             .unwrap_or((None, None, None)),
         None => (None, None, None),
     };
     // Reuse the anchored planner with the MANUAL-PRIOR limits; it fails closed (never clamps) on an
     // offset above the manual cap, a below-floor bin, a non-monotone curve, or a missing anchor.
-    let probe = plan_anchored_undervolt(static_base_curve, focus_target_mhz, Some(requested_start_mv), manual_limits);
+    let probe = plan_anchored_undervolt(static_base_curve, focus_target_mhz, Some(requested_start_mv), manual_limits,
+    );
     let within_bounds = probe.plan.is_some();
     let note = probe.note.clone();
     ManualPriorPlan {
@@ -626,7 +635,8 @@ pub fn undervolt_preflight(
         reasons.push("Safe Mode is active — refuse".to_string());
     }
     if boot_flag_armed {
-        reasons.push("a Safe Loop boot flag is already armed (prior run did not clear) — refuse".to_string());
+        reasons.push("a Safe Loop boot flag is already armed (prior run did not clear) — refuse".to_string(),
+        );
     }
     let blacklisted = points.iter().filter(|p| record.is_blacklisted(p)).count();
     if blacklisted > 0 {
@@ -680,7 +690,8 @@ pub fn undervolt_plan_lines(
         plan.skipped_above_target
     ));
     if plan.points.is_empty() {
-        out.push("candidate bins     : none (no bin needs a bounded positive raise to hold the target)".to_string());
+        out.push("candidate bins     : none (no bin needs a bounded positive raise to hold the target)".to_string(),
+        );
     } else {
         out.push(format!("candidate bins     : {} planned positive-offset point(s):", plan.points.len()));
         for p in &plan.points {
@@ -711,7 +722,8 @@ pub fn undervolt_plan_lines(
         "blacklist check    : a confirmed run must re-check each point against the Safe Loop blacklist (read-only above)"
             .to_string(),
     );
-    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock on every exit path".to_string());
+    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock on every exit path".to_string(),
+    );
     out.push("no-op (dry-run)    : no Safe Loop arm, no apply, no dwell, no VF write".to_string());
     out
 }
@@ -727,7 +739,8 @@ pub fn anchored_plan_lines(
     preflight: &PreflightVerdict,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    out.push("=== undervolt-probe PLAN (F2 anchored true-undervolt, dry-run preview) ===".to_string());
+    out.push("=== undervolt-probe PLAN (F2 anchored true-undervolt, dry-run preview) ===".to_string(),
+    );
     out.push(
         "mode               : ANCHORED (classic undervolt point — raise the anchor + cap the plateau)"
             .to_string(),
@@ -813,7 +826,8 @@ pub fn anchored_plan_lines(
             format!("REFUSE — {}", preflight.reasons.join("; "))
         }
     ));
-    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock on every exit path".to_string());
+    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock on every exit path".to_string(),
+    );
     out.push(
         "anchored guarantee : anchored mode prevents boost above the target during this probe"
             .to_string(),
@@ -846,8 +860,8 @@ pub fn anchored_descent_plan_lines(
         descent.focus_target_mhz
     ));
     out.push(format!(
-        "confirmed cap      : up to {confirmed_cap} anchored candidate(s) per --confirm run \
-         (F2_CONFIRMED_MAX_STEPS={confirmed_cap}; more FAILS CLOSED in confirmed mode)"
+        "confirmed span     : {confirmed_cap} planned physical candidate(s); no arbitrary step cap \
+         (stops at first terminal detection or the real VF floor)"
     ));
     out.push(format!(
         "offset caps        : abs +{} MHz, per-step +{} MHz (constants — NOT CLI-widenable)",
@@ -918,7 +932,8 @@ pub fn anchored_descent_plan_lines(
             format!("REFUSE — {}", preflight.reasons.join("; "))
         }
     ));
-    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock after EVERY candidate".to_string());
+    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock after EVERY candidate".to_string(),
+    );
     out.push(
         "anchored guarantee : anchored mode prevents boost above the target during each candidate"
             .to_string(),
@@ -930,8 +945,7 @@ pub fn anchored_descent_plan_lines(
     );
     out.push(
         "no-op (dry-run)    : no Safe Loop arm, no apply, no dwell, no VF write"
-            .to_string(),
-    );
+            .to_string());
     out
 }
 
@@ -948,7 +962,8 @@ pub fn manual_prior_plan_lines(
     preflight: &PreflightVerdict,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    out.push("=== undervolt-probe PLAN (F2 ANCHORED + MANUAL-PRIOR, dry-run preview) ===".to_string());
+    out.push("=== undervolt-probe PLAN (F2 ANCHORED + MANUAL-PRIOR, dry-run preview) ===".to_string(),
+    );
     out.push(
         "mode               : ANCHORED + MANUAL-PRIOR (explicit operator prior — NOT default discovery)"
             .to_string(),
@@ -1019,7 +1034,8 @@ pub fn manual_prior_plan_lines(
                 "lower-voltage bins : {} left elastic (offset 0, never raised)",
                 p.elastic_below_bins
             ));
-            out.push("within bounds      : YES (required offset within the manual-prior cap)".to_string());
+            out.push("within bounds      : YES (required offset within the manual-prior cap)".to_string(),
+            );
         }
         None => {
             out.push(format!(
@@ -1046,7 +1062,8 @@ pub fn manual_prior_plan_lines(
             format!("REFUSE — {}", preflight.reasons.join("; "))
         }
     ));
-    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock on every exit path".to_string());
+    out.push("reset_to_stock     : a confirmed run MUST reset the GPU to stock on every exit path".to_string(),
+    );
     out.push(
         "anchored guarantee : anchored mode prevents boost above the target during this probe"
             .to_string(),
@@ -1075,10 +1092,9 @@ pub fn undervolt_usage() -> String {
         "Options:",
         "  --target-mhz <MHz>   Focus target clock (default: stock boost top; never overclocks).",
         "  --start-mv <mV>      Highest voltage bin to anchor at (default: curve top).",
-        "  --steps <N>          Confirmed ANCHORED candidates to attempt at the same target, descending",
-        "                       voltage (1..=3; cap F2_CONFIRMED_MAX_STEPS=3; larger FAILS CLOSED in",
-        "                       confirmed mode). --steps 1 keeps the validated single-step path. The",
-        "                       read-only dry-run may preview a longer plan. --simple uses N as the",
+        "  --steps <N>          Explicit ANCHORED candidates to attempt at the same target, descending",
+        "                       voltage. There is no hidden step cap; N is the operator's requested",
+        "                       boundary. --steps 1 keeps the validated single-step path. --simple uses N as the",
         "                       descent budget (default: 4) and REQUIRES --steps 1 under --confirm.",
         "  --anchored           Plan the anchored classic undervolt point(s) (DEFAULT).",
         "  --simple             Plan the original single-bin positive-offset descent (boost above the",
@@ -1090,7 +1106,8 @@ pub fn undervolt_usage() -> String {
         "                       1). The default/autonomous discovery cap (+30) is unaffected.",
         "  --auto-sweep         Autonomous same-target sweep: discover the minimum stable voltage for one",
         "                       --target-mhz via the OFFICIAL progressive anchored descent (conservative",
-        "                       caps), recording an observation per candidate. Bounded; ignores --steps;",
+        "                       caps), recording an observation per candidate. Walks every real VF bin",
+        "                       until the first terminal detection or physical floor; ignores --steps;",
         "                       NOT manual-prior. Dry-run plans + previews the learned frontier.",
         "  --ladder-sweep       Autonomous MULTI-target sweep over --targets, in order. Lower targets'",
         "                       results are used only as conservative descent FLOORS for higher targets",
@@ -1100,12 +1117,12 @@ pub fn undervolt_usage() -> String {
         "  --confirm            Execute supervised anchored candidate(s) (see WARNING). Default: dry-run.",
         "  -h, --help           Print this help and exit (no hardware read, no plan, no mutation).",
         "",
-        "First hardware optimization should start small, e.g. `--steps 3`, with an operator present.",
+        "Explicit --steps runs should start small; autonomous discovery owns its full physical sweep.",
         "Default behavior is autonomous progressive anchored discovery; manual-prior is opt-in only.",
         "",
         "WARNING: --confirm MAY WRITE bounded positive VF offsets and run load dwells. It can TDR or",
         "         reboot the machine and REQUIRES an operator present and able to reboot. Anchored",
-        "         confirmed mode runs at most F2_CONFIRMED_MAX_STEPS (3) candidates at ONE target;",
+        "         autonomous discovery has no arbitrary candidate-count cap at a target;",
         "         manual-prior confirmed mode runs ONE anchored point at the explicit --start-mv. Both",
         "         arm Safe Loop before each write, reset to stock after EVERY candidate, stop at the",
         "         first non-stable candidate, and never persist, apply, or promote a profile.",
@@ -1125,7 +1142,9 @@ pub fn undervolt_usage() -> String {
 pub enum F2DwellOutcome {
     /// Dwell completed cleanly and held the target clock.
     Stable,
-    /// Instability / silent error under load (no device loss).
+    /// A known-answer workload detected a silent compute error (no device loss).
+    SilentError,
+    /// Instability under load without a classified silent compute error (no device loss).
     Unstable,
     /// TDR / crash / device-lost during the dwell.
     DeviceLost,
@@ -1143,6 +1162,9 @@ pub struct F2DwellResult {
     pub avg_clock_mhz: u32,
     pub p5_clock_mhz: u32,
     pub power_w: f32,
+    pub power_capped_frac: f32,
+    pub duration_ms: u64,
+    pub sample_count: u32,
 }
 
 /// Terminal classification of a confirmed single step. The most-severe applicable variant wins
@@ -1155,10 +1177,14 @@ pub enum F2Outcome {
     ApplyFailed(String),
     /// The post-write verify did not confirm the intended raise.
     VerifyFailed,
-    /// The dwell reported instability (no device loss).
+    /// The dwell reported a silent compute error (no device loss).
+    SilentError,
+    /// The dwell reported instability without a classified silent error (no device loss).
     Unstable,
     /// The dwell reported a crash / TDR / device loss.
     DeviceLost,
+    /// Live-Forge reclassification of a reset-clean pre-sustain `ClockDrop` while still power-bound.
+    PowerBoundClockDrop,
     /// The dwell stayed up but the sustained (p5) clock sagged below target − tolerance.
     ClockDrop,
     /// `reset_to_stock` could not be confirmed — boot flag RETAINED, fail closed.
@@ -1167,8 +1193,110 @@ pub enum F2Outcome {
     Validated,
 }
 
+/// Decision made by the live F2 discovery loop after one reset-clean candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum F2DiscoveryDecision {
+    /// Try the next lower real voltage bin for this same target.
+    ContinueVoltage,
+    /// This target held for the first time; remember it as sustainable and continue descending.
+    MarkSustainableAndContinue,
+    /// This target never held and is no longer power-bound, so move to the next lower real clock.
+    NextClockUnsustainable,
+    /// The target had already held and this candidate found its lower-voltage boundary.
+    BoundaryFound,
+    /// A normal terminal failure occurred before this target ever held.
+    NextClockAfterFailure,
+    /// Hardware/recovery state is not trustworthy; abort the whole forge.
+    AbortForge,
+}
+
+/// True when the dwell was effectively at the board power limit. The direct power ratio is the
+/// primary signal requested by F2 (99–100% of the cap); the sampled cap flag is only a fallback when
+/// the driver did not expose a usable numeric limit.
+pub fn f2_near_power_limit(
+    power_w: Option<u32>,
+    power_limit_w: Option<f32>,
+    power_capped_frac: Option<f32>,
+) -> bool {
+    match (power_w, power_limit_w) {
+        (Some(power), Some(limit)) if limit.is_finite() && limit > 0.0 => {
+            power as f32 / limit >= 0.99
+        }
+        _ => power_capped_frac.is_some_and(|f| f.is_finite() && f >= 0.5),
+    }
+}
+
+/// Pure F2 transition matrix. A pre-sustain `ClockDrop` is not automatically a voltage boundary:
+/// while the card remains at 99–100% of its power cap, lowering voltage may free enough headroom for
+/// that same target to become sustainable. Once off-cap, the same drop means the target is not viable.
+/// After a target has held once, the first drop/error is its discovered boundary.
+pub fn f2_discovery_decision(
+    outcome: &F2Outcome,
+    had_sustainable_point: bool,
+    near_power_limit: bool,
+) -> F2DiscoveryDecision {
+    match outcome {
+        F2Outcome::Validated if had_sustainable_point => F2DiscoveryDecision::ContinueVoltage,
+        F2Outcome::Validated => F2DiscoveryDecision::MarkSustainableAndContinue,
+        F2Outcome::PowerBoundClockDrop => F2DiscoveryDecision::ContinueVoltage,
+        F2Outcome::ClockDrop if had_sustainable_point => F2DiscoveryDecision::BoundaryFound,
+        F2Outcome::ClockDrop if near_power_limit => F2DiscoveryDecision::ContinueVoltage,
+        F2Outcome::ClockDrop => F2DiscoveryDecision::NextClockUnsustainable,
+        F2Outcome::SilentError | F2Outcome::Unstable if had_sustainable_point => {
+            F2DiscoveryDecision::BoundaryFound
+        }
+        F2Outcome::SilentError | F2Outcome::Unstable => F2DiscoveryDecision::NextClockAfterFailure,
+        F2Outcome::DeviceLost
+        | F2Outcome::ResetFailed
+        | F2Outcome::ArmFailed(_)
+        | F2Outcome::ApplyFailed(_)
+        | F2Outcome::VerifyFailed => F2DiscoveryDecision::AbortForge,
+    }
+}
+
+fn f2_outcome_retains_boot_flag(outcome: &F2Outcome) -> bool {
+    matches!(outcome, F2Outcome::DeviceLost | F2Outcome::ResetFailed)
+}
+
+fn resume_f2_candidates(
+    candidates: &mut Vec<AnchoredPositiveOffsetPlan>,
+    prior_good_mv: Option<u32>,
+    prior_bad_mv: Option<u32>,
+    prior_power_bound_mv: Option<u32>,
+) -> Option<u32> {
+    if let Some(bad_mv) = prior_bad_mv {
+        if prior_good_mv.is_some() {
+            candidates.clear();
+            return None;
+        }
+        // A failed warm-start with no validated point does not prove the clock unsustainable.
+        // Retry the still-unknown higher-voltage candidates while never touching the failed/deeper
+        // region again.
+        candidates.retain(|candidate| candidate.anchor.voltage_mv > bad_mv);
+        return Some(bad_mv);
+    }
+    let resume_below = prior_good_mv.into_iter().chain(prior_power_bound_mv).min();
+    if let Some(mv) = resume_below {
+        candidates.retain(|candidate| candidate.anchor.voltage_mv < mv);
+    }
+    resume_below
+}
+
+fn f2_observation_matches_current_candidate(
+    candidates: &[AnchoredPositiveOffsetPlan],
+    anchor_mv: u32,
+    base_mhz: u32,
+    offset_mhz: i32,
+) -> bool {
+    candidates.iter().any(|candidate| {
+        candidate.anchor.voltage_mv == anchor_mv
+            && candidate.anchor.base_mhz == base_mhz
+            && candidate.anchor.offset_mhz == offset_mhz
+    })
+}
+
 /// Structured report of a confirmed single step (also drives the printed output and the tests).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct F2StepReport {
     pub outcome: F2Outcome,
     pub armed: bool,
@@ -1180,6 +1308,9 @@ pub struct F2StepReport {
     pub avg_clock_mhz: Option<u32>,
     pub p5_clock_mhz: Option<u32>,
     pub power_w: Option<u32>,
+    pub power_capped_frac: Option<f32>,
+    pub dwell_duration_ms: Option<u64>,
+    pub sample_count: Option<u32>,
     /// `Some(true)` reset confirmed, `Some(false)` reset failed/unconfirmed, `None` not reached.
     pub reset_ok: Option<bool>,
     pub boot_flag_cleared: bool,
@@ -1203,8 +1334,10 @@ pub trait F2Ops {
     fn reset_to_stock(&mut self) -> Result<(), String>;
     /// Clear the Safe Loop boot flag (call ONLY after a confirmed clean reset / success).
     fn clear_boot_flag(&mut self) -> Result<(), String>;
-    /// Record the crash/instability point in the Safe Loop blacklist (crash knowledge).
-    fn blacklist_point(&mut self) -> Result<(), String>;
+    /// Record the failed point in the Safe Loop blacklist. Only an actual device loss / TDR counts
+    /// toward the consecutive-crash safety threshold; a reset-clean SilentError or Unstable result
+    /// is boundary knowledge, not a crash.
+    fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String>;
 }
 
 /// Drive the confirmed single step. Preflight refusal is handled by the caller via
@@ -1220,6 +1353,9 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
         avg_clock_mhz: None,
         p5_clock_mhz: None,
         power_w: None,
+        power_capped_frac: None,
+        dwell_duration_ms: None,
+        sample_count: None,
         reset_ok: None,
         boot_flag_cleared: false,
         blacklisted: false,
@@ -1256,14 +1392,21 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
     r.avg_clock_mhz = Some(d.avg_clock_mhz);
     r.p5_clock_mhz = Some(d.p5_clock_mhz);
     r.power_w = Some(d.power_w.round() as u32);
+    r.power_capped_frac = Some(d.power_capped_frac);
+    r.dwell_duration_ms = Some(d.duration_ms);
+    r.sample_count = Some(d.sample_count);
     match d.outcome {
         F2DwellOutcome::DeviceLost => {
             // Crash / TDR: best-effort reset, record the blacklist, and RETAIN the boot flag — a
             // reboot may be imminent, so startup recovery must still fire. Never validate.
             r.reset_ok = Some(ops.reset_to_stock().is_ok());
-            r.blacklisted = ops.blacklist_point().is_ok();
+            r.blacklisted = ops.blacklist_point(true).is_ok();
             r.outcome = F2Outcome::DeviceLost;
             r
+        }
+        F2DwellOutcome::SilentError => {
+            r.outcome = F2Outcome::SilentError;
+            finish_after_write(ops, r, true)
         }
         F2DwellOutcome::Unstable => {
             r.outcome = F2Outcome::Unstable;
@@ -1289,7 +1432,7 @@ fn finish_after_write<O: F2Ops>(ops: &mut O, mut r: F2StepReport, blacklist: boo
     let reset = ops.reset_to_stock();
     r.reset_ok = Some(reset.is_ok());
     if blacklist {
-        r.blacklisted = ops.blacklist_point().is_ok();
+        r.blacklisted = ops.blacklist_point(false).is_ok();
     }
     if reset.is_ok() {
         // Reset confirmed → GPU recovered, no offset left applied → safe to clear the boot flag.
@@ -1304,12 +1447,12 @@ fn finish_after_write<O: F2Ops>(ops: &mut O, mut r: F2StepReport, blacklist: boo
     r
 }
 
-// ── F2 confirmed ANCHORED multi-step descent: bounded same-target orchestration ─────────────────
-// The single-step state machine above proves ONE anchored point. The bounded multi-step descent
-// executes a SHORT sequence of anchored candidates at the SAME target, from safer/higher voltage to
+// ── F2 confirmed ANCHORED multi-step descent: same-target orchestration ─────────────────────────
+// The single-step state machine above proves ONE anchored point. The multi-step descent
+// executes the planned sequence of anchored candidates at the SAME target, from safer/higher voltage to
 // lower voltage, running the SAME validated per-candidate motor ([`run_confirmed_f2_step`]) for each.
 // It STOPS at the first non-stable candidate and never attempts a deeper (lower-voltage) candidate
-// after any non-stable result. Single-target, anchored-only, capped at [`F2_CONFIRMED_MAX_STEPS`];
+// after any non-stable result. Single-target and anchored-only;
 // no multi-target automation, no autonomous crash-seeking, no profile persistence/apply/promotion.
 // Trait-isolated ([`F2MultiStepOps`]) so the orchestration + stop semantics are unit-tested with a
 // mock (no hardware).
@@ -1322,6 +1465,8 @@ pub enum F2MultiStopReason {
     /// A candidate's post-write verify did not confirm the anchored raise.
     VerifierFailed,
     /// A candidate's dwell reported instability (no device loss).
+    SilentError,
+    /// A candidate's dwell reported instability without a classified silent error.
     Unstable,
     /// A candidate's dwell reported a crash / TDR / device loss.
     DeviceLost,
@@ -1340,7 +1485,7 @@ pub enum F2MultiStopReason {
 }
 
 /// Structured report of a confirmed anchored multi-step descent (drives the printed output + tests).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct F2MultiStepReport {
     /// Candidates the orchestrator was willing to attempt (planned count capped to the step cap).
     pub planned: usize,
@@ -1405,6 +1550,10 @@ pub fn run_confirmed_f2_multi_step<O: F2MultiStepOps>(
                 stop_reason = F2MultiStopReason::VerifierFailed;
                 break;
             }
+            F2Outcome::SilentError => {
+                stop_reason = F2MultiStopReason::SilentError;
+                break;
+            }
             F2Outcome::Unstable => {
                 stop_reason = F2MultiStopReason::Unstable;
                 break;
@@ -1412,6 +1561,10 @@ pub fn run_confirmed_f2_multi_step<O: F2MultiStepOps>(
             F2Outcome::DeviceLost => {
                 stop_reason = F2MultiStopReason::DeviceLost;
                 break;
+            }
+            F2Outcome::PowerBoundClockDrop => {
+                // Produced only by the integrated live-Forge policy after the single-step motor.
+                // If supplied to this legacy bounded runner, continue to the next voltage candidate.
             }
             F2Outcome::ClockDrop => {
                 stop_reason = F2MultiStopReason::ClockDrop;
@@ -1483,7 +1636,8 @@ fn f2_intent(target_mhz: u32, cand: &PositiveOffsetPlan) -> TuningPoint {
 
 /// Conservative blacklist match: refuse if the 3-axis F2 intent OR the 2-axis (freq, vf_bin) point
 /// (matching build-frontier's region keys) falls in a blacklisted region.
-fn candidate_blacklisted(record: &SafeLoopRecord, target_mhz: u32, cand: &PositiveOffsetPlan) -> bool {
+fn candidate_blacklisted(record: &SafeLoopRecord, target_mhz: u32, cand: &PositiveOffsetPlan,
+) -> bool {
     let f2 = f2_intent(target_mhz, cand);
     let f1_like = TuningPoint::from_axes([
         ("gpu_freq_mhz", target_mhz as i64),
@@ -1514,7 +1668,8 @@ pub fn confirmed_f2_refusal(
         return Some("Safe Mode is active".to_string());
     }
     if boot_flag_armed {
-        return Some("a Safe Loop boot flag is already armed (prior run did not clear)".to_string());
+        return Some("a Safe Loop boot flag is already armed (prior run did not clear)".to_string(),
+        );
     }
     if record.consecutive_crashes >= SAFE_MODE_CRASH_THRESHOLD {
         return Some(format!(
@@ -1578,14 +1733,17 @@ pub fn confirmed_manual_prior_refusal(
     if start_mv.is_none() {
         return Some("manual-prior requires an explicit --start-mv".to_string());
     }
-    confirmed_f2_refusal(record, boot_flag_armed, steps, candidate, manual_limits, target_mhz)
+    confirmed_f2_refusal(record, boot_flag_armed, steps, candidate, manual_limits, target_mhz,
+    )
 }
 
 /// Pure confirmed ANCHORED multi-step preflight (run-level gate). Returns `Some(reason)` to REFUSE
 /// (fail closed) before any hardware, or `None` to proceed. Refuses unless: `--steps` is present and
 /// within `1..=cap` (a larger request fails closed — the confirmed branch enforces its OWN cap
 /// regardless of what the dry-run may preview); not in Safe Mode; no boot flag already armed;
-/// `consecutive_crashes` below the abort threshold; and at least one anchored candidate exists. The
+/// and at least one anchored candidate exists. Actual crash/TDR recovery is represented by Safe Mode
+/// or an armed boot flag; reset-clean instability boundaries must not poison later clocks in the same
+/// supervised run. The
 /// per-candidate bounds/blacklist re-checks happen at execution time (the writer re-validates bounds
 /// and [`F2MultiStepOps::select`] re-checks Safe Loop + blacklist before each write).
 pub fn confirmed_f2_multi_refusal(
@@ -1612,13 +1770,8 @@ pub fn confirmed_f2_multi_refusal(
         return Some("Safe Mode is active".to_string());
     }
     if boot_flag_armed {
-        return Some("a Safe Loop boot flag is already armed (prior run did not clear)".to_string());
-    }
-    if record.consecutive_crashes >= SAFE_MODE_CRASH_THRESHOLD {
-        return Some(format!(
-            "consecutive_crashes {} >= abort threshold {}",
-            record.consecutive_crashes, SAFE_MODE_CRASH_THRESHOLD
-        ));
+        return Some("a Safe Loop boot flag is already armed (prior run did not clear)".to_string(),
+        );
     }
     if candidate_count == 0 {
         return Some("no anchored candidates to confirm".to_string());
@@ -1783,6 +1936,7 @@ struct RealF2Ops<'a> {
     /// the absolute cap on `offset` regardless. A single-step / manual-prior run always passes 0; only
     /// the confirmed chained target-sweep motor advances it (see [`chained_prev_offset`]).
     prev_offset_mhz: i32,
+    dwell_ms: u64,
 }
 
 #[cfg(windows)]
@@ -1834,7 +1988,8 @@ impl F2Ops for RealF2Ops<'_> {
                     .entries
                     .iter()
                     .map(|e| {
-                        (e.index, nidavellir_gpu_nvapi::vf_get_point_khz(e.index).map(|khz| khz / 1000))
+                        (e.index, nidavellir_gpu_nvapi::vf_get_point_khz(e.index).map(|khz| khz / 1000),
+                        )
                     })
                     .collect();
                 let av = crate::gpu_verify::verify_anchored_positive_offset(
@@ -1875,11 +2030,12 @@ impl F2Ops for RealF2Ops<'_> {
     }
 
     fn dwell(&mut self) -> F2DwellResult {
-        let s = crate::gpu_power_sweep::single_load_dwell();
+        let s = crate::gpu_power_sweep::single_load_dwell(self.dwell_ms);
         let outcome = if s.crashed {
             F2DwellOutcome::DeviceLost
+        } else if s.silent_error {
+            F2DwellOutcome::SilentError
         } else if !s.stable {
-            // silent_error or any non-stable/non-crash → conservatively unstable.
             F2DwellOutcome::Unstable
         } else if s.p5_clock_mhz + F2_CLOCK_DROP_TOL_MHZ < self.target_mhz {
             // Stable (no crash/error) but the sustained (p5) clock sagged below target − tol → the
@@ -1897,6 +2053,9 @@ impl F2Ops for RealF2Ops<'_> {
             avg_clock_mhz: s.avg_clock_mhz,
             p5_clock_mhz: s.p5_clock_mhz,
             power_w: s.power_w,
+            power_capped_frac: s.power_capped_frac,
+            duration_ms: s.duration_ms,
+            sample_count: s.sample_count,
         }
     }
 
@@ -1913,7 +2072,9 @@ impl F2Ops for RealF2Ops<'_> {
         for idx in indices {
             match nidavellir_gpu_nvapi::vf_get_point_khz(idx) {
                 Some(khz) if khz.abs() <= F2_RESET_TOL_KHZ => {}
-                Some(khz) => return Err(format!("reset readback offset {khz} kHz not cleared at idx {idx}")),
+                Some(khz) => {
+                    return Err(format!("reset readback offset {khz} kHz not cleared at idx {idx}"))
+                }
                 None => {
                     return Err(format!("reset readback unavailable at idx {idx} — cannot confirm cleared"))
                 }
@@ -1926,13 +2087,15 @@ impl F2Ops for RealF2Ops<'_> {
         self.store.clear_boot_flag().map_err(|e| format!("clear_boot_flag: {e}"))
     }
 
-    fn blacklist_point(&mut self) -> Result<(), String> {
+    fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String> {
         let mut rec = self.store.load_record();
         rec.blacklist.push(BlacklistRegion::around(
             f2_intent(self.target_mhz, &self.candidate),
             DEFAULT_BLACKLIST_RADIUS,
         ));
-        rec.consecutive_crashes = rec.consecutive_crashes.saturating_add(1);
+        if counts_as_crash {
+            rec.consecutive_crashes = rec.consecutive_crashes.saturating_add(1);
+        }
         self.store.save_record(&rec).map_err(|e| format!("save_record: {e}"))
     }
 }
@@ -1954,6 +2117,7 @@ struct RealF2MultiOps<'a> {
     /// observation's offset, or 0 when none). Candidate `i>0` chains off candidate `i-1` instead (it is
     /// only reached after `i-1` validated). See [`chained_prev_offset`].
     baseline_offset_mhz: i32,
+    dwell_ms: u64,
     /// The per-candidate motor for the currently-selected candidate (`None` until first `select`).
     cur: Option<RealF2Ops<'a>>,
 }
@@ -1978,8 +2142,8 @@ impl F2Ops for RealF2MultiOps<'_> {
     fn clear_boot_flag(&mut self) -> Result<(), String> {
         self.cur.as_mut().expect("select before use").clear_boot_flag()
     }
-    fn blacklist_point(&mut self) -> Result<(), String> {
-        self.cur.as_mut().expect("select before use").blacklist_point()
+    fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String> {
+        self.cur.as_mut().expect("select before use").blacklist_point(counts_as_crash)
     }
 }
 
@@ -2001,7 +2165,8 @@ impl F2MultiStepOps for RealF2MultiOps<'_> {
             return Err("Safe Mode active before candidate write".to_string());
         }
         if self.store.is_boot_flag_armed() {
-            return Err("a Safe Loop boot flag is already armed before candidate write".to_string());
+            return Err("a Safe Loop boot flag is already armed before candidate write".to_string(),
+            );
         }
         if candidate_blacklisted(&rec, self.target_mhz, &plan.anchor) {
             return Err(format!("candidate {i} intent is blacklisted"));
@@ -2020,6 +2185,7 @@ impl F2MultiStepOps for RealF2MultiOps<'_> {
             limits: self.limits,
             target_mhz: self.target_mhz,
             prev_offset_mhz,
+            dwell_ms: self.dwell_ms,
         });
         Ok(())
     }
@@ -2044,12 +2210,24 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
         return;
     }
     let floor_mv = sane.iter().map(|&(_, mv, _)| mv).min().unwrap();
-    let boost_top = sane.iter().map(|&(_, _, f)| f).max().unwrap();
+    let min_base = sane.iter().map(|&(_, _, f)| f).min().unwrap();
+    let live_curve = gpu::read_vf_curve_modern();
+    let boost_top = match crate::gpu_power_sweep::f2_stock_clock_ceiling(&live_curve) {
+        Ok(clock) => clock,
+        Err(e) => {
+            println!(
+                "undervolt-probe: stock clock domain unavailable ({e}) — fail closed (no hardware touched)."
+            );
+            return;
+        }
+    };
     let focus_target = args.target_mhz.unwrap_or(boost_top);
     let max_steps = args.steps.unwrap_or(F2_DEFAULT_STEPS);
     // Clock ceiling = stock boost top: F2 may hold an existing clock at lower voltage but never
     // overclock above stock. The offset caps are the conservative constants (not CLI-widenable).
     let limits = PositiveOffsetLimits::conservative(floor_mv, boost_top);
+    let discovery_limits =
+        PositiveOffsetLimits::hardware_frontier(floor_mv, boost_top, min_base);
 
     // Read-only Safe Loop state (shared by both modes; the dry-run NEVER mutates it).
     let record = store.load_record();
@@ -2069,22 +2247,25 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
     // LADDER-SWEEP (autonomous multi-target sweep): opt-in; runs a target sweep per `--targets` in order
     // with conservative priors. NEVER the default. Branches before auto-sweep / the plain dispatch.
     if args.ladder_sweep {
-        run_anchored_ladder_sweep(store, confirm, &args, &sane, &limits);
+        run_anchored_ladder_sweep(store, confirm, &args, &sane, &discovery_limits);
         return;
     }
 
     // AUTO-SWEEP (autonomous same-target minimum-stable-voltage discovery): opt-in; uses the OFFICIAL
     // progressive anchored descent + observation learning. NEVER the default; branches before the plain
-    // anchored/simple dispatch so default behavior is unchanged. It gets a SEPARATE limits envelope — the
-    // TARGET-SWEEP LEARNING HORIZON (absolute cap +210, per-step still +15) — so the chained descent can
-    // keep discovering deeper bins beyond the +30 default ABSOLUTE cap, but ONLY through validated
-    // per-step increments. This is NOT a global cap widening: `limits` (conservative +30/+15) is unchanged
-    // and still used by the default, ladder, and manual-prior paths.
+    // anchored/simple dispatch so default behavior is unchanged. Autonomous discovery uses the same
+    // hardware-derived physical envelope as the live Forge: no arbitrary +30/+210 or +15 progression
+    // ceiling, while the effective target remains capped at the stock live clock domain.
     if args.auto_sweep {
-        let target_sweep_limits =
-            PositiveOffsetLimits::target_sweep_learning_horizon(floor_mv, boost_top);
         run_anchored_target_sweep(
-            store, confirm, &args, &sane, &target_sweep_limits, focus_target, &record, boot_flag_armed,
+            store,
+            confirm,
+            &args,
+            &sane,
+            &discovery_limits,
+            focus_target,
+            &record,
+            boot_flag_armed,
         );
         return;
     }
@@ -2178,6 +2359,7 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
                     limits,
                     target_mhz: focus_target,
                     prev_offset_mhz: 0, // single-step: per-step measured from stock (unchanged)
+                    dwell_ms: F2_STANDARD_DWELL_MS,
                 };
                 let report = run_confirmed_f2_step(&mut ops);
                 for line in confirmed_report_lines(focus_target, &cand, &limits, &report) {
@@ -2218,7 +2400,8 @@ fn run_anchored_undervolt_probe(
     // `--steps` ≥ 2 (anchored) → bounded same-target multi-step descent. `--steps` None or 1 keeps the
     // validated single anchored step below.
     if matches!(args.steps, Some(n) if n >= 2) {
-        run_anchored_multi_step(store, confirm, args, sane, limits, focus_target, record, boot_flag_armed);
+        run_anchored_multi_step(store, confirm, args, sane, limits, focus_target, record, boot_flag_armed,
+        );
         return;
     }
 
@@ -2288,6 +2471,7 @@ fn run_anchored_undervolt_probe(
                     limits: *limits,
                     target_mhz: focus_target,
                     prev_offset_mhz: 0, // single-step anchored: per-step measured from stock (unchanged)
+                    dwell_ms: F2_STANDARD_DWELL_MS,
                 };
                 let report = run_confirmed_f2_step(&mut ops);
                 for line in confirmed_report_lines(focus_target, &anchor, limits, &report) {
@@ -2313,10 +2497,10 @@ fn run_anchored_undervolt_probe(
 /// descent (anchored candidates at the SAME target, safer/higher voltage first), runs the Safe Loop
 /// preflight read-only over every candidate's bins, and prints the plan + confirmed stop semantics +
 /// the no-op line. WITH `--confirm` it runs the fail-closed run-level preflight ([`confirmed_f2_multi_refusal`],
-/// enforcing the [`F2_CONFIRMED_MAX_STEPS`] cap) then drives [`run_confirmed_f2_multi_step`] over the
+/// with the requested physical candidate count) then drives [`run_confirmed_f2_multi_step`] over the
 /// real per-candidate motor: each candidate arms Safe Loop → applies → verifies → dwells → resets →
 /// clears, and the descent STOPS at the first non-stable candidate. Single-target, anchored-only,
-/// capped; never persists/applies/promotes a profile.
+/// never persists/applies/promotes a profile.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn run_anchored_multi_step(
@@ -2329,7 +2513,7 @@ fn run_anchored_multi_step(
     record: &SafeLoopRecord,
     boot_flag_armed: bool,
 ) {
-    // Dry-run previews up to the REQUESTED steps; the confirmed branch enforces its own cap below.
+    // Explicit --steps is the operator-selected boundary; there is no additional hidden cap.
     let max_steps = args.steps.unwrap_or(F2_DEFAULT_STEPS);
     let descent = plan_anchored_undervolt_descent(sane, focus_target, args.start_mv, limits, max_steps);
 
@@ -2348,7 +2532,7 @@ fn run_anchored_multi_step(
         .collect();
     let preflight = undervolt_preflight(record, boot_flag_armed, &points);
 
-    for line in anchored_descent_plan_lines(&descent, limits, &preflight, F2_CONFIRMED_MAX_STEPS) {
+    for line in anchored_descent_plan_lines(&descent, limits, &preflight, max_steps) {
         println!("{line}");
     }
 
@@ -2358,7 +2542,7 @@ fn run_anchored_multi_step(
             boot_flag_armed,
             args.steps,
             descent.candidates.len(),
-            F2_CONFIRMED_MAX_STEPS,
+            max_steps,
         ) {
             Some(reason) => {
                 println!(
@@ -2371,7 +2555,7 @@ fn run_anchored_multi_step(
                 warn!(
                     "undervolt-probe: --confirm — executing up to {} ANCHORED candidate(s) at {} MHz \
                      (descending voltage; stops at first non-stable) — can TDR/reboot.",
-                    F2_CONFIRMED_MAX_STEPS.min(descent.candidates.len()),
+                    descent.candidates.len(),
                     focus_target
                 );
                 let mut ops = RealF2MultiOps {
@@ -2383,9 +2567,10 @@ fn run_anchored_multi_step(
                     // Explicit --steps descent: no cross-run observation resume (within-run advancement
                     // still chains each candidate off the prior validated one via `select`).
                     baseline_offset_mhz: 0,
+                    dwell_ms: F2_STANDARD_DWELL_MS,
                     cur: None,
                 };
-                let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
+                let report = run_confirmed_f2_multi_step(&mut ops, max_steps);
                 for line in confirmed_multi_report_lines(focus_target, &descent.candidates, limits, &report) {
                     println!("{line}");
                 }
@@ -2398,13 +2583,13 @@ fn run_anchored_multi_step(
         return;
     }
     println!(
-        "(dry-run — pass `--steps N --confirm` (N up to {F2_CONFIRMED_MAX_STEPS}) for a supervised \
+        "(dry-run — pass `--steps N --confirm` for a supervised \
          anchored descent; nothing was written)"
     );
     info!(
         "undervolt-probe: DRY-RUN (anchored multi-step) — target={} MHz candidates={} requested_steps={} \
-         confirmed_cap={} preflight_safe={} — no Safe Loop arm, no apply, no dwell, no VF write.",
-        focus_target, descent.candidates.len(), max_steps, F2_CONFIRMED_MAX_STEPS, preflight.safe
+         preflight_safe={} — no Safe Loop arm, no apply, no dwell, no VF write.",
+        focus_target, descent.candidates.len(), max_steps, preflight.safe
     );
 }
 
@@ -2412,7 +2597,7 @@ fn run_anchored_multi_step(
 /// OFFICIAL progressive anchored descent (conservative caps) — NOT manual-prior. DRY-RUN by default:
 /// plans the descent, previews the current learned frontier (READ-ONLY), and prints where observations
 /// would be recorded — no Safe Loop arm / apply / dwell / VF write / observation. WITH `--confirm` it
-/// runs the bounded multi-step descent (cap [`F2_CONFIRMED_MAX_STEPS`]), records ONE observation per
+/// runs the full physical-bin descent, records ONE observation per
 /// executed candidate via [`crate::gpu_f2_sweep::record_target_sweep`], and reports the discovered
 /// last-good / first-bad / bracket. Single-target; autonomous (ignores `--steps`); never
 /// persists/applies/promotes a profile.
@@ -2433,7 +2618,8 @@ fn run_anchored_target_sweep(
     };
 
     let descent =
-        plan_anchored_undervolt_descent(sane, focus_target, args.start_mv, limits, F2_SWEEP_DRYRUN_BUDGET);
+        plan_anchored_undervolt_descent(sane, focus_target, args.start_mv, limits, F2_SWEEP_DRYRUN_BUDGET,
+    );
 
     // This GPU's identity (read-only). Scopes the resume baseline to this card and tags observations.
     let gpu_key = nidavellir_gpu_nvapi::read_curve().ok().map(|c| c.name);
@@ -2468,7 +2654,7 @@ fn run_anchored_target_sweep(
         focus_target,
         &descent,
         limits,
-        F2_CONFIRMED_MAX_STEPS,
+        descent.candidates.len(),
         &obs_path,
         frontier_preview.as_ref(),
         baseline_obs.map(|o| (o.anchor_mv, o.offset_mhz)),
@@ -2496,15 +2682,15 @@ fn run_anchored_target_sweep(
             );
             return;
         }
-        // Autonomous + bounded: the sweep's confirmed cap is always F2_CONFIRMED_MAX_STEPS (it ignores
-        // --steps). The shared multi-step refusal still enforces Safe Mode / armed-flag / crash-threshold
-        // / has-candidates and the cap (fail closed beyond it).
+        // Autonomous discovery ignores --steps and owns the complete physical candidate list. The
+        // shared refusal still enforces Safe Mode / armed flag / crash threshold / has-candidates.
+        let candidate_count = descent.candidates.len();
         match confirmed_f2_multi_refusal(
             record,
             boot_flag_armed,
-            Some(F2_CONFIRMED_MAX_STEPS),
-            descent.candidates.len(),
-            F2_CONFIRMED_MAX_STEPS,
+            Some(candidate_count),
+            candidate_count,
+            candidate_count,
         ) {
             Some(reason) => {
                 println!(
@@ -2518,7 +2704,7 @@ fn run_anchored_target_sweep(
                     "undervolt-probe: --confirm — executing autonomous TARGET SWEEP at {} MHz (up to {} \
                      candidate(s), descending; stops at first non-stable) — can TDR/reboot.",
                     focus_target,
-                    F2_CONFIRMED_MAX_STEPS.min(descent.candidates.len())
+                    candidate_count
                 );
                 let mut ops = RealF2MultiOps {
                     store,
@@ -2527,9 +2713,10 @@ fn run_anchored_target_sweep(
                     limits: *limits,
                     target_mhz: focus_target,
                     baseline_offset_mhz, // resume from the deepest prior validated same-target point
+                    dwell_ms: F2_STANDARD_DWELL_MS,
                     cur: None,
                 };
-                let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
+                let report = run_confirmed_f2_multi_step(&mut ops, candidate_count);
                 for line in confirmed_multi_report_lines(focus_target, &descent.candidates, limits, &report) {
                     println!("{line}");
                 }
@@ -2544,7 +2731,8 @@ fn run_anchored_target_sweep(
                     positive_offset_cap_mhz: limits.abs_max_offset_mhz,
                 };
                 let summary =
-                    crate::gpu_f2_sweep::record_target_sweep(&ctx, focus_target, &descent, &report, &obs_store);
+                    crate::gpu_f2_sweep::record_target_sweep(&ctx, focus_target, &descent, &report, &obs_store,
+                );
                 println!("=== TARGET SWEEP result ===");
                 println!("executed/recorded  : {}/{}", summary.executed, summary.recorded);
                 println!("last_good (min V)  : {:?} mV", summary.last_good_mv);
@@ -2577,7 +2765,8 @@ fn run_anchored_target_sweep(
                             // Reproduce the deepest point exactly: a single-candidate motor whose baseline
                             // is the offset the deepest candidate chained from during the descent.
                             let deepest_baseline =
-                                chained_prev_offset(&descent.candidates, deepest_index, baseline_offset_mhz);
+                                chained_prev_offset(&descent.candidates, deepest_index, baseline_offset_mhz,
+                            );
                             let mut rev_ops = RealF2MultiOps {
                                 store,
                                 curve: sane.to_vec(),
@@ -2585,6 +2774,7 @@ fn run_anchored_target_sweep(
                                 limits: *limits,
                                 target_mhz: focus_target,
                                 baseline_offset_mhz: deepest_baseline,
+                                dwell_ms: F2_STANDARD_DWELL_MS,
                                 cur: None,
                             };
                             let extra_reports =
@@ -2649,7 +2839,7 @@ fn run_anchored_target_sweep(
         return;
     }
     println!(
-        "(dry-run — pass `--target-mhz {focus_target} --auto-sweep --confirm` for a bounded autonomous \
+        "(dry-run — pass `--target-mhz {focus_target} --auto-sweep --confirm` for a physically bounded autonomous \
          sweep; nothing was written)"
     );
     info!(
@@ -2664,7 +2854,7 @@ fn run_anchored_target_sweep(
 /// minimum only as a conservative descent FLOOR for higher targets (never assuming the lower voltage
 /// holds the higher clock). DRY-RUN by default: plans each target's descent, prints the conservative-prior
 /// policy + the current learned frontier + the classifier-bridge preview — no Safe Loop arm / apply /
-/// dwell / VF write / observation. WITH `--confirm` it runs each target's bounded sweep sequentially,
+/// dwell / VF write / observation. WITH `--confirm` it runs each target's physically bounded sweep sequentially,
 /// records observations, and STOPS the whole ladder on a safety failure. Never persists/applies/promotes
 /// a profile.
 #[cfg(windows)]
@@ -2708,10 +2898,13 @@ fn run_anchored_ladder_sweep(
         );
         let target_limits = PositiveOffsetLimits { hw_floor_mv: floor_mv, ..*limits };
         let descent =
-            plan_anchored_undervolt_descent(sane, target, start_mv, &target_limits, F2_SWEEP_DRYRUN_BUDGET);
-        plans.push(crate::gpu_f2_sweep::ladder_target_plan(target, floor_mv, prior, &descent));
+            plan_anchored_undervolt_descent(sane, target, start_mv, &target_limits, F2_SWEEP_DRYRUN_BUDGET,
+        );
+        plans.push(crate::gpu_f2_sweep::ladder_target_plan(target, floor_mv, prior, &descent,
+        ));
     }
-    for line in crate::gpu_f2_sweep::ladder_plan_lines(&plans, F2_CONFIRMED_MAX_STEPS, &obs_path) {
+    let max_planned_candidates = plans.iter().map(|plan| plan.candidate_count).max().unwrap_or(0);
+    for line in crate::gpu_f2_sweep::ladder_plan_lines(&plans, max_planned_candidates, &obs_path) {
         println!("{line}");
     }
     // Learned frontier report + the read-only classifier-bridge preview (no profile applied/persisted).
@@ -2728,7 +2921,7 @@ fn run_anchored_ladder_sweep(
         // sweep with a conservative floor from the PREVIOUS target's discovered last-good; a normal bad
         // candidate stops only that target, but a safety failure stops the whole ladder.
         warn!(
-            "undervolt-probe: --confirm — executing autonomous LADDER SWEEP over {:?} (per-target bounded; \
+            "undervolt-probe: --confirm — executing autonomous LADDER SWEEP over {:?} (per-target physical frontier; \
              stops on safety failure) — can TDR/reboot.",
             args.targets
         );
@@ -2756,12 +2949,13 @@ fn run_anchored_ladder_sweep(
                 &target_limits,
                 F2_SWEEP_DRYRUN_BUDGET,
             );
+            let candidate_count = descent.candidates.len();
             match confirmed_f2_multi_refusal(
                 &rec,
                 armed,
-                Some(F2_CONFIRMED_MAX_STEPS),
-                descent.candidates.len(),
-                F2_CONFIRMED_MAX_STEPS,
+                Some(candidate_count),
+                candidate_count,
+                candidate_count,
             ) {
                 Some(reason) => {
                     println!("ladder: target {target} MHz REFUSED — {reason}; stopping ladder.");
@@ -2778,9 +2972,10 @@ fn run_anchored_ladder_sweep(
                         // Ladder keeps its conservative per-target voltage-FLOOR policy (no cross-run
                         // offset resume); within-run advancement still chains each candidate via `select`.
                         baseline_offset_mhz: 0,
+                        dwell_ms: F2_STANDARD_DWELL_MS,
                         cur: None,
                     };
-                    let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
+                    let report = run_confirmed_f2_multi_step(&mut ops, candidate_count);
                     let ctx = crate::gpu_f2_sweep::ObsContext {
                         run_id: run_id.clone(),
                         timestamp: now_rfc3339(),
@@ -2790,7 +2985,8 @@ fn run_anchored_ladder_sweep(
                         positive_offset_cap_mhz: target_limits.abs_max_offset_mhz,
                     };
                     let summary =
-                        crate::gpu_f2_sweep::record_target_sweep(&ctx, target, &descent, &report, &obs_store);
+                        crate::gpu_f2_sweep::record_target_sweep(&ctx, target, &descent, &report, &obs_store,
+                    );
                     println!(
                         "ladder: target {} MHz → last_good {:?} mV, first_bad {:?} mV, safe {}, stop {}",
                         target, summary.last_good_mv, summary.first_bad_mv, summary.safe, summary.stop_reason
@@ -2812,7 +3008,7 @@ fn run_anchored_ladder_sweep(
         return;
     }
     println!(
-        "(dry-run — pass `--ladder-sweep --targets {} --confirm` for a bounded autonomous ladder; nothing was written)",
+        "(dry-run — pass `--ladder-sweep --targets {} --confirm` for a physically bounded autonomous ladder; nothing was written)",
         args.targets.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
     );
     info!(
@@ -2824,25 +3020,21 @@ fn run_anchored_ladder_sweep(
 
 /// Read-only F2 forge inputs (see [`f2_forge_inputs`]). The static VF base curve sanity-filtered to
 /// plausible core points, the hardware voltage floor (lowest sane bin), the stock boost top (highest
-/// sane clock = the clock ceiling), and the CONSERVATIVE positive-offset limits.
+/// live core clock = the clock ceiling), and the hardware-derived positive-offset envelope.
 #[cfg(windows)]
 pub(crate) struct F2ForgeInputs {
     pub sane_base_curve: Vec<(usize, u32, u32)>,
-    pub floor_mv: u32,
     #[allow(dead_code)] // the clock ceiling lives inside `limits`; exposed for caller diagnostics
     pub boost_top_mhz: u32,
     pub limits: PositiveOffsetLimits,
 }
 
-/// Read-only F2 forge inputs derived the SAME way [`run_undervolt_probe`] derives them: the static VF
-/// base curve sanity-filtered to plausible core points, the hardware voltage floor (lowest sane bin),
-/// the stock boost top (highest sane clock = the clock ceiling), and the CONSERVATIVE positive-offset
-/// limits (`+30` absolute / `+15` per-step — NOT CLI-widenable). Returns `None` (fail-closed) when no
-/// sane static base points are available, mirroring the CLI's refusal. Pure read-only — no Safe Loop
-/// arm, no apply, no dwell, no VF write. Shared so the LIVE F2 forge button reuses the EXACT same input
-/// derivation as the CLI motor instead of duplicating it.
+/// Read-only F2 forge inputs derived from the static VF base plus the caller's validated live stock
+/// clock ceiling. The offset envelope spans the physical curve, while the effective target can never
+/// exceed that stock ceiling. Returns `None` when no sane base points exist. No Safe Loop arm, apply,
+/// dwell, or VF write.
 #[cfg(windows)]
-pub(crate) fn f2_forge_inputs() -> Option<F2ForgeInputs> {
+pub(crate) fn f2_forge_inputs(clock_ceiling_mhz: u32) -> Option<F2ForgeInputs> {
     use nidavellir_gpu_nvapi as gpu;
     let sane: Vec<(usize, u32, u32)> = gpu::read_vf_base_curve_modern()
         .into_iter()
@@ -2853,11 +3045,14 @@ pub(crate) fn f2_forge_inputs() -> Option<F2ForgeInputs> {
         return None;
     }
     let floor_mv = sane.iter().map(|&(_, mv, _)| mv).min().unwrap();
-    let boost_top = sane.iter().map(|&(_, _, f)| f).max().unwrap();
-    // Clock ceiling = stock boost top: F2 may hold an existing clock at lower voltage but NEVER
-    // overclocks above stock. Conservative offset caps (not CLI-widenable) — identical to the CLI path.
-    let limits = PositiveOffsetLimits::conservative(floor_mv, boost_top);
-    Some(F2ForgeInputs { sane_base_curve: sane, floor_mv, boost_top_mhz: boost_top, limits })
+    let min_base = sane.iter().map(|&(_, _, f)| f).min().unwrap();
+    // The Forge must traverse the complete real VF domain. Its offset envelope is therefore derived
+    // from the hardware curve itself, while the effective target remains capped at stock boost top.
+    let limits =
+        PositiveOffsetLimits::hardware_frontier(floor_mv, clock_ceiling_mhz, min_base);
+    Some(F2ForgeInputs { sane_base_curve: sane,
+        boost_top_mhz: clock_ceiling_mhz, limits,
+    })
 }
 
 /// Apply ONE F2 anchored undervolt point to hardware and LEAVE it applied — the APPLY path (not a probe).
@@ -2872,6 +3067,10 @@ pub(crate) fn f2_forge_inputs() -> Option<F2ForgeInputs> {
 pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Result<(), String> {
     use nidavellir_gpu_nvapi as gpu;
 
+    // Profile switching must derive the stock live ceiling, not the currently applied/capped curve.
+    // The caller already armed Safe Loop, so a reset failure remains recoverable and fails closed.
+    gpu::reset_all().map_err(|e| format!("F2 apply: pre-apply stock reset failed: {e}"))?;
+
     // Read-only static VF base, sanity-filtered — identical envelope to the forge motor.
     let sane: Vec<(usize, u32, u32)> = gpu::read_vf_base_curve_modern()
         .into_iter()
@@ -2881,9 +3080,13 @@ pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Resul
         return Err("F2 apply: no sane static VF base points — fail closed (no write)".into());
     }
     let floor_mv = sane.iter().map(|&(_, mv, _)| mv).min().unwrap();
-    let boost_top = sane.iter().map(|&(_, _, f)| f).max().unwrap();
-    // Conservative caps + clock ceiling = stock boost top (never overclock, never CLI-widenable).
-    let limits = PositiveOffsetLimits::conservative(floor_mv, boost_top);
+    let live_curve = gpu::read_vf_curve_modern();
+    let boost_top = crate::gpu_power_sweep::f2_stock_clock_ceiling(&live_curve)
+        .map_err(|e| format!("F2 apply: stock clock domain unavailable: {e}"))?;
+    let min_base = sane.iter().map(|&(_, _, f)| f).min().unwrap();
+    // Apply the exact already-validated Forge point under the same hardware-derived envelope used
+    // during discovery. The target is still capped at stock boost top and the exact anchor is required.
+    let limits = PositiveOffsetLimits::hardware_frontier(floor_mv, boost_top, min_base);
 
     let Some(anchor_idx) = select_exact_apply_anchor_bin(&sane, target_mhz, anchor_mv) else {
         return Err(format!(
@@ -2899,7 +3102,9 @@ pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Resul
         for &idx in indices {
             match gpu::vf_get_point_khz(idx) {
                 Some(khz) if khz.abs() <= F2_RESET_TOL_KHZ => {}
-                Some(khz) => return format!("{reason}; reset readback {khz} kHz NOT cleared at idx {idx}"),
+                Some(khz) => {
+                    return format!("{reason}; reset readback {khz} kHz NOT cleared at idx {idx}")
+                }
                 None => {
                     return format!(
                         "{reason}; reset readback unavailable at idx {idx} — cannot confirm cleared"
@@ -2913,12 +3118,14 @@ pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Resul
     // Plan + write the anchored curve (anchor raise + plateau caps + elastic below). prev_offset = 0: a
     // fresh single-point apply. A writer rejection may have PARTIALLY written, so reset + confirm EVERY
     // sane bin (the full set the writer could have touched) cleared before returning Err.
-    let plan = match gpu::apply_bounded_anchored_positive_offset(&sane, anchor_idx, target_mhz, 0, &limits)
+    let plan = match gpu::apply_bounded_anchored_positive_offset(&sane, anchor_idx, target_mhz, 0, &limits,
+    )
     {
         Ok(p) => p,
         Err(e) => {
             let all: Vec<usize> = sane.iter().map(|&(i, _, _)| i).collect();
-            return Err(reset_and_confirm(&all, format!("F2 apply: anchored write rejected ({e})")));
+            return Err(reset_and_confirm(&all, format!("F2 apply: anchored write rejected ({e})"),
+            ));
         }
     };
 
@@ -2927,7 +3134,10 @@ pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Resul
     let observed: Vec<(usize, Option<i32>)> = plan
         .entries
         .iter()
-        .map(|e| (e.index, gpu::vf_get_point_khz(e.index).map(|khz| khz / 1000)))
+        .map(|e| {
+            (e.index, gpu::vf_get_point_khz(e.index).map(|khz| khz / 1000),
+            )
+        })
         .collect();
     let verdict = crate::gpu_verify::verify_anchored_positive_offset(&plan, &observed, F2_VERIFY_TOL_MHZ);
     if verdict == AnchoredOffsetVerification::AnchoredRaiseVerified {
@@ -2938,84 +3148,541 @@ pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Resul
     // Fail-closed: undo the write and confirm every touched bin cleared before returning the error.
     warn!("F2 apply: anchored verify {verdict:?} — resetting to stock (fail closed)");
     let touched: Vec<usize> = plan.entries.iter().map(|e| e.index).collect();
-    Err(reset_and_confirm(&touched, format!("F2 apply: anchored verify failed ({verdict:?})")))
+    Err(reset_and_confirm(&touched, format!("F2 apply: anchored verify failed ({verdict:?})"),
+    ))
 }
 
-/// Run ONE clock's CONFIRMED F2 anchored-undervolt descent — the SAME motor sequence as the confirmed
-/// branch of [`run_anchored_ladder_sweep`], factored out so the LIVE F2 forge button reuses the proven
-/// motor without duplicating it (and without changing the CLI ladder's output). For the given target
-/// clock it: derives direction-aware descent bounds from the prior clock's last-good
-/// ([`crate::gpu_f2_sweep::ladder_target_descent_bounds`]), plans the anchored descent
-/// ([`plan_anchored_undervolt_descent`]), runs the fail-closed confirmed gate
-/// ([`confirmed_f2_multi_refusal`]), then drives the validated write→verify→dwell→reset→clear motor
-/// ([`RealF2MultiOps`] + [`run_confirmed_f2_multi_step`], capped at [`F2_CONFIRMED_MAX_STEPS`] — the
-/// per-clock safety bound is UNCHANGED), and RECORDS one observation per executed candidate
-/// ([`crate::gpu_f2_sweep::record_target_sweep`], with the Safe Loop + crash-floor guards intact). The
-/// motor resets to stock + clears the boot flag after EACH candidate. Returns the per-clock
-/// [`SweepSummary`] on a run, or `None` when the confirmed gate REFUSED (caller stops the forge).
+/// Result of one live-Forge target's complete physical-bin discovery.
+#[cfg(windows)]
+pub(crate) struct F2ClockDiscoverySummary {
+    pub sustainable: bool,
+    pub last_good_mv: Option<u32>,
+    pub first_bad_mv: Option<u32>,
+    pub next_clock_start_mv: Option<u32>,
+    pub conservative_start_mv: Option<u32>,
+    pub warm_start_rejected: bool,
+    pub executed_steps: usize,
+    pub completed: bool,
+    pub aborted: bool,
+    /// A crash/device-loss or unconfirmed reset must survive the outer belt-and-suspenders reset so
+    /// startup recovery can still account for the interrupted hardware run.
+    pub retain_boot_flag: bool,
+    pub stop_reason: String,
+    pub logs: Vec<String>,
+}
+
+#[cfg(windows)]
+pub(crate) struct F2ClockDiscoveryProgress {
+    pub target_mhz: u32,
+    pub planned_steps: usize,
+    pub unpruned_steps: usize,
+    pub anchor_mv: Option<u32>,
+    pub outcome: Option<String>,
+    pub line: String,
+}
+
+fn f2_conservative_next_clock_start(
+    power_bound_clock_drops: &[u32],
+    validated_voltages: &[u32],
+) -> Option<u32> {
+    power_bound_clock_drops
+        .iter()
+        .copied()
+        .min()
+        .or_else(|| validated_voltages.iter().copied().max())
+}
+
+fn f2_optimized_next_clock_start(
+    planned_voltages: &[u32],
+    last_good_mv: Option<u32>,
+    conservative_start_mv: Option<u32>,
+) -> Option<u32> {
+    last_good_mv
+        .and_then(|good| {
+            planned_voltages
+                .iter()
+                .copied()
+                .filter(|mv| *mv > good)
+                .min()
+                .or(Some(good))
+        })
+        .or(conservative_start_mv)
+}
+
+/// Run the live F2 discovery for one real target clock. Unlike the legacy CLI motor, this has no
+/// arbitrary candidate cap: it walks adjacent real VF bins until the physical floor or the first
+/// terminal boundary. A pre-sustain clock drop continues only while the dwell remains at 99–100% of
+/// the numeric power limit. Every candidate still executes the proven arm→write→verify→dwell→reset
+/// sequence and is persisted immediately; any untrustworthy recovery state aborts the whole forge.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_confirmed_f2_clock_descent(
+pub(crate) fn run_confirmed_f2_clock_discovery(
     store: &SafeLoopStore,
     obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
     run_id: &str,
+    gpu_key: &str,
     sane: &[(usize, u32, u32)],
-    base_floor_mv: u32,
-    base_limits: &PositiveOffsetLimits,
+    limits: &PositiveOffsetLimits,
     target_mhz: u32,
-    prev_target_mhz: Option<u32>,
-    prior_last_good_mv: Option<u32>,
-    descent_budget: usize,
-) -> Option<crate::gpu_f2_sweep::SweepSummary> {
-    use nidavellir_core::f2_observation::{now_rfc3339, F2ObsMode};
+    start_mv: Option<u32>,
+    power_limit_w: Option<f32>,
+    discovery_dwell_ms: u64,
+    qualification_dwell_ms: u64,
+    qualification_passes: usize,
+    stop: &std::sync::atomic::AtomicBool,
+    on_progress: &mut dyn FnMut(F2ClockDiscoveryProgress),
+) -> F2ClockDiscoverySummary {
+    use std::sync::atomic::Ordering;
+
+    use nidavellir_core::f2_observation::{
+        first_bad_for_target, last_good_for_target, now_rfc3339, F2ObsMode,
+    };
+
+    let mut logs = Vec::new();
+    let unpruned_descent =
+        plan_anchored_undervolt_descent(sane, target_mhz, None, limits, usize::MAX);
+    let unpruned_steps = unpruned_descent.candidates.len();
+    let mut descent =
+        plan_anchored_undervolt_descent(sane, target_mhz, start_mv, limits, usize::MAX);
+    let prior = obs_store.query_by_target_for_gpu(target_mhz, gpu_key);
+    // A driver/firmware update can change the static VF table without changing the GPU UUID. Resume
+    // only from observations whose exact anchor/base/offset still exists in the current plan.
+    let compatible_prior: Vec<_> = prior
+        .into_iter()
+        .filter(|observation| {
+            f2_observation_matches_current_candidate(
+                &unpruned_descent.candidates,
+                observation.anchor_mv,
+                observation.base_mhz,
+                observation.offset_mhz,
+            )
+        })
+        .collect();
+    let prior_good_mv = last_good_for_target(&compatible_prior, target_mhz).map(|o| o.anchor_mv);
+    let prior_bad_mv = first_bad_for_target(&compatible_prior, target_mhz).map(|o| o.anchor_mv);
+    let prior_power_bound_mv = compatible_prior
+        .iter()
+        .filter(|o| {
+            matches!(
+                o.outcome,
+                nidavellir_core::f2_observation::F2ObsOutcome::PowerBoundClockDrop
+            )
+        })
+        .map(|o| o.anchor_mv)
+        .min();
+    let mut deepest_good_candidate = prior_good_mv.and_then(|mv| {
+        descent
+            .candidates
+            .iter()
+            .find(|candidate| candidate.anchor.voltage_mv == mv)
+            .cloned()
+    });
+
+    // Resume below the deepest reset-clean point already observed on this exact GPU. A known
+    // good+bad bracket is already complete; Long may still independently revalidate its best point.
+    let resume_below_mv = resume_f2_candidates(
+        &mut descent.candidates,
+        prior_good_mv,
+        prior_bad_mv,
+        prior_power_bound_mv,
+    );
+    if prior_bad_mv.is_some() {
+        logs.push(format!(
+            "{target_mhz} MHz: retomando fronteira já delimitada em {:?}/{:?} mV",
+            prior_good_mv, prior_bad_mv
+        ));
+    } else if let Some(resume_below_mv) = resume_below_mv {
+        logs.push(format!(
+            "{target_mhz} MHz: retomando abaixo de {resume_below_mv} mV; pontos mais altos já confirmados"
+        ));
+    }
+    let candidate_count = descent.candidates.len();
+    on_progress(F2ClockDiscoveryProgress {
+        target_mhz,
+        planned_steps: candidate_count,
+        unpruned_steps,
+        anchor_mv: None,
+        outcome: None,
+        line: match start_mv {
+            Some(mv) => format!(
+                "{target_mhz} MHz: {candidate_count} dwell(s) planejados; início conservador em {mv} mV ({unpruned_steps} sem reaproveitamento)."
+            ),
+            None => format!(
+                "{target_mhz} MHz: {candidate_count} dwell(s) planejados ({unpruned_steps} sem reaproveitamento)."
+            ),
+        },
+    });
 
     let rec = store.load_record();
     let armed = store.is_boot_flag_armed();
-    // Direction-aware: descending uses the prior last-good as a START ceiling (full base floor);
-    // ascending/first uses it as a conservative FLOOR (today's behavior). Same as the CLI ladder.
-    let (start_mv, floor_mv) = crate::gpu_f2_sweep::ladder_target_descent_bounds(
-        base_floor_mv,
-        prior_last_good_mv,
-        target_mhz,
-        prev_target_mhz,
-        None,
-    );
-    let target_limits = PositiveOffsetLimits { hw_floor_mv: floor_mv, ..*base_limits };
-    let descent =
-        plan_anchored_undervolt_descent(sane, target_mhz, start_mv, &target_limits, descent_budget);
-    // Fail-closed confirmed gate (Safe Mode / armed flag / crash-floor / capped candidate count).
-    if confirmed_f2_multi_refusal(
-        &rec,
-        armed,
-        Some(F2_CONFIRMED_MAX_STEPS),
-        descent.candidates.len(),
-        F2_CONFIRMED_MAX_STEPS,
-    )
-    .is_some()
+    let validation_work = qualification_passes > 0 && deepest_good_candidate.is_some();
+    let hardware_work_count = candidate_count.max(usize::from(validation_work));
+    if hardware_work_count > 0
+        && confirmed_f2_multi_refusal(
+            &rec,
+            armed,
+            Some(hardware_work_count),
+            hardware_work_count,
+            hardware_work_count,
+        )
+        .is_some()
     {
-        return None;
+        return F2ClockDiscoverySummary {
+            sustainable: false,
+            last_good_mv: None,
+            first_bad_mv: None,
+            next_clock_start_mv: None,
+            conservative_start_mv: None,
+            warm_start_rejected: false,
+            executed_steps: 0,
+            completed: false,
+            aborted: true,
+            retain_boot_flag: false,
+            stop_reason: "SafetyGateRefused".into(),
+            logs,
+        };
     }
     let mut ops = RealF2MultiOps {
         store,
         curve: sane.to_vec(),
         candidates: descent.candidates.clone(),
-        limits: target_limits,
+        limits: *limits,
         target_mhz,
-        // Per-clock conservative voltage-FLOOR policy (no cross-run offset resume); within-run
-        // advancement still chains each candidate via `select`. Identical to the CLI ladder.
         baseline_offset_mhz: 0,
+        dwell_ms: discovery_dwell_ms,
         cur: None,
     };
-    let report = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
-    let ctx = crate::gpu_f2_sweep::ObsContext {
+    let mut ctx = crate::gpu_f2_sweep::ObsContext {
         run_id: run_id.to_string(),
         timestamp: now_rfc3339(),
-        gpu_key: nidavellir_gpu_nvapi::read_curve().ok().map(|c| c.name),
+        gpu_key: Some(gpu_key.to_string()),
         mode: F2ObsMode::LadderSweep,
-        requested_start_mv: None,
-        positive_offset_cap_mhz: target_limits.abs_max_offset_mhz,
+        requested_start_mv: start_mv,
+        positive_offset_cap_mhz: limits.abs_max_offset_mhz,
     };
-    Some(crate::gpu_f2_sweep::record_target_sweep(&ctx, target_mhz, &descent, &report, obs_store))
+
+    let mut had_sustainable = prior_good_mv.is_some();
+    let mut completed = prior_bad_mv.is_some()
+        || (candidate_count == 0
+            && (prior_good_mv.is_some()
+                || prior_bad_mv.is_some()
+                || prior_power_bound_mv.is_some()));
+    let mut aborted = false;
+    let mut retain_boot_flag = false;
+    let mut executed_steps = 0usize;
+    let mut stop_reason = if prior_bad_mv.is_some() {
+        "KnownBoundaryResumed".to_string()
+    } else {
+        "PhysicalFloorReached".to_string()
+    };
+
+    if candidate_count == 0
+        && prior_good_mv.is_none()
+        && prior_bad_mv.is_none()
+        && prior_power_bound_mv.is_none()
+    {
+        if start_mv.is_some() {
+            completed = true;
+            stop_reason = "WarmStartNoPhysicalCandidates".into();
+        } else {
+            aborted = true;
+            stop_reason = "NoPhysicalCandidates".into();
+        }
+    }
+
+    for i in 0..candidate_count {
+        if stop.load(Ordering::SeqCst) {
+            stop_reason = "Cancelled".into();
+            break;
+        }
+        if let Err(e) = ops.select(i) {
+            aborted = true;
+            stop_reason = format!("SafetyPrecheckFailed: {e}");
+            break;
+        }
+        let anchor_mv = descent.candidates[i].anchor.voltage_mv;
+        on_progress(F2ClockDiscoveryProgress {
+            target_mhz,
+            planned_steps: candidate_count,
+            unpruned_steps,
+            anchor_mv: Some(anchor_mv),
+            outcome: None,
+            line: format!("Testing {target_mhz} MHz @ {anchor_mv} mV — dwell em andamento…"),
+        });
+        let mut report = run_confirmed_f2_step(&mut ops);
+        let near_cap = f2_near_power_limit(report.power_w, power_limit_w, report.power_capped_frac);
+        if matches!(report.outcome, F2Outcome::ClockDrop) && !had_sustainable && near_cap {
+            report.outcome = F2Outcome::PowerBoundClockDrop;
+        }
+
+        logs.push(format!(
+            "{target_mhz} MHz @ {anchor_mv} mV: {:?}, p5={:?} MHz, power={:?} W, cap_near={near_cap}",
+            report.outcome, report.p5_clock_mhz, report.power_w
+        ));
+        ctx.timestamp = now_rfc3339();
+        let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+            &ctx,
+            target_mhz,
+            &descent.candidates[i],
+            &report,
+        );
+        if let Err(e) = obs_store.append(&observation) {
+            aborted = true;
+            stop_reason = format!("ObservationPersistFailed: {e}");
+            break;
+        }
+        executed_steps = executed_steps.saturating_add(1);
+        on_progress(F2ClockDiscoveryProgress {
+            target_mhz,
+            planned_steps: candidate_count,
+            unpruned_steps,
+            anchor_mv: Some(anchor_mv),
+            outcome: Some(format!("{:?}", report.outcome)),
+            line: format!(
+                "{target_mhz} MHz @ {anchor_mv} mV → {:?} · p5 {} MHz · {} W · aprendizado salvo",
+                report.outcome,
+                report.p5_clock_mhz.unwrap_or(0),
+                report.power_w.unwrap_or(0)
+            ),
+        });
+
+        match f2_discovery_decision(&report.outcome, had_sustainable, near_cap) {
+            F2DiscoveryDecision::ContinueVoltage => {
+                if matches!(report.outcome, F2Outcome::Validated) {
+                    deepest_good_candidate = Some(descent.candidates[i].clone());
+                }
+            }
+            F2DiscoveryDecision::MarkSustainableAndContinue => {
+                had_sustainable = true;
+                deepest_good_candidate = Some(descent.candidates[i].clone());
+            }
+            F2DiscoveryDecision::NextClockUnsustainable => {
+                completed = true;
+                stop_reason = "OffCapClockDropBeforeSustain".into();
+                break;
+            }
+            F2DiscoveryDecision::BoundaryFound => {
+                completed = true;
+                stop_reason = format!("{:?}", report.outcome);
+                break;
+            }
+            F2DiscoveryDecision::NextClockAfterFailure => {
+                completed = true;
+                stop_reason = format!("{:?}BeforeSustain", report.outcome);
+                break;
+            }
+            F2DiscoveryDecision::AbortForge => {
+                aborted = true;
+                retain_boot_flag = f2_outcome_retains_boot_flag(&report.outcome);
+                stop_reason = format!("{:?}", report.outcome);
+                break;
+            }
+        }
+        if i + 1 == candidate_count {
+            completed = true;
+        }
+    }
+
+    // Standard/Long qualify the discovered boundary with independent full reset/reapply passes.
+    // A reset-clean instability invalidates that anchor, moves one real VF bin upward, and restarts
+    // the complete qualification count there. A Fast observation can seed discovery but can never
+    // make an unqualified boundary deployable by itself.
+    if !aborted && completed && qualification_passes > 0 {
+        let mut qualification_candidate = deepest_good_candidate;
+        while let Some(candidate) = qualification_candidate.clone() {
+            let mut passed = 0usize;
+            let mut retry_higher = false;
+            while passed < qualification_passes {
+                if stop.load(Ordering::SeqCst) {
+                    completed = false;
+                    stop_reason = "CancelledDuringQualification".into();
+                    break;
+                }
+                let mut validation_ops = RealF2MultiOps {
+                    store,
+                    curve: sane.to_vec(),
+                    candidates: vec![candidate.clone()],
+                    limits: *limits,
+                    target_mhz,
+                    baseline_offset_mhz: 0,
+                    dwell_ms: qualification_dwell_ms,
+                    cur: None,
+                };
+                if let Err(e) = validation_ops.select(0) {
+                    aborted = true;
+                    stop_reason = format!("QualificationPrecheckFailed: {e}");
+                    break;
+                }
+                on_progress(F2ClockDiscoveryProgress {
+                    target_mhz,
+                    planned_steps: candidate_count,
+                    unpruned_steps,
+                    anchor_mv: Some(candidate.anchor.voltage_mv),
+                    outcome: None,
+                    line: format!(
+                        "Qualifying {target_mhz} MHz @ {} mV — pass {}/{} ({} s)…",
+                        candidate.anchor.voltage_mv,
+                        passed + 1,
+                        qualification_passes,
+                        qualification_dwell_ms / 1000
+                    ),
+                });
+                let report = run_confirmed_f2_step(&mut validation_ops);
+                logs.push(format!(
+                    "{target_mhz} MHz @ {} mV qualification {}/{}: {:?}",
+                    candidate.anchor.voltage_mv,
+                    passed + 1,
+                    qualification_passes,
+                    report.outcome
+                ));
+                ctx.timestamp = now_rfc3339();
+                let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+                    &ctx,
+                    target_mhz,
+                    &candidate,
+                    &report,
+                );
+                if let Err(e) = obs_store.append(&observation) {
+                    aborted = true;
+                    stop_reason = format!("ObservationPersistFailed: {e}");
+                    break;
+                }
+                executed_steps = executed_steps.saturating_add(1);
+                on_progress(F2ClockDiscoveryProgress {
+                    target_mhz,
+                    planned_steps: candidate_count,
+                    unpruned_steps,
+                    anchor_mv: Some(candidate.anchor.voltage_mv),
+                    outcome: Some(format!("{:?}", report.outcome)),
+                    line: format!(
+                        "{target_mhz} MHz @ {} mV · qualification {}/{} → {:?} · aprendizado salvo",
+                        candidate.anchor.voltage_mv,
+                        passed + 1,
+                        qualification_passes,
+                        report.outcome
+                    ),
+                });
+                if matches!(report.outcome, F2Outcome::Validated) {
+                    passed += 1;
+                    continue;
+                }
+                if matches!(
+                    report.outcome,
+                    F2Outcome::DeviceLost
+                        | F2Outcome::ResetFailed
+                        | F2Outcome::ArmFailed(_)
+                        | F2Outcome::ApplyFailed(_)
+                        | F2Outcome::VerifyFailed
+                ) {
+                    aborted = true;
+                    retain_boot_flag = f2_outcome_retains_boot_flag(&report.outcome);
+                    stop_reason = format!("QualificationAborted: {:?}", report.outcome);
+                    break;
+                }
+                retry_higher = true;
+                stop_reason = format!("QualificationRejected: {:?}", report.outcome);
+                break;
+            }
+            if aborted || !completed {
+                break;
+            }
+            if passed == qualification_passes {
+                stop_reason = "Qualified".into();
+                break;
+            }
+            if !retry_higher {
+                break;
+            }
+            let refreshed = obs_store.query_by_target_for_gpu(target_mhz, gpu_key);
+            let next_higher_mv = refreshed
+                .iter()
+                .filter(|observation| {
+                    observation.target_mhz == target_mhz
+                        && observation.outcome.is_validated()
+                        && observation.anchor_mv > candidate.anchor.voltage_mv
+                })
+                .map(|observation| observation.anchor_mv)
+                .min();
+            qualification_candidate = next_higher_mv.and_then(|mv| {
+                unpruned_descent
+                    .candidates
+                    .iter()
+                    .find(|planned| planned.anchor.voltage_mv == mv)
+                    .cloned()
+            });
+            if let Some(next) = qualification_candidate.as_ref() {
+                logs.push(format!(
+                    "{target_mhz} MHz: qualificação recuou para o próximo bin físico seguro, {} mV",
+                    next.anchor.voltage_mv
+                ));
+            } else {
+                stop_reason = "QualificationExhausted".into();
+            }
+        }
+    }
+
+    let scoped: Vec<_> = obs_store
+        .query_by_target_for_gpu(target_mhz, gpu_key)
+        .into_iter()
+        .filter(|observation| {
+            f2_observation_matches_current_candidate(
+                &unpruned_descent.candidates,
+                observation.anchor_mv,
+                observation.base_mhz,
+                observation.offset_mhz,
+            )
+        })
+        .collect();
+    let last_good_mv = last_good_for_target(&scoped, target_mhz).map(|o| o.anchor_mv);
+    let first_bad_mv = first_bad_for_target(&scoped, target_mhz).map(|o| o.anchor_mv);
+    let power_bound_clock_drops: Vec<u32> = scoped
+        .iter()
+        .filter(|o| {
+            matches!(
+                o.outcome,
+                nidavellir_core::f2_observation::F2ObsOutcome::PowerBoundClockDrop
+            )
+        })
+        .map(|o| o.anchor_mv)
+        .collect();
+    let validated_voltages: Vec<u32> = scoped
+        .iter()
+        .filter(|o| {
+            matches!(
+                o.outcome,
+                nidavellir_core::f2_observation::F2ObsOutcome::Validated
+            )
+        })
+        .map(|o| o.anchor_mv)
+        .collect();
+    let conservative_start_mv =
+        f2_conservative_next_clock_start(&power_bound_clock_drops, &validated_voltages);
+    let planned_voltages: Vec<u32> = unpruned_descent
+        .candidates
+        .iter()
+        .map(|candidate| candidate.anchor.voltage_mv)
+        .collect();
+    let next_clock_start_mv =
+        f2_optimized_next_clock_start(&planned_voltages, last_good_mv, conservative_start_mv);
+    let warm_start_rejected = start_mv.is_some()
+        && prior_good_mv.is_none()
+        && last_good_mv.is_none()
+        && (executed_steps > 0 || stop_reason == "WarmStartNoPhysicalCandidates")
+        && !aborted;
+    F2ClockDiscoverySummary {
+        sustainable: last_good_mv.is_some(),
+        last_good_mv,
+        first_bad_mv,
+        next_clock_start_mv,
+        conservative_start_mv,
+        warm_start_rejected,
+        executed_steps,
+        completed,
+        aborted,
+        retain_boot_flag,
+        stop_reason,
+        logs,
+    }
 }
 
 /// MANUAL-PRIOR anchored probe (`--manual-prior`, explicit development / known-GPU shortcut). DRY-RUN
@@ -3051,7 +3718,8 @@ fn run_manual_prior_undervolt_probe(
     // SEPARATE manual-prior offset envelope (larger bounded cap); floor / ceiling / sanity / real-bin
     // checks stay EXACTLY as default discovery. The default/autonomous path NEVER sees this cap.
     let manual_limits =
-        PositiveOffsetLimits::manual_prior(floor_mv, boost_top, F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ);
+        PositiveOffsetLimits::manual_prior(floor_mv, boost_top, F2_MANUAL_PRIOR_MAX_POSITIVE_OFFSET_MHZ,
+    );
     let plan = plan_manual_prior_undervolt(sane, focus_target, start_mv, &manual_limits);
 
     // Read-only Safe Loop preflight over the planned bins (anchor + caps + elastic), if a plan exists.
@@ -3119,6 +3787,7 @@ fn run_manual_prior_undervolt_probe(
                     limits: manual_limits,
                     target_mhz: focus_target,
                     prev_offset_mhz: 0, // manual-prior is single-step: per-step measured from stock (unchanged)
+                    dwell_ms: F2_STANDARD_DWELL_MS,
                 };
                 let report = run_confirmed_f2_step(&mut ops);
                 for line in confirmed_report_lines(focus_target, &anchor, &manual_limits, &report) {
@@ -3163,7 +3832,8 @@ mod tests {
 
     // (index, voltage_mv, base_freq_mhz): boost-top bin at 1062/1755; lower bins below the target.
     fn t_base() -> Vec<(usize, u32, u32)> {
-        vec![(0, 850, 1700), (1, 900, 1725), (2, 950, 1740), (3, 1000, 1748), (4, 1062, 1755)]
+        vec![(0, 850, 1700), (1, 900, 1725), (2, 950, 1740), (3, 1000, 1748), (4, 1062, 1755),
+        ]
     }
 
     fn pt(freq: u32, mv: u32) -> TuningPoint {
@@ -3174,7 +3844,7 @@ mod tests {
     #[test]
     fn chained_prev_offset_chains_off_prior_candidate_else_baseline() {
         let limits = PositiveOffsetLimits::conservative(850, 1755);
-        let d = plan_anchored_undervolt_descent(&t_base(), 1755, None, &limits, F2_CONFIRMED_MAX_STEPS);
+        let d = plan_anchored_undervolt_descent(&t_base(), 1755, None, &limits, usize::MAX);
         // Descent candidates for 1755 MHz on t_base: 1000 mV (+7), 950 mV (+15), 900 mV (+30).
         let offs: Vec<i32> = d.candidates.iter().map(|c| c.anchor.offset_mhz).collect();
         assert_eq!(offs, vec![7, 15, 30]);
@@ -3215,7 +3885,8 @@ mod tests {
     // A clean +15-per-bin ladder so the descent crosses the +30 default absolute cap: the horizon keeps
     // descending (through validated chained increments) exactly where the conservative envelope stops.
     fn sweep_base() -> Vec<(usize, u32, u32)> {
-        vec![(0, 850, 1740), (1, 900, 1755), (2, 950, 1770), (3, 1000, 1785), (4, 1062, 1810)]
+        vec![(0, 850, 1740), (1, 900, 1755), (2, 950, 1770), (3, 1000, 1785), (4, 1062, 1810),
+        ]
     }
 
     #[test]
@@ -3224,7 +3895,8 @@ mod tests {
         // which the +30 ABSOLUTE cap rejects (even though the per-step delta from +30 is a valid +15).
         let cons = PositiveOffsetLimits::conservative(850, 1800);
         let dc =
-            plan_anchored_undervolt_descent(&sweep_base(), 1800, None, &cons, F2_SWEEP_DRYRUN_BUDGET);
+            plan_anchored_undervolt_descent(&sweep_base(), 1800, None, &cons, F2_SWEEP_DRYRUN_BUDGET,
+        );
         let cons_offs: Vec<i32> = dc.candidates.iter().map(|c| c.anchor.offset_mhz).collect();
         assert_eq!(cons_offs, vec![15, 30]);
         assert!(dc.stop_reason.unwrap().contains("absolute cap"));
@@ -3348,11 +4020,159 @@ mod tests {
         assert!(text.contains("Safe Loop preflight"));
     }
 
+    #[test]
+    fn discovery_keeps_high_clock_while_clock_drop_is_power_bound() {
+        assert!(f2_near_power_limit(Some(199), Some(200.0), Some(0.0)));
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::ClockDrop, false, true),
+            F2DiscoveryDecision::ContinueVoltage
+        );
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::Validated, false, false),
+            F2DiscoveryDecision::MarkSustainableAndContinue
+        );
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::ClockDrop, true, true),
+            F2DiscoveryDecision::BoundaryFound
+        );
+    }
+
+    #[test]
+    fn next_clock_keeps_conservative_fallback() {
+        assert_eq!(
+            f2_conservative_next_clock_start(&[1112, 975, 950], &[943, 937, 931]),
+            Some(950)
+        );
+        assert_eq!(
+            f2_conservative_next_clock_start(&[], &[975, 968, 962]),
+            Some(975)
+        );
+        assert_eq!(f2_conservative_next_clock_start(&[], &[]), None);
+    }
+
+    #[test]
+    fn next_clock_starts_one_physical_bin_above_previous_minimum() {
+        let bins = [950, 943, 937, 931];
+        assert_eq!(
+            f2_optimized_next_clock_start(&bins, Some(937), Some(950)),
+            Some(943)
+        );
+        assert_eq!(
+            f2_optimized_next_clock_start(&bins, Some(950), Some(975)),
+            Some(950)
+        );
+        assert_eq!(
+            f2_optimized_next_clock_start(&bins, None, Some(975)),
+            Some(975)
+        );
+    }
+
+    #[test]
+    fn discovery_abandons_unsustained_clock_once_off_cap() {
+        assert!(!f2_near_power_limit(Some(185), Some(200.0), Some(1.0)));
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::ClockDrop, false, false),
+            F2DiscoveryDecision::NextClockUnsustainable
+        );
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::SilentError, false, false),
+            F2DiscoveryDecision::NextClockAfterFailure
+        );
+    }
+
+    #[test]
+    fn discovery_silent_error_is_terminal_and_device_loss_aborts_forge() {
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::SilentError, true, false),
+            F2DiscoveryDecision::BoundaryFound
+        );
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::DeviceLost, true, false),
+            F2DiscoveryDecision::AbortForge
+        );
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::ResetFailed, false, false),
+            F2DiscoveryDecision::AbortForge
+        );
+        assert!(f2_outcome_retains_boot_flag(&F2Outcome::DeviceLost));
+        assert!(f2_outcome_retains_boot_flag(&F2Outcome::ResetFailed));
+        assert!(!f2_outcome_retains_boot_flag(&F2Outcome::VerifyFailed));
+    }
+
+    #[test]
+    fn power_cap_flag_is_only_fallback_when_numeric_limit_is_missing() {
+        assert!(f2_near_power_limit(None, None, Some(0.75)));
+        assert!(!f2_near_power_limit(None, None, Some(0.25)));
+        assert!(
+            !f2_near_power_limit(Some(180), Some(200.0), Some(1.0)),
+            "a valid 90% numeric reading must not be overridden by the cap-flag fallback"
+        );
+    }
+
+    #[test]
+    fn discovery_resume_skips_confirmed_bins_and_known_boundary_skips_descent() {
+        let limits = PositiveOffsetLimits::hardware_frontier(850, 1900, 1700);
+        let mut candidates =
+            plan_anchored_undervolt_descent(&a_base(), 1755, None, &limits, usize::MAX).candidates;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.anchor.voltage_mv)
+                .collect::<Vec<_>>(),
+            vec![900, 850]
+        );
+        let current = &candidates[0].anchor;
+        assert!(f2_observation_matches_current_candidate(
+            &candidates,
+            current.voltage_mv,
+            current.base_mhz,
+            current.offset_mhz
+        ));
+        assert!(!f2_observation_matches_current_candidate(
+            &candidates,
+            current.voltage_mv,
+            current.base_mhz - 15,
+            current.offset_mhz + 15
+        ));
+        assert_eq!(
+            resume_f2_candidates(&mut candidates, Some(900), None, None),
+            Some(900)
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.anchor.voltage_mv)
+                .collect::<Vec<_>>(),
+            vec![850]
+        );
+        resume_f2_candidates(&mut candidates, Some(900), Some(850), None);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn failed_warm_start_retries_only_higher_unknown_bins() {
+        let limits = PositiveOffsetLimits::hardware_frontier(850, 1900, 1700);
+        let mut candidates =
+            plan_anchored_undervolt_descent(&a_base(), 1755, None, &limits, usize::MAX).candidates;
+        assert_eq!(
+            resume_f2_candidates(&mut candidates, None, Some(850), None),
+            Some(850)
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.anchor.voltage_mv)
+                .collect::<Vec<_>>(),
+            vec![900]
+        );
+    }
+
     // ── anchored probe (plan_anchored_undervolt / select_anchor_bin / anchored_plan_lines) ────
     // Anchor-focused base: lower bins below target, higher bins above target so the plateau caps
     // engage. (idx, mV, base): 850/1700, 900/1740, 950/1770, 1000/1800, 1062/1845.
     fn a_base() -> Vec<(usize, u32, u32)> {
-        vec![(0, 850, 1700), (1, 900, 1740), (2, 950, 1770), (3, 1000, 1800), (4, 1062, 1845)]
+        vec![(0, 850, 1700), (1, 900, 1740), (2, 950, 1770), (3, 1000, 1800), (4, 1062, 1845),
+        ]
     }
 
     #[test]
@@ -3505,7 +4325,8 @@ mod tests {
     #[test]
     fn confirmed_refuses_when_steps_not_one() {
         let c = cand();
-        let r = confirmed_f2_refusal(&SafeLoopRecord::default(), false, Some(3), Some(&c), &cand_limits(), 1755);
+        let r = confirmed_f2_refusal(&SafeLoopRecord::default(), false, Some(3), Some(&c), &cand_limits(), 1755,
+        );
         assert!(r.unwrap().contains("single-step only"));
         // Unset steps is also refused.
         assert!(confirmed_f2_refusal(&SafeLoopRecord::default(), false, None, Some(&c), &cand_limits(), 1755).is_some());
@@ -3515,7 +4336,8 @@ mod tests {
 
     #[test]
     fn confirmed_refuses_when_no_candidate() {
-        let r = confirmed_f2_refusal(&SafeLoopRecord::default(), false, Some(1), None, &cand_limits(), 1755);
+        let r = confirmed_f2_refusal(&SafeLoopRecord::default(), false, Some(1), None, &cand_limits(), 1755,
+        );
         assert!(r.unwrap().contains("no valid candidate"));
     }
 
@@ -3593,11 +4415,18 @@ mod tests {
         fn dwell(&mut self) -> F2DwellResult {
             self.log.push("dwell");
             // Dummy headline stats; the single-step state machine only branches on `outcome`.
-            F2DwellResult { outcome: self.dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0 }
+            F2DwellResult { outcome: self.dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
+                power_capped_frac: 0.0,
+                duration_ms: 15_000,
+                sample_count: 300,
+            }
         }
         fn reset_to_stock(&mut self) -> Result<(), String> { self.log.push("reset"); self.reset.clone() }
         fn clear_boot_flag(&mut self) -> Result<(), String> { self.log.push("clear"); self.clear.clone() }
-        fn blacklist_point(&mut self) -> Result<(), String> { self.log.push("blacklist"); self.blacklist.clone() }
+        fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String> {
+            self.log.push(if counts_as_crash { "blacklist-crash" } else { "blacklist" });
+            self.blacklist.clone()
+        }
     }
 
     #[test]
@@ -3634,7 +4463,7 @@ mod tests {
         assert!(r.blacklisted);
         assert!(!r.boot_flag_cleared); // RETAINED on device loss
         assert!(!ops.log.contains(&"clear"));
-        assert!(ops.log.contains(&"blacklist"));
+        assert!(ops.log.contains(&"blacklist-crash"));
     }
 
     #[test]
@@ -3646,6 +4475,20 @@ mod tests {
         assert!(!r.validated);
         assert!(r.blacklisted);
         assert!(r.boot_flag_cleared); // reset ok, no device loss → safe to clear
+        assert!(ops.log.contains(&"blacklist"));
+        assert!(!ops.log.contains(&"blacklist-crash"));
+    }
+
+    #[test]
+    fn confirmed_silent_error_is_boundary_knowledge_not_a_crash() {
+        let mut ops = MockOps::happy();
+        ops.dwell = F2DwellOutcome::SilentError;
+        let r = run_confirmed_f2_step(&mut ops);
+        assert_eq!(r.outcome, F2Outcome::SilentError);
+        assert!(r.blacklisted);
+        assert!(r.boot_flag_cleared);
+        assert!(ops.log.contains(&"blacklist"));
+        assert!(!ops.log.contains(&"blacklist-crash"));
     }
 
     #[test]
@@ -3680,7 +4523,10 @@ mod tests {
         let mut ops = MockOps::happy();
         let _ = run_confirmed_f2_step(&mut ops);
         for step in &ops.log {
-            assert!(matches!(*step, "arm" | "apply" | "verify" | "dwell" | "reset" | "clear" | "blacklist"));
+            assert!(matches!(
+                *step,
+                "arm" | "apply" | "verify" | "dwell" | "reset" | "clear" | "blacklist" | "blacklist-crash"
+            ));
         }
         assert!(!ops.log.iter().any(|s| s.contains("persist") || s.contains("promote")));
     }
@@ -3715,7 +4561,8 @@ mod tests {
     // Descent fixture: four bins below target 1755 with bounded raises (+7/+15/+30, then +45 > abs
     // cap), plus a 1062 mV bin above target so the plateau cap engages. (idx, mV, base_mhz).
     fn d_base() -> Vec<(usize, u32, u32)> {
-        vec![(0, 850, 1710), (1, 900, 1725), (2, 950, 1740), (3, 1000, 1748), (4, 1062, 1800)]
+        vec![(0, 850, 1710), (1, 900, 1725), (2, 950, 1740), (3, 1000, 1748), (4, 1062, 1800),
+        ]
     }
 
     #[test]
@@ -3740,6 +4587,25 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_discovery_has_no_six_or_three_step_cap() {
+        let curve: Vec<(usize, u32, u32)> = (0..=9)
+            .map(|i| (i, 800 + i as u32 * 10, 1815 + i as u32 * 15))
+            .collect();
+        let limits = PositiveOffsetLimits::hardware_frontier(800, 1950, 1815);
+        let d = plan_anchored_undervolt_descent(
+            &curve,
+            1950,
+            None,
+            &limits,
+            F2_SWEEP_DRYRUN_BUDGET,
+        );
+        assert_eq!(F2_SWEEP_DRYRUN_BUDGET, usize::MAX);
+        assert_eq!(d.candidates.len(), 9);
+        assert_eq!(d.candidates.first().unwrap().anchor.voltage_mv, 880);
+        assert_eq!(d.candidates.last().unwrap().anchor.voltage_mv, 800);
+    }
+
+    #[test]
     fn descent_respects_step_budget() {
         let limits = PositiveOffsetLimits::conservative(850, 1900);
         let d = plan_anchored_undervolt_descent(&d_base(), 1755, None, &limits, 2);
@@ -3752,14 +4618,14 @@ mod tests {
     }
 
     #[test]
-    fn descent_plan_lines_show_anchored_cap_and_no_write() {
+    fn descent_plan_lines_show_unlimited_physical_span_and_no_write() {
         let limits = PositiveOffsetLimits::conservative(850, 1900);
         let d = plan_anchored_undervolt_descent(&d_base(), 1755, None, &limits, 3);
         let pf = undervolt_preflight(&SafeLoopRecord::default(), false, &[]);
-        let text = anchored_descent_plan_lines(&d, &limits, &pf, F2_CONFIRMED_MAX_STEPS).join("\n");
+        let text = anchored_descent_plan_lines(&d, &limits, &pf, d.candidates.len()).join("\n");
         assert!(text.contains("ANCHORED"));
-        assert!(text.contains("confirmed cap"));
-        assert!(text.contains("F2_CONFIRMED_MAX_STEPS=3"));
+        assert!(text.contains("confirmed span"));
+        assert!(text.contains("no arbitrary step cap"));
         assert!(text.contains("anchor")); // per-candidate anchor lines
         assert!(text.contains("capped DOWN"));
         assert!(text.contains("anchored mode prevents boost above the target"));
@@ -3779,7 +4645,8 @@ mod tests {
         assert!(confirmed_f2_multi_refusal(&rec, false, None, 3, 3).is_some());
         // Above the cap → refuse (fail closed), regardless of available candidates.
         assert!(confirmed_f2_multi_refusal(&rec, false, Some(4), 3, 3).unwrap().contains("capped"));
-        // Within the cap (1..=3) with candidates + a clean record → allowed.
+        // Within the caller-declared plan span with candidates + a clean record → allowed. The live
+        // discovery passes its full physical candidate count here, not a fixed global cap.
         assert!(confirmed_f2_multi_refusal(&rec, false, Some(1), 1, 3).is_none());
         assert!(confirmed_f2_multi_refusal(&rec, false, Some(2), 2, 3).is_none());
         assert!(confirmed_f2_multi_refusal(&rec, false, Some(3), 3, 3).is_none());
@@ -3787,16 +4654,15 @@ mod tests {
         assert!(confirmed_f2_multi_refusal(&rec, false, Some(2), 0, 3)
             .unwrap()
             .contains("no anchored candidates"));
-        // Safe Mode / armed boot flag / crash threshold → refuse.
+        // Safe Mode / armed boot flag → refuse. A stale counter alone is not authoritative: actual
+        // crash recovery leaves the boot flag armed or promotes the record to Safe Mode.
         let mut sm = SafeLoopRecord::default();
         sm.safe_mode = true;
         assert!(confirmed_f2_multi_refusal(&sm, false, Some(2), 2, 3).unwrap().contains("Safe Mode"));
         assert!(confirmed_f2_multi_refusal(&rec, true, Some(2), 2, 3).unwrap().contains("boot flag"));
-        let mut cc = SafeLoopRecord::default();
-        cc.consecutive_crashes = SAFE_MODE_CRASH_THRESHOLD;
-        assert!(confirmed_f2_multi_refusal(&cc, false, Some(2), 2, 3)
-            .unwrap()
-            .contains("consecutive_crashes"));
+        let mut stale_counter = SafeLoopRecord::default();
+        stale_counter.consecutive_crashes = SAFE_MODE_CRASH_THRESHOLD;
+        assert!(confirmed_f2_multi_refusal(&stale_counter, false, Some(2), 2, 3).is_none());
     }
 
     // ── multi-step orchestrator (mock; drives the REAL per-candidate motor; no hardware) ───────
@@ -3836,7 +4702,8 @@ mod tests {
     }
     impl MockMultiOps {
         fn new(scripts: Vec<CandScript>) -> Self {
-            MockMultiOps { scripts, cur: 0, log: Vec::new() }
+            MockMultiOps { scripts, cur: 0, log: Vec::new(),
+            }
         }
         fn s(&self) -> &CandScript {
             &self.scripts[self.cur]
@@ -3848,11 +4715,22 @@ mod tests {
         fn verify(&mut self) -> PositiveOffsetVerification { self.log.push(format!("verify{}", self.cur)); self.s().verify }
         fn dwell(&mut self) -> F2DwellResult {
             self.log.push(format!("dwell{}", self.cur));
-            F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0 }
+            F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
+                power_capped_frac: 0.0,
+                duration_ms: 15_000,
+                sample_count: 300,
+            }
         }
         fn reset_to_stock(&mut self) -> Result<(), String> { self.log.push(format!("reset{}", self.cur)); self.s().reset.clone() }
         fn clear_boot_flag(&mut self) -> Result<(), String> { self.log.push(format!("clear{}", self.cur)); self.s().clear.clone() }
-        fn blacklist_point(&mut self) -> Result<(), String> { self.log.push(format!("blacklist{}", self.cur)); self.s().blacklist.clone() }
+        fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String> {
+            self.log.push(format!(
+                "{}{}",
+                if counts_as_crash { "blacklist-crash" } else { "blacklist" },
+                self.cur
+            ));
+            self.s().blacklist.clone()
+        }
     }
     impl F2MultiStepOps for MockMultiOps {
         fn candidate_count(&self) -> usize { self.scripts.len() }
@@ -3865,8 +4743,9 @@ mod tests {
 
     #[test]
     fn multi_step_runs_in_order_and_completes_all() {
-        let mut ops = MockMultiOps::new(vec![CandScript::stable(), CandScript::stable(), CandScript::stable()]);
-        let r = run_confirmed_f2_multi_step(&mut ops, F2_CONFIRMED_MAX_STEPS);
+        let mut ops = MockMultiOps::new(vec![CandScript::stable(), CandScript::stable(), CandScript::stable(),
+        ]);
+        let r = run_confirmed_f2_multi_step(&mut ops, usize::MAX);
         assert_eq!(r.stop_reason, F2MultiStopReason::CompletedAllPlanned);
         assert_eq!((r.planned, r.executed), (3, 3));
         assert_eq!(r.last_good_index, Some(2));
@@ -4028,7 +4907,8 @@ mod tests {
     }
     impl RevalMockOps {
         fn new(passes: Vec<CandScript>) -> Self {
-            RevalMockOps { passes, pass: 0, cur: 0, log: Vec::new() }
+            RevalMockOps { passes, pass: 0, cur: 0, log: Vec::new(),
+            }
         }
         fn s(&self) -> &CandScript {
             // The pass cursor advanced past the script on `select`; the motor reads the just-selected pass.
@@ -4041,11 +4921,22 @@ mod tests {
         fn verify(&mut self) -> PositiveOffsetVerification { self.log.push(format!("verify{}", self.cur)); self.s().verify }
         fn dwell(&mut self) -> F2DwellResult {
             self.log.push(format!("dwell{}", self.cur));
-            F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0 }
+            F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
+                power_capped_frac: 0.0,
+                duration_ms: 15_000,
+                sample_count: 300,
+            }
         }
         fn reset_to_stock(&mut self) -> Result<(), String> { self.log.push(format!("reset{}", self.cur)); self.s().reset.clone() }
         fn clear_boot_flag(&mut self) -> Result<(), String> { self.log.push(format!("clear{}", self.cur)); self.s().clear.clone() }
-        fn blacklist_point(&mut self) -> Result<(), String> { self.log.push(format!("blacklist{}", self.cur)); self.s().blacklist.clone() }
+        fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String> {
+            self.log.push(format!(
+                "{}{}",
+                if counts_as_crash { "blacklist-crash" } else { "blacklist" },
+                self.cur
+            ));
+            self.s().blacklist.clone()
+        }
     }
     impl F2MultiStepOps for RevalMockOps {
         fn candidate_count(&self) -> usize { 1 }
@@ -4134,7 +5025,8 @@ mod tests {
     // 1062 mV bin sits above target so the plateau cap engages; the 850 mV bin sits below the anchor
     // so the elastic case is exercised. (idx, mV, base_mhz).
     fn mp_base() -> Vec<(usize, u32, u32)> {
-        vec![(0, 850, 1560), (1, 875, 1590), (2, 900, 1740), (3, 950, 1770), (4, 1000, 1800), (5, 1062, 1845)]
+        vec![(0, 850, 1560), (1, 875, 1590), (2, 900, 1740), (3, 950, 1770), (4, 1000, 1800), (5, 1062, 1845),
+        ]
     }
 
     #[test]

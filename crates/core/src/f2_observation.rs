@@ -55,6 +55,7 @@ pub enum F2ObsVerifier {
 #[serde(rename_all = "snake_case")]
 pub enum F2ObsDwell {
     Stable,
+    SilentError,
     Unstable,
     DeviceLost,
     ClockDrop,
@@ -73,10 +74,15 @@ pub enum F2ObsOutcome {
     RejectedByPlanner,
     /// The post-write verify did not confirm the anchored raise.
     VerifierFailed,
-    /// The dwell reported instability / silent error (no device loss).
+    /// The dwell reported a silent compute error (no device loss).
+    SilentError,
+    /// The dwell reported instability without a classified silent error (no device loss).
     Unstable,
     /// The dwell reported a crash / TDR / device loss.
     DeviceLost,
+    /// The target did not hold yet, but the GPU was still at 99–100% of its power limit. This is a
+    /// search-state observation, not a voltage-instability boundary.
+    PowerBoundClockDrop,
     /// The clock sagged below tolerance under load (held the dwell but not the clock).
     ClockDrop,
     /// `reset_to_stock` could not be confirmed — a SAFETY failure (boot flag retained, fail closed).
@@ -101,6 +107,7 @@ impl F2ObsOutcome {
         matches!(
             self,
             F2ObsOutcome::VerifierFailed
+                | F2ObsOutcome::SilentError
                 | F2ObsOutcome::Unstable
                 | F2ObsOutcome::DeviceLost
                 | F2ObsOutcome::ClockDrop
@@ -115,7 +122,10 @@ impl F2ObsOutcome {
     /// run cannot be trusted to continue. Ordinary instability (`Unstable`/`ClockDrop`/`VerifierFailed`)
     /// is NOT a safety failure when the reset was clean — it is normal learning data.
     pub fn is_safety_failure(self) -> bool {
-        matches!(self, F2ObsOutcome::ResetFailed | F2ObsOutcome::CrashOrRecovery)
+        matches!(
+            self,
+            F2ObsOutcome::DeviceLost | F2ObsOutcome::ResetFailed | F2ObsOutcome::CrashOrRecovery
+        )
     }
 }
 
@@ -153,6 +163,15 @@ pub struct F2Observation {
     pub sustained_clock_mhz: Option<u32>,
     #[serde(default)]
     pub watts: Option<u32>,
+    /// Fraction of steady-state samples where the NVIDIA power-cap flag was active.
+    #[serde(default)]
+    pub power_capped_frac: Option<f32>,
+    /// Actual wall-clock duration of the dwell that produced this observation.
+    #[serde(default)]
+    pub dwell_duration_ms: Option<u64>,
+    /// Number of retained steady-state clock/power samples.
+    #[serde(default)]
+    pub sample_count: Option<u32>,
     #[serde(default)]
     pub silent_error: bool,
     #[serde(default)]
@@ -208,6 +227,12 @@ pub struct F2FrontierEntry {
     pub avg_clock_mhz: Option<u32>,
     #[serde(default)]
     pub sustained_clock_mhz: Option<u32>,
+    #[serde(default)]
+    pub power_capped_frac: Option<f32>,
+    #[serde(default)]
+    pub dwell_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub sample_count: Option<u32>,
     /// Aggregate confidence (0–1) from repeat validations at `best_anchor_mv`.
     pub confidence: f64,
     /// Successful confirmations at this exact target/anchor point.
@@ -254,14 +279,34 @@ pub fn frontier_confidence(validated_count: usize) -> f64 {
     if validated_count == 0 {
         return 0.0;
     }
-    (0.86 + 0.03 * (validated_count as f64 - 1.0)).min(0.99)
+    (1.0 - 0.15_f64.powf(validated_count as f64)).min(0.99)
+}
+
+/// Confidence from the evidence actually collected at one exact point. Standard's proven 15 s
+/// dwell with at least 100 retained samples contributes one evidence unit (0.85 confidence); shorter
+/// dwells contribute less, while longer and independently repeated clean passes mature toward 0.99.
+pub fn frontier_confidence_from_evidence(validations: &[&F2Observation]) -> f64 {
+    let evidence_units = validations.iter().fold(0.0, |sum, obs| {
+        let duration = obs.dwell_duration_ms.unwrap_or(15_000) as f64 / 15_000.0;
+        let sample_quality = (obs.sample_count.unwrap_or(100) as f64 / 100.0).min(1.0);
+        sum + duration * sample_quality
+    });
+    if evidence_units <= 0.0 {
+        0.0
+    } else {
+        (1.0 - 0.15_f64.powf(evidence_units)).min(0.99)
+    }
 }
 
 /// The last good (minimum stable) anchor for a target: the LOWEST-voltage Validated observation. This
 /// is the best undervolt found so far (lower voltage = deeper undervolt). `None` if none validated.
 pub fn last_good_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<&F2Observation> {
+    let first_bad_mv = first_bad_for_target(obs, target_mhz).map(|o| o.anchor_mv);
     obs.iter()
         .filter(|o| o.target_mhz == target_mhz && o.outcome.is_validated())
+        // A later failure at V invalidates V and every deeper/lower-voltage point, even if an older
+        // run once validated there. Only clean points strictly above the nearest known failure remain.
+        .filter(|o| first_bad_mv.is_none_or(|bad| o.anchor_mv > bad))
         .min_by_key(|o| o.anchor_mv)
 }
 
@@ -281,7 +326,11 @@ pub fn bracket_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<Volt
     let last_good_mv = last_good_for_target(obs, target_mhz)?.anchor_mv;
     let first_bad_mv = first_bad_for_target(obs, target_mhz)?.anchor_mv;
     if last_good_mv > first_bad_mv {
-        Some(VoltageBracket { first_bad_mv, last_good_mv, width_mv: last_good_mv - first_bad_mv })
+        Some(VoltageBracket {
+            first_bad_mv,
+            last_good_mv,
+            width_mv: last_good_mv - first_bad_mv,
+        })
     } else {
         None
     }
@@ -329,12 +378,12 @@ pub fn validated_descent_baseline<'a>(
 /// annotates it with first-bad / bracket / counts / aggregate confidence. Pure.
 pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<F2FrontierEntry> {
     let best = last_good_for_target(obs, target_mhz)?;
-    let validations_at_best = obs
+    let validations_at_best: Vec<&F2Observation> = obs
         .iter()
         .filter(|o| {
             o.target_mhz == target_mhz && o.outcome.is_validated() && o.anchor_mv == best.anchor_mv
         })
-        .count();
+        .collect();
     let observation_count = obs.iter().filter(|o| o.target_mhz == target_mhz).count();
     let bracket = bracket_for_target(obs, target_mhz);
     Some(F2FrontierEntry {
@@ -344,8 +393,11 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
         watts: best.watts,
         avg_clock_mhz: best.avg_clock_mhz,
         sustained_clock_mhz: best.sustained_clock_mhz,
-        confidence: frontier_confidence(validations_at_best),
-        validation_count: validations_at_best,
+        power_capped_frac: best.power_capped_frac,
+        dwell_duration_ms: best.dwell_duration_ms,
+        sample_count: best.sample_count,
+        confidence: frontier_confidence_from_evidence(&validations_at_best),
+        validation_count: validations_at_best.len(),
         first_bad_mv: first_bad_for_target(obs, target_mhz).map(|o| o.anchor_mv),
         bracket_width_mv: bracket.map(|b| b.width_mv),
         observation_count,
@@ -366,6 +418,16 @@ pub fn learned_frontier(obs: &[F2Observation]) -> Vec<F2FrontierEntry> {
         .collect()
 }
 
+/// Build a frontier using observations from one exact physical GPU only.
+pub fn learned_frontier_for_gpu(obs: &[F2Observation], gpu_key: &str) -> Vec<F2FrontierEntry> {
+    let scoped: Vec<F2Observation> = obs
+        .iter()
+        .filter(|o| o.gpu_key.as_deref() == Some(gpu_key))
+        .cloned()
+        .collect();
+    learned_frontier(&scoped)
+}
+
 /// Bridge ONE learned frontier entry to the canonical telemetry point the existing GPU profile
 /// classifiers (`synthesize_forge_profiles`) consume, paired with its confidence. F2 RAISES a
 /// lower-voltage bin (true undervolt), so the apply axis `vf_table_voltage_mv` is that LOWER anchor bin
@@ -382,6 +444,9 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
         offset_mhz: entry.offset_mhz,
         power_w: power,
         max_power_w: power,
+        // In F1, a power-bound point means the voltage probe did not reveal a useful tuning
+        // boundary, so synthesis excludes it. In F2 the anchored target was explicitly sustained;
+        // being at the cap is valid Cmax evidence and must not disqualify the forged point.
         power_capped_frac: 0.0,
         stable: true,
         perf_per_watt,
@@ -454,9 +519,22 @@ impl F2ObservationStore {
         self.load_all().into_iter().filter(|o| o.target_mhz == target_mhz).collect()
     }
 
+    /// Observations for one target on one exact physical GPU.
+    pub fn query_by_target_for_gpu(&self, target_mhz: u32, gpu_key: &str) -> Vec<F2Observation> {
+        self.load_all()
+            .into_iter()
+            .filter(|o| o.target_mhz == target_mhz && o.gpu_key.as_deref() == Some(gpu_key))
+            .collect()
+    }
+
     /// The learned frontier over the entire log.
     pub fn learned_frontier(&self) -> Vec<F2FrontierEntry> {
         learned_frontier(&self.load_all())
+    }
+
+    /// Learned frontier isolated to one exact physical GPU.
+    pub fn learned_frontier_for_gpu(&self, gpu_key: &str) -> Vec<F2FrontierEntry> {
+        learned_frontier_for_gpu(&self.load_all(), gpu_key)
     }
 }
 
@@ -492,6 +570,9 @@ mod tests {
             avg_clock_mhz: Some(target + 15),
             sustained_clock_mhz: Some(target + 15),
             watts: Some(180),
+            power_capped_frac: Some(0.0),
+            dwell_duration_ms: Some(15_000),
+            sample_count: Some(300),
             silent_error: false,
             device_lost: false,
             unstable: !outcome.is_validated(),
@@ -512,6 +593,7 @@ mod tests {
         assert!(F2ObsOutcome::Validated.is_validated());
         for o in [
             F2ObsOutcome::VerifierFailed,
+            F2ObsOutcome::SilentError,
             F2ObsOutcome::Unstable,
             F2ObsOutcome::DeviceLost,
             F2ObsOutcome::ClockDrop,
@@ -526,6 +608,7 @@ mod tests {
         assert!(!F2ObsOutcome::AbortedBySafetyGate.is_bad());
         // Only reset-failure and unrecovered crash are SAFETY failures.
         assert!(F2ObsOutcome::ResetFailed.is_safety_failure());
+        assert!(F2ObsOutcome::DeviceLost.is_safety_failure());
         assert!(F2ObsOutcome::CrashOrRecovery.is_safety_failure());
         assert!(!F2ObsOutcome::Unstable.is_safety_failure());
         assert!(!F2ObsOutcome::ClockDrop.is_safety_failure());
@@ -542,6 +625,16 @@ mod tests {
         assert_eq!(last_good_for_target(&v, 1800).unwrap().anchor_mv, 962);
         // A target with no validated point → None.
         assert!(last_good_for_target(&v, 1815).is_none());
+    }
+
+    #[test]
+    fn later_failure_invalidates_same_or_deeper_old_validations() {
+        let v = vec![
+            obs(1800, 975, F2ObsOutcome::Validated),
+            obs(1800, 968, F2ObsOutcome::Validated),
+            obs(1800, 968, F2ObsOutcome::SilentError),
+        ];
+        assert_eq!(last_good_for_target(&v, 1800).unwrap().anchor_mv, 975);
     }
 
     #[test]
@@ -636,6 +729,35 @@ mod tests {
     }
 
     #[test]
+    fn confidence_comes_from_dwell_duration_and_independent_passes() {
+        let mut short = obs(1800, 975, F2ObsOutcome::Validated);
+        short.dwell_duration_ms = Some(10_000);
+        short.sample_count = Some(100);
+        let standard = obs(1800, 975, F2ObsOutcome::Validated);
+        let mut long = obs(1800, 975, F2ObsOutcome::Validated);
+        long.dwell_duration_ms = Some(35_000);
+        let short_conf = frontier_confidence_from_evidence(&[&short]);
+        let standard_conf = frontier_confidence_from_evidence(&[&standard]);
+        let long_conf = frontier_confidence_from_evidence(&[&long, &long, &long]);
+        assert!(short_conf < standard_conf);
+        assert!(standard_conf >= 0.85);
+        assert!(long_conf > standard_conf);
+        assert!(long_conf <= 0.99);
+    }
+
+    #[test]
+    fn learned_frontier_is_scoped_to_exact_gpu_key() {
+        let a = obs(1800, 975, F2ObsOutcome::Validated);
+        let mut b = obs(1950, 1000, F2ObsOutcome::Validated);
+        b.gpu_key = Some("GPU-B-UUID".into());
+        let fr = learned_frontier_for_gpu(&[a, b], "RTX 3060 Ti");
+        assert_eq!(
+            fr.iter().map(|e| e.target_mhz).collect::<Vec<_>>(),
+            vec![1800]
+        );
+    }
+
+    #[test]
     fn learned_frontier_picks_best_per_target() {
         let v = vec![
             obs(1800, 975, F2ObsOutcome::Validated),
@@ -659,10 +781,14 @@ mod tests {
 
     #[test]
     fn bridge_builds_classifier_compatible_points() {
-        let v = vec![obs(1800, 962, F2ObsOutcome::Validated)];
+        let mut capped = obs(1800, 962, F2ObsOutcome::Validated);
+        capped.power_capped_frac = Some(1.0);
+        let v = vec![capped];
         let fr = learned_frontier(&v);
         let (p, conf) = to_power_sweep_point(&fr[0]);
-        // Classifier-relevant fields: stable, non-power-bound, apply axis = the lower anchor bin.
+        // F2 retains the cap evidence in its frontier, but its sustained point must remain eligible
+        // for synthesis: F1's "power-bound probe" exclusion has different semantics.
+        assert_eq!(fr[0].power_capped_frac, Some(1.0));
         assert!(p.stable);
         assert_eq!(p.power_capped_frac, 0.0);
         assert_eq!(p.vf_table_voltage_mv, Some(962));

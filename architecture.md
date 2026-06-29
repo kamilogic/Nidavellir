@@ -31,13 +31,20 @@ headless client used for sweeps/benchmarks. Requests/responses are the
   boot-flag (the tuning point) before a risky apply/measure; on reboot a still-armed
   flag means the last op crashed → don't re-apply; blacklist the region; after 3
   consecutive crashes → Safe Mode (stock, hands-off). Persists to ProgramData.
-- **Power sweep** (`gpu_power_sweep.rs`): holds the stock target clock, raises a
-  curve-flatten **offset**, and measures (voltage out, clock, power, cap%) under the
-  game-power render. Synthesizes **Godforge** (max-voltage / OC-oriented) and
-  **Brokkr's** (best MHz/W, off-cap). Arduous 35 s soak validates the pick.
-- **VF ceiling** (`gpu-nvapi`): the apply mechanism. Flattens every curve point at
-  or above a chosen voltage to a target clock via per-point ClkVfPoints offsets — no
-  voltage lock / no NVML clock pin, so the GPU keeps power-management elasticity.
+- **Live F2 Forge** (`gpu_power_sweep.rs` + `gpu_undervolt.rs`): resets to stock,
+  then enumerates every real live-VF clock from the highest bin downward. For each clock, it raises a
+  lower-voltage anchor to the target and caps higher bins to that target, then runs
+  the fail-closed dwell/reset motor until the voltage boundary or physical floor.
+  Power-bound clock drops before sustain continue the same clock; the first sustained
+  clock is Cmax. The complete profile frontier spans Cmax→90% Cmax so Deep Calm is selected from
+  measured data. Fast produces a provisional map; Standard qualifies each boundary with 2×60 s
+  reset/reapply passes and Long with 3×120 s. F2 Apply fails closed until qualification succeeds.
+- **Anchored VF undervolt** (`gpu-nvapi`): raises exactly one real lower-voltage
+  anchor and caps higher-voltage bins to the target via per-point ClkVfPoints
+  offsets — no voltage lock / no NVML clock pin, so lower bins retain elasticity.
+  The clock ceiling is the stock VF top, and reset is write/readback checked.
+- **Legacy F1 sweep/ceiling** (`gpu_power_sweep.rs`): retained for legacy
+  `is_undervolt == false` payloads; no longer backs the live Forge button.
 - **Continuous knowledge** (`gpu_power_sweep.rs`): `GpuKnowledge` per GPU — a
   severity-separated frontier + per-offset stats, persisted and accumulated across
   runs. Drives the data-driven exploration ceiling.
@@ -46,6 +53,10 @@ headless client used for sweeps/benchmarks. Requests/responses are the
 - `safe_loop.json` — Safe Loop record (state, consecutive_crashes, blacklist).
 - `gpu_applied.json` — the currently applied profile (re-applied on boot).
 - `gpu_knowledge.json` — per-GPU stability knowledge (frontier + per-point stats).
+- `f2_observations.jsonl` — append-only, GPU-UUID-scoped F2 candidate evidence and
+  crash-safe resume checkpoints.
+- `forge_state.json` — last complete usable forged profile snapshot; partial F2 runs
+  never overwrite it.
 - `boot_flag.json` / `heartbeat.txt` — Safe Loop liveness/boot detection.
 
 ## Platform constraints

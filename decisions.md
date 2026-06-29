@@ -2,6 +2,60 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 qualification contract — Fast provisional, 90% domain, bounded warm-start fallback (2026-06-28)
+- **Decision**: Fast remains full-frontier discovery but is preview-only. Standard adds two independent
+  60 s reset/reapply passes per discovered boundary; Long adds three 120 s passes. A failed pass moves
+  one physical VF bin upward and restarts the full qualification count.
+- **Apply gate**: additive `profiles_qualified` defaults false. Both UI and service block F2 Apply until
+  all selected profiles meet the confidence and confirmation requirements. Starting any new hardware
+  run clears qualification because new evidence may invalidate the prior boundary.
+- **Deep Calm domain**: extend the measured frontier from 95% to 90% Cmax, matching its policy floor.
+- **Cross-clock reuse**: start the next clock one physical bin above the previous minimum stable anchor;
+  retain the last power-bound ClockDrop as fallback. A rejected/no-candidate warm-start retries the same
+  target from the fallback instead of declaring that clock unsustainable.
+- **Time model**: discovery stays 10 s per candidate. Fresh-GPU estimates are Fast 20–30 min, Standard
+  55–75 min, Long 90–120 min; learned-state resume can shorten them.
+
+## F2 partial learning is durable; instability is not a crash (2026-06-28)
+- **Decision**: append every dwell observation before publishing its progress event and checkpoint
+  partial `PowerSweepProgress`; a service interruption restores an inspectable `interrupted` run.
+- **Decision**: `SilentError`/`Unstable` ends the current voltage descent and blacklists that point,
+  but does not increment `consecutive_crashes` after a confirmed reset. Only DeviceLost/TDR counts as
+  a crash and retains recovery state.
+- **Decision**: seed the next lower clock from the previous target's last power-bound ClockDrop
+  (falling back to its first sustainable voltage). This keeps one conservative overlap while skipping
+  redundant high-voltage dwells.
+- **Tradeoff**: total steps and ETA are estimates because Cmax and pruning become exact during the
+  run; the UI labels them accordingly and never parses technical log text for state.
+
+## F2 integrated Cmax/frontier algorithm — physical-bin sweep, no arbitrary step cap; modes change evidence only (2026-06-28)
+- **Decision**: preserve the intended integrated search instead of adding a separate preliminary Cmax
+  pass. Start at the highest real clock, descend that clock's real voltage anchors while it remains
+  power-bound, and reuse those dwells as discovery evidence. If no voltage sustains once power falls
+  below 99% of cap, move to the next clock. The first sustained target is Cmax.
+- **Per-clock terminal rule**: before sustain, a power-bound clock drop is search progress; an off-cap
+  drop, silent error, or instability ends that clock. After any validated point, the first
+  `SilentError`, `Unstable`, or `ClockDrop` is the lower-voltage boundary. `DeviceLost`, reset failure,
+  arm/apply/verify failure, or untrustworthy recovery aborts the whole Forge. TDR is not sought.
+- **No step budget**: autonomous discovery plans the full physical VF domain (`usize::MAX` is only a
+  no-budget planner sentinel). The real curve/floor and first terminal detection bound the run.
+  Explicit `--steps N` is still available as a manual operator boundary, not an algorithmic cap.
+- **Outer frontier**: characterize every real clock from Cmax through the last bin at or above 90% of
+  Cmax. No definitive synthesis/persistence occurs unless the whole range completes.
+- **Mode contract**: Fast, Standard, and Long never change which clocks/voltages are eligible. They
+  change only evidence depth: Fast 10 s discovery/provisional; Standard 10 s discovery + 2×60 s
+  qualification; Long 10 s discovery + 3×120 s qualification.
+- **Persistence/identity**: append each candidate immediately; scope learning and forge state to the
+  physical GPU UUID; resume below prior good/power-bound observations or reuse a complete bracket.
+- **Safety architecture**: one in-process service-wide GPU lease across starts/applies/reset; checked
+  modern-VF reset; Safe Loop flag armed before writes and retained for `DeviceLost`/reset failure;
+  partial runs cannot replace known-good profiles.
+- **Alternative rejected**: a separate max-clock-only pass would duplicate hazardous dwells and throw
+  away useful undervolt evidence. A fixed 3-step guard was also rejected because it prevented reaching
+  the actual boundary; fail-closed detection and the physical VF floor are the correct bounds.
+- **Hardware status**: code/tests only. The next step is a supervised real Forge run, separately
+  authorized because it can trigger TDR/reboot.
+
 ## F2 PHASE 2 — Apply path wired to F2 anchored undervolt; F1 KEPT (not removed); code-complete, not HW-tested (2026-06-27)
 - **Decision**: implement Phase 2 of the F2 pivot — make `ApplyPowerGodforge/Brokkrs/DeepCalm` actually
   APPLY the F2 anchored undervolt. Before this, the forge produced F2 profiles but the apply path was still

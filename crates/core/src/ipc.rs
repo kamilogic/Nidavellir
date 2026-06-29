@@ -40,11 +40,11 @@ pub enum IpcRequest {
     StopBenchmark,
     GetBenchmarkProgress,
     StartPowerSweep,
-    /// Quick-discovery variant of `StartPowerSweep` (FAST mode): fewer discovery probes / shallower
-    /// per-target depth, one ceiling soak per pick. Additive — `StartPowerSweep` keeps its behavior.
+    /// Fast-evidence variant of `StartPowerSweep`: the same complete F2 frontier with shorter dwell
+    /// validation at every tested point. Additive — `StartPowerSweep` keeps its behavior.
     StartPowerSweepFast,
-    /// Everything-up-front variant of `StartPowerSweep` (LONG mode): broader + deeper discovery and
-    /// repeated ceiling soaks per pick (confidence built in one session). Additive.
+    /// High-confidence variant of `StartPowerSweep`: the same complete F2 frontier with longer
+    /// dwells and independent repeated validations. Additive.
     StartPowerSweepLong,
     StopPowerSweep,
     GetPowerSweepProgress,
@@ -187,6 +187,36 @@ pub struct PowerSweepProgress {
     /// differentiate the profiles because it remained power-bound.
     #[serde(default)]
     pub power_bound_collapse: bool,
+    /// Structured live F2 progress. The total is an estimate because cross-clock pruning and the
+    /// final 90%-of-Cmax floor become exact only as the frontier is learned.
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub current_clock_mhz: Option<u32>,
+    #[serde(default)]
+    pub current_voltage_mv: Option<u32>,
+    #[serde(default)]
+    pub completed_steps: u32,
+    #[serde(default)]
+    pub total_steps_estimate: u32,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub estimated_remaining_ms: Option<u64>,
+    #[serde(default)]
+    pub learned_points: u32,
+    #[serde(default)]
+    pub last_outcome: Option<String>,
+    /// True once every completed candidate has been appended to durable F2 observation storage.
+    #[serde(default)]
+    pub learning_saved: bool,
+    /// True only after the full Cmax→90% frontier completed and definitive profiles were synthesized.
+    #[serde(default)]
+    pub frontier_complete: bool,
+    /// True only when the discovered frontier and selected profiles passed the mode's independent
+    /// qualification requirements. Fast intentionally leaves this false and is preview-only.
+    #[serde(default)]
+    pub profiles_qualified: bool,
 }
 
 /// One benchmark run's measured metrics (stock or tuned).
@@ -471,6 +501,7 @@ pub struct DriverStatusPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)] // IPC wire variants stay inline for backward-compatible serde shape.
 pub enum ResponseData {
     Pong,
     Hardware(HardwareInfo),
@@ -574,10 +605,15 @@ mod tests {
 
     #[test]
     fn power_sweep_progress_is_undervolt_roundtrips() {
-        let p = PowerSweepProgress { is_undervolt: true, ..Default::default() };
+        let p = PowerSweepProgress {
+            is_undervolt: true,
+            profiles_qualified: true,
+            ..Default::default()
+        };
         let json = serde_json::to_string(&p).unwrap();
         let back: PowerSweepProgress = serde_json::from_str(&json).unwrap();
         assert!(back.is_undervolt);
+        assert!(back.profiles_qualified);
         assert!(!back.power_bound_collapse);
     }
 
@@ -593,6 +629,7 @@ mod tests {
         }"#;
         let p: PowerSweepProgress = serde_json::from_str(legacy).unwrap();
         assert!(!p.is_undervolt, "missing key must default to legacy F1 behavior");
+        assert!(!p.profiles_qualified, "missing key must never unlock F2 Apply");
         assert!(!p.power_bound_collapse, "missing key must default to no structured collapse");
         assert_eq!(p.stock_clock_mhz, 1800);
     }

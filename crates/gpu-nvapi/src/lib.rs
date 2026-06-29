@@ -56,13 +56,15 @@ pub fn read_curve() -> Result<GpuCurve, String> {
     let mut points: Vec<VfCurvePoint> = curve
         .graphics
         .iter()
-        .map(|(_, e)| VfCurvePoint { voltage_mv: e.voltage.0 / 1000, freq_mhz: e.frequency.0 / 1000 })
+        .map(|(_, e)| VfCurvePoint { voltage_mv: e.voltage.0 / 1000, freq_mhz: e.frequency.0 / 1000,
+        })
         .collect();
     points.extend(
         curve
             .memory
             .iter()
-            .map(|(_, e)| VfCurvePoint { voltage_mv: e.voltage.0 / 1000, freq_mhz: e.frequency.0 / 1000 })
+            .map(|(_, e)| VfCurvePoint { voltage_mv: e.voltage.0 / 1000, freq_mhz: e.frequency.0 / 1000,
+            })
             // Guard against a card that truly reports memory clocks here.
             .filter(|p| p.freq_mhz < 4000),
     );
@@ -120,7 +122,8 @@ pub fn set_vf_ceiling(target_mhz: u32, ceiling_mv: u32, khz_per_mhz: i32) -> Res
             let v = e.voltage.0 / 1000;
             let f = (e.frequency.0 / 1000) as i32;
             if v >= ceiling_mv {
-                Some((*i, nvapi::Kilohertz2Delta((target_mhz as i32 - f) * khz_per_mhz)))
+                Some((*i, nvapi::Kilohertz2Delta((target_mhz as i32 - f) * khz_per_mhz),
+                ))
             } else {
                 None
             }
@@ -163,7 +166,8 @@ pub fn calibrate_vf_unit() -> Result<(i32, i32, i32), String> {
         .map(|(i, e)| (*i, (e.frequency.0 / 1000) as i32))
         .ok_or_else(|| "no graphics points".to_string())?;
     const PROBE: i32 = -30000; // lowering delta in table units
-    gpu.set_vfp_table(mask.mask, std::iter::once((idx, nvapi::Kilohertz2Delta(PROBE))), std::iter::empty())
+    gpu.set_vfp_table(mask.mask, std::iter::once((idx, nvapi::Kilohertz2Delta(PROBE))), std::iter::empty(),
+    )
         .map_err(|e| format!("probe set: {e:?}"))?;
     std::thread::sleep(std::time::Duration::from_millis(400));
     let c2 = gpu.vfp_curve(mask.mask).map_err(|e| format!("re-read: {e:?}"))?;
@@ -173,7 +177,8 @@ pub fn calibrate_vf_unit() -> Result<(i32, i32, i32), String> {
         .find(|(i, _)| *i == idx)
         .map(|(_, e)| (e.frequency.0 / 1000) as i32)
         .unwrap_or(base);
-    let _ = gpu.set_vfp_table(mask.mask, std::iter::once((idx, nvapi::Kilohertz2Delta(0))), std::iter::empty());
+    let _ = gpu.set_vfp_table(mask.mask, std::iter::once((idx, nvapi::Kilohertz2Delta(0))), std::iter::empty(),
+    );
     Ok((PROBE, after - base, base))
 }
 
@@ -182,7 +187,8 @@ pub fn calibrate_vf_unit() -> Result<(i32, i32, i32), String> {
 #[cfg(windows)]
 pub fn lock_core_voltage_mv(mv: u32) -> Result<(), String> {
     let gpu = first_gpu()?;
-    gpu.set_vfp_locks(std::iter::once((0usize, Some(nvapi::Microvolts(mv * 1000)))))
+    gpu.set_vfp_locks(std::iter::once((0usize, Some(nvapi::Microvolts(mv * 1000)),
+    )))
         .map_err(|e| format!("set_vfp_locks failed: {e:?}"))
 }
 
@@ -207,10 +213,13 @@ pub fn read_core_voltage_mv() -> Option<u32> {
 /// Full reset: unlock voltage and clear the core + memory clock offsets.
 #[cfg(windows)]
 pub fn reset_all() -> Result<(), String> {
-    let a = unlock_core_voltage();
-    let b = set_core_offset_mhz(0);
-    let c = set_mem_offset_mhz(0);
-    a.and(b).and(c)
+    unlock_core_voltage()?;
+    set_core_offset_mhz(0)?;
+    set_mem_offset_mhz(0)?;
+    if vf_curve_supported() {
+        reset_vf_curve_checked()?;
+    }
+    Ok(())
 }
 
 /// Modern per-point V/F curve control via the undocumented NvAPI `ClkVfPoints`
@@ -351,8 +360,10 @@ mod vfcurve {
     /// shows real freq/voltage data (proves the curve is read, not zeroed).
     pub fn dump_status() -> String {
         let _ = nvapi::initialize();
-        let Some(p) = qi(ID_STATUS) else { return "qi(status) fail".into() };
-        let Some(h) = handle() else { return "handle fail".into() };
+        let Some(p) = qi(ID_STATUS) else { return "qi(status) fail".into();
+        };
+        let Some(h) = handle() else { return "handle fail".into();
+        };
         type F = extern "C" fn(RawGpuHandle, *mut Status) -> i32;
         let f: F = unsafe { core::mem::transmute(p) };
         let mut out = format!("VER_STATUS {VER_STATUS:#x} ");
@@ -407,8 +418,10 @@ mod vfcurve {
     /// can confirm the modern GET reads the right field with the corrected struct.
     pub fn dump_points() -> String {
         let _ = nvapi::initialize();
-        let Some(p) = qi(ID_GET) else { return "qi fail".into() };
-        let Some(h) = handle() else { return "handle fail".into() };
+        let Some(p) = qi(ID_GET) else { return "qi fail".into();
+        };
+        let Some(h) = handle() else { return "handle fail".into();
+        };
         type F = extern "C" fn(RawGpuHandle, *mut Control) -> i32;
         let f: F = unsafe { core::mem::transmute(p) };
         let mut out = String::new();
@@ -729,7 +742,8 @@ pub fn apply_vf_ceiling(ceiling_mv: u32, target_mhz: u32) -> Result<usize, Strin
 pub fn apply_vf_ceiling_monotone(ceiling_mv: u32, target_mhz: u32) -> Result<usize, String> {
     let static_base = read_vf_base_curve_modern();
     if static_base.is_empty() {
-        return Err("static VF-table base unavailable (read_vf_base_curve_modern empty) — fail closed".into());
+        return Err("static VF-table base unavailable (read_vf_base_curve_modern empty) — fail closed".into(),
+        );
     }
     let plan = plan_vf_ceiling_monotone(&static_base, ceiling_mv, target_mhz);
     if !plan.iter().any(|e| e.in_flatten_set) {
@@ -866,6 +880,22 @@ impl PositiveOffsetLimits {
             clock_ceiling_mhz,
         }
     }
+
+    /// Full F2 frontier-discovery envelope. Unlike the legacy `+30`/`+210` policies, this bound is
+    /// derived only from the real hardware domain: the highest allowed target minus the lowest sane
+    /// base clock present in the live static VF table. The writer still requires a real bin, a target
+    /// at/below `clock_ceiling_mhz`, an exact effective target, and an anchor at/above the hardware
+    /// voltage floor. Setting the step cap to the same physical delta allows adjacent real VF bins
+    /// even when their base-clock spacing is larger than an arbitrary 15 MHz.
+    pub fn hardware_frontier(hw_floor_mv: u32, clock_ceiling_mhz: u32, min_base_mhz: u32) -> Self {
+        let physical_delta = clock_ceiling_mhz.saturating_sub(min_base_mhz).max(1) as i32;
+        Self {
+            abs_max_offset_mhz: physical_delta,
+            step_max_offset_mhz: physical_delta,
+            hw_floor_mv,
+            clock_ceiling_mhz,
+        }
+    }
 }
 
 /// A validated single-bin bounded positive-offset (F2) write plan. Pure data; produced ONLY when
@@ -971,7 +1001,8 @@ pub fn apply_bounded_positive_offset(
     limits: &PositiveOffsetLimits,
 ) -> Result<PositiveOffsetPlan, String> {
     let plan =
-        plan_bounded_positive_offset(static_base_curve, bin_index, target_mhz, prev_offset_mhz, limits)?;
+        plan_bounded_positive_offset(static_base_curve, bin_index, target_mhz, prev_offset_mhz, limits,
+    )?;
     // Defensive: never write a non-positive or over-cap offset even if the planner ever changes.
     if plan.offset_mhz <= 0 || plan.offset_mhz > limits.abs_max_offset_mhz {
         return Err(format!(
@@ -1217,15 +1248,33 @@ pub fn apply_bounded_anchored_positive_offset(
 /// Reset the modern V/F curve: zero every valid point's frequency offset.
 #[cfg(windows)]
 pub fn reset_vf_curve() -> usize {
+    reset_vf_curve_checked().unwrap_or(0)
+}
+
+/// Reset and verify every valid modern V/F point. Unlike the legacy best-effort helper, this returns
+/// an error if any write or readback cannot prove the curve is back at stock.
+#[cfg(windows)]
+pub fn reset_vf_curve_checked() -> Result<usize, String> {
     let mut n = 0;
     for i in 0..255 {
-        if vfcurve::get_status(i).map_or(false, |(_, uv)| uv > 0)
-            && vfcurve::set_point(i, 0) == 0
-        {
-            n += 1;
+        if vfcurve::get_status(i).is_none() {
+            continue;
+        }
+        let status = vfcurve::set_point(i, 0);
+        if status != 0 {
+            return Err(format!("VF reset: set_point({i}) status {status}"));
+        }
+        match vfcurve::get_point(i) {
+            Some(khz) if khz.abs() <= 1_000 => n += 1,
+            Some(khz) => {
+                return Err(format!("VF reset: point {i} still has {khz} kHz offset"));
+            }
+            None => {
+                return Err(format!("VF reset: point {i} readback unavailable"));
+            }
         }
     }
-    n
+    Ok(n)
 }
 
 /// Read back one point's current freq offset (kHz) via the modern GET.
@@ -1294,7 +1343,8 @@ mod tests {
 
     // (index, voltage_mv, freq_mhz) — shape of read_vf_curve_modern().
     fn curve() -> Vec<(usize, u32, u32)> {
-        vec![(0, 800, 1700), (1, 837, 1750), (2, 850, 1770), (3, 1062, 1900)]
+        vec![(0, 800, 1700), (1, 837, 1750), (2, 850, 1770), (3, 1062, 1900),
+        ]
     }
 
     #[test]
@@ -1392,7 +1442,8 @@ mod tests {
     // Static-base curve: (index, voltage_mv, base_freq_mhz). Bins span below/at/above a 900 mV
     // ceiling; the 1062 mV bin's static base (1845) is the overshoot case from the 1755@900 run.
     fn base_curve() -> Vec<(usize, u32, u32)> {
-        vec![(0, 800, 1650), (1, 875, 1700), (2, 900, 1740), (3, 975, 1800), (4, 1062, 1845)]
+        vec![(0, 800, 1650), (1, 875, 1700), (2, 900, 1740), (3, 975, 1800), (4, 1062, 1845),
+        ]
     }
 
     #[test]
@@ -1473,7 +1524,8 @@ mod tests {
     // Static base curve (index, voltage_mv, base_freq_mhz): lower-voltage bins have lower base, so a
     // small positive offset lets them hold a higher target.
     fn pos_base() -> Vec<(usize, u32, u32)> {
-        vec![(0, 850, 1700), (1, 900, 1740), (2, 950, 1770), (3, 1000, 1800), (4, 1062, 1845)]
+        vec![(0, 850, 1700), (1, 900, 1740), (2, 950, 1770), (3, 1000, 1800), (4, 1062, 1845),
+        ]
     }
 
     fn pos_limits(floor_mv: u32) -> PositiveOffsetLimits {
@@ -1637,6 +1689,23 @@ mod tests {
         let err =
             plan_bounded_anchored_positive_offset(&curve, 1, 1810, 0, &pos_limits(850)).unwrap_err();
         assert!(err.contains("non-monotone"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn hardware_frontier_limits_come_from_real_clock_domain() {
+        let limits = PositiveOffsetLimits::hardware_frontier(850, 1950, 1500);
+        assert_eq!(limits.abs_max_offset_mhz, 450);
+        assert_eq!(limits.step_max_offset_mhz, 450);
+        assert_eq!((limits.hw_floor_mv, limits.clock_ceiling_mhz), (850, 1950));
+    }
+
+    #[test]
+    fn hardware_frontier_allows_deep_real_bin_but_never_clock_above_stock_top() {
+        let limits = PositiveOffsetLimits::hardware_frontier(850, 1950, 1500);
+        let plan = plan_bounded_positive_offset(&pos_base(), 0, 1900, 0, &limits).unwrap();
+        assert_eq!((plan.offset_mhz, plan.effective_mhz), (200, 1900));
+        let err = plan_bounded_positive_offset(&pos_base(), 0, 1965, 0, &limits).unwrap_err();
+        assert!(err.contains("clock ceiling"), "unexpected error: {err}");
     }
 
     // ── TARGET-SWEEP learned offset horizon (official --auto-sweep envelope) ──────────────────

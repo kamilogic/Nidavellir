@@ -1,13 +1,53 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-27: FORGE PIVOTED TO F2 UNDERVOLT (the button's F1
-flatten-down can't differentiate this power-bound card; F2 can, proven −43 W). Phase 1 DONE + pushed
-(button runs F2; apply was gated). **Phase 2 DONE (code-complete, NOT yet HW-tested)** — the F2 apply
-path is wired: `ApplyPower*` now APPLY the F2 anchored undervolt (arm→write→verify→persist→reapply-on-boot,
-fail-closed); the Phase-1 refusal gate is gone. **NEXT = ONE supervised manual apply on the rig** (forge
-F2 → Apply → confirm anchored VF write verifies + persists + reapplies on boot; reversible via reset).
-F1 untouched (legacy `is_undervolt==false` path). See `decisions.md` top entry for rationale + phased plan.
+How to pick this up cold. State as of 2026-06-28: the F2 live Forge algorithm has been corrected in
+code. It starts at the highest real clock, uses power-bound voltage descent to discover the first
+sustainable Cmax, then characterizes every real clock through 90% Cmax. Autonomous voltage discovery
+has no arbitrary step cap. Fast is provisional; Standard qualifies boundaries with 2×60 s passes and
+Long with 3×120 s. Every candidate checkpoints by physical GPU UUID. The F2 Apply path remains wired
+but fails closed until `profiles_qualified`; F1 remains available for legacy payloads. **NEXT = supervised real Forge
+checkpoint; no hardware was run in this implementation session.** See `decisions.md` top entry.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## Latest backend/UI checkpoint (2026-06-28) — durable learning and visible progress
+- Qualification refinement: frontier extended to 90% Cmax; next-clock warm-start is one real bin above
+  the prior minimum with conservative ClockDrop fallback; Fast profiles are explicitly provisional.
+- Standard = 10 s discovery + 2×60 s qualification; Long = 10 s discovery + 3×120 s qualification.
+  Qualification failure backs off one physical bin and restarts all passes. UI and backend both block
+  F2 Apply until qualified.
+- The 18:08–18:27 Fast Forge preserved 72 observations (37 at 1935 MHz, 35 at 1920 MHz). The apparent
+  loss was the UI restoring only the last complete forge state.
+- Root cause of the stop before 1905 MHz: reset-clean SilentErrors incremented
+  `consecutive_crashes`; the third-clock preflight then refused the run. Fixed so only DeviceLost/TDR
+  increments crash streaks.
+- Live progress now checkpoints each completed dwell and exposes structured current clock/voltage,
+  completed/estimated steps, ETA, last outcome, learned count and frontier-complete status.
+- Lower clocks warm-start at the prior target's last power-bound ClockDrop, with one conservative
+  overlap. Technical log lines stream per candidate and remain visible after the run.
+- Validation: `cargo test -p nidavellir-service` 311/311; `cargo check -p
+  nidavellir-service`; `apps/ui npm.cmd run build`. No new hardware Forge was run.
+
+## Latest backend checkpoint (2026-06-28) — integrated F2 frontier corrected; ready for supervised hardware QA
+- Live path: `PowerSweepHandle::start_with_mode` → `measure_multiclock_undervolt_forge` →
+  `run_confirmed_f2_clock_discovery` → the proven per-candidate
+  arm→anchored-write→verify→dwell→checked-reset motor.
+- Highest real clock is tried first. A pre-sustain clock drop near 99–100% power cap continues down
+  voltage; off-cap failure advances the clock. First sustained target = Cmax. The outer loop then
+  covers all real bins through 90% Cmax.
+- Autonomous target/ladder/live discovery traverses the physical VF domain with no 3/6-step budget.
+  Stop is the first terminal signal or hardware floor; `DeviceLost`/reset failure aborts the Forge.
+- Fast/Standard/Long use the same frontier: provisional 10 s discovery / 2×60 s qualification /
+  3×120 s qualification. Confidence uses actual dwell, samples, and independent validations.
+- Observations are appended immediately and keyed by NVML UUID. Resume skips confirmed bins and
+  known brackets. Only a complete Cmax→90% frontier can produce the active profile set.
+- Safety: global IPC GPU lease, checked modern VF reset, Safe Loop arm-before-write, boot flag retained
+  through crash accounting, no auto-apply.
+- Validation: workspace check; core 64 / NVAPI 40 / service 309 tests; diff check clean. Read-only
+  dry-run at 1950 MHz reports ceiling 1950 and 83 physical anchors (no 3/6/+210/+15 discovery cap).
+  Repository-wide rustfmt remains a pre-existing baseline failure, so no broad rewrite was accepted.
+- Hardware checkpoint protocol: operator present and prepared for TDR/reboot; start with Fast only if
+  explicitly authorized; inspect Cmax, every per-clock stop reason, reset readback, Safe Loop state,
+  observation checkpoints, and absence of profile persistence on interruption before Standard/Long.
 
 ## Latest backend checkpoint (2026-06-27) — F2 PHASE 2: Apply path wired to F2 anchored undervolt (code-complete, NOT HW-tested)
 - **What**: the three Apply actions (`ApplyPowerGodforge/Brokkrs/DeepCalm`) now APPLY the F2 undervolt

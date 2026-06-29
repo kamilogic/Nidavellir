@@ -12,6 +12,7 @@
   } = $props();
   let applyingKey = $state(null);
   const isUndervolt = $derived(Boolean(powerSweep?.is_undervolt));
+  const profilesQualified = $derived(!isUndervolt || Boolean(powerSweep?.profiles_qualified));
 
   const meta = [
     {
@@ -156,7 +157,7 @@
 
   async function applyPowerCard(key, p) {
     const state = profileState(powerName(key), p);
-    if (!p || state.active || applyingKey) return;
+    if (!p || !profilesQualified || state.active || applyingKey) return;
     applyingKey = key;
     try {
       await onApplyPower?.(key);
@@ -167,7 +168,7 @@
 
   async function applyProfile(m) {
     const state = profileState(m.name, powerProfile(m));
-    if (!hasData(m) || state.active || applyingKey) return;
+    if (!hasData(m) || !profilesQualified || state.active || applyingKey) return;
     applyingKey = m.key;
     try {
       await onApplyPower?.(m.key);
@@ -210,10 +211,12 @@
             <button
               class="btn small"
               class:go={!state.active}
-              disabled={state.active || applyingKey === key}
+              disabled={!profilesQualified || state.active || applyingKey === key}
               onclick={() => applyPowerCard(key, p)}
             >
-              {#if applyingKey === key}
+              {#if !profilesQualified}
+                Run Standard to qualify
+              {:else if applyingKey === key}
                 Applying...
               {:else if state.active}
                 Applied ✓
@@ -249,8 +252,10 @@
             {/if}
             {#if state.active}
               <StatusBadge label="Active" variant="active" symbol="check" compact />
+            {:else if isUndervolt && point && profilesQualified}
+              <StatusBadge label="Qualified" variant="forged" symbol="knowledge" compact />
             {:else if isUndervolt && point}
-              <StatusBadge label="Discovered" variant="forged" symbol="knowledge" compact />
+              <StatusBadge label="Provisional" variant="tempered" symbol="activity" compact />
             {:else if state.updated}
               <StatusBadge label="Updated" variant="tempered" symbol="activity" compact />
             {/if}
@@ -293,10 +298,12 @@
           <button
             class="btn small"
             class:go={!state.active}
-            disabled={state.active || applyingKey === item.key}
+            disabled={!profilesQualified || state.active || applyingKey === item.key}
             onclick={() => applyProfile(item)}
           >
-            {#if applyingKey === item.key}
+            {#if !profilesQualified}
+              Run Standard to qualify
+            {:else if applyingKey === item.key}
               Applying...
             {:else if state.active}
               Applied ✓

@@ -7,17 +7,28 @@
     powerSweep = null,
     powerRunning = false,
     safeLoop = null,
-    showLog = false,
     onStopPower,
   } = $props();
 
   const points = $derived(powerSweep?.points ?? []);
+  const isUndervolt = $derived(Boolean(powerSweep?.is_undervolt));
+  const profilesQualified = $derived(!isUndervolt || Boolean(powerSweep?.profiles_qualified));
   const phase = $derived(powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : "Not running");
   const hasRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
   const latestPoint = $derived(points.length ? points[points.length - 1] : null);
   const latestLogLine = $derived.by(() => {
     const log = powerSweep?.log ?? [];
     return log.length ? log[log.length - 1] : null;
+  });
+  const completedSteps = $derived(Number(powerSweep?.completed_steps ?? 0));
+  const totalSteps = $derived(Number(powerSweep?.total_steps_estimate ?? 0));
+  const progressPercent = $derived.by(() => {
+    if (!totalSteps) return 0;
+    return Math.min(100, Math.max(0, (completedSteps / totalSteps) * 100));
+  });
+  const technicalLog = $derived.by(() => {
+    const lines = powerSweep?.log ?? [];
+    return lines.length ? lines : ["No technical Forge events recorded yet."];
   });
   const latestMessage = $derived.by(() => {
     if (powerSweep?.note) return powerSweep.note;
@@ -29,6 +40,9 @@
   const title = $derived(powerRunning ? "Forge in Progress" : "Forge Progress");
   const intro = $derived.by(() => {
     if (powerRunning) return "Nidavellir is learning this GPU's stable core curve.";
+    if (hasRun && (powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm) && !profilesQualified) {
+      return "The latest Fast result is provisional. Standard or Long qualification is required before Apply.";
+    }
     if (hasRun) return "Review the latest core forge run and the profiles it produced.";
     return "Forge progress will appear here when Nidavellir starts learning the GPU core curve.";
   });
@@ -40,6 +54,9 @@
     ].filter(([, point]) => point),
   );
   const nextStep = $derived.by(() => {
+    if (!powerRunning && profileRows.length && !profilesQualified) {
+      return "Next: run Standard or Long to qualify these boundaries and unlock Apply.";
+    }
     if (!powerRunning && profileRows.length) return "Next: choose and apply the profile that matches your goal.";
     if (!powerRunning) return "Next: start Forge GPU when you are ready.";
     if (!points.length) return "Next: measure the first stable operating point.";
@@ -63,6 +80,17 @@
   function fixed(value, digits = 0) {
     const n = Number(value);
     return Number.isFinite(n) ? n.toFixed(digits) : "0";
+  }
+
+  function duration(value) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms < 0) return "Calculating…";
+    const totalSeconds = Math.round(ms / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    if (hours) return `${hours}h ${minutes}m`;
+    const seconds = totalSeconds % 60;
+    return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
   }
 
   function targetLabel(point) {
@@ -122,6 +150,14 @@
     </div>
     <div class="head-actions">
       <StatusBadge label={safetyState} variant={safetyVariant} symbol={safetyVariant === "attention" ? "attention" : "shield"} compact />
+      {#if profileRows.length}
+        <StatusBadge
+          label={profilesQualified ? "Qualified" : "Provisional"}
+          variant={profilesQualified ? "forged" : "tempered"}
+          symbol={profilesQualified ? "knowledge" : "activity"}
+          compact
+        />
+      {/if}
       <span class="run-state" class:live={powerRunning}>{powerRunning ? "Running" : hasRun ? "Stopped" : "Idle"}</span>
       {#if powerRunning}
         <button class="btn stop" onclick={onStopPower}>
@@ -142,6 +178,44 @@
     </div>
     <p>{latestMessage}</p>
   </div>
+
+  <section class="sweep-progress" aria-label="GPU sweep progress">
+    <div class="sweep-progress-head">
+      <div>
+        <span>Full GPU sweep</span>
+        <strong>{completedSteps} / {totalSteps || "—"} estimated dwells</strong>
+      </div>
+      <div class="sweep-timing">
+        <small>{fixed(progressPercent)}%</small>
+        <small>ETA {powerRunning ? duration(powerSweep?.estimated_remaining_ms) : "—"}</small>
+      </div>
+    </div>
+    <div
+      class="progress-track"
+      role="progressbar"
+      aria-label="Estimated Forge completion"
+      aria-valuemin="0"
+      aria-valuemax="100"
+      aria-valuenow={Math.round(progressPercent)}
+    >
+      <span style={`width: ${progressPercent}%`}></span>
+    </div>
+    <div class="live-target">
+      <span>
+        {powerSweep?.current_clock_mhz
+          ? `${powerSweep.current_clock_mhz} MHz @ ${powerSweep.current_voltage_mv ?? "—"} mV`
+          : powerRunning
+            ? "Preparing next hardware point"
+            : "No active hardware point"}
+      </span>
+      <small>{powerSweep?.last_outcome ?? (powerRunning ? "Waiting for dwell result" : "Idle")}</small>
+      <small class:saved={powerSweep?.learning_saved}>
+        {powerSweep?.learning_saved
+          ? `${powerSweep?.learned_points ?? 0} new dwell(s) saved`
+          : "No saved learning in this run"}
+      </small>
+    </div>
+  </section>
 
   <div class="progress-grid">
     <article>
@@ -228,21 +302,20 @@
     </div>
   {/if}
 
-  {#if powerSweep?.log?.length}
-    <details class="progress-log" open={showLog}>
-      <summary>
+  <section class="progress-log" aria-label="Technical Power Sweep log">
+      <header>
         <Terminal size={14} strokeWidth={1.85} />
         <span>Technical Power Sweep log</span>
-      </summary>
+        <small>{powerRunning ? "Live" : "Persistent history"}</small>
+      </header>
       <LogTerminal
         title="nidavellir / core vf forge"
-        status={powerSweep.running ? powerSweep.phase : "done"}
-        live={powerSweep.running}
-        lines={powerSweep.log ?? []}
-        runningText={powerSweep.running ? `${powerSweep.phase}...` : null}
+        status={powerSweep?.running ? powerSweep.phase : "idle"}
+        live={Boolean(powerSweep?.running)}
+        lines={technicalLog}
+        runningText={powerSweep?.running ? `${powerSweep.phase}...` : null}
       />
-    </details>
-  {/if}
+  </section>
 </div>
 
 <style>
@@ -334,6 +407,7 @@
     color: var(--forge-gold);
   }
   .progress-summary,
+  .sweep-progress,
   .progress-grid article,
   .next-step,
   .profile-results {
@@ -346,6 +420,70 @@
     grid-template-columns: minmax(150px, 0.28fr) minmax(0, 1fr);
     gap: 0.75rem;
     padding: 0.7rem 0.8rem;
+  }
+  .sweep-progress {
+    padding: 0.72rem 0.8rem;
+  }
+  .sweep-progress-head,
+  .live-target,
+  .progress-log header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+  .sweep-progress-head span,
+  .progress-log header span {
+    display: block;
+    color: var(--nord-dim);
+    font-size: 0.7rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .sweep-progress-head strong {
+    display: block;
+    margin-top: 0.2rem;
+    color: var(--text);
+    font-size: 0.9rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .sweep-timing {
+    display: flex;
+    gap: 0.7rem;
+    color: var(--forge-gold);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .progress-track {
+    height: 8px;
+    margin-top: 0.65rem;
+    overflow: hidden;
+    border: 1px solid rgba(214, 168, 93, 0.22);
+    border-radius: 999px;
+    background: rgba(5, 7, 11, 0.72);
+  }
+  .progress-track span {
+    display: block;
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, rgba(214, 168, 93, 0.72), var(--forge-gold));
+    box-shadow: 0 0 14px rgba(214, 168, 93, 0.26);
+    transition: width 220ms ease-out;
+  }
+  .live-target {
+    margin-top: 0.55rem;
+    color: var(--muted);
+    font-size: 0.74rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .live-target span {
+    color: var(--text);
+    font-weight: 700;
+  }
+  .live-target small.saved {
+    color: var(--forge-green);
   }
   .label-with-icon {
     display: inline-flex;
@@ -447,21 +585,16 @@
     border-top: 1px solid var(--forge-line);
     padding-top: 0.65rem;
   }
-  .progress-log summary {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    cursor: pointer;
+  .progress-log header {
+    justify-content: flex-start;
     color: var(--muted);
-    font-size: 0.75rem;
-    font-weight: 800;
-    letter-spacing: 0.08em;
-    list-style: none;
     margin-bottom: 0.55rem;
-    text-transform: uppercase;
   }
-  .progress-log summary::-webkit-details-marker {
-    display: none;
+  .progress-log header small {
+    margin-left: auto;
+    color: var(--nord-dim);
+    font-size: 0.68rem;
+    font-weight: 700;
   }
   @media (max-width: 760px) {
     .progress-head,
@@ -478,6 +611,11 @@
     .pipeline-steps,
     .result-grid {
       grid-template-columns: 1fr;
+    }
+    .sweep-progress-head,
+    .live-target {
+      align-items: flex-start;
+      flex-direction: column;
     }
   }
 </style>

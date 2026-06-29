@@ -8,6 +8,55 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-06-28) — F2 qualification refinement
+- Fast traverses the full physical frontier with 10 s discovery dwells but remains provisional;
+  frontend and backend block F2 Apply until `profiles_qualified`.
+- Standard qualifies each discovered boundary with 2 independent 60 s reset/reapply passes; Long
+  uses 3×120 s. A failed qualification backs off one physical VF bin and restarts all passes.
+- Frontier coverage now reaches 90% Cmax so Deep Calm has measured candidates matching its policy.
+- Each lower clock starts one real VF bin above the previous minimum stable anchor; the previous
+  power-bound ClockDrop is retained as fallback if that optimized warm-start is rejected.
+- No hardware Forge was run for this implementation. Next step is supervised Fast/Standard QA.
+
+## Latest (2026-06-28) — F2 durability, cross-clock reuse and live progress
+- Real Fast Forge evidence proved learning was durable (72 JSONL observations) but partial progress
+  was not restored visibly, and reset-clean SilentErrors incorrectly polluted the crash counter.
+- Fixed crash semantics, durable partial `forge_state` checkpoints, structured ETA/progress fields,
+  permanent Technical Power Sweep log, and conservative cross-clock voltage reuse.
+- Deployable profiles require the complete Cmax→90% frontier plus Standard/Long qualification; partial learning remains available
+  for resume and previous complete profiles are retained.
+- Do not run another supervised hardware Forge automatically. Next manual validation should confirm
+  1905 MHz is no longer refused after SilentError, the next clock starts near the prior boundary, and
+  UI progress/log update every dwell.
+
+## Latest (2026-06-28) — F2 integrated frontier corrected — code-complete, hardware checkpoint pending
+- **Clock discovery**: the live Forge resets to stock, then starts at the highest real live-VF clock bin (1950 MHz on the
+  current RTX 3060 Ti table), not a short preselected list. A pre-sustain `ClockDrop` at 99–100% of
+  the numeric power cap keeps the same clock and lowers voltage; once off-cap it moves to the next
+  real clock. The first reset-clean sustained target becomes Cmax.
+- **Unlimited voltage discovery**: autonomous target/ladder/live Forge paths have no arbitrary 3- or
+  6-step cap. They walk every physically valid VF anchor until the first silent error, instability,
+  sustained-clock drop after the target has held, device loss/TDR, reset failure, cancellation, or
+  the hardware floor. Explicit `--steps N` remains an operator-selected manual boundary only.
+- **Complete frontier**: after Cmax, every real clock bin down through 90% of Cmax is characterized.
+  Profiles are synthesized only after that complete Cmax→90% frontier exists; partial,
+  cancelled, or safety-aborted runs leave the last good forge snapshot untouched.
+- **Modes are evidence, not breadth**: Fast / Standard / Long traverse the same complete frontier.
+  Fast = provisional 10 s discovery; Standard = 10 s discovery + 2×60 s qualification; Long =
+  10 s discovery + 3×120 s qualification. Confidence comes from real dwell duration, sample count,
+  and repeated evidence.
+- **Learning and resume**: every candidate is appended immediately to `f2_observations.jsonl`,
+  scoped by NVML GPU UUID. A restart resumes below the deepest reset-clean observation or reuses an
+  existing good/bad bracket; later failures invalidate stale equal/deeper validations.
+- **Safety closeout**: service-wide IPC GPU lease; arm failures stop before writes; modern VF reset is
+  write/readback checked; startup recovery retains the boot flag until reapply accounting; direct
+  `DeviceLost`/unconfirmed reset aborts the Forge and keeps recovery armed. F2 cap evidence remains
+  diagnostic and does not make an actually sustained F2 point ineligible for profile synthesis.
+- **Validation**: `cargo check --workspace`; core 64 / NVAPI 40 / service 309 tests; `git diff --check`
+  clean. Read-only 1950 MHz auto-sweep dry-run now reports stock ceiling 1950 and 83 physical anchors
+  (previously failed at legacy 1920/+15). No confirmed Forge, VF write, TDR attempt, apply, reboot, or
+  other hardware execution was performed. Next action is the explicit supervised hardware checkpoint.
+
 ## Latest (2026-06-27) — F2 Phase 2 Apply contract closed — implemented and validated
 - **Backend**: `ApplyPower*` routes F2 profiles to the anchored-undervolt writer and preserves legacy F1.
   Apply is Safe-Loop armed, verified, persisted, reapplied on boot, reversible, and fail-closed.

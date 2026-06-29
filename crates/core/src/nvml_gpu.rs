@@ -6,6 +6,8 @@ use crate::sensor_meta::{SensorQuality, SensorSource};
 pub struct NvmlGpuReading {
     pub index: u32,
     pub name: String,
+    /// Stable physical-device identity used to isolate learned tuning data between identical models.
+    pub uuid: Option<String>,
     pub utilization_pct: Option<f64>,
     pub vram_used_mb: Option<u64>,
     pub vram_total_mb: Option<u64>,
@@ -77,6 +79,7 @@ pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
             continue;
         };
         let name = device.name().unwrap_or_else(|_| format!("NVIDIA GPU {i}"));
+        let uuid = device.uuid().ok();
         let util = device
             .utilization_rates()
             .ok()
@@ -103,6 +106,7 @@ pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
         out.push(NvmlGpuReading {
             index: i,
             name,
+            uuid,
             utilization_pct: util,
             vram_used_mb,
             vram_total_mb,

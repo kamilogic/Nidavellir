@@ -19,6 +19,13 @@ use tracing::{info, warn};
 /// How often the liveness heartbeat is refreshed.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
+fn retain_boot_flag_until_reapply(action: &RecoveryAction) -> bool {
+    matches!(
+        action,
+        RecoveryAction::BlacklistAndRecede { .. } | RecoveryAction::EnterSafeMode { .. }
+    )
+}
+
 /// Run boot-time crash recovery and return the (persisted) updated record.
 ///
 /// The returned [`TuningPoint`] is what *should* be (re)applied to hardware.
@@ -66,10 +73,14 @@ pub fn run_startup_recovery(store: &SafeLoopStore) -> SafeLoopRecord {
 
     let _ = target; // application is a v0.3+ concern; intent is logged above.
 
-    // The crash has been accounted for in `record`; disarm so the *next* boot
-    // starts clean unless a new apply re-arms it.
-    if let Err(e) = store.clear_boot_flag() {
-        warn!("Safe Loop: failed to clear boot-flag: {e}");
+    // Keep an accounted crash flag armed until apply-on-boot has observed it and explicitly skipped
+    // the persisted profile. Clearing it here would let the same crashing profile be reapplied later
+    // in this startup sequence. Clean/idle actions have no crash profile to suppress.
+    let retain_until_reapply = retain_boot_flag_until_reapply(&action);
+    if !retain_until_reapply {
+        if let Err(e) = store.clear_boot_flag() {
+            warn!("Safe Loop: failed to clear boot-flag: {e}");
+        }
     }
     if let Err(e) = store.save_record(&record) {
         warn!("Safe Loop: failed to persist record: {e}");
@@ -143,4 +154,31 @@ fn read_last_bugcheck_message() -> Option<String> {
 #[cfg(not(windows))]
 fn read_last_bugcheck_message() -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nidavellir_core::safe_loop::TuningPoint;
+
+    #[test]
+    fn crash_recovery_retains_flag_until_reapply_can_skip_bad_profile() {
+        let point = TuningPoint::stock();
+        assert!(retain_boot_flag_until_reapply(
+            &RecoveryAction::BlacklistAndRecede {
+                crashed: point.clone(),
+                recede_to: point.clone(),
+                class: CrashClass::Unknown,
+            }
+        ));
+        assert!(retain_boot_flag_until_reapply(
+            &RecoveryAction::EnterSafeMode {
+                stock: point.clone()
+            }
+        ));
+        assert!(!retain_boot_flag_until_reapply(&RecoveryAction::Idle));
+        assert!(!retain_boot_flag_until_reapply(
+            &RecoveryAction::ApplyLastValidated { point }
+        ));
+    }
 }

@@ -63,7 +63,8 @@ impl SweepProfile {
 /// Instability severity, ordered (mirrors the L1/L2/L3 fail tiers). Stored per point
 /// and per frontier so the algorithm can weigh a cheap SilentError differently from
 /// an expensive HardReboot.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug,
+)]
 enum FailSeverity {
     #[default]
     None,
@@ -164,14 +165,8 @@ fn idle() -> PowerSweepProgress {
     PowerSweepProgress { phase: "idle".into(), ..Default::default() }
 }
 
-/// Live power-sweep BUTTON mode. Selects how aggressively the multi-clock forge measures and how many
-/// times each pick is re-soaked at its ceiling. `Standard` is the proven default exercised by the
-/// plain `StartPowerSweep` IPC (behavior UNCHANGED). `Fast` trims DISCOVERY only — fewer probes /
-/// shallower depth — for a quicker supervised run, leaving cross-run confidence to IDLE / later manual
-/// runs. `Long` widens + deepens discovery AND repeats the per-pick ceiling soak so a deep point earns
-/// confidence in a SINGLE session. INVARIANT: the per-pick fail-closed ceiling soak
-/// (`validate_pick_at_ceiling`, ~35 s arduous duration) runs at least once in EVERY mode — modes never
-/// weaken that safety floor, never auto-apply, and never persist except on a usable profile.
+/// Live power-sweep BUTTON mode. Every mode traverses the same complete F2 clock×voltage frontier.
+/// Modes differ only in dwell duration and independent validation passes at each discovered boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PowerSweepMode {
     Fast,
@@ -198,11 +193,54 @@ impl PowerSweepMode {
         match self {
             PowerSweepMode::Fast => (FAST_MAX_PROBES, FAST_MAX_PROBES_PER_TARGET, 1),
             PowerSweepMode::Standard => (BUTTON_MAX_PROBES, BUTTON_MAX_PROBES_PER_TARGET, 1),
-            PowerSweepMode::Long => {
-                (LONG_MAX_PROBES, LONG_MAX_PROBES_PER_TARGET, LONG_VALIDATION_PASSES)
-            }
+            PowerSweepMode::Long => (LONG_MAX_PROBES, LONG_MAX_PROBES_PER_TARGET, LONG_VALIDATION_PASSES,
+            ),
         }
     }
+
+    #[cfg(windows)]
+    fn f2_policy(self) -> F2ForgeModePolicy {
+        match self {
+            PowerSweepMode::Fast => F2ForgeModePolicy {
+                discovery_dwell_ms: 10_000,
+                qualification_dwell_ms: 0,
+                qualification_passes: 0,
+            },
+            PowerSweepMode::Standard => F2ForgeModePolicy {
+                discovery_dwell_ms: 10_000,
+                qualification_dwell_ms: 60_000,
+                qualification_passes: 2,
+            },
+            PowerSweepMode::Long => F2ForgeModePolicy {
+                discovery_dwell_ms: 10_000,
+                qualification_dwell_ms: 120_000,
+                qualification_passes: 3,
+            },
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct F2ForgeModePolicy {
+    discovery_dwell_ms: u64,
+    qualification_dwell_ms: u64,
+    qualification_passes: usize,
+}
+
+#[cfg(windows)]
+fn f2_profiles_meet_qualification(
+    policy: F2ForgeModePolicy,
+    profiles: &[Option<PowerSweepPoint>],
+    confidence_threshold: f64,
+) -> bool {
+    let required_confirmations = policy.qualification_passes.saturating_add(1) as u32;
+    policy.qualification_passes > 0
+        && profiles.iter().all(Option::is_some)
+        && profiles.iter().flatten().all(|point| {
+            point.confidence.unwrap_or(0.0) >= confidence_threshold
+                && point.validation_count.unwrap_or(0) >= required_confirmations
+        })
 }
 
 #[derive(Clone)]
@@ -229,14 +267,13 @@ impl PowerSweepHandle {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
-    /// Start the live multi-clock forge in the proven `Standard` mode (the plain `StartPowerSweep`
-    /// IPC). Behavior is unchanged from before button modes existed.
+    /// Start the live F2 forge in `Standard` mode (the plain `StartPowerSweep` IPC).
     pub fn start(&self, store: SafeLoopStore) -> bool {
         self.start_with_mode(store, PowerSweepMode::Standard)
     }
     /// Start the live multi-clock forge in a specific button `mode` (Fast / Standard / Long). All
-    /// modes run the same supervised, fail-closed core; the mode only varies discovery breadth/depth
-    /// and per-pick ceiling-soak passes (see [`PowerSweepMode`]).
+    /// modes run the same complete physical frontier and fail-closed motor; only dwell duration and
+    /// independent validation count vary.
     pub fn start_with_mode(&self, store: SafeLoopStore, mode: PowerSweepMode) -> bool {
         if self.running.swap(true, Ordering::SeqCst) {
             return false;
@@ -296,12 +333,11 @@ enum ForgeStateLoad {
     Corrupt,
 }
 
-/// Serialize a completed progress for persistence: force `running=false` and trim
-/// the log to its tail so the file stays small. Returns `None` if serialization
-/// fails (caller simply skips the write).
+/// Serialize a live or completed progress checkpoint and trim the log tail so the file stays small.
+/// The stored `running` bit lets startup label an interrupted run without ever resurrecting it.
+/// Returns `None` if serialization fails (caller simply skips the write).
 fn encode_forge_state(gpu_key: &str, prog: &PowerSweepProgress) -> Option<String> {
     let mut snapshot = prog.clone();
-    snapshot.running = false;
     if snapshot.log.len() > FORGE_STATE_LOG_TAIL {
         let drop = snapshot.log.len() - FORGE_STATE_LOG_TAIL;
         snapshot.log.drain(0..drop);
@@ -322,12 +358,22 @@ fn decode_forge_state(json: &str, gpu_key: &str) -> ForgeStateLoad {
         Err(_) => return ForgeStateLoad::Corrupt,
     };
     if file.schema_version != FORGE_STATE_SCHEMA {
-        return ForgeStateLoad::SchemaMismatch { found: file.schema_version };
+        return ForgeStateLoad::SchemaMismatch { found: file.schema_version,
+        };
     }
     if file.gpu_key != gpu_key {
-        return ForgeStateLoad::GpuMismatch { stored: file.gpu_key };
+        return ForgeStateLoad::GpuMismatch { stored: file.gpu_key,
+        };
     }
     let mut prog = file.progress;
+    if prog.running {
+        prog.phase = "interrupted".into();
+        prog.estimated_remaining_ms = None;
+        prog.note = Some(format!(
+            "A execução anterior foi interrompida; {} dwell(s) já aprendidos permanecem salvos.",
+            prog.learned_points
+        ));
+    }
     prog.running = false;
     ForgeStateLoad::Loaded(Box::new(prog))
 }
@@ -398,15 +444,29 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
     }
 }
 
+#[cfg(windows)]
+fn current_gpu_key() -> String {
+    if let Some(gpu) = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()
+        .into_iter()
+        .next()
+    {
+        if let Some(uuid) = gpu.uuid {
+            return format!("nvml:{uuid}");
+        }
+        return format!("nvml-index-{}:{}", gpu.index, gpu.name);
+    }
+    nidavellir_gpu_nvapi::read_curve()
+        .map(|c| format!("nvapi:{}", c.name))
+        .unwrap_or_else(|_| "unknown-gpu".into())
+}
+
 /// Build the power-sweep handle, seeded from the persisted forge result when one
 /// matches this GPU. The GPU key is derived the same way the sweep keys its
 /// knowledge (`read_curve().name`), so keys match reliably.
 #[cfg(windows)]
 pub fn restore_handle() -> PowerSweepHandle {
     let handle = PowerSweepHandle::default();
-    let gpu_key = nidavellir_gpu_nvapi::read_curve()
-        .map(|c| c.name)
-        .unwrap_or_else(|_| "unknown-gpu".into());
+    let gpu_key = current_gpu_key();
     if let Some(prog) = load_forge_state(&gpu_key) {
         if let Ok(mut g) = handle.progress.lock() {
             *g = prog;
@@ -427,9 +487,7 @@ pub fn restore_handle() -> PowerSweepHandle {
 /// point's dwell stats. Never mutates anything.
 #[cfg(windows)]
 pub fn load_restored_progress() -> Option<PowerSweepProgress> {
-    let gpu_key = nidavellir_gpu_nvapi::read_curve()
-        .map(|c| c.name)
-        .unwrap_or_else(|_| "unknown-gpu".into());
+    let gpu_key = current_gpu_key();
     load_forge_state(&gpu_key)
 }
 
@@ -498,8 +556,7 @@ impl FailTier {
 #[cfg(windows)]
 fn classify_failure(
     res: StabilityResult,
-    ctx: &mut nidavellir_gpu_stress::GpuCtx,
-) -> FailTier {
+    ctx: &mut nidavellir_gpu_stress::GpuCtx) -> FailTier {
     match res {
         StabilityResult::SilentError => FailTier::L1Instability,
         StabilityResult::Stable => FailTier::L1Instability, // not expected; treat as mild
@@ -940,12 +997,16 @@ fn select_brokkrs_v2(
         all_points
             .iter()
             .copied()
-            .min_by(|a, b| a.power_capped_frac.partial_cmp(&b.power_capped_frac).unwrap_or(Ord::Equal))
+            .min_by(|a, b| {
+            a.power_capped_frac.partial_cmp(&b.power_capped_frac).unwrap_or(Ord::Equal)
+        })
     } else {
         off_cap
             .iter()
             .copied()
-            .max_by(|a, b| a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal))
+            .max_by(|a, b| {
+            a.perf_per_watt.partial_cmp(&b.perf_per_watt).unwrap_or(Ord::Equal)
+        })
     };
     (v1, log)
 }
@@ -973,13 +1034,16 @@ impl ForgePolicy {
     /// Brokkr's floor relaxed 0.98 -> 0.95 so the knee can sit a little deeper (up to 5% clock
     /// traded for much larger efficiency gains) without colliding into Deep Calm's 90% floor.
     fn balanced() -> Self {
-        Self { brokkrs_min_clock_frac: 0.95, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 }
+        Self { brokkrs_min_clock_frac: 0.95, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85,
+        }
     }
     fn conservative() -> Self {
-        Self { brokkrs_min_clock_frac: 0.99, deep_calm_min_clock_frac: 0.92, confidence_threshold: 0.95 }
+        Self { brokkrs_min_clock_frac: 0.99, deep_calm_min_clock_frac: 0.92, confidence_threshold: 0.95,
+        }
     }
     fn aggressive() -> Self {
-        Self { brokkrs_min_clock_frac: 0.97, deep_calm_min_clock_frac: 0.85, confidence_threshold: 0.70 }
+        Self { brokkrs_min_clock_frac: 0.97, deep_calm_min_clock_frac: 0.85, confidence_threshold: 0.70,
+        }
     }
 }
 
@@ -1003,7 +1067,8 @@ enum Regime {
 /// thermal-throttle threshold is assumed when a temperature is present.
 #[cfg(windows)]
 #[allow(dead_code)] // wired into the live sweep by F1b Phase 2
-fn classify_regime(cap_fraction: f32, power_w: f32, power_limit_w: f32, temp_c: Option<f32>) -> Regime {
+fn classify_regime(cap_fraction: f32, power_w: f32, power_limit_w: f32, temp_c: Option<f32>,
+) -> Regime {
     let near_power = cap_fraction > 0.5 || (power_limit_w > 0.0 && power_w >= 0.95 * power_limit_w);
     let near_thermal = temp_c.map_or(false, |t| t >= 83.0);
     match (near_power, near_thermal) {
@@ -1284,7 +1349,8 @@ fn phase_b_start_below(descent: &FrontierDescent, phase_a_floor_mv: u32) -> Opti
 /// feeds it is produced by F1b Phase 2.
 #[cfg(windows)]
 #[allow(dead_code)] // wired into the live sweep by F1b Phase 2 (multi-clock measurement)
-fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &ForgePolicy) -> ForgeProfiles {
+fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &ForgePolicy,
+) -> ForgeProfiles {
     use std::cmp::Ordering as Ord;
     let mut log = Vec::new();
 
@@ -1381,7 +1447,9 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
         .iter()
         .copied()
         .filter(|(p, _)| sustained(p) as f64 >= dc_floor)
-        .max_by(|a, b| a.0.perf_per_watt.partial_cmp(&b.0.perf_per_watt).unwrap_or(Ord::Equal))
+        .max_by(|a, b| {
+            a.0.perf_per_watt.partial_cmp(&b.0.perf_per_watt).unwrap_or(Ord::Equal)
+        })
         .unwrap_or(godforge);
 
     // Brokkr's = best R within the Brokkr's clock floor; must be a real trade (clock
@@ -1781,7 +1849,8 @@ impl BindThresholds {
     /// Live thresholds. The clock arm was retired (F1b audit); only the regime threshold remains.
     /// Kept named `v2()` for call-site stability (`classify_binding` + tests).
     fn v2() -> Self {
-        Self { cap_frac: BIND_CAP_FRAC }
+        Self { cap_frac: BIND_CAP_FRAC,
+        }
     }
 }
 
@@ -1870,7 +1939,8 @@ fn classify_binding(
         (false, BindReason::None)
     };
 
-    BindDecision { eligible, bound, reason, avg_clock_mhz, p5_clock_mhz, power_capped_frac }
+    BindDecision { eligible, bound, reason, avg_clock_mhz, p5_clock_mhz, power_capped_frac,
+    }
 }
 
 /// Dry-run reporting lines for bind-seeking (pure, so the dry-run output is unit-testable without
@@ -2099,7 +2169,8 @@ fn build_frontier(
     probe: impl Fn(u32, u32) -> ProbeSample,
 ) -> FrontierBuildResult {
     let (paired, log) =
-        run_target_descents(candidate_clocks, descent, carry, max_per_target, bind_seeking, &probe);
+        run_target_descents(candidate_clocks, descent, carry, max_per_target, bind_seeking, &probe,
+    );
     let profiles = synthesize_forge_profiles(&paired, policy);
     FrontierBuildResult {
         frontier: paired.into_iter().map(|(p, _)| p).collect(),
@@ -2130,7 +2201,8 @@ fn run_target_descents(
     for &target in candidate_clocks {
         let decision = warm_start_mv(prev.as_ref(), carry);
         let (mut bracket, mut point) =
-            descend_target(target, decision.start_mv, descent, max_per_target, bind_seeking, probe);
+            descend_target(target, decision.start_mv, descent, max_per_target, bind_seeking, probe,
+        );
         bracket.warm_started = decision.warm_started;
         bracket.bracket_source_target = decision.source_target;
         bracket.bracket_reuse_start_mv = decision.warm_started.then_some(decision.start_mv);
@@ -2149,7 +2221,8 @@ fn run_target_descents(
             ));
             let warm_probes = bracket.probes_used;
             let (mut fb, fb_point) =
-                descend_target(target, carry.safe_start_cap_mv, descent, max_per_target, bind_seeking, probe);
+                descend_target(target, carry.safe_start_cap_mv, descent, max_per_target, bind_seeking, probe,
+            );
             fb.bracket_source_target = decision.source_target;
             fb.fell_back_to_cap = true;
             fb.probes_used = fb.probes_used.saturating_add(warm_probes);
@@ -2333,7 +2406,8 @@ fn descend_phase_b(
         points.len(),
         knee_bin.map(|b| b.to_string()).unwrap_or_else(|| "none".to_string())
     ));
-    PhaseBTrajectory { points, stop_reason, probes_used, log }
+    PhaseBTrajectory { points, stop_reason, probes_used, log,
+    }
 }
 
 /// Result of a two-phase (F1c) frontier build. `result` is the same `FrontierBuildResult` the live run
@@ -2373,7 +2447,8 @@ fn build_frontier_two_phase(
     probe: impl Fn(u32, u32) -> ProbeSample,
 ) -> TwoPhaseFrontier {
     let (paired_a, mut log) =
-        run_target_descents(candidate_clocks, descent, carry, max_per_target, bind_seeking, &probe);
+        run_target_descents(candidate_clocks, descent, carry, max_per_target, bind_seeking, &probe,
+    );
     let profiles_a = synthesize_forge_profiles(&paired_a, policy);
 
     // Build a Phase-A-only result identical to `build_frontier`'s output (no Phase B ran).
@@ -2660,24 +2735,10 @@ const LONG_VALIDATION_PASSES: u32 = 3;
 #[cfg(windows)]
 const POWER_SWEEP_MAX_VALIDATION_PASSES: u32 = 5;
 
-/// LIVE F2 anchored-undervolt forge depth, mapped from the button MODE. F2 maps mode primarily to the
-/// number of candidate CLOCKS swept (descending), NOT to the per-clock descent depth: the per-clock
-/// confirmed motor stays bounded by the F2 confirmed-step cap (`F2_CONFIRMED_MAX_STEPS = 3`) in EVERY
-/// mode — that per-clock safety bound is NEVER widened. `STANDARD` is the default breadth; `FAST` trims to
-/// fewer clocks (quicker supervised run); `LONG` widens to MORE clocks. The per-clock descent budget is
-/// the SAME in every mode (the constant planner budget the CLI ladder uses); modes vary clock BREADTH
-/// only, never per-clock exposure. Hardware-relative: the clocks themselves come from
-/// `candidate_clocks(seed.stock_sustained, seed.stock_boost, …)`, never fixed MHz.
+/// Complete F2 frontier ends at the last real clock bin at or above 90% of the discovered Cmax so
+/// Deep Calm's 90% policy floor is backed by measured data instead of a truncated 95% domain.
 #[cfg(windows)]
-const F2_FORGE_STANDARD_CLOCKS: usize = 4;
-#[cfg(windows)]
-const F2_FORGE_FAST_CLOCKS: usize = 2;
-#[cfg(windows)]
-const F2_FORGE_LONG_CLOCKS: usize = 6;
-/// Defensive hard cap on how many candidate clocks the live F2 forge will sweep in one run — bounds
-/// total supervised hardware time regardless of mode (each clock is its own bounded confirmed descent).
-#[cfg(windows)]
-const F2_FORGE_MAX_CLOCKS: usize = 8;
+const F2_CMAX_FLOOR_PERCENT: u64 = 90;
 
 // ── Phase 2B.2-b.3: graphics-core SANITY-DOMAIN guards ──────────────────────────────
 // NOT tuning targets — only safety guards to reject non-core / memory-domain / implausible
@@ -2986,6 +3047,12 @@ fn derive_core_seed(curve: &[(usize, u32, u32)]) -> Result<CoreSeed, String> {
     })
 }
 
+pub(crate) fn f2_stock_clock_ceiling(
+    live_curve: &[(usize, u32, u32)],
+) -> Result<u32, String> {
+    derive_core_seed(live_curve).map(|seed| seed.stock_boost_max_mhz)
+}
+
 /// Restore the GPU to stock: zero the core offset, clear the modern VF-curve offsets, and
 /// release any NVML clock cap. Idempotent; called on every exit path of the supervised run.
 /// `pub(crate)` so the isolated F2 confirmed path (`gpu_undervolt`) reuses the SAME reset as
@@ -3008,6 +3075,9 @@ pub(crate) struct SingleDwell {
     pub avg_clock_mhz: u32,
     pub p5_clock_mhz: u32,
     pub power_w: f32,
+    pub power_capped_frac: f32,
+    pub duration_ms: u64,
+    pub sample_count: u32,
 }
 
 /// Run ONE game-power load dwell via the validated [`load_and_measure`] path (fresh wgpu context,
@@ -3015,8 +3085,8 @@ pub(crate) struct SingleDwell {
 /// simplified outcome. Reused by the F2 confirmed single step so it shares the hardware-tested
 /// measurement path rather than duplicating it. No VF write / no apply happens here.
 #[cfg(windows)]
-pub(crate) fn single_load_dwell() -> SingleDwell {
-    let m = load_and_measure(DWELL_MS);
+pub(crate) fn single_load_dwell(dwell_ms: u64) -> SingleDwell {
+    let m = load_and_measure(dwell_ms);
     SingleDwell {
         crashed: matches!(m.result, StabilityResult::Crash),
         silent_error: matches!(m.result, StabilityResult::SilentError),
@@ -3024,6 +3094,9 @@ pub(crate) fn single_load_dwell() -> SingleDwell {
         avg_clock_mhz: m.clock_mhz,
         p5_clock_mhz: m.p5_clock_mhz,
         power_w: m.power_w,
+        power_capped_frac: m.capped_frac,
+        duration_ms: m.duration_ms,
+        sample_count: m.sample_count,
     }
 }
 
@@ -3298,7 +3371,8 @@ fn measure_multiclock_forge(
         warn!("multiclock-forge: no real VF bin ≤ {safe_start_mv} mV — failing closed (no hardware floor)");
         return None;
     }
-    let plan = plan_frontier(targets.clone(), &descent, DWELL_MS, limits.max_probes_per_target);
+    let plan = plan_frontier(targets.clone(), &descent, DWELL_MS, limits.max_probes_per_target,
+    );
     let capped_dwells = limits
         .max_probes
         .map_or(plan.est_dwell_count, |mp| plan.est_dwell_count.min(mp));
@@ -3489,7 +3563,8 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
         warn!("build-frontier: no real VF bin ≤ {safe_start_mv} mV — failing closed (no hardware floor)");
         return;
     }
-    let plan = plan_frontier(targets.clone(), &descent, DWELL_MS, limits.max_probes_per_target);
+    let plan = plan_frontier(targets.clone(), &descent, DWELL_MS, limits.max_probes_per_target,
+    );
     // Effective dwell budget after --max-probes (the run hard-stops at this many probes).
     let capped_dwells = limits
         .max_probes
@@ -3606,7 +3681,8 @@ pub fn run_build_frontier(store: &SafeLoopStore, confirm: bool, limits: Frontier
     }
     // Voltage soft-max warning with curve-top-vs-capped-descent context (Phase 2B.2-c.0 polish).
     if let Some(w) =
-        soft_max_voltage_warning(seed.safe_start_mv, descent.safe_start_mv, CORE_VF_SOFT_MAX_MV)
+        soft_max_voltage_warning(seed.safe_start_mv, descent.safe_start_mv, CORE_VF_SOFT_MAX_MV,
+    )
     {
         println!("WARNING            : {w}");
         warn!("build-frontier: {w}");
@@ -4008,7 +4084,8 @@ fn run_power_sweep(
                 Some(t) => pts.iter().copied().filter(|q| q.target_clock_mhz == Some(t)).collect(),
                 None => pts.clone(),
             };
-            arduous_validate(&mut ctx, &store, clk, p, &same_clock, &stop, label, &progress, &mut prog)
+            arduous_validate(&mut ctx, &store, clk, p, &same_clock, &stop, label, &progress, &mut prog,
+            )
         };
         match label {
             "Godforge" => prog.godforge = validated,
@@ -4053,21 +4130,25 @@ fn run_power_sweep(
     info!("Power sweep finished");
 }
 
-/// Map a button MODE to `(candidate_clocks, per_clock_descent_budget)` for the LIVE F2 forge. The
-/// clock count is the primary breadth knob (Fast = fewer, Long = more, both clamped to
-/// [`F2_FORGE_MAX_CLOCKS`]). The descent budget only shapes how many candidates the PLANNER offers per
-/// clock; the confirmed motor still clamps to its hard `F2_CONFIRMED_MAX_STEPS` safety bound, so the
-/// per-clock exposure is identical in every mode regardless of this budget (it reuses the same dry-run
-/// budget the CLI ladder uses, so the planner can present the natural descent). Pure + testable.
+/// Every distinct frequency present in the sane static VF table, highest first. These are the GPU's
+/// real clock bins; no synthetic 30 MHz ladder and no mode-specific truncation.
 #[cfg(windows)]
-fn f2_forge_depth(mode: PowerSweepMode) -> (usize, usize) {
-    let clocks = match mode {
-        PowerSweepMode::Fast => F2_FORGE_FAST_CLOCKS,
-        PowerSweepMode::Standard => F2_FORGE_STANDARD_CLOCKS,
-        PowerSweepMode::Long => F2_FORGE_LONG_CLOCKS,
-    }
-    .clamp(1, F2_FORGE_MAX_CLOCKS);
-    (clocks, crate::gpu_undervolt::F2_SWEEP_DRYRUN_BUDGET)
+fn f2_real_clock_targets(curve: &[(usize, u32, u32)], clock_ceiling_mhz: u32) -> Vec<u32> {
+    let mut clocks: Vec<u32> = curve
+        .iter()
+        .filter(|&&(_, mv, mhz)| {
+            is_sane_core_point(mv, mhz) && mhz <= clock_ceiling_mhz
+        })
+        .map(|&(_, _, mhz)| mhz)
+        .collect();
+    clocks.sort_unstable_by(|a, b| b.cmp(a));
+    clocks.dedup();
+    clocks
+}
+
+#[cfg(windows)]
+fn f2_clock_within_cmax_floor(target_mhz: u32, cmax_mhz: u32) -> bool {
+    target_mhz as u64 * 100 >= cmax_mhz as u64 * F2_CMAX_FLOOR_PERCENT
 }
 
 /// LIVE F2 ANCHORED-UNDERVOLT forge — the new primary method behind the live forge button (replaces the
@@ -4083,19 +4164,19 @@ fn f2_forge_depth(mode: PowerSweepMode) -> (usize, usize) {
 /// It REUSES, never reinvents:
 /// - hardware-relative candidate CLOCKS via [`derive_core_seed`] + [`candidate_clocks`] (the SAME
 ///   derivation the F1 forge uses — no fixed MHz);
-/// - the F2 INPUT derivation + per-clock CONFIRMED motor via
-///   [`crate::gpu_undervolt::f2_forge_inputs`] + [`crate::gpu_undervolt::run_confirmed_f2_clock_descent`]
+/// - the F2 INPUT derivation + complete per-clock CONFIRMED discovery via
+///   [`crate::gpu_undervolt::f2_forge_inputs`] +
+///   [`crate::gpu_undervolt::run_confirmed_f2_clock_discovery`]
 ///   (each candidate = anchored write→verify→dwell→reset→clear, recorded as an observation, with the
-///   Safe Loop arm/clear + crash-floor guards intact — the motor already VALIDATED each recorded
-///   candidate, so there is NO separate re-validation step here);
+///   Safe Loop arm/clear + crash-floor guards intact; Standard/Long then independently qualify the
+///   discovered boundary with longer reset/reapply passes);
 /// - the F2→profiles synthesis bridge: [`F2ObservationStore::learned_frontier`] →
 ///   [`frontier_to_points`] → [`synthesize_forge_profiles`].
 ///
 /// Safety: STOPS the whole forge on a per-clock safety failure ([`crate::gpu_f2_sweep::ladder_should_continue`])
 /// or a confirmed-gate refusal; resets to stock + clears the boot flag on EVERY exit path (success,
 /// fail-closed, safety-stop); persists `forge_state.json` ONLY when a usable Godforge profile exists;
-/// applies NOTHING. `mode` selects breadth (candidate-clock count) only — the per-clock motor's safety
-/// bound is identical in every mode.
+/// applies NOTHING. Every mode traverses the same clock domain; `mode` changes only evidence depth.
 #[cfg(windows)]
 fn measure_multiclock_undervolt_forge(
     progress: &Arc<Mutex<PowerSweepProgress>>,
@@ -4103,14 +4184,32 @@ fn measure_multiclock_undervolt_forge(
     store: &SafeLoopStore,
     mode: PowerSweepMode,
 ) {
+    use std::collections::{HashMap, HashSet};
+    use std::time::Instant;
+
     use nidavellir_core::f2_observation::{new_run_id, F2ObservationStore};
     use nidavellir_gpu_nvapi as gpu;
 
     info!("F2 undervolt forge starting (anchored min-stable-voltage per clock) — mode {}", mode.label());
+    let previous = progress.lock().map(|g| g.clone()).unwrap_or_default();
     let mut prog = idle();
+    // Keep the last completed profiles available while a new frontier is learned. A partial run may
+    // replace its live/checkpoint view, but must never erase a previously usable recommendation.
+    prog.points = previous.points;
+    prog.recommended = previous.recommended;
+    prog.godforge = previous.godforge;
+    prog.brokkrs = previous.brokkrs;
+    prog.deep_calm = previous.deep_calm;
+    prog.power_bound_collapse = previous.power_bound_collapse;
+    // A new hardware run may discover evidence that invalidates an older boundary. Keep the prior
+    // recommendations visible, but fail closed until this run finishes a complete qualification.
+    prog.profiles_qualified = false;
     prog.running = true;
     prog.phase = "power".into();
-    prog.is_undervolt = true; // F2 path → Apply IPC must REFUSE the F1 ceiling write (Phase 1 gate).
+    prog.is_undervolt = true; // Apply IPC routes these points through the anchored F2 writer.
+    prog.mode = Some(mode.label().to_string());
+    prog.frontier_complete = false;
+    prog.learning_saved = true;
     prog.power_limit_w = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()
         .into_iter()
         .next()
@@ -4123,22 +4222,53 @@ fn measure_multiclock_undervolt_forge(
     ));
     set(progress, prog.clone());
 
-    // Identity for forge-state persistence (single source of truth across restarts).
-    let gpu_key = nidavellir_gpu_nvapi::read_curve()
-        .map(|c| c.name)
-        .unwrap_or_else(|_| "unknown-gpu".into());
+    // Stable physical identity scopes observations and persisted profiles to this exact GPU.
+    let gpu_key = current_gpu_key();
 
     // Final reset helper — runs on EVERY exit path (success / fail-closed / safety-stop). The motor
     // already resets per candidate; this is the belt-and-suspenders final restore.
-    let final_reset = |store: &SafeLoopStore| {
-        let _ = gpu::reset_all();
-        let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-        let _ = store.clear_boot_flag();
+    let final_reset = |store: &SafeLoopStore, clear_boot_flag: bool| -> Result<(), String> {
+        let clock_error = nidavellir_core::nvml_gpu::reset_core_clock_lock().err();
+        let gpu_error = gpu::reset_all().err();
+        if clock_error.is_some() || gpu_error.is_some() {
+            return Err(format!(
+                "final reset incomplete: clock-cap={}; VF/global={}",
+                clock_error.as_deref().unwrap_or("ok"),
+                gpu_error.as_deref().unwrap_or("ok")
+            ));
+        }
+        if clear_boot_flag {
+            store.clear_boot_flag()
+                .map_err(|e| format!("boot-flag clear failed after confirmed reset: {e}"))?;
+        }
+        Ok(())
     };
+
+    let safe_record = store.load_record();
+    if safe_record.safe_mode || store.is_boot_flag_armed() {
+        prog.running = false;
+        prog.phase = "done".into();
+        prog.note = Some(
+            "Forja F2 recusada pelo Safe Loop — Safe Mode ou recuperação pendente; nenhum hardware foi alterado."
+                .into(),
+        );
+        set(progress, prog);
+        return;
+    }
+    // Discovery must observe the stock live clock domain, not a previously applied/capped profile.
+    if let Err(e) = final_reset(store, true) {
+        prog.running = false;
+        prog.phase = "done".into();
+        prog.note = Some(format!(
+            "Forja F2 abortada antes da descoberta — não foi possível confirmar stock: {e}"
+        ));
+        set(progress, prog);
+        return;
+    }
 
     // ── Derive hardware-relative candidate clocks (REUSE the F1 forge derivation; no fixed MHz) ──
     if !gpu::vf_curve_supported() {
-        final_reset(store);
+        let _ = final_reset(store, true);
         prog.running = false;
         prog.phase = "done".into();
         prog.note = Some(
@@ -4153,7 +4283,7 @@ fn measure_multiclock_undervolt_forge(
     let seed = match derive_core_seed(&live) {
         Ok(s) => s,
         Err(e) => {
-            final_reset(store);
+            let _ = final_reset(store, true);
             prog.running = false;
             prog.phase = "done".into();
             prog.note = Some(format!(
@@ -4165,10 +4295,12 @@ fn measure_multiclock_undervolt_forge(
         }
     };
 
-    // F2 motor inputs (static VF base curve + conservative offset limits) — derived the SAME way the
-    // CLI motor derives them. Fail-closed if no sane static base points.
-    let Some(f2_inputs) = crate::gpu_undervolt::f2_forge_inputs() else {
-        final_reset(store);
+    // F2 motor inputs (static VF base curve + hardware-derived physical offset envelope).
+    // Fail-closed if no sane static base points.
+    let Some(f2_inputs) =
+        crate::gpu_undervolt::f2_forge_inputs(seed.stock_boost_max_mhz)
+    else {
+        let _ = final_reset(store, true);
         prog.running = false;
         prog.phase = "done".into();
         prog.note = Some(
@@ -4179,38 +4311,10 @@ fn measure_multiclock_undervolt_forge(
         return;
     };
 
-    // One NON-LOAD telemetry snapshot for regime context; CLAMP idle Unconstrained → PowerLimited so a
-    // first supervised run never explores ABOVE stock (identical clamp to the F1 forge).
-    let snap = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml().into_iter().next();
-    let (cap_frac, power_w, limit_w, temp_c) = match &snap {
-        Some(r) => (
-            if r.power_capped == Some(true) { 1.0 } else { 0.0 },
-            r.power_w.unwrap_or(0.0),
-            r.power_limit_w.unwrap_or(0.0),
-            r.temperature_c,
-        ),
-        None => (0.0, 0.0, 0.0, None),
-    };
-    let regime_raw = classify_regime(cap_frac, power_w, limit_w, temp_c);
-    let regime = if matches!(regime_raw, Regime::Unconstrained) {
-        Regime::PowerLimited
-    } else {
-        regime_raw
-    };
-
-    let (max_clocks, descent_budget) = f2_forge_depth(mode);
-    // Hardware-relative candidate clocks (descending). REUSE the SAME derivation as the F1 forge; then
-    // trim to the mode's breadth (the top `max_clocks`, descending).
-    let mut targets = candidate_clocks(
-        seed.stock_sustained_mhz,
-        seed.stock_boost_max_mhz,
-        regime,
-        FRONTIER_CLOCK_STEP_MHZ,
-        FRONTIER_FLOOR_FRAC,
-    );
-    targets.truncate(max_clocks);
+    let mode_policy = mode.f2_policy();
+    let targets = f2_real_clock_targets(&live, seed.stock_boost_max_mhz);
     if targets.is_empty() {
-        final_reset(store);
+        let _ = final_reset(store, true);
         prog.running = false;
         prog.phase = "done".into();
         prog.note = Some(
@@ -4222,87 +4326,303 @@ fn measure_multiclock_undervolt_forge(
         return;
     }
     prog.stock_clock_mhz = seed.stock_sustained_mhz;
+    let started = Instant::now();
+    let estimated_targets: Vec<u32> = targets
+        .iter()
+        .copied()
+        .take_while(|target| f2_clock_within_cmax_floor(*target, targets[0]))
+        .collect();
+    let mut estimated_steps_by_target: HashMap<u32, usize> = estimated_targets
+        .iter()
+        .map(|&target| {
+            let descent = crate::gpu_undervolt::plan_anchored_undervolt_descent(
+                &f2_inputs.sane_base_curve,
+                target,
+                None,
+                &f2_inputs.limits,
+                usize::MAX,
+            );
+            let validation = mode_policy.qualification_passes;
+            (target, descent.candidates.len().saturating_add(validation))
+        })
+        .collect();
+    prog.total_steps_estimate = estimated_steps_by_target
+        .values()
+        .copied()
+        .sum::<usize>()
+        .try_into()
+        .unwrap_or(u32::MAX);
+    let estimated_work_ms = estimated_steps_by_target.values().fold(0u64, |total, steps| {
+        let qualification_steps = mode_policy.qualification_passes.min(*steps);
+        let discovery_steps = steps.saturating_sub(qualification_steps);
+        total
+            .saturating_add(
+                u64::try_from(discovery_steps)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(mode_policy.discovery_dwell_ms.saturating_add(5_000)),
+            )
+            .saturating_add(
+                u64::try_from(qualification_steps)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(mode_policy.qualification_dwell_ms.saturating_add(5_000)),
+            )
+    });
+    let planned_average_step_ms = if prog.total_steps_estimate > 0 {
+        estimated_work_ms / u64::from(prog.total_steps_estimate)
+    } else {
+        mode_policy.discovery_dwell_ms.saturating_add(5_000)
+    };
+    prog.estimated_remaining_ms = Some(estimated_work_ms);
     prog.log.push(format!(
-        "Frontier F2: {} clock(s) candidato(s) ({:?} MHz), clock base ~{} MHz, regime {:?}.",
-        targets.len(), targets, seed.stock_sustained_mhz, regime
+        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, qualificação {}×{} s; ~{} dwells na estimativa inicial.",
+        targets.len(), targets[0],
+        mode.label(),
+        mode_policy.discovery_dwell_ms / 1000,
+        mode_policy.qualification_passes,
+        mode_policy.qualification_dwell_ms / 1000,
+        prog.total_steps_estimate
     ));
     set(progress, prog.clone());
 
     warn!("f2-forge: CONFIRMED — supervised hardware run begins (anchored undervolt per clock; can TDR/reboot).");
 
-    // ── Per-clock confirmed F2 descent (REUSE the proven motor; stop on safety failure) ──
+    // ── Complete real-clock discovery. Cmax is the first target that actually sustains under load.
     let obs_store = F2ObservationStore::system();
     let run_id = new_run_id("f2-forge");
-    let mut prev_good: Option<u32> = None;
-    let mut prev_target: Option<u32> = None;
+    let power_limit = (cap > 0.0).then_some(cap);
+    let mut cmax: Option<u32> = None;
+    let mut forge_complete = false;
+    let mut forge_aborted = false;
+    let mut retain_boot_flag = false;
+    let mut next_clock_start_mv: Option<u32> = None;
+    let mut conservative_start_mv: Option<u32> = None;
+    let mut adjusted_targets = HashSet::new();
     for (i, &target) in targets.iter().enumerate() {
+        if let Some(max) = cmax {
+            if !f2_clock_within_cmax_floor(target, max) {
+                forge_complete = true;
+                prog.log.push(format!(
+                    "Fronteira completa: próximo bin real {target} MHz está abaixo de 90% do Cmax {max} MHz."
+                ));
+                break;
+            }
+        }
         if stop.load(Ordering::SeqCst) {
             prog.log.push("Parada solicitada — encerrando a forja F2.".into());
             break;
         }
         prog.phase = "descend".into();
+        prog.current_clock_mhz = Some(target);
+        prog.current_voltage_mv = next_clock_start_mv;
         prog.log.push(format!("Clock {}/{}: {target} MHz — descendo tensão (motor F2 confirmado)…", i + 1, targets.len()));
         set(progress, prog.clone());
 
-        match crate::gpu_undervolt::run_confirmed_f2_clock_descent(
+        let mut on_progress =
+            |event: crate::gpu_undervolt::F2ClockDiscoveryProgress| {
+                if event.anchor_mv.is_none() && adjusted_targets.insert(event.target_mhz) {
+                    let actual = event
+                        .planned_steps
+                        .saturating_add(mode_policy.qualification_passes);
+                    let previous_estimate = estimated_steps_by_target
+                        .insert(event.target_mhz, actual)
+                        .unwrap_or(0);
+                    let revised = usize::try_from(prog.total_steps_estimate)
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(previous_estimate)
+                        .saturating_add(actual);
+                    prog.total_steps_estimate = revised.try_into().unwrap_or(u32::MAX);
+                    if event.unpruned_steps > event.planned_steps {
+                        prog.log.push(format!(
+                            "{} MHz: {} dwell(s) redundantes pulados pelo reaproveitamento da fronteira anterior.",
+                            event.target_mhz,
+                            event.unpruned_steps - event.planned_steps
+                        ));
+                    }
+                }
+
+                if event.outcome.is_some() {
+                    prog.completed_steps = prog.completed_steps.saturating_add(1);
+                    prog.learned_points = prog.learned_points.saturating_add(1);
+                }
+                prog.current_clock_mhz = Some(event.target_mhz);
+                prog.current_voltage_mv = event.anchor_mv;
+                prog.last_outcome = event.outcome.clone();
+                prog.elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                let remaining = prog
+                    .total_steps_estimate
+                    .saturating_sub(prog.completed_steps);
+                let per_step_ms = if prog.completed_steps > 0 {
+                    (prog.elapsed_ms / u64::from(prog.completed_steps))
+                        .max(planned_average_step_ms)
+                } else {
+                    planned_average_step_ms
+                };
+                prog.estimated_remaining_ms =
+                    Some(u64::from(remaining).saturating_mul(per_step_ms));
+                prog.log.push(event.line);
+                set(progress, prog.clone());
+                if event.outcome.is_some() {
+                    save_forge_state(&gpu_key, &prog);
+                }
+            };
+        let attempted_start_mv = next_clock_start_mv;
+        let mut summary = crate::gpu_undervolt::run_confirmed_f2_clock_discovery(
             store,
             &obs_store,
             &run_id,
+            &gpu_key,
             &f2_inputs.sane_base_curve,
-            f2_inputs.floor_mv,
             &f2_inputs.limits,
             target,
-            prev_target,
-            prev_good,
-            descent_budget,
-        ) {
-            None => {
-                // Confirmed gate REFUSED (Safe Mode / armed flag / crash-floor / no candidates) — stop.
-                prog.log.push(format!(
-                    "Clock {target} MHz RECUSADO pelo gate de segurança F2 — encerrando a forja."
-                ));
-                warn!("f2-forge: confirmed gate refused at {target} MHz — stopping forge");
-                break;
-            }
-            Some(summary) => {
-                prog.log.push(format!(
-                    "Clock {} MHz → tensão mínima estável {:?} mV, primeira falha {:?} mV, seguro {}, motivo {}.",
-                    target, summary.last_good_mv, summary.first_bad_mv, summary.safe, summary.stop_reason
-                ));
-                set(progress, prog.clone());
-                if !crate::gpu_f2_sweep::ladder_should_continue(summary.safe) {
-                    prog.log.push(format!(
-                        "Clock {target} MHz terminou em estado INSEGURO — encerrando a forja (sem mais clocks)."
+            next_clock_start_mv,
+            power_limit,
+            mode_policy.discovery_dwell_ms,
+            mode_policy.qualification_dwell_ms,
+            mode_policy.qualification_passes,
+            stop,
+            &mut on_progress,
+        );
+        let mut target_executed_steps = summary.executed_steps;
+        let mut fallback_message = None;
+        if summary.warm_start_rejected {
+            if let (Some(warm), Some(fallback)) = (attempted_start_mv, conservative_start_mv) {
+                if fallback > warm {
+                    fallback_message = Some(format!(
+                        "{target} MHz: warm-start em {warm} mV não sustentou; fallback conservador em {fallback} mV."
                     ));
-                    warn!("f2-forge: unsafe end at {target} MHz — stopping forge");
-                    break;
+                    let fallback_summary = crate::gpu_undervolt::run_confirmed_f2_clock_discovery(
+                        store,
+                        &obs_store,
+                        &run_id,
+                        &gpu_key,
+                        &f2_inputs.sane_base_curve,
+                        &f2_inputs.limits,
+                        target,
+                        Some(fallback),
+                        power_limit,
+                        mode_policy.discovery_dwell_ms,
+                        mode_policy.qualification_dwell_ms,
+                        mode_policy.qualification_passes,
+                        stop,
+                        &mut on_progress,
+                    );
+                    target_executed_steps = target_executed_steps
+                        .saturating_add(fallback_summary.executed_steps);
+                    summary = fallback_summary;
                 }
-                prev_good = summary.last_good_mv;
-                prev_target = Some(target);
             }
+        }
+        if let Some(message) = fallback_message {
+            prog.log.push(message);
+        }
+        prog.log.extend(
+            summary
+                .logs
+                .iter()
+                .filter(|line| line.contains("retomando"))
+                .cloned(),
+        );
+        prog.log.push(format!(
+            "Clock {target} MHz → sustentável {}, tensão mínima {:?} mV, primeira falha {:?} mV, motivo {}.",
+            summary.sustainable, summary.last_good_mv, summary.first_bad_mv, summary.stop_reason
+        ));
+        let prior_clock_estimate = estimated_steps_by_target
+            .insert(target, target_executed_steps)
+            .unwrap_or(0);
+        let revised_total = usize::try_from(prog.total_steps_estimate)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(prior_clock_estimate)
+            .saturating_add(target_executed_steps);
+        prog.total_steps_estimate = revised_total
+            .max(usize::try_from(prog.completed_steps).unwrap_or(usize::MAX))
+            .try_into()
+            .unwrap_or(u32::MAX);
+        next_clock_start_mv = summary.next_clock_start_mv;
+        conservative_start_mv = summary.conservative_start_mv;
+        if let Some(mv) = next_clock_start_mv {
+            prog.log.push(format!(
+                "Próximo clock começará em {mv} mV: um bin físico acima do mínimo anterior; fallback {:?} mV.",
+                conservative_start_mv
+            ));
+        }
+        set(progress, prog.clone());
+        if summary.aborted {
+            forge_aborted = true;
+            retain_boot_flag |= summary.retain_boot_flag;
+            warn!("f2-forge: unsafe/failed end at {target} MHz — stopping forge");
+            break;
+        }
+        if !summary.completed {
+            break;
+        }
+        if summary.sustainable && cmax.is_none() {
+            cmax = Some(target);
+            prog.log.push(format!(
+                "Cmax descoberto: {target} MHz sustentado. Continuando por todos os bins reais até 90%."
+            ));
+        }
+        if i + 1 == targets.len() && cmax.is_some() {
+            forge_complete = true;
         }
     }
 
-    // ── Synthesize the three profiles from the LEARNED FRONTIER (the SAME bridge the CLI preview uses).
-    // NO separate re-validation step: the F2 motor already validated (write→verify→dwell) every recorded
-    // candidate, so the learned frontier holds only validated points.
+    // Synthesize only after the complete Cmax→90% frontier exists for this exact physical GPU.
     prog.phase = "synthesize".into();
     set(progress, prog.clone());
-    let frontier = obs_store.learned_frontier();
-    let pts = nidavellir_core::f2_observation::frontier_to_points(&frontier);
-    let profiles = synthesize_forge_profiles(&pts, &ForgePolicy::balanced());
-    prog.log.extend(profiles.log.clone());
-    prog.power_bound_collapse = profiles.power_bound_collapse;
-    prog.godforge = profiles.godforge;
-    prog.brokkrs = profiles.brokkrs;
-    prog.deep_calm = profiles.deep_calm;
-    prog.points = pts.into_iter().map(|(p, _)| p).collect();
-    prog.recommended = prog.brokkrs;
+    if let (true, Some(max)) = (forge_complete && !forge_aborted, cmax) {
+        let frontier = obs_store.learned_frontier_for_gpu(&gpu_key)
+            .into_iter()
+            .filter(|entry| {
+                entry.target_mhz <= max && f2_clock_within_cmax_floor(entry.target_mhz, max)
+            })
+            .collect::<Vec<_>>();
+        let pts = nidavellir_core::f2_observation::frontier_to_points(&frontier);
+        let profiles = synthesize_forge_profiles(&pts, &ForgePolicy::balanced());
+        prog.log.extend(profiles.log.clone());
+        prog.power_bound_collapse = profiles.power_bound_collapse;
+        prog.godforge = profiles.godforge;
+        prog.brokkrs = profiles.brokkrs;
+        prog.deep_calm = profiles.deep_calm;
+        prog.points = pts.into_iter().map(|(p, _)| p).collect();
+        prog.recommended = prog.brokkrs;
+        let required_confirmations = mode_policy.qualification_passes.saturating_add(1) as u32;
+        prog.profiles_qualified = f2_profiles_meet_qualification(
+            mode_policy,
+            &[prog.godforge, prog.brokkrs, prog.deep_calm],
+            ForgePolicy::balanced().confidence_threshold,
+        );
+        if !prog.profiles_qualified {
+            prog.log.push(format!(
+                "FORGE: perfis provisórios — modo {} exige {} confirmação(ões) por ponto e confiança ≥ {:.2}; Apply permanece bloqueado.",
+                mode.label(),
+                required_confirmations,
+                ForgePolicy::balanced().confidence_threshold
+            ));
+        }
+    } else {
+        prog.log.push(
+            "Fronteira parcial encerrada: observações preservadas; perfis definitivos anteriores mantidos."
+                .into(),
+        );
+    }
 
-    // ALWAYS restore stock + clear the boot flag (the motor reset per candidate; this is the final belt).
-    final_reset(store);
+    // ALWAYS restore stock. Clear the boot flag only after the reset is confirmed.
+    if let Err(e) = final_reset(store, !retain_boot_flag) {
+        forge_complete = false;
+        prog.godforge = None;
+        prog.brokkrs = None;
+        prog.deep_calm = None;
+        prog.recommended = None;
+        prog.profiles_qualified = false;
+        prog.log.push(format!("Reset final NÃO confirmado: {e}"));
+    } else if retain_boot_flag {
+        prog.log.push(
+            "Recuperação permanece armada após DeviceLost/reset não confirmado; a inicialização deverá contabilizar a execução interrompida."
+                .into(),
+        );
+    }
 
-    if prog.godforge.is_some() {
+    if forge_complete && prog.godforge.is_some() {
         let fmt = |o: Option<PowerSweepPoint>| match o {
             Some(p) => format!(
                 "{} MHz @ {} mV ({:.0} W)",
@@ -4312,20 +4632,32 @@ fn measure_multiclock_undervolt_forge(
             ),
             None => "—".into(),
         };
+        let readiness = if prog.profiles_qualified {
+            "perfis qualificados, prontos para aplicação explícita"
+        } else {
+            "prévia descoberta; execute Standard ou Long para qualificar antes de aplicar"
+        };
         prog.note = Some(format!(
-            "Forja F2 · cap {cap:.0} W · Godforge {} · Brokkr's {} · Deep Calm {} — perfis descobertos, prontos para aplicação explícita.",
+            "Forja F2 · cap {cap:.0} W · Godforge {} · Brokkr's {} · Deep Calm {} — {readiness}.",
             fmt(prog.godforge), fmt(prog.brokkrs), fmt(prog.deep_calm)
         ));
     } else {
-        prog.note = Some("Nenhum perfil F2 estável encontrado.".into());
+        prog.note = Some(format!(
+            "Forja F2 parcial: {} novo(s) dwell(s) preservado(s) no Forge Knowledge; nenhum perfil definitivo novo foi criado.",
+            prog.learned_points
+        ));
     }
+    prog.frontier_complete = forge_complete && prog.godforge.is_some();
+    prog.elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    prog.estimated_remaining_ms = None;
+    prog.current_clock_mhz = None;
+    prog.current_voltage_mv = None;
     prog.running = false;
     prog.phase = "done".into();
-    // Persist the completed result ONLY when there is a usable profile (a failed/empty run never
-    // overwrites a previously good snapshot). NO auto-apply.
-    if prog.godforge.is_some() {
-        save_forge_state(&gpu_key, &prog);
-    }
+    // Every candidate is already durable in f2_observations.jsonl. Persist the UI checkpoint too so
+    // a partial/failed run remains inspectable after a service restart. Previous completed profiles
+    // stay attached until a newer complete frontier replaces them. NO auto-apply.
+    save_forge_state(&gpu_key, &prog);
     set(progress, prog);
     info!("F2 undervolt forge finished");
 }
@@ -4350,6 +4682,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn power_sweep_mode_tuning_preserves_standard_and_bounds_fast_long() {
+        // Legacy F1 tuning remains covered because the old engine is intentionally retained, but the
+        // live F2 route uses `f2_policy()` below and does not consume these breadth/depth budgets.
         // INVARIANT: Standard stays byte-identical to the pre-modes (proven, HW-validated) button —
         // same probe/depth caps and a single ceiling soak. The plain `StartPowerSweep` maps here.
         assert_eq!(PowerSweepMode::default(), PowerSweepMode::Standard);
@@ -4374,23 +4708,87 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn f2_forge_depth_breadth_is_bounded_and_mode_ordered() {
-        // F2 maps MODE to candidate-clock BREADTH (Fast < Standard < Long), each clamped to the hard
-        // F2_FORGE_MAX_CLOCKS bound. The per-clock descent budget is identical across modes (the motor's
-        // F2_CONFIRMED_MAX_STEPS safety bound governs per-clock exposure regardless of this budget).
-        let (fast_clk, fast_budget) = f2_forge_depth(PowerSweepMode::Fast);
-        let (std_clk, std_budget) = f2_forge_depth(PowerSweepMode::Standard);
-        let (long_clk, long_budget) = f2_forge_depth(PowerSweepMode::Long);
-        // Breadth ordering: Fast fewer, Long more.
-        assert!(fast_clk < std_clk, "fast must sweep fewer clocks than standard");
-        assert!(long_clk > std_clk, "long must sweep more clocks than standard");
-        // Every mode stays within [1, F2_FORGE_MAX_CLOCKS].
-        for c in [fast_clk, std_clk, long_clk] {
-            assert!((1..=F2_FORGE_MAX_CLOCKS).contains(&c), "clock breadth {c} out of bounds");
-        }
-        // Per-clock budget is the same across modes (breadth, not per-clock depth, is the F2 mode knob).
-        assert_eq!(fast_budget, std_budget);
-        assert_eq!(std_budget, long_budget);
+    fn f2_modes_share_discovery_and_scale_qualification() {
+        let fast = PowerSweepMode::Fast.f2_policy();
+        let standard = PowerSweepMode::Standard.f2_policy();
+        let long = PowerSweepMode::Long.f2_policy();
+        assert_eq!(
+            (
+                fast.discovery_dwell_ms,
+                standard.discovery_dwell_ms,
+                long.discovery_dwell_ms
+            ),
+            (10_000, 10_000, 10_000)
+        );
+        assert_eq!(
+            (fast.qualification_dwell_ms, fast.qualification_passes),
+            (0, 0)
+        );
+        assert_eq!(
+            (
+                standard.qualification_dwell_ms,
+                standard.qualification_passes
+            ),
+            (60_000, 2)
+        );
+        assert_eq!(
+            (long.qualification_dwell_ms, long.qualification_passes),
+            (120_000, 3)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_apply_qualification_requires_mode_evidence_on_all_profiles() {
+        let qualified = PowerSweepPoint {
+            confidence: Some(0.99),
+            validation_count: Some(3),
+            ..Default::default()
+        };
+        let mut profiles = [Some(qualified); 3];
+        assert!(!f2_profiles_meet_qualification(
+            PowerSweepMode::Fast.f2_policy(),
+            &profiles,
+            0.85
+        ));
+        assert!(f2_profiles_meet_qualification(
+            PowerSweepMode::Standard.f2_policy(),
+            &profiles,
+            0.85
+        ));
+        profiles[2] = Some(PowerSweepPoint {
+            confidence: Some(0.84),
+            validation_count: Some(3),
+            ..Default::default()
+        });
+        assert!(!f2_profiles_meet_qualification(
+            PowerSweepMode::Standard.f2_policy(),
+            &profiles,
+            0.85
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_uses_every_real_clock_bin_and_stops_below_90_percent_of_cmax() {
+        let curve = vec![
+            (0, 900, 1905),
+            (1, 925, 1950),
+            (2, 950, 1935),
+            (3, 975, 1905),
+            (4, 1000, 1890),
+            (5, 1025, 1845),
+        ];
+        assert_eq!(
+            f2_real_clock_targets(&curve, 1950),
+            vec![1950, 1935, 1905, 1890, 1845]
+        );
+        let stock_curve: Vec<(usize, u32, u32)> = (0..8)
+            .map(|i| (i, 900 + i as u32 * 6, 1845 + i as u32 * 15))
+            .collect();
+        assert_eq!(f2_stock_clock_ceiling(&stock_curve).unwrap(), 1950);
+        assert!(f2_clock_within_cmax_floor(1755, 1950));
+        assert!(!f2_clock_within_cmax_floor(1740, 1950));
     }
 
     #[cfg(windows)]
@@ -4522,7 +4920,8 @@ mod tests {
             (fp(1770, 156.0), 0.95),
             (fp(1740, 150.0), 0.95),
         ];
-        let policy = ForgePolicy { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 };
+        let policy = ForgePolicy { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85,
+        };
         let p = synthesize_forge_profiles(&frontier, &policy);
         assert_eq!(p.godforge.unwrap().clock_mhz, 1830, "Godforge = highest sustainable clock");
         // Brokkr's floor 0.98*1830 = 1793.4 → only 1815/1800 eligible; max R = 1815.
@@ -4545,7 +4944,8 @@ mod tests {
         ];
         // Pins the 98% Brokkr's floor explicitly (decoupled from the default, which relaxed to 95%)
         // so the test keeps verifying max-R selection at the floor it was designed for.
-        let policy = ForgePolicy { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 };
+        let policy = ForgePolicy { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85,
+        };
         let p = synthesize_forge_profiles(&frontier, &policy);
         assert_eq!(p.godforge.unwrap().clock_mhz, 2880, "Godforge = highest sustainable clock");
         // Floor 0.98*2880 = 2822.4 → 2860/2840 eligible. Max-R rule: 2860 (R≈14.3) beats
@@ -4578,7 +4978,8 @@ mod tests {
         // Godforge 2000; Brokkr's floor 0.98 = 1960. A point at 1960 is eligible; 1959 is not.
         // Pins the 98% floor explicitly (decoupled from the default, which relaxed to 95%) so the
         // boundary semantics this test exercises stay anchored to 0.98.
-        let policy = ForgePolicy { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85 };
+        let policy = ForgePolicy { brokkrs_min_clock_frac: 0.98, deep_calm_min_clock_frac: 0.90, confidence_threshold: 0.85,
+        };
         let at_floor = vec![(fp(2000, 200.0), 0.95), (fp(1960, 150.0), 0.95)];
         let p = synthesize_forge_profiles(&at_floor, &policy);
         assert_eq!(p.brokkrs.unwrap().clock_mhz, 1960, "exactly at floor → eligible");
@@ -5001,7 +5402,8 @@ mod tests {
             probed.borrow_mut().push(vbin);
             stable_sample(target, 180.0, 0.95) // stable everywhere → descend to the hardware floor
         };
-        let r = build_frontier(&[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&[1830u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         let seq = probed.borrow().clone();
         // Every probed voltage is a REAL curve bin — never an invented step-grid voltage.
         assert!(seq.iter().all(|v| IRREGULAR_BINS.contains(v)), "probed only real bins: {seq:?}");
@@ -5030,7 +5432,8 @@ mod tests {
                 stable_sample(target, 175.0, 0.95)
             }
         };
-        let r = build_frontier(&[1830u32, 1800], &d, &ForgePolicy::balanced(), &carry, None, false, probe);
+        let r = build_frontier(&[1830u32, 1800], &d, &ForgePolicy::balanced(), &carry, None, false, probe,
+        );
         let first_b = b_first.borrow().expect("B was probed");
         assert_eq!(first_b, 900, "warm start snaps the 875 margin target UP to the real 900 bin");
         assert!(IRREGULAR_BINS.contains(&first_b), "start bin is a real curve bin");
@@ -5111,7 +5514,8 @@ mod tests {
             }
             v -= step;
         }
-        FrontierDescent { bins_desc, safe_start_mv, voltage_step_mv: step, lowest_safe_mv: floor }
+        FrontierDescent { bins_desc, safe_start_mv, voltage_step_mv: step, lowest_safe_mv: floor,
+        }
     }
 
     #[cfg(windows)]
@@ -5212,7 +5616,8 @@ mod tests {
         assert_eq!(seed.cluster_bins_mv.first(), Some(&700)); // discovered floor, not 875
         assert!(seed.cluster_bins_mv.windows(2).all(|w| w[0] < w[1])); // strictly ascending, unique
         // Feeding the seed bins into the descent yields a real-bin sequence down to that floor.
-        let d = derive_descent(&seed.cluster_bins_mv, seed.safe_start_mv, FRONTIER_VOLT_STEP_MV);
+        let d = derive_descent(&seed.cluster_bins_mv, seed.safe_start_mv, FRONTIER_VOLT_STEP_MV,
+        );
         assert_eq!(d.lowest_safe_mv, 700);
         assert_eq!(d.safe_start_mv, 1075);
         assert!(d.bins_desc.iter().all(|v| seed.cluster_bins_mv.contains(v)));
@@ -5308,7 +5713,8 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 800);
-        let _ = build_frontier(&[1935, 1905, 1875], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let _ = build_frontier(&[1935, 1905, 1875], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         assert_eq!(executed.load(SeqCst), max); // exactly 3 real probes ran before the cap
     }
 
@@ -5361,7 +5767,8 @@ mod tests {
             unstable_sample()
         };
         let d = step_descent(1000, 25, 900);
-        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         // 1830: 1000/975/950 stable (3) + 925 abort (1) = 4 calls; 1800 & 1770: 1 call each.
         assert_eq!(calls.load(SeqCst), 6);
         assert_eq!(r.frontier.len(), 1);
@@ -5389,7 +5796,8 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         assert_eq!(r.frontier.len(), 5);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
         assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 1815);
@@ -5417,7 +5825,8 @@ mod tests {
             }
         };
         let d = step_descent(1100, 25, 800);
-        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         assert_eq!(r.frontier.len(), 6);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 2880, "Godforge = highest clock");
         assert_eq!(r.profiles.brokkrs.unwrap().clock_mhz, 2860, "Brokkr's = max R within 98% floor");
@@ -5436,7 +5845,8 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].vf_table_voltage_mv, Some(900), "deepest stable bin kept");
         assert!(r.frontier[0].stable);
@@ -5458,7 +5868,8 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 950);
-        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&[2000u32], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         assert!(min_probed.get() >= 950, "never probe below the known-unsafe floor");
         assert!(r.frontier[0].vf_table_voltage_mv.unwrap() >= 950);
     }
@@ -5475,7 +5886,8 @@ mod tests {
             s
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         assert_eq!(r.frontier.len(), 1, "unverified clock rejected");
         assert_eq!(r.frontier[0].clock_mhz, 1770);
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1770);
@@ -5500,7 +5912,8 @@ mod tests {
             }
         };
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[1830u32, 1815, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&[1830u32, 1815, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         assert_eq!(r.frontier.len(), 2, "partial frontier (1815 dropped)");
         assert_eq!(r.profiles.godforge.unwrap().clock_mhz, 1830);
         assert!(r.profiles.deep_calm.is_some());
@@ -5518,7 +5931,8 @@ mod tests {
             }
         };
         let d = step_descent(950, 25, 700);
-        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&[1830u32, 1800, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         assert!(r.profiles.godforge.is_some());
         assert!(r.profiles.brokkrs.is_some());
         assert!(r.profiles.deep_calm.is_some());
@@ -5530,7 +5944,8 @@ mod tests {
     fn sim_no_valid_points_returns_safe_failure() {
         let probe = |_t: u32, _v: u32| unstable_sample(); // nothing ever stable
         let d = step_descent(1000, 25, 700);
-        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe);
+        let r = build_frontier(&[1830u32, 1770], &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, probe,
+        );
         assert!(r.frontier.is_empty());
         assert!(r.profiles.godforge.is_none());
         assert!(r.profiles.brokkrs.is_none());
@@ -5541,7 +5956,8 @@ mod tests {
     /// build-frontier-shaped carry config: cap 1075, floor 875, step 25, margin 1 step.
     #[cfg(windows)]
     fn carry_cfg(enabled: bool) -> BracketCarryConfig {
-        BracketCarryConfig { enabled, safe_start_cap_mv: 1075, floor_mv: 875, step_mv: 25, margin_steps: 1 }
+        BracketCarryConfig { enabled, safe_start_cap_mv: 1075, floor_mv: 875, step_mv: 25, margin_steps: 1,
+        }
     }
 
     #[cfg(windows)]
@@ -5694,14 +6110,16 @@ mod tests {
             *off_calls.borrow_mut() += 1;
             if v >= 925 { stable_sample(t, 180.0, 0.95) } else { unstable_sample() }
         };
-        let off = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, off_probe);
+        let off = build_frontier(&targets, &d, &ForgePolicy::balanced(), &BracketCarryConfig::disabled(&d), None, false, off_probe,
+        );
 
         let on_calls = RefCell::new(0u32);
         let on_probe = |t: u32, v: u32| {
             *on_calls.borrow_mut() += 1;
             if v >= 925 { stable_sample(t, 180.0, 0.95) } else { unstable_sample() }
         };
-        let on = build_frontier(&targets, &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, on_probe);
+        let on = build_frontier(&targets, &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, on_probe,
+        );
 
         // Identical frontier (same deepest verified bin per target), but fewer probes.
         let off_bins: Vec<_> = off.frontier.iter().map(|p| p.vf_table_voltage_mv).collect();
@@ -5723,11 +6141,16 @@ mod tests {
         // high voltage (≥1000 mV); the warm-start probe at 950 fails verify → B2 falls back to the
         // cap, finds 1785's high-voltage ceiling, and does NOT drop the target.
         let probe = |target: u32, vbin: u32| match target {
-            1815 => if vbin >= 925 { stable_sample(1815, 180.0, 0.95) } else { unstable_sample() },
-            _ => if vbin >= 1000 { stable_sample(1785, 175.0, 0.95) } else { unverified_probe() },
+            1815 => {
+                if vbin >= 925 { stable_sample(1815, 180.0, 0.95) } else { unstable_sample() }
+            }
+            _ => {
+                if vbin >= 1000 { stable_sample(1785, 175.0, 0.95) } else { unverified_probe() }
+            }
         };
         let d = step_descent(1075, 25, 875);
-        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe);
+        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe,
+        );
         assert_eq!(r.frontier.len(), 2); // 1785 recovered via fallback, not dropped
         let t1785 = r.frontier.iter().find(|p| p.target_clock_mhz == Some(1785)).expect("1785 present");
         assert_eq!(t1785.vf_table_voltage_mv, Some(1000));
@@ -5752,7 +6175,8 @@ mod tests {
             if vbin >= 925 { stable_sample(1785, 175.0, 0.95) } else { unstable_sample() }
         };
         let d = step_descent(1075, 25, 875);
-        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe);
+        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe,
+        );
         assert_eq!(*first_vbin_1785.borrow(), Some(1075)); // started at the cap, no warm-start
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].target_clock_mhz, Some(1785));
@@ -5785,7 +6209,8 @@ mod tests {
             stable_sample(1785, 175.0, 0.95)
         };
         let d = step_descent(1075, 25, 875);
-        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe);
+        let r = build_frontier(&[1815u32, 1785], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe,
+        );
         assert_eq!(*first_vbin_1785.borrow(), Some(1075)); // not seeded from the crashed target
         assert_eq!(r.frontier.len(), 1);
         assert_eq!(r.frontier[0].target_clock_mhz, Some(1815));
@@ -5809,7 +6234,8 @@ mod tests {
             if vbin >= 925 { stable_sample(target, 180.0, 0.95) } else { unstable_sample() }
         };
         let d = step_descent(1075, 25, 875);
-        let _ = build_frontier(&[1815u32, 1785, 1755], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe);
+        let _ = build_frontier(&[1815u32, 1785, 1755], &d, &ForgePolicy::balanced(), &carry_cfg(true), None, false, probe,
+        );
         assert_eq!(executed.load(SeqCst), max); // exactly the budget, no fallback burst beyond it
     }
 
@@ -6052,7 +6478,9 @@ mod tests {
         // A card pinned at the cap across the WHOLE curve: descend to the floor, never a knee. This is
         // the only legitimate "true collapse" — proven by reaching the hardware floor still saturated.
         let d = step_descent(1075, 25, 800);
-        let traj = descend_phase_b(1815, 1075, &d, 99, &|_t: u32, _v: u32| pb_sample(1810, 199.0, 1.0));
+        let traj = descend_phase_b(1815, 1075, &d, 99, &|_t: u32, _v: u32| {
+            pb_sample(1810, 199.0, 1.0)
+        });
         assert_eq!(traj.stop_reason, BracketStop::CleanFloor);
         assert_eq!(traj.points.len(), 12, "every bin probed to the floor");
         assert_eq!(detect_power_bound_knee(&traj.points), None);
@@ -6270,8 +6698,10 @@ mod tests {
     fn phase_a_deepest_bin_finds_focus_floor() {
         // One retained point per target; its applied VF bin is the deepest Phase-A bin for that target.
         let frontier = vec![
-            (probe_to_point(1935, 1025, &pb_sample(1810, 199.0, 1.0)), 0.21),
-            (probe_to_point(1815, 1025, &pb_sample(1810, 199.0, 1.0)), 0.21),
+            (probe_to_point(1935, 1025, &pb_sample(1810, 199.0, 1.0)), 0.21,
+            ),
+            (probe_to_point(1815, 1025, &pb_sample(1810, 199.0, 1.0)), 0.21,
+            ),
         ];
         assert_eq!(phase_a_deepest_bin(&frontier, 1815), Some(1025));
         assert_eq!(phase_a_deepest_bin(&frontier, 1755), None, "target with no retained point");
@@ -6617,7 +7047,10 @@ mod tests {
         // First bin unverified → SoftUnverified before any binding evaluation; no point recorded.
         let d = step_descent(1075, 25, 875);
         let probe =
-            |target: u32, vbin: u32| if vbin == 1075 { unverified_probe() } else { bind_sample(target, 0.0) };
+            |target: u32, vbin: u32| {
+            if vbin == 1075 { unverified_probe() } else { bind_sample(target, 0.0)
+            }
+        };
         let (bracket, point) = descend_target(1800, 1075, &d, None, true, &probe);
         assert_eq!(bracket.stop_reason, BracketStop::SoftUnverified);
         assert!(point.is_none());
@@ -6630,7 +7063,10 @@ mod tests {
         // evaluated on the Stable arm).
         let d = step_descent(1075, 25, 875);
         let probe =
-            |target: u32, vbin: u32| if vbin == 1075 { unstable_sample() } else { bind_sample(target, 0.0) };
+            |target: u32, vbin: u32| {
+            if vbin == 1075 { unstable_sample() } else { bind_sample(target, 0.0)
+            }
+        };
         let (bracket, _p) = descend_target(1800, 1075, &d, None, true, &probe);
         assert_eq!(bracket.stop_reason, BracketStop::SoftUnstable);
     }
@@ -6640,12 +7076,18 @@ mod tests {
     fn bind_seeking_crash_and_abort_precede_binding() {
         let d = step_descent(1075, 25, 875);
         let crash =
-            |target: u32, vbin: u32| if vbin == 1075 { crashed_sample() } else { bind_sample(target, 0.0) };
+            |target: u32, vbin: u32| {
+            if vbin == 1075 { crashed_sample() } else { bind_sample(target, 0.0)
+            }
+        };
         let (b1, _) = descend_target(1800, 1075, &d, None, true, &crash);
         assert_eq!(b1.stop_reason, BracketStop::HardFailure);
         assert!(b1.is_hard_failed());
         let abort =
-            |target: u32, vbin: u32| if vbin == 1075 { aborted_sample() } else { bind_sample(target, 0.0) };
+            |target: u32, vbin: u32| {
+            if vbin == 1075 { aborted_sample() } else { bind_sample(target, 0.0)
+            }
+        };
         let (b2, _) = descend_target(1800, 1075, &d, None, true, &abort);
         assert_eq!(b2.stop_reason, BracketStop::Aborted);
         assert!(b2.is_hard_failed());
@@ -6657,7 +7099,10 @@ mod tests {
         // A global --max-probes drain stops BudgetExhausted before binding logic (and is NOT a finding).
         let d = step_descent(1075, 25, 875);
         let probe =
-            |target: u32, vbin: u32| if vbin == 1075 { budget_sample() } else { bind_sample(target, 0.0) };
+            |target: u32, vbin: u32| {
+            if vbin == 1075 { budget_sample() } else { bind_sample(target, 0.0)
+            }
+        };
         let (bracket, _p) = descend_target(1800, 1075, &d, None, true, &probe);
         assert_eq!(bracket.stop_reason, BracketStop::BudgetExhausted);
     }
@@ -6828,8 +7273,9 @@ mod tests {
     #[test]
     fn forge_state_roundtrips_and_forces_not_running() {
         let mut prog = idle();
-        prog.phase = "done".into();
+        prog.phase = "descend".into();
         prog.running = true; // a running snapshot must restore as NOT running
+        prog.learned_points = 7;
         prog.stock_clock_mhz = 1786;
         prog.points = vec![fp(1830, 200.0), fp(1815, 181.0)];
         prog.godforge = Some(fp(1830, 200.0));
@@ -6839,7 +7285,9 @@ mod tests {
         match decode_forge_state(&json, "RTX-TEST") {
             ForgeStateLoad::Loaded(p) => {
                 assert!(!p.running, "restored progress must never be running");
-                assert_eq!(p.phase, "done");
+                assert_eq!(p.phase, "interrupted");
+                assert_eq!(p.learned_points, 7);
+                assert!(p.note.as_deref().unwrap_or_default().contains("7 dwell"));
                 assert_eq!(p.points.len(), 2);
                 assert_eq!(p.godforge.unwrap().clock_mhz, 1830);
                 assert_eq!(p.brokkrs.unwrap().clock_mhz, 1815);
@@ -6847,6 +7295,34 @@ mod tests {
             }
             other => panic!("expected Loaded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_power_progress_defaults_live_f2_fields() {
+        let mut value = serde_json::to_value(PowerSweepProgress::default()).expect("encode");
+        let object = value.as_object_mut().expect("object");
+        for field in [
+            "mode",
+            "current_clock_mhz",
+            "current_voltage_mv",
+            "completed_steps",
+            "total_steps_estimate",
+            "elapsed_ms",
+            "estimated_remaining_ms",
+            "learned_points",
+            "last_outcome",
+            "learning_saved",
+            "frontier_complete",
+            "profiles_qualified",
+        ] {
+            object.remove(field);
+        }
+        let restored: PowerSweepProgress = serde_json::from_value(value).expect("legacy decode");
+        assert_eq!(restored.completed_steps, 0);
+        assert_eq!(restored.total_steps_estimate, 0);
+        assert!(!restored.learning_saved);
+        assert!(!restored.frontier_complete);
+        assert!(!restored.profiles_qualified);
     }
 
     #[cfg(windows)]

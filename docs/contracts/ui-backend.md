@@ -776,6 +776,87 @@ anchored undervolt when `is_undervolt == true` — they no longer return the
 
 &#x20; fail-closed supervised safety model. The UI does not parse `note` or `log` for mode state.
 
+&#x20; \*\*SUPERSEDED by the 2026-06-28 mode-semantics note below\*\*: all modes now traverse the same
+
+&#x20; complete frontier; copy must describe dwell/evidence, not discovery breadth.
+
+
+\## Backend → Frontend (2026-06-28): corrected F2 frontier + mode semantics
+
+The live Forge algorithm now matches the intended integrated F2 search. This note supersedes the
+2026-06-26 descriptions of Fast as “fewer/shallower probes” and Long as “broader/deeper discovery.”
+
+\- \*\*Start methods stay unchanged.\*\* Keep the existing mappings:
+
+&#x20; Fast → `StartPowerSweepFast`; Standard → `StartPowerSweep`; Long → `StartPowerSweepLong`.
+
+\- \*\*Identical discovery frontier in every mode.\*\* All three reset to stock and start at the highest real live-VF
+&#x20; clock, discover the first sustainable Cmax through voltage descent, then characterize every real
+&#x20; clock bin through 90% of Cmax. No mode tries fewer clocks or a shallower voltage range.
+
+\- \*\*Mode semantics are evidence only:\*\*
+
+&#x20; \*\*Fast\*\* — full-frontier discovery with 10 s dwells and no qualification pass. It produces
+&#x20; a provisional preview only; `ApplyPower*` remains locked.
+
+&#x20; \*\*Standard\*\* — 10 s discovery, then two independent 60 s reset/reapply qualification passes
+&#x20; at every discovered boundary.
+
+&#x20; \*\*Long\*\* — 10 s discovery, then three independent 120 s reset/reapply qualification passes
+&#x20; at every discovered boundary. Longest run and strongest initial confidence.
+
+\- \*\*Qualification and Apply:\*\* `PowerSweepProgress.profiles_qualified` is additive/default-false.
+&#x20; The frontend must label unqualified F2 results as provisional and disable Apply. The service also
+&#x20; rejects `ApplyPower*` for provisional F2 results, so stale or custom clients fail closed.
+
+\- \*\*Expected fresh-GPU wall time:\*\* Fast ≈20–30 min, Standard ≈55–75 min, Long ≈90–120 min.
+&#x20; Learned GPUs normally resume faster. These remain estimates, not deadlines.
+
+\- \*\*Progress/safety:\*\* no definitive profiles are returned from a partial, cancelled, or
+&#x20; safety-aborted run. Every mode uses the same arm→write→verify→dwell→checked-reset motor; nothing
+&#x20; is auto-applied. A real run may still TDR/reboot and remains a supervised action.
+
+\## Backend → Frontend (2026-06-28): durable F2 progress, ETA and cross-clock reuse
+
+`GetPowerSweepProgress` gains additive, defaulted fields. Legacy payloads remain valid:
+
+\- `mode: Option<String>`
+\- `current_clock_mhz: Option<u32>`
+\- `current_voltage_mv: Option<u32>`
+\- `completed_steps: u32`
+\- `total_steps_estimate: u32`
+\- `elapsed_ms: u64`
+\- `estimated_remaining_ms: Option<u64>`
+\- `learned_points: u32`
+\- `last_outcome: Option<String>`
+\- `learning_saved: bool`
+\- `frontier_complete: bool`
+\- `profiles_qualified: bool`
+
+The total and ETA are explicitly estimates: Cmax and cross-clock pruning become exact while the run
+learns the frontier. The frontend must use these structured fields for the progress bar and current
+target; `log` remains display-only.
+
+Every completed candidate is appended to `f2_observations.jsonl` before the progress event says
+`learning_saved`. `forge_state.json` now checkpoints live/partial progress as well as complete results,
+so an interrupted service restores the run as `phase = "interrupted"` and `running = false`. A partial
+run retains previous profile points for inspection but clears qualification until a complete
+Standard/Long run establishes that the active boundaries are still safe. A complete Fast run may
+synthesize provisional profiles, but cannot make them deployable.
+
+The Technical Power Sweep log is permanent in Forge Progress and receives per-candidate lines for
+planning, `Testing clock @ voltage`, outcome, p5/power and durable-save confirmation.
+
+The next lower clock starts one physical VF bin above the previous clock's minimum stable anchor.
+The previous clock's last power-bound `ClockDrop` remains the conservative fallback. If the optimized
+warm-start cannot sustain (or plans no valid candidate), the same target retries from that fallback.
+This skips known-redundant higher-voltage dwells without treating an aggressive warm-start as proof
+that the clock is unsustainable.
+
+Safe Loop semantics are also corrected: reset-clean `SilentError`/`Unstable` points are blacklisted
+as frontier knowledge but do not increment `consecutive_crashes`. Only `DeviceLost`/TDR counts as a
+crash and retains recovery state.
+
 
 
 (No other active backend → frontend requests)

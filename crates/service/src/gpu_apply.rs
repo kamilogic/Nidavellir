@@ -153,7 +153,8 @@ pub fn apply_and_persist(
     if let Some(m) = mem_offset_mhz {
         intent.axes.insert("gpu_mem_offset_mhz".into(), m as i64);
     }
-    let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_apply"));
+    store.arm_boot_flag(&BootFlag::new(intent, "gpu_apply"))
+        .map_err(|e| format!("GPU apply: failed to arm Safe Loop before write: {e}"))?;
 
     if let Some(c) = core {
         apply_core(c)?;
@@ -193,7 +194,8 @@ pub fn apply_and_persist_undervolt(
     if let Some(m) = mem_offset_mhz {
         intent.axes.insert("gpu_mem_offset_mhz".into(), m as i64);
     }
-    let _ = store.arm_boot_flag(&BootFlag::new(intent, "gpu_apply_undervolt"));
+    store.arm_boot_flag(&BootFlag::new(intent, "gpu_apply_undervolt"))
+        .map_err(|e| format!("F2 apply: failed to arm Safe Loop before write: {e}"))?;
 
     // Fail-closed: a non-verified write has already reset to stock inside this call, so nothing is left
     // applied. The boot-flag stays armed on the error path (same as the F1 apply) — safe; reset clears it.
@@ -232,16 +234,19 @@ pub fn apply_and_persist_undervolt(
 /// Reset the GPU to stock and forget the persisted profile.
 #[cfg(windows)]
 pub fn reset(store: &SafeLoopStore) -> Result<(), String> {
-    clear_applied();
-    let _ = store.clear_boot_flag();
-    let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
-    // Zero the modern V/F curve offsets too (reset_all uses the legacy path and
-    // won't clear ceiling offsets written via ClkVfPoints).
-    if nidavellir_gpu_nvapi::vf_curve_supported() {
-        let n = nidavellir_gpu_nvapi::reset_vf_curve();
-        info!("VF curve reset: {n} pts zerados");
+    let clock_error = nidavellir_core::nvml_gpu::reset_core_clock_lock().err();
+    let gpu_error = nidavellir_gpu_nvapi::reset_all().err();
+    if clock_error.is_some() || gpu_error.is_some() {
+        return Err(format!(
+            "GPU reset incomplete: clock-cap={}; VF/global={}",
+            clock_error.as_deref().unwrap_or("ok"),
+            gpu_error.as_deref().unwrap_or("ok")
+        ));
     }
-    nidavellir_gpu_nvapi::reset_all()
+    clear_applied();
+    store
+        .clear_boot_flag()
+        .map_err(|e| format!("GPU reset completed but Safe Loop flag could not be cleared: {e}"))
 }
 
 #[cfg(not(windows))]
@@ -276,6 +281,9 @@ pub fn reset(_store: &SafeLoopStore) -> Result<(), String> {
 pub fn reapply_on_boot(store: &SafeLoopStore) {
     if store.is_boot_flag_armed() {
         warn!("GPU apply-on-boot: boot-flag armed (prior crash) — not re-applying");
+        if let Err(e) = store.clear_boot_flag() {
+            warn!("GPU apply-on-boot: failed to disarm accounted recovery flag: {e}");
+        }
         return;
     }
     if store.load_record().safe_mode {

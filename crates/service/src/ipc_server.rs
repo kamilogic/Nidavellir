@@ -139,6 +139,12 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         Err(e) => return IpcResponse::failure(format!("State lock poisoned: {e}")),
     };
 
+    if gpu_write_requires_idle(&request) && gpu_operation_running(&guard) {
+        return IpcResponse::failure(
+            "Another GPU operation owns the service-wide tuning lease; stop it before starting or applying another operation",
+        );
+    }
+
     match &request {
         IpcRequest::Ping => IpcResponse::success(ResponseData::Pong),
         IpcRequest::DetectHardware => {
@@ -363,6 +369,43 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
     }
 }
 
+fn gpu_operation_running(state: &AppState) -> bool {
+    state.gpu_validation.status().running
+        || !matches!(
+            state.real_sweep.progress().phase,
+            nidavellir_core::gpu_sweep::SweepPhase::Idle
+                | nidavellir_core::gpu_sweep::SweepPhase::Done
+                | nidavellir_core::gpu_sweep::SweepPhase::Aborted
+        )
+        || state.mem_sweep.progress().running
+        || state.forge_all.progress().running
+        || state.benchmark.progress().running
+        || state.power_sweep.progress().running
+}
+
+fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
+    matches!(
+        request,
+        IpcRequest::StartGpuValidation
+            | IpcRequest::StartRealSweep
+            | IpcRequest::StartRealSweepFast
+            | IpcRequest::StartMemSweep
+            | IpcRequest::ApplyGodforge
+            | IpcRequest::ApplyBrokkrs
+            | IpcRequest::ApplyDeepCalm
+            | IpcRequest::ApplyMemPeak
+            | IpcRequest::ResetGpuTuning
+            | IpcRequest::StartForgeAll
+            | IpcRequest::StartBenchmark
+            | IpcRequest::StartPowerSweep
+            | IpcRequest::StartPowerSweepFast
+            | IpcRequest::StartPowerSweepLong
+            | IpcRequest::ApplyPowerGodforge
+            | IpcRequest::ApplyPowerBrokkrs
+            | IpcRequest::ApplyPowerDeepCalm
+    )
+}
+
 /// Route a forge-profile apply to the correct writer (Phase 2). When the active forge produced an F2
 /// anchored-undervolt result (`is_undervolt == true`), apply the F2 anchored undervolt; otherwise apply
 /// the legacy F1 flatten-down ceiling. F2 RAISES a lower-voltage bin to hold the clock (dropping power);
@@ -375,6 +418,11 @@ fn apply_forge_profile(
     label: &str,
 ) -> IpcResponse {
     if prog.is_undervolt {
+        if !prog.profiles_qualified {
+            return IpcResponse::failure(
+                "F2 profiles are provisional — run Standard or Long qualification before Apply",
+            );
+        }
         apply_undervolt_profile(store, pt, label)
     } else {
         apply_power_profile(store, pt, label)
@@ -527,7 +575,11 @@ mod tests {
         // The router keys on the structured `is_undervolt` flag: F2 forge → undervolt apply; a legacy
         // (default) payload → the unchanged F1 apply path. Both with no point yield a clear failure
         // (nothing applied), which is the safe observable here without touching hardware.
-        let f2 = PowerSweepProgress { is_undervolt: true, ..Default::default() };
+        let f2 = PowerSweepProgress {
+            is_undervolt: true,
+            profiles_qualified: true,
+            ..Default::default()
+        };
         assert!(f2.is_undervolt);
         let f1 = PowerSweepProgress::default();
         assert!(!f1.is_undervolt, "default must keep the legacy F1 apply behavior");
@@ -536,6 +588,50 @@ mod tests {
         assert!(!r_f2.ok, "no forge point → failure");
         let r_f1 = apply_forge_profile(&dummy_store(), &f1, None, "Godforge");
         assert!(!r_f1.ok, "no sweep point → failure");
+    }
+
+    #[test]
+    fn provisional_f2_profile_cannot_be_applied() {
+        let provisional = PowerSweepProgress {
+            is_undervolt: true,
+            profiles_qualified: false,
+            ..Default::default()
+        };
+        let response = apply_forge_profile(&dummy_store(), &provisional, None, "Godforge");
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("provisional")
+        );
+    }
+
+    #[test]
+    fn service_wide_gpu_lease_covers_starts_applies_and_reset() {
+        for request in [
+            IpcRequest::StartGpuValidation,
+            IpcRequest::StartRealSweep,
+            IpcRequest::StartMemSweep,
+            IpcRequest::StartForgeAll,
+            IpcRequest::StartBenchmark,
+            IpcRequest::StartPowerSweep,
+            IpcRequest::StartPowerSweepFast,
+            IpcRequest::StartPowerSweepLong,
+            IpcRequest::ApplyPowerGodforge,
+            IpcRequest::ApplyPowerBrokkrs,
+            IpcRequest::ApplyPowerDeepCalm,
+            IpcRequest::ResetGpuTuning,
+        ] {
+            assert!(
+                gpu_write_requires_idle(&request),
+                "{request:?} must require the GPU lease"
+            );
+        }
+        assert!(!gpu_write_requires_idle(&IpcRequest::GetPowerSweepProgress));
+        assert!(!gpu_write_requires_idle(&IpcRequest::StopPowerSweep));
+        assert!(!gpu_write_requires_idle(&IpcRequest::ReadSensors));
     }
 
     fn dummy_store() -> nidavellir_core::safe_loop::SafeLoopStore {
