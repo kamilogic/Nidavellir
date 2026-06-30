@@ -42,7 +42,10 @@
 
 use std::ffi::OsString;
 
-use nidavellir_core::f2_observation::{F2QualificationCoverage, F2QualificationVerdict};
+use nidavellir_core::f2_observation::{
+    F2QualificationCoverage, F2QualificationPattern, F2QualificationStrength,
+    F2QualificationVerdict,
+};
 use nidavellir_core::safe_loop::{
     SafeLoopRecord, SafeLoopStore, TuningPoint, SAFE_MODE_CRASH_THRESHOLD,
 };
@@ -53,6 +56,8 @@ use nidavellir_gpu_nvapi::{
 
 #[cfg(windows)]
 use nidavellir_core::safe_loop::{BlacklistRegion, BootFlag, DEFAULT_BLACKLIST_RADIUS};
+#[cfg(windows)]
+use nidavellir_gpu_stress::VfQualifierPattern;
 #[cfg(windows)]
 use tracing::{info, warn};
 
@@ -1944,7 +1949,26 @@ pub fn confirmed_multi_report_lines(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum F2StressPurpose {
     PowerDiscovery,
-    TransientQualification,
+    Fsgl2Qualification(F2QualificationPattern),
+}
+
+#[cfg(windows)]
+impl F2StressPurpose {
+    fn is_qualification(self) -> bool {
+        !matches!(self, F2StressPurpose::PowerDiscovery)
+    }
+
+    fn qualifier_pattern(self) -> Option<VfQualifierPattern> {
+        match self {
+            F2StressPurpose::PowerDiscovery => None,
+            F2StressPurpose::Fsgl2Qualification(F2QualificationPattern::A) => {
+                Some(VfQualifierPattern::Fsgl2A)
+            }
+            F2StressPurpose::Fsgl2Qualification(F2QualificationPattern::B) => {
+                Some(VfQualifierPattern::Fsgl2B)
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1959,7 +1983,7 @@ fn classify_f2_stress_dwell(
         F2DwellOutcome::SilentError
     } else if !s.stable {
         F2DwellOutcome::Unstable
-    } else if purpose == F2StressPurpose::TransientQualification
+    } else if purpose.is_qualification()
         && s.qualification_coverage
             .as_ref()
             .is_some_and(|coverage| coverage.verdict == F2QualificationVerdict::Inconclusive)
@@ -2087,8 +2111,14 @@ impl F2Ops for RealF2Ops<'_> {
     fn dwell(&mut self) -> F2DwellResult {
         let s = match self.stress_purpose {
             F2StressPurpose::PowerDiscovery => crate::gpu_power_sweep::single_load_dwell(self.dwell_ms),
-            F2StressPurpose::TransientQualification => {
-                crate::gpu_power_sweep::single_qualifier_dwell(self.dwell_ms, self.target_mhz)
+            purpose => {
+                crate::gpu_power_sweep::single_qualifier_dwell(
+                    self.dwell_ms,
+                    self.target_mhz,
+                    purpose
+                        .qualifier_pattern()
+                        .expect("qualification purpose has a pattern"),
+                )
             }
         };
         // Mixed qualification telemetry is intentionally excluded from ClockDrop classification:
@@ -3305,8 +3335,24 @@ enum F2QualificationOutcome {
     Aborted { stop_reason: String, retain_boot_flag: bool },
 }
 
-/// Run the failure-seeking qualification (`qualification_passes` independent reset/reapply passes) on
-/// ONE already-PowerRender-validated anchored candidate. Each pass uses the proven
+#[cfg(windows)]
+fn annotate_qualification_report(
+    report: &mut F2StepReport,
+    strength: F2QualificationStrength,
+    pattern: Option<F2QualificationPattern>,
+    pass_index: u32,
+    retry_count: u32,
+) {
+    if let Some(coverage) = report.qualification_coverage.as_mut() {
+        coverage.strength = strength;
+        coverage.pattern = pattern;
+        coverage.pass_index = pass_index;
+        coverage.retry_count = retry_count;
+    }
+}
+
+/// Run the FSGL2 qualification (`qualification_passes` independent reset/reapply patterns) on ONE
+/// already-PowerRender-validated anchored candidate. Each pass uses the proven
 /// arm→write→verify→dwell→reset motor and is persisted immediately as Qualification evidence. Pure
 /// hardware sequencing — all policy (what to do with the result) stays in the caller.
 #[cfg(windows)]
@@ -3332,109 +3378,280 @@ fn qualify_anchored_candidate(
 
     use nidavellir_core::f2_observation::now_rfc3339;
 
-    let mut passed = 0usize;
-    let mut inconclusive_retries = 0usize;
-    while passed < qualification_passes {
-        if stop.load(Ordering::SeqCst) {
-            return F2QualificationOutcome::Cancelled;
-        }
-        let mut validation_ops = RealF2MultiOps {
-            store,
-            curve: sane.to_vec(),
-            candidates: vec![candidate.clone()],
-            limits: *limits,
-            target_mhz,
-            baseline_offset_mhz: 0,
-            dwell_ms: qualification_dwell_ms,
-            stress_purpose: F2StressPurpose::TransientQualification,
-            cur: None,
-        };
-        if let Err(e) = validation_ops.select(0) {
-            return F2QualificationOutcome::Aborted {
-                stop_reason: format!("QualificationPrecheckFailed: {e}"),
-                retain_boot_flag: false,
-            };
-        }
-        on_progress(F2ClockDiscoveryProgress {
-            target_mhz,
-            planned_steps: candidate_count,
-            unpruned_steps,
-            anchor_mv: Some(candidate.anchor.voltage_mv),
-            outcome: None,
-            line: format!(
-                "Qualifying {target_mhz} MHz @ {} mV — pass {}/{} ({} s)…",
-                candidate.anchor.voltage_mv,
-                passed + 1,
-                qualification_passes,
-                qualification_dwell_ms / 1000
-            ),
-        });
-        let mut report = run_confirmed_f2_step(&mut validation_ops);
-        if let Some(coverage) = report.qualification_coverage.as_mut() {
-            coverage.retry_count = inconclusive_retries as u32;
-        }
-        logs.push(format!(
-            "{target_mhz} MHz @ {} mV qualification {}/{}: {:?}",
-            candidate.anchor.voltage_mv,
-            passed + 1,
-            qualification_passes,
-            report.outcome
-        ));
-        qual_ctx.timestamp = now_rfc3339();
-        let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
-            qual_ctx,
-            target_mhz,
-            candidate,
-            &report,
-        );
-        if let Err(e) = obs_store.append(&observation) {
-            return F2QualificationOutcome::Aborted {
-                stop_reason: format!("ObservationPersistFailed: {e}"),
-                retain_boot_flag: false,
-            };
-        }
-        *executed_steps = executed_steps.saturating_add(1);
-        on_progress(F2ClockDiscoveryProgress {
-            target_mhz,
-            planned_steps: candidate_count,
-            unpruned_steps,
-            anchor_mv: Some(candidate.anchor.voltage_mv),
-            outcome: Some(format!("{:?}", report.outcome)),
-            line: format!(
-                "{target_mhz} MHz @ {} mV · qualification {}/{} → {:?} · aprendizado salvo",
-                candidate.anchor.voltage_mv,
-                passed + 1,
-                qualification_passes,
-                report.outcome
-            ),
-        });
-        match &report.outcome {
-            F2Outcome::Validated => {
-                passed += 1;
-                inconclusive_retries = 0;
+    let patterns = fsgl2_gate_patterns(qualification_passes);
+    for (pattern_index, pattern) in patterns.iter().copied().enumerate() {
+        let pass_index = pattern_index + 1;
+        let mut inconclusive_retries = 0usize;
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return F2QualificationOutcome::Cancelled;
             }
-            F2Outcome::DeviceLost
-            | F2Outcome::ResetFailed
-            | F2Outcome::ArmFailed(_)
-            | F2Outcome::ApplyFailed(_)
-            | F2Outcome::VerifyFailed => {
+            let mut validation_ops = RealF2MultiOps {
+                store,
+                curve: sane.to_vec(),
+                candidates: vec![candidate.clone()],
+                limits: *limits,
+                target_mhz,
+                baseline_offset_mhz: 0,
+                dwell_ms: qualification_dwell_ms,
+                stress_purpose: F2StressPurpose::Fsgl2Qualification(pattern),
+                cur: None,
+            };
+            if let Err(e) = validation_ops.select(0) {
                 return F2QualificationOutcome::Aborted {
-                    stop_reason: format!("QualificationAborted: {:?}", report.outcome),
-                    retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
+                    stop_reason: format!("QualificationPrecheckFailed: {e}"),
+                    retain_boot_flag: false,
                 };
             }
-            F2Outcome::Inconclusive => {
-                if inconclusive_retries == 0 {
-                    inconclusive_retries += 1;
-                    logs.push(format!(
-                        "{target_mhz} MHz @ {} mV qualification inconclusiva; repetindo uma vez",
-                        candidate.anchor.voltage_mv
-                    ));
-                    continue;
-                }
-                return F2QualificationOutcome::Inconclusive;
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(candidate.anchor.voltage_mv),
+                outcome: None,
+                line: format!(
+                    "FSGL2 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
+                    fsgl2_pattern_label(pattern),
+                    pass_index,
+                    patterns.len(),
+                    candidate.anchor.voltage_mv,
+                    qualification_dwell_ms / 1000
+                ),
+            });
+            let mut report = run_confirmed_f2_step(&mut validation_ops);
+            annotate_qualification_report(
+                &mut report,
+                F2QualificationStrength::Fsgl2,
+                Some(pattern),
+                pass_index as u32,
+                inconclusive_retries as u32,
+            );
+            logs.push(format!(
+                "{target_mhz} MHz @ {} mV FSGL2 {} {}/{}: {:?}",
+                candidate.anchor.voltage_mv,
+                fsgl2_pattern_label(pattern),
+                pass_index,
+                patterns.len(),
+                report.outcome
+            ));
+            qual_ctx.timestamp = now_rfc3339();
+            let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+                qual_ctx,
+                target_mhz,
+                candidate,
+                &report,
+            );
+            if let Err(e) = obs_store.append(&observation) {
+                return F2QualificationOutcome::Aborted {
+                    stop_reason: format!("ObservationPersistFailed: {e}"),
+                    retain_boot_flag: false,
+                };
             }
-            other => return F2QualificationOutcome::Rejected(format!("{other:?}")),
+            *executed_steps = executed_steps.saturating_add(1);
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(candidate.anchor.voltage_mv),
+                outcome: Some(format!("{:?}", report.outcome)),
+                line: format!(
+                    "{target_mhz} MHz @ {} mV · FSGL2 {} {}/{} → {:?} · aprendizado salvo",
+                    candidate.anchor.voltage_mv,
+                    fsgl2_pattern_label(pattern),
+                    pass_index,
+                    patterns.len(),
+                    report.outcome
+                ),
+            });
+            match &report.outcome {
+                F2Outcome::Validated => break,
+                F2Outcome::DeviceLost
+                | F2Outcome::ResetFailed
+                | F2Outcome::ArmFailed(_)
+                | F2Outcome::ApplyFailed(_)
+                | F2Outcome::VerifyFailed => {
+                    return F2QualificationOutcome::Aborted {
+                        stop_reason: format!("QualificationAborted: {:?}", report.outcome),
+                        retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
+                    };
+                }
+                F2Outcome::Inconclusive => {
+                    if inconclusive_retries == 0 {
+                        inconclusive_retries += 1;
+                        logs.push(format!(
+                            "{target_mhz} MHz @ {} mV FSGL2 {} inconclusivo; repetindo uma vez",
+                            candidate.anchor.voltage_mv,
+                            fsgl2_pattern_label(pattern)
+                        ));
+                        continue;
+                    }
+                    return F2QualificationOutcome::Inconclusive;
+                }
+                other => return F2QualificationOutcome::Rejected(format!("{other:?}")),
+            }
+        }
+    }
+    F2QualificationOutcome::Qualified
+}
+
+#[cfg(windows)]
+fn fsgl2_pattern_label(pattern: F2QualificationPattern) -> &'static str {
+    match pattern {
+        F2QualificationPattern::A => "A",
+        F2QualificationPattern::B => "B",
+    }
+}
+
+#[cfg(windows)]
+fn fsgl2_gate_patterns(final_gate_passes: usize) -> Vec<F2QualificationPattern> {
+    [F2QualificationPattern::A, F2QualificationPattern::B]
+        .into_iter()
+        .take(final_gate_passes.min(2))
+        .collect()
+}
+
+#[cfg(windows)]
+fn fsgl2_next_higher_candidate_index(rejected_index: usize) -> Option<usize> {
+    rejected_index.checked_sub(1)
+}
+
+/// Run the optional final FSGL2 boundary gate on ONE already-qualified candidate. This does not rediscover the
+/// voltage ladder: a real failure rejects exactly this bin, and the caller moves one physical bin
+/// higher before trying FSGL2 again.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn gate_anchored_candidate_fsgl2(
+    store: &SafeLoopStore,
+    obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
+    qual_ctx: &mut crate::gpu_f2_sweep::ObsContext,
+    sane: &[(usize, u32, u32)],
+    limits: &PositiveOffsetLimits,
+    target_mhz: u32,
+    candidate: &AnchoredPositiveOffsetPlan,
+    candidate_count: usize,
+    unpruned_steps: usize,
+    final_gate_dwell_ms: u64,
+    final_gate_passes: usize,
+    stop: &std::sync::atomic::AtomicBool,
+    logs: &mut Vec<String>,
+    executed_steps: &mut usize,
+    on_progress: &mut dyn FnMut(F2ClockDiscoveryProgress),
+) -> F2QualificationOutcome {
+    use std::sync::atomic::Ordering;
+
+    use nidavellir_core::f2_observation::now_rfc3339;
+
+    let patterns = fsgl2_gate_patterns(final_gate_passes);
+    for (pattern_index, pattern) in patterns.iter().copied().enumerate() {
+        let pass_index = (pattern_index + 1) as u32;
+        let mut inconclusive_retries = 0usize;
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return F2QualificationOutcome::Cancelled;
+            }
+            let mut validation_ops = RealF2MultiOps {
+                store,
+                curve: sane.to_vec(),
+                candidates: vec![candidate.clone()],
+                limits: *limits,
+                target_mhz,
+                baseline_offset_mhz: 0,
+                dwell_ms: final_gate_dwell_ms,
+                stress_purpose: F2StressPurpose::Fsgl2Qualification(pattern),
+                cur: None,
+            };
+            if let Err(e) = validation_ops.select(0) {
+                return F2QualificationOutcome::Aborted {
+                    stop_reason: format!("Fsgl2PrecheckFailed: {e}"),
+                    retain_boot_flag: false,
+                };
+            }
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(candidate.anchor.voltage_mv),
+                outcome: None,
+                line: format!(
+                    "FSGL2 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
+                    fsgl2_pattern_label(pattern),
+                    pass_index,
+                    patterns.len(),
+                    candidate.anchor.voltage_mv,
+                    final_gate_dwell_ms / 1000
+                ),
+            });
+            let mut report = run_confirmed_f2_step(&mut validation_ops);
+            annotate_qualification_report(
+                &mut report,
+                F2QualificationStrength::Fsgl2,
+                Some(pattern),
+                pass_index,
+                inconclusive_retries as u32,
+            );
+            logs.push(format!(
+                "{target_mhz} MHz @ {} mV FSGL2 {} {}/{}: {:?}",
+                candidate.anchor.voltage_mv,
+                fsgl2_pattern_label(pattern),
+                pass_index,
+                patterns.len(),
+                report.outcome
+            ));
+            qual_ctx.timestamp = now_rfc3339();
+            let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+                qual_ctx,
+                target_mhz,
+                candidate,
+                &report,
+            );
+            if let Err(e) = obs_store.append(&observation) {
+                return F2QualificationOutcome::Aborted {
+                    stop_reason: format!("ObservationPersistFailed: {e}"),
+                    retain_boot_flag: false,
+                };
+            }
+            *executed_steps = executed_steps.saturating_add(1);
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(candidate.anchor.voltage_mv),
+                outcome: Some(format!("{:?}", report.outcome)),
+                line: format!(
+                    "{target_mhz} MHz @ {} mV · FSGL2 {} {}/{} → {:?} · aprendizado salvo",
+                    candidate.anchor.voltage_mv,
+                    fsgl2_pattern_label(pattern),
+                    pass_index,
+                    patterns.len(),
+                    report.outcome
+                ),
+            });
+            match &report.outcome {
+                F2Outcome::Validated => break,
+                F2Outcome::DeviceLost
+                | F2Outcome::ResetFailed
+                | F2Outcome::ArmFailed(_)
+                | F2Outcome::ApplyFailed(_)
+                | F2Outcome::VerifyFailed => {
+                    return F2QualificationOutcome::Aborted {
+                        stop_reason: format!("Fsgl2Aborted: {:?}", report.outcome),
+                        retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
+                    };
+                }
+                F2Outcome::Inconclusive => {
+                    if inconclusive_retries == 0 {
+                        inconclusive_retries += 1;
+                        logs.push(format!(
+                            "{target_mhz} MHz @ {} mV FSGL2 {} inconclusivo; repetindo uma vez",
+                            candidate.anchor.voltage_mv,
+                            fsgl2_pattern_label(pattern)
+                        ));
+                        continue;
+                    }
+                    return F2QualificationOutcome::Inconclusive;
+                }
+                other => return F2QualificationOutcome::Rejected(format!("{other:?}")),
+            }
         }
     }
     F2QualificationOutcome::Qualified
@@ -3460,6 +3677,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     discovery_dwell_ms: u64,
     qualification_dwell_ms: u64,
     qualification_passes: usize,
+    final_gate_dwell_ms: u64,
+    final_gate_passes: usize,
     stop: &std::sync::atomic::AtomicBool,
     on_progress: &mut dyn FnMut(F2ClockDiscoveryProgress),
 ) -> F2ClockDiscoverySummary {
@@ -3505,7 +3724,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     // Standard/Long must not qualify a boundary that exists only because a previous run accepted it.
     // Prior positives may guide Fast/resume, but qualification modes must rediscover the boundary with
     // the current PowerRender discovery contract before the FailureSeekingGameLoop is allowed to run.
-    let refresh_discovery_for_qualification = qualification_passes > 0;
+    let refresh_discovery_for_qualification = qualification_passes > 0 || final_gate_passes > 0;
     let resume_good_mv = if refresh_discovery_for_qualification {
         None
     } else {
@@ -3648,17 +3867,16 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         ));
     }
 
-    // Qualification evidence context (separate from the Discovery `ctx` used by the PowerRender step),
-    // and whether ANY anchor has qualified yet this clock. The interleaved loop qualifies each
-    // PowerRender-validated bin before descending, so the heavy failure-seeking workload never runs
-    // more than one real VF bin below an already-proven point.
+    // Qualification evidence context, separate from the Discovery `ctx` used by PowerRender.
+    // FSGL2 is the default per-candidate qualifier during descent. The optional final gate is kept
+    // dormant for now so a later FSGL3-style doubt-breaker can use the same boundary shape.
     let mut qual_ctx = ctx.clone();
     qual_ctx.evidence_kind = nidavellir_core::f2_observation::F2EvidenceKind::Qualification;
     qual_ctx.discovery_contract_version = None;
     qual_ctx.qualification_contract_version =
         Some(nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION);
     qual_ctx.qualification_coverage = None;
-    let mut qualified_any = false;
+    let mut last_qualified_index: Option<usize> = None;
 
     for i in 0..candidate_count {
         if stop.load(Ordering::SeqCst) {
@@ -3726,7 +3944,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 // Only an actual sustained (Validated) dwell is a qualification candidate; a pre-sustain
                 // power-bound clock drop just keeps the descent going lower.
                 if matches!(report.outcome, F2Outcome::Validated) && qualification_passes > 0 {
-                    // Standard/Long: qualify THIS bin with the failure-seeking loop before going any
+                    // Standard/Long: qualify THIS bin with FSGL2 A/B before going any
                     // deeper. If it passes we descend one real bin lower (next iteration's PowerRender
                     // measures its power and gates the next qualification); if it fails we stop here with
                     // the last qualified bin as the boundary — the heavy qualifier never runs more than
@@ -3749,14 +3967,14 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                         on_progress,
                     ) {
                         F2QualificationOutcome::Qualified => {
-                            qualified_any = true;
+                            last_qualified_index = Some(i);
                             completed = true;
                             stop_reason = "Qualified".into();
                             // Fall through: descend one real bin lower on the next iteration.
                         }
                         F2QualificationOutcome::Rejected(reason) => {
-                            completed = qualified_any;
-                            stop_reason = if qualified_any {
+                            completed = last_qualified_index.is_some();
+                            stop_reason = if last_qualified_index.is_some() {
                                 format!(
                                     "QualifiedBoundary: {anchor_mv} mV rejeitado abaixo do último qualificado ({reason})"
                                 )
@@ -3766,8 +3984,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                             break;
                         }
                         F2QualificationOutcome::Inconclusive => {
-                            completed = qualified_any;
-                            stop_reason = if qualified_any {
+                            completed = last_qualified_index.is_some();
+                            stop_reason = if last_qualified_index.is_some() {
                                 "QualifiedBoundaryInconclusiveDeeper".into()
                             } else {
                                 "QualificationInconclusive".into()
@@ -3818,6 +4036,83 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         }
         if i + 1 == candidate_count {
             completed = true;
+        }
+    }
+
+    if final_gate_passes > 0
+        && !aborted
+        && !stop.load(Ordering::SeqCst)
+        && last_qualified_index.is_some()
+    {
+        let mut gate_index = last_qualified_index;
+        completed = false;
+        while let Some(idx) = gate_index {
+            let candidate = &descent.candidates[idx];
+            match gate_anchored_candidate_fsgl2(
+                store,
+                obs_store,
+                &mut qual_ctx,
+                sane,
+                limits,
+                target_mhz,
+                candidate,
+                candidate_count,
+                unpruned_steps,
+                final_gate_dwell_ms,
+                final_gate_passes,
+                stop,
+                &mut logs,
+                &mut executed_steps,
+                on_progress,
+            ) {
+                F2QualificationOutcome::Qualified => {
+                    completed = true;
+                    stop_reason = "BoundaryAccepted".into();
+                    logs.push(format!(
+                        "{target_mhz} MHz @ {} mV BoundaryAccepted",
+                        candidate.anchor.voltage_mv
+                    ));
+                    break;
+                }
+                F2QualificationOutcome::Rejected(reason) => {
+                    logs.push(format!(
+                        "{target_mhz} MHz @ {} mV boundary rejected by FSGL2 ({reason})",
+                        candidate.anchor.voltage_mv
+                    ));
+                    gate_index = fsgl2_next_higher_candidate_index(idx);
+                    if gate_index.is_none() {
+                        completed = false;
+                        stop_reason = format!("Fsgl2RejectedNoHigherBin: {reason}");
+                    }
+                }
+                F2QualificationOutcome::Inconclusive => {
+                    completed = false;
+                    stop_reason = "Fsgl2Inconclusive".into();
+                    break;
+                }
+                F2QualificationOutcome::Cancelled => {
+                    completed = false;
+                    stop_reason = "CancelledDuringFsgl2".into();
+                    break;
+                }
+                F2QualificationOutcome::Aborted {
+                    stop_reason: reason,
+                    retain_boot_flag: retain,
+                } => {
+                    aborted = true;
+                    retain_boot_flag |= retain;
+                    stop_reason = reason;
+                    break;
+                }
+            }
+        }
+    } else if final_gate_passes == 0 && !aborted && completed {
+        if let Some(idx) = last_qualified_index {
+            let candidate = &descent.candidates[idx];
+            logs.push(format!(
+                "{target_mhz} MHz @ {} mV BoundaryAccepted (FSGL2 default)",
+                candidate.anchor.voltage_mv
+            ));
         }
     }
 
@@ -4283,7 +4578,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_qualification_does_not_treat_light_phase_p5_as_clock_drop() {
+    fn fsgl2_qualification_does_not_treat_light_phase_p5_as_clock_drop() {
         let stable_low_p5 = crate::gpu_power_sweep::SingleDwell {
             crashed: false,
             silent_error: false,
@@ -4308,10 +4603,21 @@ mod tests {
             classify_f2_stress_dwell(
                 &stable_low_p5,
                 1800,
-                F2StressPurpose::TransientQualification
+                F2StressPurpose::Fsgl2Qualification(F2QualificationPattern::A)
             ),
             F2DwellOutcome::Stable
         );
+    }
+
+    #[test]
+    fn fsgl2_gate_uses_a_then_b_and_failure_moves_one_bin_up() {
+        assert_eq!(
+            fsgl2_gate_patterns(2),
+            vec![F2QualificationPattern::A, F2QualificationPattern::B]
+        );
+        assert_eq!(fsgl2_gate_patterns(1), vec![F2QualificationPattern::A]);
+        assert_eq!(fsgl2_next_higher_candidate_index(3), Some(2));
+        assert_eq!(fsgl2_next_higher_candidate_index(0), None);
     }
 
     #[test]

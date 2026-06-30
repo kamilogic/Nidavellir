@@ -119,6 +119,25 @@ impl VfQualifierPhase {
     }
 }
 
+/// Qualification workload sequence. FSGL1 remains available as a lighter legacy pattern; FSGL2 A/B are
+/// the current default qualification patterns and intentionally differ from each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfQualifierPattern {
+    Fsgl1,
+    Fsgl2A,
+    Fsgl2B,
+}
+
+impl VfQualifierPattern {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fsgl1 => "fsgl1",
+            Self::Fsgl2A => "fsgl2-a",
+            Self::Fsgl2B => "fsgl2-b",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VfWorkload {
     PowerRender,
@@ -138,29 +157,65 @@ struct VfQualifierSegment {
 }
 
 /// One cycle crosses distinct graphics/compute profiles and deliberate idle→heavy transitions. The
-/// weights describe the approved 60-second Standard pass and scale exactly for Long.
-fn vf_qualifier_plan(target_ms: u64) -> Vec<VfQualifierSegment> {
-    const TEMPLATE: [(VfQualifierPhase, VfWorkload, u64); 8] = [
-        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
-        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
-        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 6),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 8),
+/// weights scale to the requested target duration.
+fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQualifierSegment> {
+    const FSGL1: [(VfQualifierPhase, VfWorkload, u64); 10] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 5),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 7),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 5),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 7),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 15),
         (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 4),
-        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
-        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 12),
-        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 10),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 7),
     ];
-    const TOTAL_WEIGHT: u64 = 60;
+    const FSGL2_A: [(VfQualifierPhase, VfWorkload, u64); 12] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 4),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 6),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 5),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 5),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 4),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 5),
+    ];
+    const FSGL2_B: [(VfQualifierPhase, VfWorkload, u64); 13] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 4),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 6),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 6),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 6),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 3),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 3),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 4),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 5),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 4),
+    ];
 
+    let template: &[(VfQualifierPhase, VfWorkload, u64)] = match pattern {
+        VfQualifierPattern::Fsgl1 => &FSGL1,
+        VfQualifierPattern::Fsgl2A => &FSGL2_A,
+        VfQualifierPattern::Fsgl2B => &FSGL2_B,
+    };
+    let total_weight = template.iter().map(|(_, _, weight)| *weight).sum::<u64>();
     let mut assigned = 0u64;
-    TEMPLATE
+    template
         .iter()
         .enumerate()
         .map(|(index, &(phase, workload, weight))| {
-            let duration_ms = if index + 1 == TEMPLATE.len() {
+            let duration_ms = if index + 1 == template.len() {
                 target_ms.saturating_sub(assigned)
             } else {
-                target_ms.saturating_mul(weight) / TOTAL_WEIGHT
+                target_ms.saturating_mul(weight) / total_weight
             };
             assigned = assigned.saturating_add(duration_ms);
             VfQualifierSegment { phase, workload, duration_ms }
@@ -1329,7 +1384,11 @@ impl GpuCtx {
     /// [`Self::run_render_stress`]; this method is only for Standard/Long reset/reapply passes.
     pub fn run_vf_qualifier_stress(&self, target_ms: u64) -> RenderResult {
         let phase = AtomicU8::new(VfQualifierPhase::NONE_CODE);
-        self.run_vf_qualifier_stress_with_phase(target_ms, &phase)
+        self.run_vf_qualifier_stress_with_phase_and_pattern(
+            target_ms,
+            &phase,
+            VfQualifierPattern::Fsgl1,
+        )
     }
 
     /// Same qualifier with an observable phase id for the service's concurrent NVML sampler.
@@ -1338,10 +1397,23 @@ impl GpuCtx {
         target_ms: u64,
         phase_state: &AtomicU8,
     ) -> RenderResult {
+        self.run_vf_qualifier_stress_with_phase_and_pattern(
+            target_ms,
+            phase_state,
+            VfQualifierPattern::Fsgl1,
+        )
+    }
+
+    pub fn run_vf_qualifier_stress_with_phase_and_pattern(
+        &self,
+        target_ms: u64,
+        phase_state: &AtomicU8,
+        pattern: VfQualifierPattern,
+    ) -> RenderResult {
         let started = std::time::Instant::now();
         let mut frames = 0u64;
         let mut reports = Vec::new();
-        let plan = vf_qualifier_plan(target_ms);
+        let plan = vf_qualifier_plan(target_ms, pattern);
 
         for segment in plan {
             phase_state.store(segment.phase.code(), Ordering::SeqCst);
@@ -1837,7 +1909,7 @@ mod tests {
 
     #[test]
     fn vf_qualifier_plan_preserves_duration_and_crosses_load_amplitudes() {
-        let plan = vf_qualifier_plan(60_000);
+        let plan = vf_qualifier_plan(60_000, VfQualifierPattern::Fsgl1);
         assert_eq!(plan.iter().map(|segment| segment.duration_ms).sum::<u64>(), 60_000);
         assert_eq!(plan.first().map(|segment| segment.phase), Some(VfQualifierPhase::PowerOpening));
         assert_eq!(plan.last().map(|segment| segment.phase), Some(VfQualifierPhase::PowerClosing));
@@ -1848,5 +1920,20 @@ mod tests {
         assert!(plan.iter().all(|segment| segment.duration_ms > 0));
         assert_eq!(VfQualifierPhase::from_code(VfQualifierPhase::TextureRop.code()),
                    Some(VfQualifierPhase::TextureRop));
+    }
+
+    #[test]
+    fn fsgl2_patterns_preserve_duration_and_differ_in_order() {
+        let a = vf_qualifier_plan(60_000, VfQualifierPattern::Fsgl2A);
+        let b = vf_qualifier_plan(60_000, VfQualifierPattern::Fsgl2B);
+        assert_eq!(a.iter().map(|segment| segment.duration_ms).sum::<u64>(), 60_000);
+        assert_eq!(b.iter().map(|segment| segment.duration_ms).sum::<u64>(), 60_000);
+        let a_order: Vec<_> = a.iter().map(|segment| segment.phase).collect();
+        let b_order: Vec<_> = b.iter().map(|segment| segment.phase).collect();
+        assert_ne!(a_order, b_order);
+        assert!(a.iter().any(|segment| segment.workload == VfWorkload::HeavySpike));
+        assert!(b.iter().any(|segment| segment.workload == VfWorkload::TextureRop));
+        assert_eq!(VfQualifierPattern::Fsgl2A.label(), "fsgl2-a");
+        assert_eq!(VfQualifierPattern::Fsgl2B.label(), "fsgl2-b");
     }
 }

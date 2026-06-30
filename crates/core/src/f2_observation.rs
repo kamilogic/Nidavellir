@@ -25,7 +25,7 @@ pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 /// Current homogeneous PowerRender discovery contract.
 pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 1;
 /// Current FailureSeekingGameLoop qualification contract.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 2;
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 3;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -47,23 +47,86 @@ pub enum F2QualificationVerdict {
     Inconclusive,
 }
 
+/// Strength of the qualification evidence. FSGL1 remains readable for compatibility; FSGL2 is the
+/// current deployable qualifier required for Apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum F2QualificationStrength {
+    #[default]
+    Fsgl1,
+    Fsgl2,
+}
+
+/// Deterministic FSGL2 pattern used by the current deployable qualifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum F2QualificationPattern {
+    A,
+    B,
+}
+
+/// Per-phase telemetry captured during a qualification dwell. Optional values remain absent when a
+/// driver/sample path could not provide them; they are never fabricated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct F2QualificationPhaseMetric {
+    pub phase_name: String,
+    pub phase_pattern: String,
+    pub duration_ms: u64,
+    pub frame_count: u64,
+    pub checksum_count: u32,
+    pub compute_check_count: u32,
+    #[serde(default)]
+    pub clock_avg: Option<f32>,
+    #[serde(default)]
+    pub clock_p5: Option<u32>,
+    #[serde(default)]
+    pub clock_p50: Option<u32>,
+    #[serde(default)]
+    pub clock_p95: Option<u32>,
+    #[serde(default)]
+    pub target_residency_pct: Option<f32>,
+    #[serde(default)]
+    pub power_avg: Option<f32>,
+    #[serde(default)]
+    pub power_p95: Option<f32>,
+    #[serde(default)]
+    pub power_capped_fraction: Option<f32>,
+    #[serde(default)]
+    pub temperature_avg: Option<f32>,
+    #[serde(default)]
+    pub temperature_max: Option<f32>,
+    pub coverage_status: String,
+}
+
 /// Compact, append-only qualification coverage summary. Phase details remain service-internal; this
 /// carries the durable facts needed to decide whether a validation may qualify Apply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct F2QualificationCoverage {
+    #[serde(default)]
+    pub strength: F2QualificationStrength,
+    #[serde(default)]
+    pub pattern: Option<F2QualificationPattern>,
+    #[serde(default)]
+    pub pass_index: u32,
     pub verdict: F2QualificationVerdict,
     pub phases_completed: u32,
     pub phases_expected: u32,
     pub checksum_count: u32,
     pub sample_count: u32,
     #[serde(default)]
+    pub compute_check_count: u32,
+    #[serde(default)]
     pub target_residency_frac: Option<f32>,
     #[serde(default)]
     pub heavy_light_power_delta_w: Option<f32>,
     #[serde(default)]
+    pub failure_phase: Option<String>,
+    #[serde(default)]
     pub retry_count: u32,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub phase_metrics: Vec<F2QualificationPhaseMetric>,
 }
 
 /// Which F2 path produced an observation.
@@ -388,7 +451,11 @@ pub fn is_current_qualification_pass(o: &F2Observation) -> bool {
         && o.outcome.is_validated()
         && o.qualification_coverage
             .as_ref()
-            .is_some_and(|coverage| coverage.verdict == F2QualificationVerdict::Pass)
+            .is_some_and(|coverage| {
+                coverage.strength == F2QualificationStrength::Fsgl2
+                    && coverage.pattern.is_some()
+                    && coverage.verdict == F2QualificationVerdict::Pass
+            })
 }
 
 /// Lowest-voltage stable point proven by the current, homogeneous discovery contract. Negative
@@ -485,9 +552,19 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
                 && (is_current_discovery_evidence(o) || is_current_qualification_pass(o))
         })
         .collect();
-    let qualification_count = evidence_at_best
-        .iter()
-        .filter(|o| is_current_qualification_pass(o))
+    let has_fsgl2_a = evidence_at_best.iter().any(|o| {
+        is_current_qualification_pass(o)
+            && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
+                == Some(F2QualificationPattern::A)
+    });
+    let has_fsgl2_b = evidence_at_best.iter().any(|o| {
+        is_current_qualification_pass(o)
+            && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
+                == Some(F2QualificationPattern::B)
+    });
+    let qualification_count = [has_fsgl2_a, has_fsgl2_b]
+        .into_iter()
+        .filter(|present| *present)
         .count();
     let observation_count = obs.iter().filter(|o| o.target_mhz == target_mhz).count();
     let bracket = bracket_for_target(obs, target_mhz);
@@ -697,20 +774,36 @@ mod tests {
         }
     }
 
-    fn qualification_pass(mut o: F2Observation) -> F2Observation {
+    fn qualification_pass(o: F2Observation) -> F2Observation {
+        qualification_pass_with_pattern(o, F2QualificationPattern::A)
+    }
+
+    fn qualification_pass_with_pattern(
+        mut o: F2Observation,
+        pattern: F2QualificationPattern,
+    ) -> F2Observation {
         o.evidence_kind = F2EvidenceKind::Qualification;
         o.discovery_contract_version = None;
         o.qualification_contract_version = Some(F2_QUALIFICATION_CONTRACT_VERSION);
         o.qualification_coverage = Some(F2QualificationCoverage {
+            strength: F2QualificationStrength::Fsgl2,
+            pattern: Some(pattern),
+            pass_index: match pattern {
+                F2QualificationPattern::A => 1,
+                F2QualificationPattern::B => 2,
+            },
             verdict: F2QualificationVerdict::Pass,
             phases_completed: 8,
             phases_expected: 8,
             checksum_count: 8,
             sample_count: 100,
+            compute_check_count: 1,
             target_residency_frac: Some(1.0),
             heavy_light_power_delta_w: Some(20.0),
+            failure_phase: None,
             retry_count: 0,
             reason: None,
+            phase_metrics: Vec::new(),
         });
         o
     }
@@ -951,6 +1044,34 @@ mod tests {
         .unwrap();
         assert_eq!(entry.best_anchor_mv, 962);
         assert_eq!(entry.validation_count, 1);
+    }
+
+    #[test]
+    fn learned_frontier_ignores_fsgl1_for_apply_qualification() {
+        let discovery = obs(1800, 962, F2ObsOutcome::Validated);
+        let mut fsgl1 = qualification_pass(discovery.clone());
+        fsgl1.qualification_coverage.as_mut().unwrap().strength =
+            F2QualificationStrength::Fsgl1;
+        fsgl1.qualification_coverage.as_mut().unwrap().pattern = None;
+        let current_fsgl2 = qualification_pass(discovery.clone());
+
+        let entry = frontier_entry_for_target(&[discovery, fsgl1, current_fsgl2], 1800).unwrap();
+        assert_eq!(entry.best_anchor_mv, 962);
+        assert_eq!(entry.validation_count, 1);
+    }
+
+    #[test]
+    fn learned_frontier_counts_distinct_fsgl2_patterns() {
+        let discovery = obs(1800, 962, F2ObsOutcome::Validated);
+        let a1 = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::A);
+        let a2 = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::A);
+        let only_a = frontier_entry_for_target(&[discovery.clone(), a1, a2], 1800).unwrap();
+        assert_eq!(only_a.validation_count, 1);
+
+        let a = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::A);
+        let b = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::B);
+        let a_and_b = frontier_entry_for_target(&[discovery, a, b], 1800).unwrap();
+        assert_eq!(a_and_b.validation_count, 2);
     }
 
     #[test]

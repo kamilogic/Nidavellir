@@ -1,16 +1,36 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-29: the F2 live Forge algorithm has been corrected in
-code. It starts at the highest real clock, uses power-bound voltage descent to discover the first
-sustainable Cmax, then characterizes every real clock through 90% Cmax. Autonomous voltage discovery
-has no arbitrary step cap. Fast is provisional; Standard qualifies boundaries with 2×60 s passes and
-Long with 3×120 s. Discovery retains the steady power render; Standard/Long qualification uses a
-versioned FailureSeekingGameLoop with phase coverage/checksums. Standard/Long must redescobrir a
-boundary no run atual antes de qualificar; prior_good antigo é só dica, não passe direto para Apply.
-Every candidate checkpoints by physical GPU UUID. The F2 Apply path remains wired
-but fails closed until `profiles_qualified`; F1 remains available for legacy payloads. **NEXT = supervised real Forge
-checkpoint; no hardware was run in this implementation session.** See `decisions.md` top entry.
+How to pick this up cold. State as of 2026-06-30: the F2 live Forge algorithm now separates
+PowerRender measurement from FSGL2 deployable qualification. It starts at the highest
+real clock, uses power-bound voltage descent to discover Cmax, then characterizes every real clock
+through 90% Cmax. Autonomous voltage discovery has no arbitrary step cap. Fast is provisional.
+Standard/Long now run FSGL2 A 60 s + B 60 s as the interleaved per-bin qualifier during descent; FSGL1
+is paused for the current hardware trial. If FSGL2 fails, that candidate is rejected and the last
+FSGL2-qualified physical bin remains the accepted boundary. Apply requires current-contract FSGL2 A+B
+evidence (`profiles_qualified`); PowerRender and FSGL1 alone never unlock Apply. Standard/Long must redescobrir a boundary no run atual antes de
+qualificar; prior_good antigo é só dica. Every candidate checkpoints by physical GPU UUID. F1 remains
+available for legacy payloads. **NEXT = supervised real Forge checkpoint; no hardware was run in this
+implementation session.** See `decisions.md` top entry.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## Latest backend checkpoint (2026-06-30) — FSGL2 default qualification trial (code-complete, NOT HW-tested)
+- **What**: added `qualification_contract_version = 3` with `Fsgl1`/`Fsgl2` strength, FSGL2 pattern
+  A/B, per-phase metrics, failure phase and compute/checksum counts in `f2_observations.jsonl`.
+- **Algorithm**: current descent remains PowerRender-gated, but each sustainable Standard/Long
+  candidate now qualifies with FSGL2 A then B (60 s each) before the algorithm descends one physical VF
+  bin lower. `Pass` on both marks `BoundaryAccepted (FSGL2 default)` for the current deepest qualified
+  point; any real FSGL2 fail rejects that candidate and leaves the previous FSGL2-qualified bin as the
+  boundary. `Inconclusive` retries once and then blocks Apply without marking the bin bad.
+- **Workloads**: FSGL1 remains in the stress library as a lighter legacy profile but is paused in the
+  Standard/Long runtime path. FSGL2 A/B differ in order and emphasis,
+  mixing BoostEdge, HeavySpike, TextureRop, ComputeBurst, IdlePulse and MixedGame. BoostEdge coverage
+  now fails inconclusive if it is power-cap masked.
+- **Apply gate**: `validation_count` now counts distinct current FSGL2 patterns, so A+B are required.
+  FSGL1-qualified or legacy-qualified points remain provisional.
+- **Validation so far**: no-hardware validation passed with targeted FSGL2 tests, `cargo test
+  --workspace`, `cargo check --workspace`, `npm.cmd run build` in `apps/ui`, `cargo clippy --workspace
+  --all-targets` and `git diff --check`. `clippy` still reports existing baseline warnings. Hardware
+  validation has not been run.
 
 ## Latest backend checkpoint (2026-06-29) — Cmax descent interleaves qualification per VF bin (code-complete, NOT HW-tested with new flow)
 - **Why**: discovery descended `PowerRender` to the deepest survivable bin then qualified THAT (most

@@ -21,12 +21,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
-use nidavellir_core::f2_observation::{F2QualificationCoverage, F2QualificationVerdict};
+use nidavellir_core::f2_observation::{
+    F2QualificationCoverage, F2QualificationPattern, F2QualificationPhaseMetric,
+    F2QualificationStrength, F2QualificationVerdict,
+};
 use nidavellir_core::gpu_sweep::StabilityResult;
 use nidavellir_core::ipc::{DwellQuality, PowerSweepPoint, PowerSweepProgress};
 use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
 #[cfg(windows)]
-use nidavellir_gpu_stress::VfQualifierPhase;
+use nidavellir_gpu_stress::{VfQualifierPattern, VfQualifierPhase};
 use tracing::{info, warn};
 
 // Long enough for power to RAMP UP and stabilize (real loads like Heaven take
@@ -211,16 +214,22 @@ impl PowerSweepMode {
                 discovery_dwell_ms: 10_000,
                 qualification_dwell_ms: 0,
                 qualification_passes: 0,
+                final_gate_dwell_ms: 0,
+                final_gate_passes: 0,
             },
             PowerSweepMode::Standard => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
                 qualification_dwell_ms: 60_000,
                 qualification_passes: 2,
+                final_gate_dwell_ms: 0,
+                final_gate_passes: 0,
             },
             PowerSweepMode::Long => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
-                qualification_dwell_ms: 120_000,
-                qualification_passes: 3,
+                qualification_dwell_ms: 60_000,
+                qualification_passes: 2,
+                final_gate_dwell_ms: 0,
+                final_gate_passes: 0,
             },
         }
     }
@@ -232,6 +241,13 @@ struct F2ForgeModePolicy {
     discovery_dwell_ms: u64,
     qualification_dwell_ms: u64,
     qualification_passes: usize,
+    final_gate_dwell_ms: u64,
+    final_gate_passes: usize,
+}
+
+#[cfg(windows)]
+fn f2_required_qualification_passes(policy: F2ForgeModePolicy) -> usize {
+    policy.final_gate_passes.max(policy.qualification_passes)
 }
 
 #[cfg(windows)]
@@ -240,8 +256,8 @@ fn f2_profiles_meet_qualification(
     profiles: &[Option<PowerSweepPoint>],
     confidence_threshold: f64,
 ) -> bool {
-    let required_confirmations = policy.qualification_passes as u32;
-    policy.qualification_passes > 0
+    let required_confirmations = f2_required_qualification_passes(policy) as u32;
+    required_confirmations > 0
         && profiles.iter().all(Option::is_some)
         && profiles.iter().flatten().all(|point| {
             point.confidence.unwrap_or(0.0) >= confidence_threshold
@@ -763,11 +779,14 @@ fn worst_quality(a: DwellQuality, b: DwellQuality) -> DwellQuality {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderStressPurpose {
     PowerCharacterization,
-    VfQualification,
+    VfQualification(VfQualifierPattern),
 }
 
 #[cfg(windows)]
-fn avg_power_for_phases(samples: &[(u32, f32, bool, Option<f32>, u8)], phases: &[VfQualifierPhase]) -> Option<f32> {
+type PhaseSample = (u32, f32, bool, Option<f32>, u8);
+
+#[cfg(windows)]
+fn avg_power_for_phases(samples: &[PhaseSample], phases: &[VfQualifierPhase]) -> Option<f32> {
     let mut total = 0.0f32;
     let mut count = 0u32;
     for sample in samples {
@@ -781,17 +800,70 @@ fn avg_power_for_phases(samples: &[(u32, f32, bool, Option<f32>, u8)], phases: &
 }
 
 #[cfg(windows)]
+fn pct_u32(mut values: Vec<u32>, pct: f64) -> Option<u32> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let idx = (((values.len() - 1) as f64) * pct).round() as usize;
+    values.get(idx).copied()
+}
+
+#[cfg(windows)]
+fn pct_f32(mut values: Vec<f32>, pct: f64) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = (((values.len() - 1) as f64) * pct).round() as usize;
+    values.get(idx).copied()
+}
+
+#[cfg(windows)]
+fn avg_f32(values: &[f32]) -> Option<f32> {
+    (!values.is_empty()).then(|| values.iter().sum::<f32>() / values.len() as f32)
+}
+
+#[cfg(windows)]
+fn f2_pattern_from_stress(
+    pattern: VfQualifierPattern,
+) -> (F2QualificationStrength, Option<F2QualificationPattern>, &'static str) {
+    match pattern {
+        VfQualifierPattern::Fsgl1 => (F2QualificationStrength::Fsgl1, None, "fsgl1"),
+        VfQualifierPattern::Fsgl2A => (
+            F2QualificationStrength::Fsgl2,
+            Some(F2QualificationPattern::A),
+            "fsgl2-a",
+        ),
+        VfQualifierPattern::Fsgl2B => (
+            F2QualificationStrength::Fsgl2,
+            Some(F2QualificationPattern::B),
+            "fsgl2-b",
+        ),
+    }
+}
+
+#[cfg(windows)]
 fn qualification_coverage_from_run(
     result: StabilityResult,
     phase_reports: &[nidavellir_gpu_stress::VfPhaseReport],
-    samples: &[(u32, f32, bool, Option<f32>, u8)],
+    samples: &[PhaseSample],
     target_mhz: Option<u32>,
+    pattern: VfQualifierPattern,
 ) -> F2QualificationCoverage {
     const EXPECTED_PHASES: u32 = 8;
     let mut seen = [false; 8];
     let mut checksum_count = 0u32;
+    let mut compute_check_count = 0u32;
+    let mut failure_phase = None;
     for report in phase_reports {
         checksum_count = checksum_count.saturating_add(report.checksum_count);
+        if report.phase == VfQualifierPhase::ComputeBurst {
+            compute_check_count = compute_check_count.saturating_add(report.checksum_count);
+        }
+        if failure_phase.is_none() && !report.result.is_stable() {
+            failure_phase = Some(report.phase.label().to_string());
+        }
         if report.result.is_stable() {
             seen[report.phase.code() as usize] = true;
         }
@@ -822,6 +894,81 @@ fn qualification_coverage_from_run(
     );
     let light_power = avg_power_for_phases(samples, &[VfQualifierPhase::BoostEdge]);
     let heavy_light_power_delta_w = heavy_power.zip(light_power).map(|(heavy, light)| heavy - light);
+    let boost_samples = samples
+        .iter()
+        .filter(|sample| VfQualifierPhase::from_code(sample.4) == Some(VfQualifierPhase::BoostEdge))
+        .count();
+    let boost_capped_fraction = (boost_samples > 0).then(|| {
+        samples
+            .iter()
+            .filter(|sample| {
+                VfQualifierPhase::from_code(sample.4) == Some(VfQualifierPhase::BoostEdge)
+                    && sample.2
+            })
+            .count() as f32
+            / boost_samples as f32
+    });
+    let (strength, qualifier_pattern, phase_pattern) = f2_pattern_from_stress(pattern);
+    let phase_metrics = phase_reports
+        .iter()
+        .map(|report| {
+            let phase_samples: Vec<_> = samples
+                .iter()
+                .copied()
+                .filter(|sample| VfQualifierPhase::from_code(sample.4) == Some(report.phase))
+                .collect();
+            let clocks: Vec<u32> = phase_samples.iter().map(|sample| sample.0).collect();
+            let powers: Vec<f32> = phase_samples.iter().map(|sample| sample.1).collect();
+            let temperatures: Vec<f32> = phase_samples.iter().filter_map(|sample| sample.3).collect();
+            let target_residency_pct = target_mhz.and_then(|target| {
+                let target_floor = target.saturating_sub(F2_QUALIFIER_TARGET_TOL_MHZ);
+                (!phase_samples.is_empty()).then(|| {
+                    let resident = phase_samples
+                        .iter()
+                        .filter(|sample| sample.0 >= target_floor)
+                        .count();
+                    resident as f32 * 100.0 / phase_samples.len() as f32
+                })
+            });
+            let power_capped_fraction = (!phase_samples.is_empty()).then(|| {
+                phase_samples.iter().filter(|sample| sample.2).count() as f32
+                    / phase_samples.len() as f32
+            });
+            let coverage_status = if !report.result.is_stable() {
+                "fail"
+            } else if phase_samples.is_empty() {
+                "telemetry_missing"
+            } else if report.checksum_count == 0 {
+                "checksum_missing"
+            } else {
+                "pass"
+            };
+            F2QualificationPhaseMetric {
+                phase_name: report.phase.label().to_string(),
+                phase_pattern: phase_pattern.to_string(),
+                duration_ms: report.elapsed_ms,
+                frame_count: report.frames,
+                checksum_count: report.checksum_count,
+                compute_check_count: if report.phase == VfQualifierPhase::ComputeBurst {
+                    report.checksum_count
+                } else {
+                    0
+                },
+                clock_avg: (!clocks.is_empty())
+                    .then(|| clocks.iter().map(|clock| *clock as f32).sum::<f32>() / clocks.len() as f32),
+                clock_p5: pct_u32(clocks.clone(), 0.05),
+                clock_p50: pct_u32(clocks.clone(), 0.50),
+                clock_p95: pct_u32(clocks, 0.95),
+                target_residency_pct,
+                power_avg: avg_f32(&powers),
+                power_p95: pct_f32(powers, 0.95),
+                power_capped_fraction,
+                temperature_avg: avg_f32(&temperatures),
+                temperature_max: pct_f32(temperatures, 1.0),
+                coverage_status: coverage_status.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
 
     let (verdict, reason) = if !result.is_stable() {
         (F2QualificationVerdict::Fail, Some("workload_failed".to_string()))
@@ -833,6 +980,11 @@ fn qualification_coverage_from_run(
         (F2QualificationVerdict::Inconclusive, Some("telemetry_missing".to_string()))
     } else if target_residency_frac.is_some_and(|frac| frac < 0.35) {
         (F2QualificationVerdict::Inconclusive, Some("target_residency_low".to_string()))
+    } else if boost_capped_fraction.is_some_and(|frac| frac > 0.20) {
+        (
+            F2QualificationVerdict::Inconclusive,
+            Some("boost_edge_power_bound".to_string()),
+        )
     } else if heavy_light_power_delta_w.is_some_and(|delta| delta < 3.0) {
         (F2QualificationVerdict::Inconclusive, Some("phase_contrast_low".to_string()))
     } else {
@@ -840,15 +992,21 @@ fn qualification_coverage_from_run(
     };
 
     F2QualificationCoverage {
+        strength,
+        pattern: qualifier_pattern,
+        pass_index: 0,
         verdict,
         phases_completed,
         phases_expected: EXPECTED_PHASES,
         checksum_count,
         sample_count: phase_sample_count,
+        compute_check_count,
         target_residency_frac,
         heavy_light_power_delta_w,
+        failure_phase,
         retry_count: 0,
         reason,
+        phase_metrics,
     }
 }
 
@@ -873,8 +1031,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     let stop = Arc::new(AtomicBool::new(false));
     // Collect raw samples in the sampler thread for precise stats (mean/max/std + the
     // richer min/p5/temperature stats). Tuple: (clock_mhz, power_w, capped, temp_c, qualifier_phase).
-    let samples: Arc<Mutex<Vec<(u32, f32, bool, Option<f32>, u8)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let samples: Arc<Mutex<Vec<PhaseSample>>> = Arc::new(Mutex::new(Vec::new()));
     let phase_state = Arc::new(AtomicU8::new(VfQualifierPhase::NONE_CODE));
     let volt = Arc::new(AtomicU32::new(0));
     // Ramp-filtered + sanity-checked voltage samples → measured-voltage telemetry
@@ -896,7 +1053,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
                 if let (Some(c), Some(p)) = (r.core_clock_mhz, r.power_w) {
                     // Discovery discards ramp-up for steady-state power. Qualification keeps the
                     // opening/transition samples because the phase changes are the workload.
-                    if purpose == RenderStressPurpose::VfQualification
+                    if matches!(purpose, RenderStressPurpose::VfQualification(_))
                         || t0.elapsed().as_millis() >= RAMP_DISCARD_MS
                     {
                         if let Ok(mut v) = smp.lock() {
@@ -913,7 +1070,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
             }
             // Voltage via NVAPI is heavier (re-inits), so sample it sparsely.
             tick += 1;
-            if tick % 16 == 0 {
+            if tick.is_multiple_of(16) {
                 if let Some(mv) = nidavellir_gpu_nvapi::read_core_voltage_mv() {
                     vlt.fetch_max(mv, Ordering::SeqCst); // legacy max — unchanged
                     // Additive telemetry: ramp-filter + sanity-check, like clock/power.
@@ -942,8 +1099,12 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     // actually helps in.
     let render = catch_unwind(AssertUnwindSafe(|| match purpose {
         RenderStressPurpose::PowerCharacterization => ctx.run_render_stress(ms),
-        RenderStressPurpose::VfQualification => {
-            ctx.run_vf_qualifier_stress_with_phase(ms, phase_state.as_ref())
+        RenderStressPurpose::VfQualification(pattern) => {
+            ctx.run_vf_qualifier_stress_with_phase_and_pattern(
+                ms,
+                phase_state.as_ref(),
+                pattern,
+            )
         }
     }));
     let (res, phase_reports) = match render {
@@ -961,8 +1122,12 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     let volt_mv = volt.load(Ordering::SeqCst);
     let duration_ms = t0.elapsed().as_millis() as u64;
     let v = samples.lock().map(|g| g.clone()).unwrap_or_default();
-    let qualification_coverage = (purpose == RenderStressPurpose::VfQualification)
-        .then(|| qualification_coverage_from_run(res, &phase_reports, &v, target_mhz));
+    let qualification_coverage = match purpose {
+        RenderStressPurpose::VfQualification(pattern) => {
+            Some(qualification_coverage_from_run(res, &phase_reports, &v, target_mhz, pattern))
+        }
+        RenderStressPurpose::PowerCharacterization => None,
+    };
     let volt_samples = volts.lock().map(|g| g.clone()).unwrap_or_default();
     let (volt_min_mv, volt_avg_mv, volt_max_mv, volt_sample_count) = match voltage_stats(&volt_samples)
     {
@@ -3281,8 +3446,16 @@ pub(crate) fn single_load_dwell(dwell_ms: u64) -> SingleDwell {
 /// render used by discovery; callers must also avoid interpreting aggregate light/medium-phase
 /// telemetry as a sustained-clock boundary.
 #[cfg(windows)]
-pub(crate) fn single_qualifier_dwell(dwell_ms: u64, target_mhz: u32) -> SingleDwell {
-    let m = load_and_measure_for(dwell_ms, RenderStressPurpose::VfQualification, Some(target_mhz));
+pub(crate) fn single_qualifier_dwell(
+    dwell_ms: u64,
+    target_mhz: u32,
+    pattern: VfQualifierPattern,
+) -> SingleDwell {
+    let m = load_and_measure_for(
+        dwell_ms,
+        RenderStressPurpose::VfQualification(pattern),
+        Some(target_mhz),
+    );
     single_dwell_from_measured(m)
 }
 
@@ -4544,7 +4717,9 @@ fn measure_multiclock_undervolt_forge(
                 &f2_inputs.limits,
                 usize::MAX,
             );
-            let validation = mode_policy.qualification_passes;
+            let validation = mode_policy
+                .qualification_passes
+                .saturating_add(mode_policy.final_gate_passes);
             (target, descent.candidates.len().saturating_add(validation))
         })
         .collect();
@@ -4555,7 +4730,10 @@ fn measure_multiclock_undervolt_forge(
         .try_into()
         .unwrap_or(u32::MAX);
     let estimated_work_ms = estimated_steps_by_target.values().fold(0u64, |total, steps| {
-        let qualification_steps = mode_policy.qualification_passes.min(*steps);
+        let qualification_steps = mode_policy
+            .qualification_passes
+            .saturating_add(mode_policy.final_gate_passes)
+            .min(*steps);
         let discovery_steps = steps.saturating_sub(qualification_steps);
         total
             .saturating_add(
@@ -4576,12 +4754,14 @@ fn measure_multiclock_undervolt_forge(
     };
     prog.estimated_remaining_ms = Some(estimated_work_ms);
     prog.log.push(format!(
-        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, qualificação {}×{} s; ~{} dwells na estimativa inicial.",
+        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, FSGL2 qualificação {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
         targets.len(), targets[0],
         mode.label(),
         mode_policy.discovery_dwell_ms / 1000,
         mode_policy.qualification_passes,
         mode_policy.qualification_dwell_ms / 1000,
+        mode_policy.final_gate_passes,
+        mode_policy.final_gate_dwell_ms / 1000,
         prog.total_steps_estimate
     ));
     set(progress, prog.clone());
@@ -4624,7 +4804,8 @@ fn measure_multiclock_undervolt_forge(
                 if event.anchor_mv.is_none() && adjusted_targets.insert(event.target_mhz) {
                     let actual = event
                         .planned_steps
-                        .saturating_add(mode_policy.qualification_passes);
+                        .saturating_add(mode_policy.qualification_passes)
+                        .saturating_add(mode_policy.final_gate_passes);
                     let previous_estimate = estimated_steps_by_target
                         .insert(event.target_mhz, actual)
                         .unwrap_or(0);
@@ -4681,6 +4862,8 @@ fn measure_multiclock_undervolt_forge(
             mode_policy.discovery_dwell_ms,
             mode_policy.qualification_dwell_ms,
             mode_policy.qualification_passes,
+            mode_policy.final_gate_dwell_ms,
+            mode_policy.final_gate_passes,
             stop,
             &mut on_progress,
         );
@@ -4705,6 +4888,8 @@ fn measure_multiclock_undervolt_forge(
                         mode_policy.discovery_dwell_ms,
                         mode_policy.qualification_dwell_ms,
                         mode_policy.qualification_passes,
+                        mode_policy.final_gate_dwell_ms,
+                        mode_policy.final_gate_passes,
                         stop,
                         &mut on_progress,
                     );
@@ -4787,7 +4972,7 @@ fn measure_multiclock_undervolt_forge(
         prog.deep_calm = profiles.deep_calm;
         prog.points = pts.into_iter().map(|(p, _)| p).collect();
         prog.recommended = prog.brokkrs;
-        let required_confirmations = mode_policy.qualification_passes as u32;
+        let required_confirmations = f2_required_qualification_passes(mode_policy) as u32;
         prog.profiles_qualified = f2_profiles_meet_qualification(
             mode_policy,
             &[prog.godforge, prog.brokkrs, prog.deep_calm],
@@ -4947,19 +5132,31 @@ mod tests {
             (10_000, 10_000, 10_000)
         );
         assert_eq!(
-            (fast.qualification_dwell_ms, fast.qualification_passes),
-            (0, 0)
+            (
+                fast.qualification_dwell_ms,
+                fast.qualification_passes,
+                fast.final_gate_dwell_ms,
+                fast.final_gate_passes
+            ),
+            (0, 0, 0, 0)
         );
         assert_eq!(
             (
                 standard.qualification_dwell_ms,
-                standard.qualification_passes
+                standard.qualification_passes,
+                standard.final_gate_dwell_ms,
+                standard.final_gate_passes
             ),
-            (60_000, 2)
+            (60_000, 2, 0, 0)
         );
         assert_eq!(
-            (long.qualification_dwell_ms, long.qualification_passes),
-            (120_000, 3)
+            (
+                long.qualification_dwell_ms,
+                long.qualification_passes,
+                long.final_gate_dwell_ms,
+                long.final_gate_passes
+            ),
+            (60_000, 2, 0, 0)
         );
     }
 
@@ -4982,6 +5179,17 @@ mod tests {
             &profiles,
             0.85
         ));
+        profiles[0] = Some(PowerSweepPoint {
+            confidence: Some(0.99),
+            validation_count: Some(1),
+            ..Default::default()
+        });
+        assert!(!f2_profiles_meet_qualification(
+            PowerSweepMode::Standard.f2_policy(),
+            &profiles,
+            0.85
+        ));
+        profiles[0] = Some(qualified);
         profiles[2] = Some(PowerSweepPoint {
             confidence: Some(0.84),
             validation_count: Some(2),
@@ -5031,22 +5239,39 @@ mod tests {
             })
             .collect();
 
-        let pass =
-            qualification_coverage_from_run(StabilityResult::Stable, &reports, &samples, Some(1800));
+        let pass = qualification_coverage_from_run(
+            StabilityResult::Stable,
+            &reports,
+            &samples,
+            Some(1800),
+            VfQualifierPattern::Fsgl2A,
+        );
         assert_eq!(pass.verdict, F2QualificationVerdict::Pass);
+        assert_eq!(pass.strength, F2QualificationStrength::Fsgl2);
+        assert_eq!(pass.pattern, Some(F2QualificationPattern::A));
         assert_eq!(pass.phases_completed, 8);
+        assert_eq!(pass.compute_check_count, 1);
+        assert_eq!(pass.phase_metrics.len(), 8);
+        assert_eq!(pass.phase_metrics[0].phase_pattern, "fsgl2-a");
 
         let failed = qualification_coverage_from_run(
             StabilityResult::SilentError,
             &reports,
             &samples,
             Some(1800),
+            VfQualifierPattern::Fsgl2B,
         );
         assert_eq!(failed.verdict, F2QualificationVerdict::Fail);
 
-        let missing_phase =
-            qualification_coverage_from_run(StabilityResult::Stable, &reports[..7], &samples, Some(1800));
+        let missing_phase = qualification_coverage_from_run(
+            StabilityResult::Stable,
+            &reports[..7],
+            &samples,
+            Some(1800),
+            VfQualifierPattern::Fsgl1,
+        );
         assert_eq!(missing_phase.verdict, F2QualificationVerdict::Inconclusive);
+        assert_eq!(missing_phase.strength, F2QualificationStrength::Fsgl1);
     }
 
     #[cfg(windows)]

@@ -55,32 +55,31 @@ The live F2 Forge deliberately asks two different questions with two different r
 - **Discovery / Fast:** the steady eight-instance textured `PowerRender` determines Cmax,
   near-power-limit behavior, sustained p5 and the voltage boundary. Its homogeneous load keeps
   clock/power measurements comparable across physical VF bins.
-- **Standard / Long qualification:** after reset/reapply, a deterministic transient qualifier
-  (`FailureSeekingGameLoop`) crosses PowerOpening, BoostEdge, HeavySpike, TextureRop, ComputeBurst,
-  IdlePulse, MixedGame and PowerClosing. Each phase has its own checksum and coverage evidence, so
-  only an unexpected divergence is a `SilentError`.
+- **Standard / Long qualification:** FSGL2 A+B is the default interleaved per-bin qualifier. FSGL1
+  remains available as a lighter legacy profile but is paused for the current hardware trial. The
+  qualifier uses deterministic transient profiles that cross PowerOpening,
+  BoostEdge, HeavySpike, TextureRop, ComputeBurst, IdlePulse, MixedGame and PowerClosing. Each phase
+  has its own checksum and coverage evidence, so only an unexpected divergence is a `SilentError`.
 
 **Interleaved per-bin descent (Standard / Long).** Discovery does not run `PowerRender` all the way to
 the deepest survivable bin and only then qualify it — `PowerRender` tolerates more than the
 failure-seeking qualifier (and than real games), so the deepest PowerRender point is often too aggressive
 and qualifying it there risks a TDR. Instead, the descent stops at the FIRST sustained (under-cap)
-point, qualifies it with the full pass count, and only then steps one real VF bin lower: `PowerRender`
-there measures that bin's power and gates whether to attempt qualification at all. Each deeper bin is
-fully qualified before going lower; the first qualification failure stops the descent and keeps the last
-qualified bin as the boundary. The heavy qualifier therefore never runs more than one VF bin below an
-already-proven point. (Fast keeps descending to the PowerRender floor — it is provisional and never
-qualifies.) A rejected deeper bin is recorded as negative evidence, so the learned frontier
-automatically selects the deepest *qualified* bin.
+point, qualifies it with FSGL2 pattern A and pattern B, and only then steps one real VF bin lower:
+`PowerRender` there measures that bin's power and gates whether to attempt FSGL2 at all. Each deeper
+bin is FSGL2-qualified before going lower; the first FSGL2 failure stops the descent and leaves the
+last FSGL2-qualified bin as the accepted boundary. (Fast keeps descending to the PowerRender floor —
+it is provisional and never qualifies.) Negative observations make the learned frontier automatically
+select the deepest bin that still has current FSGL2 A+B evidence.
 
 The qualifier is an orthogonal rejection test, not a replacement for power characterization.
 Its aggregate p5 includes intentional light phases and therefore cannot create `ClockDrop`; that
 classification remains exclusive to the steady discovery render. Qualification evidence is versioned
-separately from discovery evidence; current Apply qualification counts only current-contract
-qualification passes. If a boundary fails qualification, the Forge backs off one physical VF bin,
-runs fresh `PowerRender` discovery there, then restarts the qualification count. No manual bad-point
-registry is encoded, and Standard/Long never qualify an old `prior_good` boundary without current-run
-rediscovery first. No synthetic workload is claimed to certify a particular game without supervised
-calibration.
+separately from discovery evidence; current Apply qualification counts only current-contract FSGL2
+passes and requires both distinct patterns A+B. FSGL1-qualified, legacy-qualified and discovery-only
+points remain provisional. No manual bad-point registry is encoded, and Standard/Long never qualify an
+old `prior_good` boundary without current-run rediscovery first. No synthetic workload is claimed to
+certify a particular game without supervised calibration.
 
 ## Problems hit → solutions
 

@@ -958,6 +958,30 @@ qualifier never runs more than one bin below a proven point. Two frontend-visibl
   unchanged.
 
 
+\## Backend → Frontend (2026-06-30): FSGL2 default qualification (no IPC change)
+
+No IPC method or payload field changes. This supersedes the earlier wording that a qualification
+failure reruns fresh PowerRender and all qualification passes, and the temporary FSGL1 descent filter.
+
+\- \*\*PowerRender remains measurement only.\*\* It finds sustainable/power-characterized bins and keeps
+  Cmax, p5, cap and `ClockDrop` semantics comparable. It is not deployable stability evidence.
+
+\- \*\*FSGL2 is now the descent qualifier.\*\* Standard/Long run FSGL2 pattern A 60 s and pattern B
+  60 s while descending physical VF bins. FSGL1 remains available as a legacy/light profile but is not
+  used by the current Standard/Long path.
+
+\- \*\*FSGL2 is required for Apply.\*\* A deployable point must pass FSGL2 pattern A 60 s and pattern B
+  60 s. `profiles_qualified == true` now means the synthesized points have current-contract FSGL2 A+B
+  evidence. FSGL1-only and legacy/current discovery evidence remain provisional and keep Apply locked.
+
+\- \*\*FSGL2 failure behavior.\*\* A real FSGL2 fail records that bin as unstable and stops the descent
+  with the last FSGL2-qualified physical bin. `Inconclusive` retries once and then blocks Apply without
+  marking the bin bad.
+
+\- \*\*Frontend action required: none.\*\* Existing `profiles_qualified` UI gating, Apply enablement and
+  progress polling remain correct.
+
+
 
 (No other active backend → frontend requests)
 

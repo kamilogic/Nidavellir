@@ -2,6 +2,28 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## FSGL2 becomes the default Standard/Long qualifier (2026-06-30)
+- **Problem**: a boundary could pass PowerRender and two FSGL1 passes but still TDR in a game. FSGL1 was
+  useful as a discovery/fronteira filter, but it was still too close to a soak pattern and not enough as
+  a deployable stability contract.
+- **Decision**: keep PowerRender as measurement/characterization only, pause FSGL1 in the Standard/Long
+  runtime path, and use FSGL2 as the default interleaved per-bin qualifier: pattern A 60 s + pattern B
+  60 s. If either FSGL2 pass fails, the candidate bin is recorded as bad and the algorithm keeps the
+  previous FSGL2-qualified physical bin as the boundary.
+- **Workload contract**: FSGL2 uses different deterministic profile order/emphasis (BoostEdge,
+  HeavySpike, TextureRop, ComputeBurst, IdlePulse, MixedGame) and records per-phase metrics:
+  phase/pattern/pass, duration, frames, checksums, compute checks, clock percentiles/residency,
+  power/cap fraction, temperature, failure phase and coverage status. BoostEdge power-cap masking or
+  weak phase contrast makes the result `Inconclusive`, not `Pass`.
+- **Apply gate**: `F2_QUALIFICATION_CONTRACT_VERSION = 3`. Apply counts only current-contract FSGL2
+  `Pass` evidence and requires distinct patterns A+B. FSGL1-qualified, discovery-only, legacy and old
+  contract evidence may guide discovery but cannot unlock Apply.
+- **Future gate**: if FSGL2 proves more reliable as the default, a later FSGL3 can be designed as the
+  final doubt-breaker instead of reintroducing FSGL1 in front of FSGL2.
+- **Status**: code-complete, no hardware run in this session. No-hardware validation passed with
+  targeted FSGL2 tests, workspace Rust tests/checks, UI build, `clippy` and diff whitespace checks.
+  Supervised stock/conservative FSGL2 validation is still required before Forge-long testing.
+
 ## Cmax descent interleaves qualification per VF bin (2026-06-29)
 - **Problem**: per clock, discovery descended `PowerRender` PAST the first sustained point to the
   deepest PowerRender-survivable bin, THEN qualified that deepest bin with the failure-seeking
