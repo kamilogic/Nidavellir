@@ -1,36 +1,32 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-30: the F2 live Forge algorithm now separates
-PowerRender measurement from FSGL2 deployable qualification. It starts at the highest
+How to pick this up cold. State as of 2026-06-30: the F2 live Forge algorithm separates
+PowerRender measurement from FSGL3 golden-sample qualification. It starts at the highest
 real clock, uses power-bound voltage descent to discover Cmax, then characterizes every real clock
 through 90% Cmax. Autonomous voltage discovery has no arbitrary step cap. Fast is provisional.
-Standard/Long now run FSGL2 A 60 s + B 60 s as the interleaved per-bin qualifier during descent; FSGL1
-is paused for the current hardware trial. If FSGL2 fails, that candidate is rejected and the last
-FSGL2-qualified physical bin remains the accepted boundary. Apply requires current-contract FSGL2 A+B
-evidence (`profiles_qualified`); PowerRender and FSGL1 alone never unlock Apply. Standard/Long must redescobrir a boundary no run atual antes de
-qualificar; prior_good antigo é só dica. Every candidate checkpoints by physical GPU UUID. F1 remains
-available for legacy payloads. **NEXT = supervised real Forge checkpoint; no hardware was run in this
-implementation session.** See `decisions.md` top entry.
+Standard/Long capture stock power/boost/texture-ROP goldens with three fresh GPU contexts, then run
+FSGL3 A 60 s + B 60 s per bin with 100% frame verification and deliberate droop bursts. If FSGL3
+fails, the last FSGL3-qualified bin remains the boundary. Apply requires current-contract v4 FSGL3
+A+B evidence; FSGL1/FSGL2 and PowerRender remain provisional. Standard/Long must rediscover a
+boundary in the current run before qualifying it. Every candidate checkpoints by GPU UUID; goldens
+do not persist. F1 remains available for legacy payloads. **NEXT = clear persisted Forge state, then
+run the supervised FSGL3 hardware gate; no hardware was run in this implementation session.**
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-06-30) — FSGL2 default qualification trial (code-complete, NOT HW-tested)
-- **What**: added `qualification_contract_version = 3` with `Fsgl1`/`Fsgl2` strength, FSGL2 pattern
-  A/B, per-phase metrics, failure phase and compute/checksum counts in `f2_observations.jsonl`.
-- **Algorithm**: current descent remains PowerRender-gated, but each sustainable Standard/Long
-  candidate now qualifies with FSGL2 A then B (60 s each) before the algorithm descends one physical VF
-  bin lower. `Pass` on both marks `BoundaryAccepted (FSGL2 default)` for the current deepest qualified
-  point; any real FSGL2 fail rejects that candidate and leaves the previous FSGL2-qualified bin as the
-  boundary. `Inconclusive` retries once and then blocks Apply without marking the bin bad.
-- **Workloads**: FSGL1 remains in the stress library as a lighter legacy profile but is paused in the
-  Standard/Long runtime path. FSGL2 A/B differ in order and emphasis,
-  mixing BoostEdge, HeavySpike, TextureRop, ComputeBurst, IdlePulse and MixedGame. BoostEdge coverage
-  now fails inconclusive if it is power-cap masked.
-- **Apply gate**: `validation_count` now counts distinct current FSGL2 patterns, so A+B are required.
-  FSGL1-qualified or legacy-qualified points remain provisional.
-- **Validation so far**: no-hardware validation passed with targeted FSGL2 tests, `cargo test
-  --workspace`, `cargo check --workspace`, `npm.cmd run build` in `apps/ui`, `cargo clippy --workspace
-  --all-targets` and `git diff --check`. `clippy` still reports existing baseline warnings. Hardware
-  validation has not been run.
+## Latest backend checkpoint (2026-06-30) — FSGL3 golden-sample qualification (code-complete, NOT HW-tested)
+- **Battery**: added FSGL3 A/B plans, positional REDUCE3, deterministic stock-golden capture and
+  per-frame on-GPU comparison. Golden mode runs six-frame bursts separated by 4 ms; legacy
+  FSGL1/FSGL2 still use the unchanged REDUCE/self-reference/250 ms path.
+- **Forge wiring**: Standard/Long capture power, boost and texture/ROP goldens after stock reset and
+  seed derivation, with one fresh `GpuCtx` per configuration. Capture failure aborts safely. Goldens
+  thread through `run_confirmed_f2_clock_discovery` to `single_qualifier_dwell` and never persist.
+- **Default and Apply gate**: `qualify_anchored_candidate` now constructs FSGL3 A/B purposes.
+  `F2_QUALIFICATION_CONTRACT_VERSION = 4`; only current FSGL3 A+B evidence unlocks Apply.
+- **Validation so far**: `cargo build --workspace`, `cargo check --workspace`, `cargo test
+  --workspace`, `npm.cmd run build`, `cargo clippy --workspace --all-targets` and `git diff --check`
+  pass. Clippy reports only the existing baseline warnings. Hardware validation remains pending.
+- **Hardware next**: clear persisted Forge state, then confirm FSGL3 rejects 1920 MHz @ 912 mV and
+  1935 MHz @ 918 mV before any Standard/Long acceptance or in-game comparison.
 
 ## Latest backend checkpoint (2026-06-29) — Cmax descent interleaves qualification per VF bin (code-complete, NOT HW-tested with new flow)
 - **Why**: discovery descended `PowerRender` to the deepest survivable bin then qualified THAT (most

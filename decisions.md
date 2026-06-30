@@ -2,6 +2,28 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## FSGL3 uses stock goldens and verifies every rendered frame (2026-06-30)
+- **Problem**: FSGL2 sampled framebuffer checksums about every 250 ms and compared against the first
+  frame of the same segment. Known low-average-power TextureRop/MixedGame instability could therefore
+  escape qualification and later TDR in a game.
+- **Decision**: keep `PowerRender` discovery unchanged and make FSGL3 A+B the Standard/Long
+  interleaved qualifier. Capture power, boost and texture/ROP REDUCE3 goldens at stock with three
+  fresh `GpuCtx` instances, then compare every rendered frame on-GPU. Goldens are per-run and never
+  persisted; non-deterministic stock capture aborts Forge.
+- **Transient contract**: FSGL3 emphasizes TextureRop/MixedGame and repeats six heavy frames followed
+  by a 4 ms gap. This intentionally probes the first post-gap frame while preserving the existing
+  eight telemetry phases and one-heavy-render-per-context invariant.
+- **Compatibility**: FSGL1/FSGL2 patterns, REDUCE self-reference cadence, discovery, compute KATs and
+  IPC payloads are unchanged. Historical evidence remains readable.
+- **Apply gate**: `F2_QUALIFICATION_CONTRACT_VERSION = 4`. Only current FSGL3 A+B `Pass` evidence
+  counts toward deployable profiles; older strengths/contracts remain provisional.
+- **Trade-off**: per-frame copy+REDUCE3 adds GPU queue pressure. Polling remains bounded every three
+  frames; if the supervised hardware gate exposes TDR pressure, the next mitigation is a small verify
+  ring rather than weakening coverage.
+- **Status**: code-complete; workspace build/check/tests, UI build, clippy and diff checks pass.
+  Hardware was not run. Before the first trial, clear persisted Forge state and verify rejection of
+  1920 MHz @ 912 mV and 1935 MHz @ 918 mV.
+
 ## FSGL2 becomes the default Standard/Long qualifier (2026-06-30)
 - **Problem**: a boundary could pass PowerRender and two FSGL1 passes but still TDR in a game. FSGL1 was
   useful as a discovery/fronteira filter, but it was still too close to a soak pattern and not enough as

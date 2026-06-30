@@ -982,6 +982,25 @@ failure reruns fresh PowerRender and all qualification passes, and the temporary
   progress polling remain correct.
 
 
+\## Backend → Frontend (2026-06-30): FSGL3 golden-sample default (no IPC change)
+
+No IPC method or payload field changes. This supersedes the FSGL2 default qualification note above.
+
+\- \*\*FSGL3 is now the deployable qualifier.\*\* Standard/Long capture deterministic stock render
+  goldens, then run FSGL3 A+B with per-frame on-GPU verification and deliberate droop bursts.
+  PowerRender discovery and its Cmax/p5/`ClockDrop` semantics remain unchanged.
+
+\- \*\*Apply now requires contract v4 FSGL3 A+B.\*\* `profiles_qualified == true` means every
+  synthesized point has both current FSGL3 patterns. FSGL1/FSGL2, discovery-only and old-contract
+  evidence remain provisional.
+
+\- \*\*Stock capture may fail closed before descent.\*\* If any power/boost/texture-ROP golden is
+  non-deterministic or the GPU device is lost, Forge ends at stock with a clear progress note.
+
+\- \*\*Frontend action required: none.\*\* Existing progress polling, `profiles_qualified` gating and
+  Apply enablement remain correct.
+
+
 
 (No other active backend → frontend requests)
 

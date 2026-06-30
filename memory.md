@@ -8,20 +8,20 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-06-30) — F2 FSGL2 default qualifier trial
+## Latest (2026-06-30) — F2 FSGL3 golden-sample qualifier
 - Discovery remains the proven steady `PowerRender`; it only measures/characterizes power,
   p5-clock, cap behavior and `ClockDrop`. It no longer decides deployable stability.
-- Standard/Long now use FSGL2 as the interleaved per-bin qualifier: pattern A 60 s + pattern B 60 s
-  before descending to the next physical VF bin. FSGL1 is paused for this hardware trial and remains
-  readable as legacy/light evidence only.
-- FSGL2 patterns deliberately change workload type/order: BoostEdge, HeavySpike, TextureRop,
-  ComputeBurst, IdlePulse and MixedGame, with per-phase telemetry/checksums and coverage reasons.
-- Current Apply qualification counts only current-contract FSGL2 Pass evidence, and the count is
-  distinct-pattern based: A+B are required. Legacy, discovery and FSGL1 positives can seed the
-  frontier but cannot unlock Apply; inconclusive coverage is neither good nor bad boundary evidence.
-- If FSGL2 rejects a candidate, the service records that bin as unstable and keeps the last
-  FSGL2-qualified physical bin as the accepted boundary. A future FSGL3 can be added later as a final
-  doubt-breaker if this trial proves FSGL2 is the better default.
+- Before Standard/Long descent, stock captures one deterministic REDUCE3 golden for each render
+  configuration (power, boost and texture/ROP), using a fresh `GpuCtx` per configuration. Any stock
+  divergence or device loss aborts Forge; goldens are session-only and are not persisted.
+- FSGL3 A/B is now the interleaved per-bin qualifier. It biases TextureRop/MixedGame, introduces
+  short six-frame/4 ms droop bursts and compares every rendered frame on-GPU against the stock
+  golden. FSGL1/FSGL2 remain available with their previous self-reference/250 ms behavior.
+- `F2_QUALIFICATION_CONTRACT_VERSION = 4`. Apply counts only current-contract FSGL3 `Pass` evidence
+  with distinct A+B patterns; FSGL1, FSGL2, discovery and old-contract positives remain provisional.
+- If FSGL3 rejects a candidate, the service records that bin as unstable and keeps the last
+  FSGL3-qualified physical bin as the accepted boundary. `Inconclusive` retries once and then blocks
+  Apply without marking the bin bad.
 - Standard/Long no longer qualify an old `prior_good` directly. Previous positives can guide resume,
   but a deployable boundary must be rediscovered by the current run before qualification begins.
 - `ResetGpuTuning` is now an explicit recovery path outside the normal start/apply lease: after a
@@ -31,8 +31,9 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 - UI recovery now separates the normal path from destructive reset: post-TDR Needs Attention /
   Interrupted offers **Recover & continue** (ResetGpuTuning, then selected StartPowerSweep mode,
   preserving F2 observations) and a clearly separate **Full reset** for `ResetGpuTuningFull`.
-- No IPC or frontend payload changed. No hardware Forge was run; next checkpoint is supervised
-  stock/conservative calibration followed by Standard qualification and real-game comparison.
+- No IPC or frontend payload changed. No hardware Forge was run. Before the first FSGL3 run, clear
+  persisted Forge state so FSGL2 floors cannot seed the trial; then verify the known 1920 MHz @ 912 mV
+  and 1935 MHz @ 918 mV failure points under supervision.
 
 ## Latest (2026-06-28) — F2 qualification refinement
 - Fast traverses the full physical frontier with 10 s discovery dwells but remains provisional;

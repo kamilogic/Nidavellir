@@ -21,6 +21,11 @@ const C1: u32 = 1664525;
 const C2: u32 = 1013904223;
 const HASH1: u32 = 2654435761;
 const TABLE_INIT: u32 = 2246822519;
+// FSGL3 hardware-calibration knobs: shorten the gap or increase TextureRop/MixedGame
+// weights if known unstable bins survive; use a verify ring if per-frame work causes TDR pressure.
+const DROOP_BURST: u64 = 6;
+const DROOP_GAP_MS: u64 = 4;
+const GOLDEN_MIN_FRAMES: u64 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -59,6 +64,13 @@ pub struct RenderResult {
     /// Present only when the transient VF qualifier failed inside a named phase.
     pub failure_phase: Option<VfQualifierPhase>,
     pub phase_reports: Vec<VfPhaseReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderGoldens {
+    pub power: u32,
+    pub boost: u32,
+    pub texrop: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,13 +131,15 @@ impl VfQualifierPhase {
     }
 }
 
-/// Qualification workload sequence. FSGL1 remains available as a lighter legacy pattern; FSGL2 A/B are
-/// the current default qualification patterns and intentionally differ from each other.
+/// Qualification workload sequence. FSGL1/2 remain available as legacy patterns; FSGL3 A/B are the
+/// current default qualification patterns and intentionally differ from each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfQualifierPattern {
     Fsgl1,
     Fsgl2A,
     Fsgl2B,
+    Fsgl3A,
+    Fsgl3B,
 }
 
 impl VfQualifierPattern {
@@ -134,12 +148,14 @@ impl VfQualifierPattern {
             Self::Fsgl1 => "fsgl1",
             Self::Fsgl2A => "fsgl2-a",
             Self::Fsgl2B => "fsgl2-b",
+            Self::Fsgl3A => "fsgl3-a",
+            Self::Fsgl3B => "fsgl3-b",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VfWorkload {
+pub enum VfWorkload {
     PowerRender,
     BoostEdge,
     HeavySpike,
@@ -147,6 +163,53 @@ enum VfWorkload {
     ComputeBurst,
     IdlePulse,
     MixedGame,
+}
+
+fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u32> {
+    match workload {
+        VfWorkload::PowerRender | VfWorkload::HeavySpike | VfWorkload::IdlePulse => {
+            Some(goldens.power)
+        }
+        VfWorkload::BoostEdge => Some(goldens.boost),
+        VfWorkload::TextureRop => Some(goldens.texrop),
+        VfWorkload::ComputeBurst | VfWorkload::MixedGame => None,
+    }
+}
+
+fn observe_golden_checksum(
+    reference: &mut Option<u32>,
+    checksum: u32,
+    frame_count: u64,
+) -> Result<(), String> {
+    match *reference {
+        None => {
+            *reference = Some(checksum);
+            Ok(())
+        }
+        Some(expected) if expected == checksum => Ok(()),
+        Some(expected) => Err(format!(
+            "stock render golden diverged after {frame_count} frame(s): first={expected} current={checksum}"
+        )),
+    }
+}
+
+fn finish_golden_capture(reference: Option<u32>, frame_count: u64) -> Result<u32, String> {
+    if frame_count < GOLDEN_MIN_FRAMES {
+        return Err(format!(
+            "stock render golden observed only {frame_count} frame(s), need at least {GOLDEN_MIN_FRAMES}"
+        ));
+    }
+    reference.ok_or_else(|| "stock render golden produced no checksum".to_string())
+}
+
+fn render_integrity_result(crashed: bool, diverged: bool) -> StabilityResult {
+    if crashed {
+        StabilityResult::Crash
+    } else if diverged {
+        StabilityResult::SilentError
+    } else {
+        StabilityResult::Stable
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,11 +263,42 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 5),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 4),
     ];
+    const FSGL3_A: [(VfQualifierPhase, VfWorkload, u64); 12] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 4),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 7),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 4),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 7),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 10),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 4),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 5),
+    ];
+    const FSGL3_B: [(VfQualifierPhase, VfWorkload, u64); 13] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 4),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 7),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 7),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 10),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 3),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 4),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 4),
+    ];
 
     let template: &[(VfQualifierPhase, VfWorkload, u64)] = match pattern {
         VfQualifierPattern::Fsgl1 => &FSGL1,
         VfQualifierPattern::Fsgl2A => &FSGL2_A,
         VfQualifierPattern::Fsgl2B => &FSGL2_B,
+        VfQualifierPattern::Fsgl3A => &FSGL3_A,
+        VfQualifierPattern::Fsgl3B => &FSGL3_B,
     };
     let total_weight = template.iter().map(|(_, _, weight)| *weight).sum::<u64>();
     let mut assigned = 0u64;
@@ -532,6 +626,40 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
 }
 "#;
 
+// Positional checksum for FSGL3. Each invocation hashes a deterministic grid-stride
+// lane, then atomically folds lanes by addition so scheduling order cannot change it.
+const REDUCE3_SHADER: &str = r#"
+struct P { n: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read> buf: array<u32>;
+@group(0) @binding(1) var<storage, read_write> res: atomic<u32>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let stride = nwg.x * 64u;
+    var i = g.x;
+    var h = 2166136261u;
+    loop {
+        if (i >= p.n) { break; }
+        h = (h ^ (buf[i] ^ (i * 2654435761u))) * 16777619u;
+        i = i + stride;
+    }
+    atomicAdd(&res, h);
+}
+"#;
+
+const CHECKSUM_COMPARE_SHADER: &str = r#"
+struct P { golden: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read_write> sum: atomic<u32>;
+@group(0) @binding(1) var<storage, read_write> mismatches: atomic<u32>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(1)
+fn main() {
+    if (atomicLoad(&sum) != p.golden) {
+        atomicAdd(&mismatches, 1u);
+    }
+}
+"#;
+
 // VRAM integrity: write a deterministic pattern, then verify it bit-for-bit,
 // counting mismatches on the GPU (only the count is read back).
 const VRAM_PATTERN_FN: &str = r#"
@@ -578,6 +706,22 @@ fn lcg_pow(n: u64) -> (u32, u32) {
 fn lcg_jump(seed: u32, n: u64) -> u32 {
     let (a, c) = lcg_pow(n);
     a.wrapping_mul(seed).wrapping_add(c)
+}
+
+#[cfg(test)]
+fn reduce3_checksum_cpu(buf: &[u32], lanes: u32) -> u32 {
+    let mut total = 0u32;
+    for lane in 0..lanes {
+        let mut i = lane as usize;
+        let mut h = 2166136261u32;
+        while i < buf.len() {
+            h = (h ^ (buf[i] ^ (i as u32).wrapping_mul(2654435761)))
+                .wrapping_mul(16777619);
+            i += lanes as usize;
+        }
+        total = total.wrapping_add(h);
+    }
+    total
 }
 
 /// (A, C) for `f^n` where f(x) = (CHAIN_CP*x + CHAIN_CQ) mod (mask+1), so the
@@ -1377,7 +1521,181 @@ impl GpuCtx {
     /// compute-only validation passes. Returns the verdict plus the rendered
     /// frame count / FPS — the benchmark uses the FPS as its performance metric.
     pub fn run_render_stress(&self, target_ms: u64) -> RenderResult {
-        self.run_render_profile(target_ms, VfWorkload::PowerRender, None, false, false)
+        self.run_render_profile(target_ms, VfWorkload::PowerRender, None, false, false, None)
+    }
+
+    pub fn capture_one_golden(
+        &self,
+        profile: VfWorkload,
+        sample_ms: u64,
+    ) -> Result<u32, String> {
+        const DIM: u32 = 1536;
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("golden-render-target"),
+            size: wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+
+        const SRC: u32 = 1024;
+        let src_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("golden-render-src-tex"),
+            size: wgpu::Extent3d { width: SRC, height: SRC, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut src_data = vec![0u8; (SRC as usize) * (SRC as usize) * 4];
+        for (i, px) in src_data.chunks_exact_mut(4).enumerate() {
+            let h = (i as u32).wrapping_mul(2654435761);
+            px[0] = (h >> 24) as u8;
+            px[1] = (h >> 16) as u8;
+            px[2] = (h >> 8) as u8;
+            px[3] = 255;
+        }
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture { texture: &src_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &src_data,
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(SRC * 4), rows_per_image: Some(SRC) },
+            wgpu::Extent3d { width: SRC, height: SRC, depth_or_array_layers: 1 },
+        );
+        let src_view = src_tex.create_view(&Default::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("golden-render-samp"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let (shader_source, instances, blend) = match profile {
+            VfWorkload::PowerRender => (RENDER_SHADER, 8, wgpu::BlendState::REPLACE),
+            VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
+            VfWorkload::TextureRop => (TEXTURE_ROP_SHADER, 4, wgpu::BlendState::ALPHA_BLENDING),
+            VfWorkload::HeavySpike
+            | VfWorkload::IdlePulse
+            | VfWorkload::ComputeBurst
+            | VfWorkload::MixedGame => {
+                return Err(format!("unsupported golden render profile: {profile:?}"));
+            }
+        };
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("golden-render"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("golden-render"), layout: None,
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs", buffers: &[], compilation_options: Default::default() },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader, entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+        });
+        let tex_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("golden-render-tex"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        let px_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("golden-render-px"),
+            size: (DIM as u64) * (DIM as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sum_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("golden-render-sum"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let red_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("golden-render-rp"),
+            contents: bytemuck::bytes_of(&Quad { a: DIM * DIM, b: 0, c: 0, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let red_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("golden-reduce3"),
+            source: wgpu::ShaderSource::Wgsl(REDUCE3_SHADER.into()),
+        });
+        let red_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("golden-reduce3"),
+            layout: None,
+            module: &red_mod,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        let red_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("golden-reduce3"),
+            layout: &red_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: px_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: sum_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: red_params.as_entire_binding() },
+            ],
+        });
+
+        let start = std::time::Instant::now();
+        let mut frames = 0u64;
+        let mut golden = None;
+        while (start.elapsed().as_millis() as u64) < sample_ms {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("golden-render"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rp.set_pipeline(&pipeline);
+                rp.set_bind_group(0, &tex_bind, &[]);
+                rp.draw(0..3, 0..instances);
+            }
+            enc.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::ImageCopyBuffer { buffer: &px_buf, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(DIM * 4), rows_per_image: Some(DIM) } },
+                wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
+            );
+            enc.clear_buffer(&sum_buf, 0, None);
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&red_pipe);
+                cp.set_bind_group(0, &red_bind, &[]);
+                cp.dispatch_workgroups(256, 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            self.device.poll(wgpu::Maintain::Wait);
+            if self.crashed.load(Ordering::SeqCst) {
+                return Err("device lost while capturing stock golden".into());
+            }
+            let checksum = self.read_u32(&sum_buf);
+            frames = frames.saturating_add(1);
+            observe_golden_checksum(&mut golden, checksum, frames)?;
+        }
+        finish_golden_capture(golden, frames)
     }
 
     /// Failure-seeking F2 qualification loop. Discovery must keep calling
@@ -1409,6 +1727,21 @@ impl GpuCtx {
         target_ms: u64,
         phase_state: &AtomicU8,
         pattern: VfQualifierPattern,
+    ) -> RenderResult {
+        self.run_vf_qualifier_stress_with_phase_pattern_and_goldens(
+            target_ms,
+            phase_state,
+            pattern,
+            None,
+        )
+    }
+
+    pub fn run_vf_qualifier_stress_with_phase_pattern_and_goldens(
+        &self,
+        target_ms: u64,
+        phase_state: &AtomicU8,
+        pattern: VfQualifierPattern,
+        goldens: Option<RenderGoldens>,
     ) -> RenderResult {
         let started = std::time::Instant::now();
         let mut frames = 0u64;
@@ -1459,6 +1792,7 @@ impl GpuCtx {
                         Some(segment.phase),
                         matches!(other, VfWorkload::IdlePulse),
                         true,
+                        goldens.and_then(|g| golden_for_workload(g, other)),
                     ),
                 };
                 frames = frames.saturating_add(result.frames);
@@ -1495,6 +1829,7 @@ impl GpuCtx {
         phase: Option<VfQualifierPhase>,
         idle_pulses: bool,
         full_workload_duration: bool,
+        golden: Option<u32>,
     ) -> RenderResult {
         let start = std::time::Instant::now();
         let mut frames: u64 = 0;
@@ -1603,7 +1938,10 @@ impl GpuCtx {
             label: Some("render-rp"), contents: bytemuck::bytes_of(&Quad { a: n, b: 0, c: 0, d: 0 }), usage: wgpu::BufferUsages::UNIFORM,
         });
         let red_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("reduce"), source: wgpu::ShaderSource::Wgsl(REDUCE_SHADER.into()),
+            label: Some("reduce"),
+            source: wgpu::ShaderSource::Wgsl(
+                if golden.is_some() { REDUCE3_SHADER } else { REDUCE_SHADER }.into(),
+            ),
         });
         let red_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("reduce"), layout: None, module: &red_mod, entry_point: "main", compilation_options: Default::default(),
@@ -1616,6 +1954,52 @@ impl GpuCtx {
                 wgpu::BindGroupEntry { binding: 2, resource: red_params.as_entire_binding() },
             ],
         });
+        let golden_mismatch_buf = golden.map(|_| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("render-golden-mismatch"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let compare_params = golden.map(|g| {
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("render-golden-params"),
+                contents: bytemuck::bytes_of(&Quad { a: g, b: 0, c: 0, d: 0 }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+        });
+        let compare_mod = golden.map(|_| {
+            self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("checksum-compare"),
+                source: wgpu::ShaderSource::Wgsl(CHECKSUM_COMPARE_SHADER.into()),
+            })
+        });
+        let compare_pipe = compare_mod.as_ref().map(|module| {
+            self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("checksum-compare"),
+                layout: None,
+                module,
+                entry_point: "main",
+                compilation_options: Default::default(),
+            })
+        });
+        let compare_bind = match (&compare_pipe, &golden_mismatch_buf, &compare_params) {
+            (Some(pipe), Some(mismatch), Some(params)) => Some(
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("checksum-compare"),
+                    layout: &pipe.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: sum_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: mismatch.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                    ],
+                }),
+            ),
+            _ => None,
+        };
 
         let mut reference = None;
         let mut diverged = false;
@@ -1624,9 +2008,13 @@ impl GpuCtx {
         let workload_start =
             if full_workload_duration { std::time::Instant::now() } else { start };
         let mut last_idle = workload_start;
+        let golden_mode = golden.is_some();
 
         while (workload_start.elapsed().as_millis() as u64) < target_ms {
-            if idle_pulses && last_idle.elapsed().as_millis() >= 750 {
+            if golden_mode && frames > 0 && frames.is_multiple_of(DROOP_BURST) {
+                self.device.poll(wgpu::Maintain::Wait);
+                std::thread::sleep(std::time::Duration::from_millis(DROOP_GAP_MS));
+            } else if !golden_mode && idle_pulses && last_idle.elapsed().as_millis() >= 750 {
                 self.device.poll(wgpu::Maintain::Wait);
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 last_idle = std::time::Instant::now();
@@ -1644,6 +2032,27 @@ impl GpuCtx {
                 rp.set_pipeline(&pipeline);
                 rp.set_bind_group(0, &tex_bind, &[]);
                 rp.draw(0..3, 0..instances);
+            }
+            if golden_mode {
+                enc.copy_texture_to_buffer(
+                    wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::ImageCopyBuffer { buffer: &px_buf, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(DIM * 4), rows_per_image: Some(DIM) } },
+                    wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
+                );
+                enc.clear_buffer(&sum_buf, 0, None);
+                {
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&red_pipe);
+                    cp.set_bind_group(0, &red_bind, &[]);
+                    cp.dispatch_workgroups(256, 1, 1);
+                }
+                if let (Some(pipe), Some(bind)) = (&compare_pipe, &compare_bind) {
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(pipe);
+                    cp.set_bind_group(0, bind, &[]);
+                    cp.dispatch_workgroups(1, 1, 1);
+                }
+                checksum_count = checksum_count.saturating_add(1);
             }
             self.queue.submit(Some(enc.finish()));
             frames += 1;
@@ -1663,7 +2072,19 @@ impl GpuCtx {
                 break;
             }
 
-            if last_check.elapsed().as_millis() >= 250 {
+            if golden_mode {
+                if last_check.elapsed().as_millis() >= 250 {
+                    last_check = std::time::Instant::now();
+                    self.device.poll(wgpu::Maintain::Wait);
+                    if golden_mismatch_buf
+                        .as_ref()
+                        .is_some_and(|buf| self.read_u32(buf) > 0)
+                    {
+                        diverged = true;
+                        break;
+                    }
+                }
+            } else if last_check.elapsed().as_millis() >= 250 {
                 last_check = std::time::Instant::now();
                 let mut enc = self.device.create_command_encoder(&Default::default());
                 enc.copy_texture_to_buffer(
@@ -1693,14 +2114,17 @@ impl GpuCtx {
             }
             self.device.poll(wgpu::Maintain::Wait);
         }
+        if golden_mode && !diverged && !self.crashed.load(Ordering::SeqCst) {
+            self.device.poll(wgpu::Maintain::Wait);
+            if golden_mismatch_buf
+                .as_ref()
+                .is_some_and(|buf| self.read_u32(buf) > 0)
+            {
+                diverged = true;
+            }
+        }
 
-        let result = if self.crashed.load(Ordering::SeqCst) {
-            StabilityResult::Crash
-        } else if diverged {
-            StabilityResult::SilentError
-        } else {
-            StabilityResult::Stable
-        };
+        let result = render_integrity_result(self.crashed.load(Ordering::SeqCst), diverged);
         let secs = start.elapsed().as_secs_f64().max(0.001);
         let phase_reports = phase
             .map(|phase| {
@@ -1935,5 +2359,70 @@ mod tests {
         assert!(b.iter().any(|segment| segment.workload == VfWorkload::TextureRop));
         assert_eq!(VfQualifierPattern::Fsgl2A.label(), "fsgl2-a");
         assert_eq!(VfQualifierPattern::Fsgl2B.label(), "fsgl2-b");
+    }
+
+    #[test]
+    fn fsgl3_patterns_preserve_duration_bias_texrop_and_differ_in_order() {
+        let a = vf_qualifier_plan(60_000, VfQualifierPattern::Fsgl3A);
+        let b = vf_qualifier_plan(60_000, VfQualifierPattern::Fsgl3B);
+        assert_eq!(a.iter().map(|segment| segment.duration_ms).sum::<u64>(), 60_000);
+        assert_eq!(b.iter().map(|segment| segment.duration_ms).sum::<u64>(), 60_000);
+        assert_eq!(a.first().map(|segment| segment.phase), Some(VfQualifierPhase::PowerOpening));
+        assert_eq!(a.last().map(|segment| segment.phase), Some(VfQualifierPhase::PowerClosing));
+        assert_eq!(b.first().map(|segment| segment.phase), Some(VfQualifierPhase::PowerOpening));
+        assert_eq!(b.last().map(|segment| segment.phase), Some(VfQualifierPhase::PowerClosing));
+        let a_order: Vec<_> = a.iter().map(|segment| segment.phase).collect();
+        let b_order: Vec<_> = b.iter().map(|segment| segment.phase).collect();
+        assert_ne!(a_order, b_order);
+        let texrop_ms = |plan: &[VfQualifierSegment]| {
+            plan.iter()
+                .filter(|segment| segment.workload == VfWorkload::TextureRop)
+                .map(|segment| segment.duration_ms)
+                .sum::<u64>()
+        };
+        assert!(texrop_ms(&a) > 15_000);
+        assert!(texrop_ms(&b) > 15_000);
+        assert!(a.iter().any(|segment| segment.workload == VfWorkload::MixedGame));
+        assert!(b.iter().any(|segment| segment.workload == VfWorkload::MixedGame));
+        assert_eq!(VfQualifierPattern::Fsgl3A.label(), "fsgl3-a");
+        assert_eq!(VfQualifierPattern::Fsgl3B.label(), "fsgl3-b");
+    }
+
+    #[test]
+    fn golden_capture_requires_consistent_frames() {
+        let mut reference = None;
+        for frame in 1..=GOLDEN_MIN_FRAMES {
+            observe_golden_checksum(&mut reference, 0x1234_5678, frame).unwrap();
+        }
+        assert_eq!(
+            finish_golden_capture(reference, GOLDEN_MIN_FRAMES).unwrap(),
+            0x1234_5678
+        );
+
+        let mut divergent = None;
+        observe_golden_checksum(&mut divergent, 7, 1).unwrap();
+        assert!(observe_golden_checksum(&mut divergent, 8, 2).is_err());
+        assert!(finish_golden_capture(Some(7), GOLDEN_MIN_FRAMES - 1).is_err());
+    }
+
+    #[test]
+    fn golden_mismatch_maps_to_silent_error() {
+        assert_eq!(render_integrity_result(false, false), StabilityResult::Stable);
+        assert_eq!(
+            render_integrity_result(false, true),
+            StabilityResult::SilentError
+        );
+        assert_eq!(render_integrity_result(true, false), StabilityResult::Crash);
+    }
+
+    #[test]
+    fn reduce3_checksum_changes_with_single_texel_bit_flip() {
+        let base = [0x1234_5678, 0x90ab_cdef, 0x0000_0000, 0xffff_ffff];
+        let mut flipped = base;
+        flipped[2] ^= 1;
+        assert_ne!(
+            reduce3_checksum_cpu(&base, 256 * 64),
+            reduce3_checksum_cpu(&flipped, 256 * 64)
+        );
     }
 }

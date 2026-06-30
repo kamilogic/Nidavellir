@@ -25,7 +25,7 @@ pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 /// Current homogeneous PowerRender discovery contract.
 pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 1;
 /// Current FailureSeekingGameLoop qualification contract.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 3;
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 4;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -47,17 +47,18 @@ pub enum F2QualificationVerdict {
     Inconclusive,
 }
 
-/// Strength of the qualification evidence. FSGL1 remains readable for compatibility; FSGL2 is the
-/// current deployable qualifier required for Apply.
+/// Strength of the qualification evidence. FSGL1/FSGL2 remain readable for compatibility; FSGL3 is
+/// the current deployable qualifier required for Apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum F2QualificationStrength {
     #[default]
     Fsgl1,
     Fsgl2,
+    Fsgl3,
 }
 
-/// Deterministic FSGL2 pattern used by the current deployable qualifier.
+/// Deterministic A/B pattern used by the current deployable qualifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum F2QualificationPattern {
@@ -452,7 +453,7 @@ pub fn is_current_qualification_pass(o: &F2Observation) -> bool {
         && o.qualification_coverage
             .as_ref()
             .is_some_and(|coverage| {
-                coverage.strength == F2QualificationStrength::Fsgl2
+                coverage.strength == F2QualificationStrength::Fsgl3
                     && coverage.pattern.is_some()
                     && coverage.verdict == F2QualificationVerdict::Pass
             })
@@ -552,17 +553,17 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
                 && (is_current_discovery_evidence(o) || is_current_qualification_pass(o))
         })
         .collect();
-    let has_fsgl2_a = evidence_at_best.iter().any(|o| {
+    let has_fsgl3_a = evidence_at_best.iter().any(|o| {
         is_current_qualification_pass(o)
             && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
                 == Some(F2QualificationPattern::A)
     });
-    let has_fsgl2_b = evidence_at_best.iter().any(|o| {
+    let has_fsgl3_b = evidence_at_best.iter().any(|o| {
         is_current_qualification_pass(o)
             && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
                 == Some(F2QualificationPattern::B)
     });
-    let qualification_count = [has_fsgl2_a, has_fsgl2_b]
+    let qualification_count = [has_fsgl3_a, has_fsgl3_b]
         .into_iter()
         .filter(|present| *present)
         .count();
@@ -786,7 +787,7 @@ mod tests {
         o.discovery_contract_version = None;
         o.qualification_contract_version = Some(F2_QUALIFICATION_CONTRACT_VERSION);
         o.qualification_coverage = Some(F2QualificationCoverage {
-            strength: F2QualificationStrength::Fsgl2,
+            strength: F2QualificationStrength::Fsgl3,
             pattern: Some(pattern),
             pass_index: match pattern {
                 F2QualificationPattern::A => 1,
@@ -805,6 +806,12 @@ mod tests {
             reason: None,
             phase_metrics: Vec::new(),
         });
+        o
+    }
+
+    fn legacy_fsgl2_qualification_pass(o: F2Observation) -> F2Observation {
+        let mut o = qualification_pass(o);
+        o.qualification_coverage.as_mut().unwrap().strength = F2QualificationStrength::Fsgl2;
         o
     }
 
@@ -1047,21 +1054,23 @@ mod tests {
     }
 
     #[test]
-    fn learned_frontier_ignores_fsgl1_for_apply_qualification() {
+    fn learned_frontier_ignores_legacy_strengths_for_apply_qualification() {
         let discovery = obs(1800, 962, F2ObsOutcome::Validated);
         let mut fsgl1 = qualification_pass(discovery.clone());
         fsgl1.qualification_coverage.as_mut().unwrap().strength =
             F2QualificationStrength::Fsgl1;
         fsgl1.qualification_coverage.as_mut().unwrap().pattern = None;
-        let current_fsgl2 = qualification_pass(discovery.clone());
+        let fsgl2 = legacy_fsgl2_qualification_pass(discovery.clone());
+        let current_fsgl3 = qualification_pass(discovery.clone());
 
-        let entry = frontier_entry_for_target(&[discovery, fsgl1, current_fsgl2], 1800).unwrap();
+        let entry = frontier_entry_for_target(&[discovery, fsgl1, fsgl2, current_fsgl3], 1800)
+            .unwrap();
         assert_eq!(entry.best_anchor_mv, 962);
         assert_eq!(entry.validation_count, 1);
     }
 
     #[test]
-    fn learned_frontier_counts_distinct_fsgl2_patterns() {
+    fn learned_frontier_counts_distinct_fsgl3_patterns() {
         let discovery = obs(1800, 962, F2ObsOutcome::Validated);
         let a1 = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::A);
         let a2 = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::A);

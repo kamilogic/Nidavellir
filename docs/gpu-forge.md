@@ -55,29 +55,31 @@ The live F2 Forge deliberately asks two different questions with two different r
 - **Discovery / Fast:** the steady eight-instance textured `PowerRender` determines Cmax,
   near-power-limit behavior, sustained p5 and the voltage boundary. Its homogeneous load keeps
   clock/power measurements comparable across physical VF bins.
-- **Standard / Long qualification:** FSGL2 A+B is the default interleaved per-bin qualifier. FSGL1
-  remains available as a lighter legacy profile but is paused for the current hardware trial. The
-  qualifier uses deterministic transient profiles that cross PowerOpening,
-  BoostEdge, HeavySpike, TextureRop, ComputeBurst, IdlePulse, MixedGame and PowerClosing. Each phase
-  has its own checksum and coverage evidence, so only an unexpected divergence is a `SilentError`.
+- **Standard / Long qualification:** FSGL3 A+B is the default interleaved per-bin qualifier. Before
+  descent, stock captures deterministic power, boost and texture/ROP checksums with one fresh
+  `GpuCtx` per render configuration. FSGL3 biases TextureRop/MixedGame, crosses the same eight
+  telemetry phases, and verifies every rendered frame on-GPU against the matching stock golden.
+  Six-frame bursts separated by 4 ms deliberately probe the first frame after a current step.
+  FSGL1/FSGL2 remain available with their original self-reference/250 ms behavior.
 
 **Interleaved per-bin descent (Standard / Long).** Discovery does not run `PowerRender` all the way to
 the deepest survivable bin and only then qualify it — `PowerRender` tolerates more than the
 failure-seeking qualifier (and than real games), so the deepest PowerRender point is often too aggressive
 and qualifying it there risks a TDR. Instead, the descent stops at the FIRST sustained (under-cap)
-point, qualifies it with FSGL2 pattern A and pattern B, and only then steps one real VF bin lower:
-`PowerRender` there measures that bin's power and gates whether to attempt FSGL2 at all. Each deeper
-bin is FSGL2-qualified before going lower; the first FSGL2 failure stops the descent and leaves the
-last FSGL2-qualified bin as the accepted boundary. (Fast keeps descending to the PowerRender floor —
+point, qualifies it with FSGL3 pattern A and pattern B, and only then steps one real VF bin lower:
+`PowerRender` there measures that bin's power and gates whether to attempt FSGL3 at all. Each deeper
+bin is FSGL3-qualified before going lower; the first FSGL3 failure stops the descent and leaves the
+last FSGL3-qualified bin as the accepted boundary. (Fast keeps descending to the PowerRender floor —
 it is provisional and never qualifies.) Negative observations make the learned frontier automatically
-select the deepest bin that still has current FSGL2 A+B evidence.
+select the deepest bin that still has current FSGL3 A+B evidence.
 
 The qualifier is an orthogonal rejection test, not a replacement for power characterization.
 Its aggregate p5 includes intentional light phases and therefore cannot create `ClockDrop`; that
 classification remains exclusive to the steady discovery render. Qualification evidence is versioned
-separately from discovery evidence; current Apply qualification counts only current-contract FSGL2
-passes and requires both distinct patterns A+B. FSGL1-qualified, legacy-qualified and discovery-only
-points remain provisional. No manual bad-point registry is encoded, and Standard/Long never qualify an
+separately from discovery evidence; current Apply qualification counts only current-contract FSGL3
+passes and requires both distinct patterns A+B under qualification contract v4. FSGL1/FSGL2,
+legacy-qualified and discovery-only points remain provisional. Goldens are session-only and are not
+written to Forge state. No manual bad-point registry is encoded, and Standard/Long never qualify an
 old `prior_good` boundary without current-run rediscovery first. No synthetic workload is claimed to
 certify a particular game without supervised calibration.
 

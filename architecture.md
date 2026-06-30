@@ -39,13 +39,13 @@ headless client used for sweeps/benchmarks. Requests/responses are the
   the fail-closed dwell/reset motor until the voltage boundary or physical floor.
   Power-bound clock drops before sustain continue the same clock; the first sustained
   clock is Cmax. The complete profile frontier spans Cmax→90% Cmax so Deep Calm is selected from
-  measured data. Fast produces a provisional map; Standard/Long currently use FSGL2 A+B 2×60 s as the
-  default interleaved per-bin qualifier, with FSGL1 paused as a legacy/light profile. Discovery uses the
-  homogeneous power render so p5, power-limit and `ClockDrop` stay comparable; qualification uses the
-  orthogonal FailureSeekingGameLoop and records `Pass`/`Fail`/`Inconclusive` coverage without treating
-  light-phase aggregate p5 as a boundary. A rejected FSGL2 candidate stops the descent with the last
-  FSGL2-qualified physical bin. F2 Apply fails closed until current-contract FSGL2 A+B qualification
-  succeeds.
+  measured data. Fast produces a provisional map; Standard/Long capture three stock render goldens
+  with fresh contexts, then use FSGL3 A+B 2×60 s as the default interleaved per-bin qualifier.
+  Discovery keeps the homogeneous power render so p5, power-limit and `ClockDrop` stay comparable;
+  qualification uses TextureRop/MixedGame-biased transients, deliberate droop bursts and on-GPU
+  verification of every rendered frame. A rejected FSGL3 candidate stops descent at the last
+  FSGL3-qualified physical bin. F2 Apply fails closed until current-contract v4 FSGL3 A+B succeeds;
+  FSGL1/FSGL2 remain readable legacy evidence and retain their original stress behavior.
 - **Anchored VF undervolt** (`gpu-nvapi`): raises exactly one real lower-voltage
   anchor and caps higher-voltage bins to the target via per-point ClkVfPoints
   offsets — no voltage lock / no NVML clock pin, so lower bins retain elasticity.

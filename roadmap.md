@@ -18,17 +18,16 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
 - **Current F2 frontier (2026-06-30)** — code-complete: the live Forge starts at the highest real
   clock, discovers Cmax through power-bound voltage descent, and characterizes every real bin through
   90% Cmax. Autonomous descent has no arbitrary step budget; Fast is provisional discovery;
-  Standard/Long use FSGL2 A/B 2×60 s as the default interleaved per-bin qualifier; FSGL1 is paused
-  for this hardware trial.
+  Standard/Long use FSGL3 A/B 2×60 s as the default interleaved per-bin qualifier.
   Discovery keeps the homogeneous game-power render while qualification uses versioned
-  FailureSeekingGameLoop evidence with per-phase checksums/coverage; an FSGL2 rejection stops the
-  descent with the last FSGL2-qualified physical bin;
+  stock-golden evidence, 100% frame checks and deliberate droop probes; an FSGL3 rejection stops the
+  descent with the last FSGL3-qualified physical bin;
   observations checkpoint/resume by GPU UUID; partial UI progress is durable; adjacent clocks reuse
   one bin above the prior minimum and fall back to the prior power-bound boundary; deployable synthesis
   still requires the complete range and successful qualification.
   The explicit F2 Apply path remains verified and legacy F1 remains intact. **Next: supervised
-  stock/conservative FSGL2 validation**, then Standard Forge, Apply/reboot validation and separate
-  Phase 3 F1 cleanup review.
+  FSGL3 validation against the known 1920 MHz @ 912 mV and 1935 MHz @ 918 mV failures**, then Standard
+  Forge, Apply/reboot validation and separate Phase 3 F1 cleanup review.
 - **F1 — Profile model**: 3-profile synthesis (Godforge=clock / Brokkr's=R / Deep
   Calm=MHz/W) + V2 confidence gate.
   - **F1a (DONE)** — pure `synthesize_forge_profiles` + unit tests. Not yet wired.

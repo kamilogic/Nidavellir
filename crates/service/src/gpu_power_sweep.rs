@@ -29,7 +29,7 @@ use nidavellir_core::gpu_sweep::StabilityResult;
 use nidavellir_core::ipc::{DwellQuality, PowerSweepPoint, PowerSweepProgress};
 use nidavellir_core::safe_loop::{BootFlag, SafeLoopStore, TuningPoint};
 #[cfg(windows)]
-use nidavellir_gpu_stress::{VfQualifierPattern, VfQualifierPhase};
+use nidavellir_gpu_stress::{RenderGoldens, VfQualifierPattern, VfQualifierPhase, VfWorkload};
 use tracing::{info, warn};
 
 // Long enough for power to RAMP UP and stabilize (real loads like Heaven take
@@ -43,6 +43,8 @@ const VOLT_SANE_MIN_MV: u32 = 500;
 const VOLT_SANE_MAX_MV: u32 = 1250;
 #[cfg(windows)]
 const F2_QUALIFIER_TARGET_TOL_MHZ: u32 = 30;
+#[cfg(windows)]
+const FSGL3_GOLDEN_SAMPLE_MS: u64 = 2_000;
 
 /// Brokkr's V2 selection profiles. The threshold is the minimum stability
 /// confidence (Wilson lower bound over a point's accumulated trials) a candidate
@@ -779,7 +781,7 @@ fn worst_quality(a: DwellQuality, b: DwellQuality) -> DwellQuality {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderStressPurpose {
     PowerCharacterization,
-    VfQualification(VfQualifierPattern),
+    VfQualification(VfQualifierPattern, RenderGoldens),
 }
 
 #[cfg(windows)]
@@ -839,6 +841,16 @@ fn f2_pattern_from_stress(
             F2QualificationStrength::Fsgl2,
             Some(F2QualificationPattern::B),
             "fsgl2-b",
+        ),
+        VfQualifierPattern::Fsgl3A => (
+            F2QualificationStrength::Fsgl3,
+            Some(F2QualificationPattern::A),
+            "fsgl3-a",
+        ),
+        VfQualifierPattern::Fsgl3B => (
+            F2QualificationStrength::Fsgl3,
+            Some(F2QualificationPattern::B),
+            "fsgl3-b",
         ),
     }
 }
@@ -1016,6 +1028,22 @@ fn load_and_measure(ms: u64) -> Measured {
 }
 
 #[cfg(windows)]
+fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
+    fn capture(label: &str, workload: VfWorkload) -> Result<u32, String> {
+        let ctx = nidavellir_gpu_stress::GpuCtx::new()
+            .map_err(|e| format!("{label}: GpuCtx init failed: {e}"))?;
+        ctx.capture_one_golden(workload, FSGL3_GOLDEN_SAMPLE_MS)
+            .map_err(|e| format!("{label}: {e}"))
+    }
+
+    Ok(RenderGoldens {
+        power: capture("power golden", VfWorkload::PowerRender)?,
+        boost: capture("boost golden", VfWorkload::BoostEdge)?,
+        texrop: capture("texture/ROP golden", VfWorkload::TextureRop)?,
+    })
+}
+
+#[cfg(windows)]
 fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Option<u32>) -> Measured {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicU32, AtomicU8};
@@ -1053,7 +1081,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
                 if let (Some(c), Some(p)) = (r.core_clock_mhz, r.power_w) {
                     // Discovery discards ramp-up for steady-state power. Qualification keeps the
                     // opening/transition samples because the phase changes are the workload.
-                    if matches!(purpose, RenderStressPurpose::VfQualification(_))
+                    if matches!(purpose, RenderStressPurpose::VfQualification(_, _))
                         || t0.elapsed().as_millis() >= RAMP_DISCARD_MS
                     {
                         if let Ok(mut v) = smp.lock() {
@@ -1099,11 +1127,12 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     // actually helps in.
     let render = catch_unwind(AssertUnwindSafe(|| match purpose {
         RenderStressPurpose::PowerCharacterization => ctx.run_render_stress(ms),
-        RenderStressPurpose::VfQualification(pattern) => {
-            ctx.run_vf_qualifier_stress_with_phase_and_pattern(
+        RenderStressPurpose::VfQualification(pattern, goldens) => {
+            ctx.run_vf_qualifier_stress_with_phase_pattern_and_goldens(
                 ms,
                 phase_state.as_ref(),
                 pattern,
+                Some(goldens),
             )
         }
     }));
@@ -1123,7 +1152,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     let duration_ms = t0.elapsed().as_millis() as u64;
     let v = samples.lock().map(|g| g.clone()).unwrap_or_default();
     let qualification_coverage = match purpose {
-        RenderStressPurpose::VfQualification(pattern) => {
+        RenderStressPurpose::VfQualification(pattern, _) => {
             Some(qualification_coverage_from_run(res, &phase_reports, &v, target_mhz, pattern))
         }
         RenderStressPurpose::PowerCharacterization => None,
@@ -3450,10 +3479,11 @@ pub(crate) fn single_qualifier_dwell(
     dwell_ms: u64,
     target_mhz: u32,
     pattern: VfQualifierPattern,
+    goldens: RenderGoldens,
 ) -> SingleDwell {
     let m = load_and_measure_for(
         dwell_ms,
-        RenderStressPurpose::VfQualification(pattern),
+        RenderStressPurpose::VfQualification(pattern, goldens),
         Some(target_mhz),
     );
     single_dwell_from_measured(m)
@@ -4687,6 +4717,32 @@ fn measure_multiclock_undervolt_forge(
     };
 
     let mode_policy = mode.f2_policy();
+    let qualification_needs_goldens =
+        mode_policy.qualification_passes > 0 || mode_policy.final_gate_passes > 0;
+    let render_goldens = if qualification_needs_goldens {
+        prog.log.push("FSGL3: capturando golden stock para power/boost/texture-ROP…".into());
+        set(progress, prog.clone());
+        match capture_fsgl3_render_goldens() {
+            Ok(goldens) => {
+                prog.log.push("FSGL3: golden stock capturado; qualificação pode começar.".into());
+                set(progress, prog.clone());
+                Some(goldens)
+            }
+            Err(e) => {
+                let _ = final_reset(store, true);
+                prog.running = false;
+                prog.phase = "done".into();
+                prog.note = Some(format!(
+                    "Forja F2 abortada antes da qualificação FSGL3 — stock não produziu golden determinístico: {e}. GPU no stock, nada aplicado."
+                ));
+                set(progress, prog);
+                warn!("f2-forge: FSGL3 golden capture failed: {e}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let targets = f2_real_clock_targets(&live, seed.stock_boost_max_mhz);
     if targets.is_empty() {
         let _ = final_reset(store, true);
@@ -4754,7 +4810,7 @@ fn measure_multiclock_undervolt_forge(
     };
     prog.estimated_remaining_ms = Some(estimated_work_ms);
     prog.log.push(format!(
-        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, FSGL2 qualificação {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
+        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, FSGL3 qualificação {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
         targets.len(), targets[0],
         mode.label(),
         mode_policy.discovery_dwell_ms / 1000,
@@ -4864,6 +4920,7 @@ fn measure_multiclock_undervolt_forge(
             mode_policy.qualification_passes,
             mode_policy.final_gate_dwell_ms,
             mode_policy.final_gate_passes,
+            render_goldens,
             stop,
             &mut on_progress,
         );
@@ -4890,6 +4947,7 @@ fn measure_multiclock_undervolt_forge(
                         mode_policy.qualification_passes,
                         mode_policy.final_gate_dwell_ms,
                         mode_policy.final_gate_passes,
+                        render_goldens,
                         stop,
                         &mut on_progress,
                     );
@@ -5244,24 +5302,25 @@ mod tests {
             &reports,
             &samples,
             Some(1800),
-            VfQualifierPattern::Fsgl2A,
+            VfQualifierPattern::Fsgl3A,
         );
         assert_eq!(pass.verdict, F2QualificationVerdict::Pass);
-        assert_eq!(pass.strength, F2QualificationStrength::Fsgl2);
+        assert_eq!(pass.strength, F2QualificationStrength::Fsgl3);
         assert_eq!(pass.pattern, Some(F2QualificationPattern::A));
         assert_eq!(pass.phases_completed, 8);
         assert_eq!(pass.compute_check_count, 1);
         assert_eq!(pass.phase_metrics.len(), 8);
-        assert_eq!(pass.phase_metrics[0].phase_pattern, "fsgl2-a");
+        assert_eq!(pass.phase_metrics[0].phase_pattern, "fsgl3-a");
 
         let failed = qualification_coverage_from_run(
             StabilityResult::SilentError,
             &reports,
             &samples,
             Some(1800),
-            VfQualifierPattern::Fsgl2B,
+            VfQualifierPattern::Fsgl3B,
         );
         assert_eq!(failed.verdict, F2QualificationVerdict::Fail);
+        assert_eq!(failed.strength, F2QualificationStrength::Fsgl3);
 
         let missing_phase = qualification_coverage_from_run(
             StabilityResult::Stable,
