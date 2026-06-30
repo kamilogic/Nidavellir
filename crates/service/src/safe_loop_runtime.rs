@@ -74,12 +74,13 @@ pub fn run_startup_recovery(store: &SafeLoopStore) -> SafeLoopRecord {
             crashed,
             recede_to,
             class,
+            count_toward_safe_mode,
         } => {
             warn!(
                 "Safe Loop: boot-flag was ARMED — last apply {crashed:?} crashed ({class:?}). \
                  Blacklisting region and receding to {recede_to:?} \
-                 (consecutive crashes: {})",
-                record.consecutive_crashes
+                 (consecutive crashes: {}, counted toward Safe Mode: {count_toward_safe_mode})",
+                record.consecutive_crashes,
             );
         }
         RecoveryAction::EnterSafeMode { .. } => {
@@ -195,6 +196,7 @@ mod tests {
                 crashed: point.clone(),
                 recede_to: point.clone(),
                 class: CrashClass::Unknown,
+                count_toward_safe_mode: true,
             }
         ));
         assert!(retain_boot_flag_until_reapply(

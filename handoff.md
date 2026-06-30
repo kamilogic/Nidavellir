@@ -1,17 +1,33 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-30: the F2 live Forge algorithm separates
-PowerRender measurement from FSGL3 golden-sample qualification. It starts at the highest
-real clock, uses power-bound voltage descent to discover Cmax, then characterizes every real clock
-through 90% Cmax. Autonomous voltage discovery has no arbitrary step cap. Fast is provisional.
-Standard/Long capture stock power/boost/texture-ROP goldens with three fresh GPU contexts, then run
-FSGL3 A 60 s + B 60 s per bin with 100% frame verification and deliberate droop bursts. If FSGL3
-fails, the last FSGL3-qualified bin remains the boundary. Apply requires current-contract v4 FSGL3
-A+B evidence; FSGL1/FSGL2 and PowerRender remain provisional. Standard/Long must rediscover a
-boundary in the current run before qualifying it. Every candidate checkpoints by GPU UUID; goldens
-do not persist. F1 remains available for legacy payloads. **NEXT = clear persisted Forge state, then
-run the supervised FSGL3 hardware gate; no hardware was run in this implementation session.**
+How to pick this up cold. State as of 2026-06-30: the F2 live Forge uses PowerRender discovery plus
+FSGL3 A/B golden qualification and now stops voltage descent on a relative heavy-phase p5 margin
+collapse before a TDR where possible. Coverage ambiguity retries twice with longer dwell and then
+skips only that clock. Supervised F2 TDR recovery blacklists/recedes without consuming the normal-use
+Safe Mode crash budget, and an interrupted run resumes once when the UI reconnects. Apply requests
+12 mV above the learned boundary, snaps to a valid physical VF bin and exposes both values. `finished`
+means profiles are qualified. **NEXT = supervised Leva 1 hardware gate; Leva 2 remains blocked.**
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## Latest backend checkpoint (2026-06-30) — margin boundary + continuous recovery (code-complete, NOT HW-tested)
+- **Margin stop**: equivalent FSGL3 heavy phases produce one robust p5 per dwell; A/B histories stay
+  separate. `MARGIN_DROP_TOL_MHZ = 30` requires two prior stable references before the relative arm,
+  while the existing target-minus-30 arm remains available.
+- **Ambiguity**: two same-point retries use 1.5× dwell. Exhaustion records Inconclusive, completes the
+  current clock safely and continues the outer frontier; it neither marks the point bad nor claims
+  qualification.
+- **Recovery**: 0x116/0x117 are OC/TDR classes. Exact `f2_undervolt_probe` TDR/Unknown events do not
+  advance Safe Mode; unrelated crashes do. DeviceLost no longer increments before startup recovery,
+  and blacklist insertion is idempotent and scoped to the exact F2 intent.
+- **Resume/final state**: persisted mode is a stable `fast|standard|long` id. Restored `interrupted`
+  state triggers one automatic non-destructive Reset+Start on UI reconnect. `finished` is emitted only
+  for complete qualified profiles; Fast is `provisional`.
+- **Apply margin**: `APPLY_MARGIN_MV = 12` snaps to an exact higher physical bin. Additive
+  `boundary_voltage_mv` and `apply_margin_mv` preserve transparent boundary/apply semantics.
+- **Pre-hang**: 300 ms missing-valid-sample stall is recorded/logged only. No concurrent reset was
+  added; activation waits for hardware calibration plus cooperative cancellation.
+- **Hardware**: not run. Gate must check margin ClockDrop frequency, clock-to-clock continuation,
+  repeated TDR recovery, reconnect resume and the applied margin bin in game.
 
 ## Latest backend checkpoint (2026-06-30) — FSGL3 golden-sample qualification (code-complete, NOT HW-tested)
 - **Battery**: added FSGL3 A/B plans, positional REDUCE3, deterministic stock-golden capture and

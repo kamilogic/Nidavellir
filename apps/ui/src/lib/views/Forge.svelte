@@ -28,6 +28,7 @@
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
   let hardwareLoaded = $state(false);
+  let autoResumeAttempted = $state(false);
 
   const powerRunning = $derived(Boolean(powerSweep?.running));
   const memRunning = $derived(Boolean(memSweep?.running));
@@ -176,6 +177,9 @@
       const sl = await serviceCall("GetSafeLoopStatus");
       safeLoop = sl?.data?.type === "SafeLoop" ? sl.data : safeLoop;
       error = null;
+      if (powerSweep?.phase === "interrupted" && !powerSweep?.running && !autoResumeAttempted) {
+        void autoRecoverInterruptedPower();
+      }
     } catch (e) {
       error = String(e);
     }
@@ -234,11 +238,33 @@
   };
   const startPower = (mode = forgeMode) =>
     call(POWER_START[mode] ?? POWER_START.standard, setPower);
+  const restoredForgeMode = () => {
+    const mode = String(powerSweep?.mode ?? "").toLowerCase();
+    if (mode === "fast" || mode === "rápida") return "fast";
+    if (mode === "long" || mode === "longa") return "long";
+    return "standard";
+  };
+  const autoRecoverInterruptedPower = async () => {
+    autoResumeAttempted = true;
+    const mode = restoredForgeMode();
+    forgeMode = mode;
+    verification = null;
+    try {
+      const reset = await serviceCall("ResetGpuTuning");
+      setApplied(reset);
+      const started = await serviceCall(POWER_START[mode]);
+      setPower(started);
+      error = null;
+    } catch (e) {
+      error = `Automatic Forge recovery failed: ${String(e)}`;
+    }
+  };
   const recoverAndStartPower = async (mode = forgeMode) => {
     const confirmed = globalThis.confirm?.(
       "Continue Forge from saved learning? Nidavellir will reset the GPU to stock, clear recovery, preserve learned observations, then start the selected Forge mode.",
     ) ?? true;
     if (!confirmed) return;
+    autoResumeAttempted = true;
     verification = null;
     try {
       const reset = await serviceCall("ResetGpuTuning");

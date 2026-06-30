@@ -20,7 +20,11 @@
     return "Not learned yet";
   });
   const knownSafeEdgeAnchor = $derived(
-    latestPowerStable?.vf_table_voltage_mv != null ? `Curve anchor: ${latestPowerStable.vf_table_voltage_mv} mV` : null,
+    latestPowerStable?.boundary_voltage_mv != null
+      ? `Learned boundary: ${latestPowerStable.boundary_voltage_mv} mV`
+      : latestPowerStable?.vf_table_voltage_mv != null
+        ? `Curve anchor: ${latestPowerStable.vf_table_voltage_mv} mV`
+        : null,
   );
 </script>
 

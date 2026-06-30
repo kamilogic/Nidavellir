@@ -28,6 +28,14 @@ pub const BUGCHECK_CLOCK_WATCHDOG: u64 = 0x101;
 pub const BUGCHECK_WHEA_UNCORRECTABLE: u64 = 0x124;
 /// `0x133 DPC_WATCHDOG_VIOLATION` — also commonly OC/driver instability.
 pub const BUGCHECK_DPC_WATCHDOG: u64 = 0x133;
+/// `0x116 VIDEO_TDR_FAILURE` — the GPU watchdog could not recover the display driver.
+pub const BUGCHECK_VIDEO_TDR_FAILURE: u64 = 0x116;
+/// `0x117 VIDEO_TDR_TIMEOUT_DETECTED` — the GPU watchdog detected a timeout.
+pub const BUGCHECK_VIDEO_TDR_TIMEOUT: u64 = 0x117;
+
+/// Exact boot-flag phase used by the supervised F2 Forge motor. Keep this explicit rather than
+/// matching arbitrary "probe" strings so normal apply/use crashes retain the Safe Mode threshold.
+pub const SUPERVISED_F2_FORGE_PHASE: &str = "f2_undervolt_probe";
 
 /// A point in tuning space: axis name → integer setting (mV offset, MHz, ratio…).
 ///
@@ -160,9 +168,11 @@ pub enum CrashClass {
 pub fn classify_bugcheck(code: u64) -> CrashClass {
     match code {
         0 => CrashClass::Unknown,
-        BUGCHECK_CLOCK_WATCHDOG | BUGCHECK_WHEA_UNCORRECTABLE | BUGCHECK_DPC_WATCHDOG => {
-            CrashClass::OcInstability
-        }
+        BUGCHECK_CLOCK_WATCHDOG
+        | BUGCHECK_WHEA_UNCORRECTABLE
+        | BUGCHECK_DPC_WATCHDOG
+        | BUGCHECK_VIDEO_TDR_FAILURE
+        | BUGCHECK_VIDEO_TDR_TIMEOUT => CrashClass::OcInstability,
         _ => CrashClass::Unrelated,
     }
 }
@@ -280,6 +290,9 @@ pub enum RecoveryAction {
         crashed: TuningPoint,
         recede_to: TuningPoint,
         class: CrashClass,
+        /// Supervised Forge TDRs are expected boundary evidence and must not consume the normal-use
+        /// Safe Mode crash budget. Unrelated crashes and non-Forge phases still count.
+        count_toward_safe_mode: bool,
     },
     /// Crash threshold tripped — apply stock and stop touching anything.
     EnterSafeMode { stock: TuningPoint },
@@ -303,8 +316,13 @@ pub fn decide_recovery(
     match boot_flag {
         Some(flag) => {
             // The apply that armed this flag never reached a clean validation.
-            let crashes = record.consecutive_crashes.saturating_add(1);
-            if crashes >= SAFE_MODE_CRASH_THRESHOLD {
+            let supervised_forge_tdr = flag.phase == SUPERVISED_F2_FORGE_PHASE
+                && bugcheck != CrashClass::Unrelated;
+            let count_toward_safe_mode = !supervised_forge_tdr;
+            let crashes = record
+                .consecutive_crashes
+                .saturating_add(u32::from(count_toward_safe_mode));
+            if count_toward_safe_mode && crashes >= SAFE_MODE_CRASH_THRESHOLD {
                 RecoveryAction::EnterSafeMode {
                     stock: TuningPoint::stock(),
                 }
@@ -313,6 +331,7 @@ pub fn decide_recovery(
                     crashed: flag.intent.clone(),
                     recede_to: record.recovery_target(),
                     class: bugcheck,
+                    count_toward_safe_mode,
                 }
             }
         }
@@ -348,11 +367,16 @@ pub fn apply_recovery(record: &mut SafeLoopRecord, action: &RecoveryAction) -> T
             crashed,
             recede_to,
             class,
+            count_toward_safe_mode,
         } => {
-            record.consecutive_crashes = record.consecutive_crashes.saturating_add(1);
-            record
-                .blacklist
-                .push(BlacklistRegion::around(crashed.clone(), DEFAULT_BLACKLIST_RADIUS));
+            if *count_toward_safe_mode {
+                record.consecutive_crashes = record.consecutive_crashes.saturating_add(1);
+            }
+            if !record.is_blacklisted(crashed) {
+                record
+                    .blacklist
+                    .push(BlacklistRegion::around(crashed.clone(), DEFAULT_BLACKLIST_RADIUS));
+            }
             push_capped(&mut record.crash_log, *class, 32);
             record.state = SafeLoopState::Unstable;
             recede_to.clone()
@@ -565,6 +589,8 @@ mod tests {
         assert_eq!(classify_bugcheck(0x124), CrashClass::OcInstability);
         assert_eq!(classify_bugcheck(0x101), CrashClass::OcInstability);
         assert_eq!(classify_bugcheck(0x133), CrashClass::OcInstability);
+        assert_eq!(classify_bugcheck(0x116), CrashClass::OcInstability);
+        assert_eq!(classify_bugcheck(0x117), CrashClass::OcInstability);
         assert_eq!(classify_bugcheck(0x50), CrashClass::Unrelated);
         assert_eq!(classify_bugcheck(0), CrashClass::Unknown);
     }
@@ -641,6 +667,7 @@ mod tests {
                 crashed: crashed.clone(),
                 recede_to: good.clone(),
                 class: CrashClass::OcInstability,
+                count_toward_safe_mode: true,
             }
         );
         let applied = apply_recovery(&mut rec, &action);
@@ -669,6 +696,51 @@ mod tests {
         assert!(rec.safe_mode);
         assert_eq!(rec.state, SafeLoopState::SafeMode);
         assert_eq!(rec.consecutive_crashes, 3);
+    }
+
+    #[test]
+    fn supervised_f2_tdrs_blacklist_without_entering_safe_mode() {
+        let mut rec = SafeLoopRecord::default();
+        for voltage_mv in [950, 943, 937, 931, 925] {
+            let crashed = TuningPoint::from_axes([
+                ("gpu_freq_mhz", 1935),
+                ("gpu_vf_bin_mv", voltage_mv),
+                ("gpu_offset_mhz", 15),
+            ]);
+            let flag = BootFlag::new(crashed.clone(), SUPERVISED_F2_FORGE_PHASE);
+            let action = decide_recovery(Some(&flag), CrashClass::OcInstability, &rec);
+            assert_eq!(
+                action,
+                RecoveryAction::BlacklistAndRecede {
+                    crashed: crashed.clone(),
+                    recede_to: rec.recovery_target(),
+                    class: CrashClass::OcInstability,
+                    count_toward_safe_mode: false,
+                }
+            );
+            let _ = apply_recovery(&mut rec, &action);
+        }
+        assert_eq!(rec.consecutive_crashes, 0);
+        assert!(!rec.safe_mode);
+        assert_eq!(rec.blacklist.len(), 5);
+    }
+
+    #[test]
+    fn unrelated_crash_during_f2_still_counts_toward_safe_mode() {
+        let rec = SafeLoopRecord {
+            consecutive_crashes: SAFE_MODE_CRASH_THRESHOLD - 1,
+            ..SafeLoopRecord::default()
+        };
+        let flag = BootFlag::new(
+            TuningPoint::from_axes([("gpu_freq_mhz", 1935)]),
+            SUPERVISED_F2_FORGE_PHASE,
+        );
+        assert_eq!(
+            decide_recovery(Some(&flag), CrashClass::Unrelated, &rec),
+            RecoveryAction::EnterSafeMode {
+                stock: TuningPoint::stock()
+            }
+        );
     }
 
     #[test]

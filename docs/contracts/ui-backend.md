@@ -1002,6 +1002,35 @@ No IPC method or payload field changes. This supersedes the FSGL2 default qualif
 
 
 
+\## Backend → Frontend (2026-06-30): margin boundary, honest finish and automatic interrupted resume
+
+The live F2 payload remains backward-compatible. Two optional `PowerSweepPoint` fields are additive:
+
+\- `boundary_voltage_mv: Option<u32>` — learned F2 margin boundary before application policy.
+
+\- `apply_margin_mv: Option<u32>` — effective upward margin after snapping to a physical VF bin.
+
+`vf_table_voltage_mv` remains the exact physical bin used by Apply. For a current F2 point, UI copy
+must distinguish the learned boundary from the applied VF bin instead of presenting them as the same
+measurement.
+
+`PowerSweepProgress.phase` now uses honest terminal states:
+
+\- `finished` — complete frontier and qualified profiles; Apply may be available.
+
+\- `provisional` — complete discovery/profile preview without qualification.
+
+\- `incomplete` — safe partial ending; learning is preserved.
+
+\- `interrupted` — recovery is retained. The Forge UI performs one automatic non-destructive
+`ResetGpuTuning` + original `StartPowerSweep*` attempt when it reconnects. The persisted `mode` is now
+the stable id `fast`, `standard` or `long`; legacy localized values remain accepted by the UI.
+
+No new IPC method is required. Manual Stop must not be auto-resumed. Pre-hang telemetry is not a UI
+safety state and must not be inferred from logs.
+
+
+
 (No other active backend → frontend requests)
 
 

@@ -101,6 +101,18 @@ const F2_VERIFY_TOL_MHZ: u32 = 15;
 #[cfg(windows)]
 const F2_CLOCK_DROP_TOL_MHZ: u32 = 30;
 
+/// Relative sustained-clock margin allowed between equivalent FSGL3 qualification passes. A
+/// candidate whose heavy-phase p5 falls farther than this below the median of prior stable
+/// candidates at the same target/pattern has reached the voltage-margin cliff even if it did not
+/// crash. This is policy, not a hardware limit.
+#[cfg(windows)]
+const MARGIN_DROP_TOL_MHZ: u32 = 30;
+
+/// Number of additional attempts after an inconclusive FSGL3 qualification dwell. Coverage
+/// ambiguity is not instability: retry the same physical point, then skip only this clock.
+#[cfg(windows)]
+const INCONCLUSIVE_RETRY_BUDGET: usize = 2;
+
 /// Proven Standard dwell duration. The live Forge modes may select another duration, but the CLI
 /// paths keep this baseline unless they opt in explicitly.
 #[cfg(windows)]
@@ -1257,7 +1269,7 @@ pub fn f2_discovery_decision(
             F2DiscoveryDecision::BoundaryFound
         }
         F2Outcome::SilentError | F2Outcome::Unstable => F2DiscoveryDecision::NextClockAfterFailure,
-        F2Outcome::Inconclusive => F2DiscoveryDecision::AbortForge,
+        F2Outcome::Inconclusive => F2DiscoveryDecision::NextClockAfterFailure,
         F2Outcome::DeviceLost
         | F2Outcome::ResetFailed
         | F2Outcome::ArmFailed(_)
@@ -1347,9 +1359,8 @@ pub trait F2Ops {
     fn reset_to_stock(&mut self) -> Result<(), String>;
     /// Clear the Safe Loop boot flag (call ONLY after a confirmed clean reset / success).
     fn clear_boot_flag(&mut self) -> Result<(), String>;
-    /// Record the failed point in the Safe Loop blacklist. Only an actual device loss / TDR counts
-    /// toward the consecutive-crash safety threshold; a reset-clean SilentError or Unstable result
-    /// is boundary knowledge, not a crash.
+    /// Record the failed point in the Safe Loop blacklist. A device loss retains the boot flag so
+    /// startup recovery can account it exactly once; reset-clean instability is boundary knowledge.
     fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String>;
 }
 
@@ -2134,6 +2145,12 @@ impl F2Ops for RealF2Ops<'_> {
         // Mixed qualification telemetry is intentionally excluded from ClockDrop classification:
         // its light phases would make aggregate p5 unsuitable as a sustained-clock boundary.
         let outcome = classify_f2_stress_dwell(&s, self.target_mhz, self.stress_purpose);
+        if s.prehang_stall_detected {
+            warn!(
+                "undervolt-probe dwell: pre-hang telemetry observed an NVML valid-sample stall >= {} ms; reset action remains disabled pending hardware calibration",
+                crate::gpu_power_sweep::PREHANG_STALL_MS
+            );
+        }
         info!(
             "undervolt-probe dwell: {outcome:?} avg_clock={} MHz p5={} MHz power={:.0} W silent_error={}",
             s.avg_clock_mhz, s.p5_clock_mhz, s.power_w, s.silent_error
@@ -2178,14 +2195,12 @@ impl F2Ops for RealF2Ops<'_> {
         self.store.clear_boot_flag().map_err(|e| format!("clear_boot_flag: {e}"))
     }
 
-    fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String> {
+    fn blacklist_point(&mut self, _counts_as_crash: bool) -> Result<(), String> {
         let mut rec = self.store.load_record();
-        rec.blacklist.push(BlacklistRegion::around(
-            f2_intent(self.target_mhz, &self.candidate),
-            DEFAULT_BLACKLIST_RADIUS,
-        ));
-        if counts_as_crash {
-            rec.consecutive_crashes = rec.consecutive_crashes.saturating_add(1);
+        let intent = f2_intent(self.target_mhz, &self.candidate);
+        if !rec.is_blacklisted(&intent) {
+            rec.blacklist
+                .push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
         }
         self.store.save_record(&rec).map_err(|e| format!("save_record: {e}"))
     }
@@ -3336,13 +3351,102 @@ enum F2QualificationOutcome {
     /// A reset-clean instability — the qualifier rejected this point. Carries the failing outcome's
     /// debug string (purely for the stop reason / logs).
     Rejected(String),
-    /// Reset-clean but coverage too weak to accept or reject, even after one retry.
+    /// Reset-clean but coverage too weak to accept or reject after the retry budget.
     Inconclusive,
     /// Stop was requested mid-qualification.
     Cancelled,
     /// A hard failure (device lost / reset failed / arm / apply / verify / precheck / persist). The
     /// caller must abort the forge; `retain_boot_flag` follows the usual DeviceLost/ResetFailed rule.
     Aborted { stop_reason: String, retain_boot_flag: bool },
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct F2QualificationMarginHistory {
+    pattern_a: Vec<u32>,
+    pattern_b: Vec<u32>,
+}
+
+#[cfg(windows)]
+impl F2QualificationMarginHistory {
+    fn values(&self, pattern: F2QualificationPattern) -> &[u32] {
+        match pattern {
+            F2QualificationPattern::A => &self.pattern_a,
+            F2QualificationPattern::B => &self.pattern_b,
+        }
+    }
+
+    fn push(&mut self, pattern: F2QualificationPattern, p5_mhz: u32) {
+        match pattern {
+            F2QualificationPattern::A => self.pattern_a.push(p5_mhz),
+            F2QualificationPattern::B => self.pattern_b.push(p5_mhz),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn median_u32(values: &[u32]) -> Option<u32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        Some(((u64::from(sorted[middle - 1]) + u64::from(sorted[middle])) / 2) as u32)
+    } else {
+        Some(sorted[middle])
+    }
+}
+
+#[cfg(windows)]
+fn qualification_margin_p5(coverage: Option<&F2QualificationCoverage>) -> Option<u32> {
+    let coverage = coverage?;
+    if coverage.verdict != F2QualificationVerdict::Pass {
+        return None;
+    }
+    let heavy_phase_p5: Vec<u32> = coverage
+        .phase_metrics
+        .iter()
+        .filter(|metric| {
+            metric.coverage_status == "pass"
+                && matches!(
+                    metric.phase_name.as_str(),
+                    "heavy-spike" | "texture-rop" | "mixed-game" | "power-closing"
+                )
+        })
+        .filter_map(|metric| metric.clock_p5)
+        .collect();
+    median_u32(&heavy_phase_p5)
+}
+
+#[cfg(windows)]
+fn qualification_margin_is_clock_drop(
+    current_p5_mhz: u32,
+    stable_history: &[u32],
+    target_mhz: u32,
+) -> bool {
+    let below_target =
+        current_p5_mhz.saturating_add(F2_CLOCK_DROP_TOL_MHZ) < target_mhz;
+    let below_relative_margin = stable_history.len() >= 2
+        && median_u32(stable_history).is_some_and(|baseline| {
+            current_p5_mhz.saturating_add(MARGIN_DROP_TOL_MHZ) < baseline
+        });
+    below_target || below_relative_margin
+}
+
+#[cfg(windows)]
+fn qualification_attempt_dwell_ms(base_dwell_ms: u64, retry_count: usize) -> u64 {
+    if retry_count == 0 {
+        base_dwell_ms
+    } else {
+        base_dwell_ms.saturating_mul(3) / 2
+    }
+}
+
+#[cfg(windows)]
+fn qualification_should_retry_inconclusive(retry_count: usize) -> bool {
+    retry_count < INCONCLUSIVE_RETRY_BUDGET
 }
 
 #[cfg(windows)]
@@ -3379,6 +3483,7 @@ fn qualify_anchored_candidate(
     unpruned_steps: usize,
     qualification_dwell_ms: u64,
     qualification_passes: usize,
+    margin_history: &mut F2QualificationMarginHistory,
     render_goldens: Option<RenderGoldens>,
     stop: &std::sync::atomic::AtomicBool,
     logs: &mut Vec<String>,
@@ -3403,6 +3508,8 @@ fn qualify_anchored_candidate(
             if stop.load(Ordering::SeqCst) {
                 return F2QualificationOutcome::Cancelled;
             }
+            let attempt_dwell_ms =
+                qualification_attempt_dwell_ms(qualification_dwell_ms, inconclusive_retries);
             let mut validation_ops = RealF2MultiOps {
                 store,
                 curve: sane.to_vec(),
@@ -3410,7 +3517,7 @@ fn qualify_anchored_candidate(
                 limits: *limits,
                 target_mhz,
                 baseline_offset_mhz: 0,
-                dwell_ms: qualification_dwell_ms,
+                dwell_ms: attempt_dwell_ms,
                 stress_purpose: F2StressPurpose::Fsgl3Qualification(pattern, goldens),
                 cur: None,
             };
@@ -3432,7 +3539,7 @@ fn qualify_anchored_candidate(
                     pass_index,
                     patterns.len(),
                     candidate.anchor.voltage_mv,
-                    qualification_dwell_ms / 1000
+                    attempt_dwell_ms / 1000
                 ),
             });
             let mut report = run_confirmed_f2_step(&mut validation_ops);
@@ -3443,6 +3550,30 @@ fn qualify_anchored_candidate(
                 pass_index as u32,
                 inconclusive_retries as u32,
             );
+            if matches!(report.outcome, F2Outcome::Validated) {
+                if let Some(current_p5) =
+                    qualification_margin_p5(report.qualification_coverage.as_ref())
+                {
+                    if qualification_margin_is_clock_drop(
+                        current_p5,
+                        margin_history.values(pattern),
+                        target_mhz,
+                    ) {
+                        report.outcome = F2Outcome::ClockDrop;
+                        report.dwell = Some(F2DwellOutcome::ClockDrop);
+                        report.validated = false;
+                        logs.push(format!(
+                            "{target_mhz} MHz @ {} mV FSGL3 {}: colapso de margem p5={current_p5} MHz (baseline {:?} MHz, tolerância {} MHz)",
+                            candidate.anchor.voltage_mv,
+                            qualification_pattern_label(pattern),
+                            median_u32(margin_history.values(pattern)),
+                            MARGIN_DROP_TOL_MHZ
+                        ));
+                    } else {
+                        margin_history.push(pattern, current_p5);
+                    }
+                }
+            }
             logs.push(format!(
                 "{target_mhz} MHz @ {} mV FSGL3 {} {}/{}: {:?}",
                 candidate.anchor.voltage_mv,
@@ -3493,12 +3624,14 @@ fn qualify_anchored_candidate(
                     };
                 }
                 F2Outcome::Inconclusive => {
-                    if inconclusive_retries == 0 {
+                    if qualification_should_retry_inconclusive(inconclusive_retries) {
                         inconclusive_retries += 1;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV FSGL3 {} inconclusivo; repetindo uma vez",
+                            "{target_mhz} MHz @ {} mV FSGL3 {} inconclusivo; retentativa {}/{} com dwell ampliado",
                             candidate.anchor.voltage_mv,
-                            qualification_pattern_label(pattern)
+                            qualification_pattern_label(pattern),
+                            inconclusive_retries,
+                            INCONCLUSIVE_RETRY_BUDGET
                         ));
                         continue;
                     }
@@ -3902,6 +4035,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         Some(nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION);
     qual_ctx.qualification_coverage = None;
     let mut last_qualified_index: Option<usize> = None;
+    let mut qualification_margin_history = F2QualificationMarginHistory::default();
 
     for i in 0..candidate_count {
         if stop.load(Ordering::SeqCst) {
@@ -3986,6 +4120,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                         unpruned_steps,
                         qualification_dwell_ms,
                         qualification_passes,
+                        &mut qualification_margin_history,
                         render_goldens,
                         stop,
                         &mut logs,
@@ -4010,11 +4145,14 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                             break;
                         }
                         F2QualificationOutcome::Inconclusive => {
-                            completed = last_qualified_index.is_some();
+                            // Coverage ambiguity is local to this clock. Preserve any shallower
+                            // qualified boundary, skip the remainder of this clock and let the
+                            // outer multi-clock Forge continue.
+                            completed = true;
                             stop_reason = if last_qualified_index.is_some() {
                                 "QualifiedBoundaryInconclusiveDeeper".into()
                             } else {
-                                "QualificationInconclusive".into()
+                                "QualificationInconclusiveSkippedClock".into()
                             };
                             break;
                         }
@@ -4617,6 +4755,7 @@ mod tests {
             duration_ms: 60_000,
             sample_count: 1_000,
             qualification_coverage: None,
+            prehang_stall_detected: false,
         };
         assert_eq!(
             classify_f2_stress_dwell(
@@ -4640,6 +4779,94 @@ mod tests {
                 )
             ),
             F2DwellOutcome::Stable
+        );
+    }
+
+    fn qualification_coverage_with_phase_p5(
+        pattern: F2QualificationPattern,
+        phase_values: &[(&str, u32)],
+    ) -> F2QualificationCoverage {
+        F2QualificationCoverage {
+            strength: F2QualificationStrength::Fsgl3,
+            pattern: Some(pattern),
+            pass_index: 1,
+            verdict: F2QualificationVerdict::Pass,
+            phases_completed: 8,
+            phases_expected: 8,
+            checksum_count: 8,
+            sample_count: 100,
+            compute_check_count: 1,
+            target_residency_frac: Some(1.0),
+            heavy_light_power_delta_w: Some(20.0),
+            failure_phase: None,
+            retry_count: 0,
+            reason: None,
+            phase_metrics: phase_values
+                .iter()
+                .map(|(phase_name, p5)| {
+                    nidavellir_core::f2_observation::F2QualificationPhaseMetric {
+                        phase_name: (*phase_name).to_string(),
+                        phase_pattern: match pattern {
+                            F2QualificationPattern::A => "fsgl3-a",
+                            F2QualificationPattern::B => "fsgl3-b",
+                        }
+                        .to_string(),
+                        duration_ms: 1_000,
+                        frame_count: 10,
+                        checksum_count: 1,
+                        compute_check_count: 0,
+                        clock_avg: Some(*p5 as f32),
+                        clock_p5: Some(*p5),
+                        clock_p50: Some(*p5),
+                        clock_p95: Some(*p5),
+                        target_residency_pct: Some(100.0),
+                        power_avg: Some(150.0),
+                        power_p95: Some(155.0),
+                        power_capped_fraction: Some(0.0),
+                        temperature_avg: Some(60.0),
+                        temperature_max: Some(62.0),
+                        coverage_status: "pass".into(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn qualification_margin_uses_heavy_phase_p5_and_ignores_normal_noise() {
+        let coverage = qualification_coverage_with_phase_p5(
+            F2QualificationPattern::A,
+            &[
+                ("boost-edge", 1200),
+                ("heavy-spike", 1940),
+                ("texture-rop", 1935),
+                ("mixed-game", 1945),
+                ("power-closing", 1950),
+            ],
+        );
+        assert_eq!(qualification_margin_p5(Some(&coverage)), Some(1942));
+        let history = [1950, 1935];
+        assert!(!qualification_margin_is_clock_drop(1935, &history, 1900));
+        assert!(qualification_margin_is_clock_drop(1900, &history, 1900));
+    }
+
+    #[test]
+    fn qualification_margin_falls_back_to_target_and_retry_budget_is_finite() {
+        assert!(qualification_margin_is_clock_drop(1760, &[], 1800));
+        assert!(!qualification_margin_is_clock_drop(1770, &[], 1800));
+        assert_eq!(qualification_attempt_dwell_ms(60_000, 0), 60_000);
+        assert_eq!(qualification_attempt_dwell_ms(60_000, 1), 90_000);
+        assert_eq!(qualification_attempt_dwell_ms(60_000, 2), 90_000);
+        assert!(qualification_should_retry_inconclusive(0));
+        assert!(qualification_should_retry_inconclusive(1));
+        assert!(!qualification_should_retry_inconclusive(2));
+    }
+
+    #[test]
+    fn discovery_inconclusive_skips_clock_instead_of_aborting_forge() {
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::Inconclusive, false, false),
+            F2DiscoveryDecision::NextClockAfterFailure
         );
     }
 
@@ -4954,6 +5181,21 @@ mod tests {
         assert!(confirmed_f2_refusal(&rec, false, Some(1), Some(&c), &cand_limits(), 1755)
             .unwrap()
             .contains("blacklisted"));
+    }
+
+    #[test]
+    fn f2_blacklist_is_scoped_to_one_clock_and_point() {
+        let c = cand();
+        let mut rec = SafeLoopRecord::default();
+        rec.blacklist.push(BlacklistRegion::around(
+            f2_intent(1755, &c),
+            DEFAULT_BLACKLIST_RADIUS,
+        ));
+        assert!(candidate_blacklisted(&rec, 1755, &c));
+        assert!(
+            !candidate_blacklisted(&rec, 1770, &c),
+            "one failed clock must not block the remaining multi-clock frontier"
+        );
     }
 
     #[test]

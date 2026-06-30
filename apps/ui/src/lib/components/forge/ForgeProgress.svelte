@@ -107,6 +107,9 @@
   }
 
   function curveAnchor(point) {
+    if (point?.vf_table_voltage_mv != null && point?.boundary_voltage_mv != null) {
+      return `Apply VF bin: ${point.vf_table_voltage_mv} mV · learned boundary ${point.boundary_voltage_mv} mV · +${point.apply_margin_mv ?? 0} mV margin`;
+    }
     if (point?.vf_table_voltage_mv != null) return `VF bin: ${point.vf_table_voltage_mv} mV`;
     return null;
   }

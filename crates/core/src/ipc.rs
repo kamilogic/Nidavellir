@@ -104,6 +104,14 @@ pub struct PowerSweepPoint {
     /// key. `None` for legacy points produced before the split. (Added: voltage split.)
     #[serde(default)]
     pub vf_table_voltage_mv: Option<u32>,
+    /// Learned voltage-margin boundary before the application safety margin is added. For F2 points,
+    /// `vf_table_voltage_mv` is the exact physical bin Apply will use; this field preserves the
+    /// evidence boundary so the policy shift remains visible and auditable.
+    #[serde(default)]
+    pub boundary_voltage_mv: Option<u32>,
+    /// Effective upward application margin after snapping to a real VF-table bin.
+    #[serde(default)]
+    pub apply_margin_mv: Option<u32>,
 
     // ── Richer dwell stats (all additive/optional; `None` on legacy points) ──
     /// Lowest sustained clock (MHz) over the dwell — a clock that dips well below

@@ -2,6 +2,26 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 uses a margin boundary and treats supervised TDR as learning (2026-06-30)
+- **Decision**: qualification compares like-for-like FSGL3 heavy-phase p5 telemetry, separated by A/B
+  pattern. A relative fall beyond 30 MHz after two stable references is a reset-clean `ClockDrop`,
+  not a crash. Aggregate mixed-workload p5 remains excluded.
+- **Ambiguity**: `Inconclusive` retries the same point twice with a 1.5× dwell and then skips only the
+  current clock. The Forge continues, but cannot emit `finished` or unlock Apply without qualified
+  profiles. Hard recovery-integrity failures still abort.
+- **Recovery accounting**: exact `f2_undervolt_probe` TDR/Unknown boot flags blacklist and recede
+  without consuming the normal-use Safe Mode threshold. Unrelated bugchecks and all non-Forge phases
+  keep the existing threshold. Startup recovery is the single crash-accounting authority.
+- **Resume policy**: the initial Forge action is consent to resume the same interrupted run. Resume is
+  attempted once when the UI reconnects, not as an unconditional background stress run at service
+  boot. Manual Stop is not resumable.
+- **Apply policy**: the learned boundary and applied point are distinct. Apply requests +12 mV and
+  snaps upward to an exact valid VF bin; both boundary and effective margin are visible in additive
+  IPC fields.
+- **Pre-hang gate**: record the 300 ms missing-valid-NVML-sample signal, but do not reset hardware from
+  the sampler thread. Active mitigation requires calibrated evidence and cooperative cancellation.
+- **Status**: code-complete, no hardware run. Leva 2 dispersion/bisection stays gated.
+
 ## FSGL3 uses stock goldens and verifies every rendered frame (2026-06-30)
 - **Problem**: FSGL2 sampled framebuffer checksums about every 250 ms and compared against the first
   frame of the same segment. Known low-average-power TextureRop/MixedGame instability could therefore

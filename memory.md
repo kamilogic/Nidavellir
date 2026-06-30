@@ -8,6 +8,30 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-06-30) — F2 margin boundary, continuity and supervised recovery
+- FSGL3 qualification now derives a like-for-like heavy-phase p5 signal per A/B pattern. A candidate
+  becomes `ClockDrop` when that p5 falls more than `MARGIN_DROP_TOL_MHZ = 30` below the median of at
+  least two prior stable candidates at the same clock/pattern, or more than 30 MHz below target.
+- `Inconclusive` gets `INCONCLUSIVE_RETRY_BUDGET = 2` retries at the same point; retries use a 1.5×
+  dwell. Exhaustion skips only the current clock and never becomes a global Forge abort. Hard device,
+  reset, arm, apply, verify and persistence failures remain fail-closed.
+- `finished` is now reserved for a complete frontier with qualified profiles. Complete Fast results
+  are `provisional`; partial safe endings are `incomplete`; retained recovery is `interrupted`.
+- Safe Loop classifies VIDEO TDR 0x116/0x117 as OC instability. An exact
+  `f2_undervolt_probe` TDR/Unknown recovery blacklists and recedes without consuming the normal-use
+  Safe Mode crash budget; unrelated crashes and non-Forge phases still count. DeviceLost is accounted
+  once at startup, and duplicate blacklist regions are not appended.
+- An interrupted Forge automatically performs the existing non-destructive Reset+Start sequence once
+  when the UI reconnects, using the persisted original mode. Manual Stop does not create an
+  auto-resume state; F2 observations remain the resume source.
+- Apply policy requests `APPLY_MARGIN_MV = 12`, snaps upward to the first exact valid physical VF bin
+  and clamps to the highest valid anchor. `boundary_voltage_mv` and `apply_margin_mv` are additive IPC
+  fields; `vf_table_voltage_mv` remains the exact applied bin.
+- `PREHANG_STALL_MS = 300` is telemetry-only in this Leva. Proactive reset remains disabled until the
+  hardware gate validates signal precision and a cooperative stress cancellation path exists.
+- No hardware Forge, VF write, Apply or reboot was run during implementation. Leva 2 remains blocked
+  on the supervised hardware gate.
+
 ## Latest (2026-06-30) — F2 FSGL3 golden-sample qualifier
 - Discovery remains the proven steady `PowerRender`; it only measures/characterizes power,
   p5-clock, cap behavior and `ClockDrop`. It no longer decides deployable stability.

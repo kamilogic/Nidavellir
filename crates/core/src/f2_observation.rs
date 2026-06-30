@@ -634,6 +634,8 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
         stable: true,
         perf_per_watt,
         vf_table_voltage_mv: Some(entry.best_anchor_mv),
+        boundary_voltage_mv: Some(entry.best_anchor_mv),
+        apply_margin_mv: Some(0),
         p5_clock_mhz: entry.sustained_clock_mhz,
         target_clock_mhz: Some(entry.target_mhz),
         confidence: Some(entry.confidence),
@@ -1096,6 +1098,8 @@ mod tests {
         assert!(p.stable);
         assert_eq!(p.power_capped_frac, 0.0);
         assert_eq!(p.vf_table_voltage_mv, Some(962));
+        assert_eq!(p.boundary_voltage_mv, Some(962));
+        assert_eq!(p.apply_margin_mv, Some(0));
         assert_eq!(p.target_clock_mhz, Some(1800));
         assert_eq!(p.clock_mhz, 1815);
         assert_eq!(p.p5_clock_mhz, Some(1815));

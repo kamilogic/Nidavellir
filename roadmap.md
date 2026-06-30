@@ -25,9 +25,13 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   observations checkpoint/resume by GPU UUID; partial UI progress is durable; adjacent clocks reuse
   one bin above the prior minimum and fall back to the prior power-bound boundary; deployable synthesis
   still requires the complete range and successful qualification.
-  The explicit F2 Apply path remains verified and legacy F1 remains intact. **Next: supervised
-  FSGL3 validation against the known 1920 MHz @ 912 mV and 1935 MHz @ 918 mV failures**, then Standard
-  Forge, Apply/reboot validation and separate Phase 3 F1 cleanup review.
+  Qualification now stops on a relative heavy-phase p5 margin collapse, retries weak coverage twice
+  and continues across clocks. Supervised F2 TDR recovery is learning rather than normal-use crash
+  budget, interrupted runs resume on UI reconnect, and Apply requests +12 mV then snaps to a valid
+  physical bin (clamped to the highest valid anchor when necessary). The explicit F2 Apply path remains verified and legacy F1 remains
+  intact. **Next: supervised Leva 1 gate** against the known 1920 MHz @ 912 mV and 1935 MHz @ 918 mV
+  failures, then validate reconnect recovery and the applied margin bin in game. Only after those
+  measurements calibrate transition dispersion should Leva 2 begin; bisection remains separately gated.
 - **F1 — Profile model**: 3-profile synthesis (Godforge=clock / Brokkr's=R / Deep
   Calm=MHz/W) + V2 confidence gate.
   - **F1a (DONE)** — pure `synthesize_forge_profiles` + unit tests. Not yet wired.

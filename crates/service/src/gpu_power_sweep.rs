@@ -45,6 +45,15 @@ const VOLT_SANE_MAX_MV: u32 = 1250;
 const F2_QUALIFIER_TARGET_TOL_MHZ: u32 = 30;
 #[cfg(windows)]
 const FSGL3_GOLDEN_SAMPLE_MS: u64 = 2_000;
+/// Initial telemetry threshold for a missing-valid-NVML-sample stall. Leva 1 records the signal only;
+/// proactive reset remains disabled until the hardware gate proves the signal has acceptable
+/// precision and the stress loop has a safe cooperative-cancellation path.
+#[cfg(windows)]
+pub(crate) const PREHANG_STALL_MS: u64 = 300;
+/// Policy margin above the learned F2 voltage boundary. The requested millivolts are always snapped
+/// upward to an exact physical VF-table bin before Apply; the effective margin is exposed in IPC.
+#[cfg(windows)]
+const APPLY_MARGIN_MV: u32 = 12;
 
 /// Brokkr's V2 selection profiles. The threshold is the minimum stability
 /// confidence (Wilson lower bound over a point's accumulated trials) a candidate
@@ -187,6 +196,14 @@ pub enum PowerSweepMode {
 }
 
 impl PowerSweepMode {
+    fn id(self) -> &'static str {
+        match self {
+            PowerSweepMode::Fast => "fast",
+            PowerSweepMode::Standard => "standard",
+            PowerSweepMode::Long => "long",
+        }
+    }
+
     /// Human label for the UI-facing note / logs.
     #[cfg(windows)]
     fn label(self) -> &'static str {
@@ -335,7 +352,7 @@ impl PowerSweepHandle {
                 warn!("F2 power sweep worker panicked; marking Forge idle after fail-closed interruption");
                 if let Ok(mut prog) = progress.lock() {
                     prog.running = false;
-                    prog.phase = "done".into();
+                    prog.phase = "interrupted".into();
                     prog.estimated_remaining_ms = None;
                     prog.profiles_qualified = false;
                     prog
@@ -684,6 +701,7 @@ struct Measured {
     end_temp_c: Option<f32>,
     avg_temp_c: Option<f32>,
     qualification_coverage: Option<F2QualificationCoverage>,
+    prehang_stall_detected: bool,
 }
 
 impl Measured {
@@ -710,8 +728,14 @@ impl Measured {
             end_temp_c: None,
             avg_temp_c: None,
             qualification_coverage: None,
+            prehang_stall_detected: false,
         }
     }
+}
+
+#[cfg(windows)]
+fn prehang_stall_signal(saw_valid_sample: bool, elapsed_since_valid_ms: u64) -> bool {
+    saw_valid_sample && elapsed_since_valid_ms >= PREHANG_STALL_MS
 }
 
 /// 5th-percentile (lower) clock of a sample set — the "bad-case" sustained clock.
@@ -1028,6 +1052,50 @@ fn load_and_measure(ms: u64) -> Measured {
 }
 
 #[cfg(windows)]
+fn f2_apply_anchor_with_margin(
+    curve: &[(usize, u32, u32)],
+    target_mhz: u32,
+    boundary_mv: u32,
+) -> u32 {
+    let mut valid_anchors: Vec<u32> = curve
+        .iter()
+        .filter(|(_, mv, base_mhz)| {
+            *mv >= boundary_mv && *base_mhz < target_mhz && is_sane_core_point(*mv, *base_mhz)
+        })
+        .map(|(_, mv, _)| *mv)
+        .collect();
+    valid_anchors.sort_unstable();
+    valid_anchors.dedup();
+    let requested_mv = boundary_mv.saturating_add(APPLY_MARGIN_MV);
+    valid_anchors
+        .iter()
+        .copied()
+        .find(|mv| *mv >= requested_mv)
+        .or_else(|| valid_anchors.last().copied())
+        .unwrap_or(boundary_mv)
+}
+
+#[cfg(windows)]
+fn apply_f2_margin_policy(
+    points: &mut [(PowerSweepPoint, f64)],
+    curve: &[(usize, u32, u32)],
+) {
+    for (point, _) in points {
+        let Some(target_mhz) = point.target_clock_mhz else {
+            continue;
+        };
+        let boundary_mv = point
+            .boundary_voltage_mv
+            .or(point.vf_table_voltage_mv)
+            .unwrap_or(point.voltage_mv);
+        let apply_mv = f2_apply_anchor_with_margin(curve, target_mhz, boundary_mv);
+        point.boundary_voltage_mv = Some(boundary_mv);
+        point.vf_table_voltage_mv = Some(apply_mv);
+        point.apply_margin_mv = Some(apply_mv.saturating_sub(boundary_mv));
+    }
+}
+
+#[cfg(windows)]
 fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
     fn capture(label: &str, workload: VfWorkload) -> Result<u32, String> {
         let ctx = nidavellir_gpu_stress::GpuCtx::new()
@@ -1061,24 +1129,32 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     // richer min/p5/temperature stats). Tuple: (clock_mhz, power_w, capped, temp_c, qualifier_phase).
     let samples: Arc<Mutex<Vec<PhaseSample>>> = Arc::new(Mutex::new(Vec::new()));
     let phase_state = Arc::new(AtomicU8::new(VfQualifierPhase::NONE_CODE));
+    let prehang_stall = Arc::new(AtomicBool::new(false));
     let volt = Arc::new(AtomicU32::new(0));
     // Ramp-filtered + sanity-checked voltage samples → measured-voltage telemetry
     // (avg/min/max/count). The legacy `volt` AtomicU32 max is kept UNCHANGED so the
     // apply key (which snaps `volt_mv`) is unaffected.
     let volts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-    let (s2, smp, vlt, vsmp, phase_for_sampler) = (
+    let (s2, smp, vlt, vsmp, phase_for_sampler, prehang_for_sampler) = (
         stop.clone(),
         samples.clone(),
         volt.clone(),
         volts.clone(),
         phase_state.clone(),
+        prehang_stall.clone(),
     );
     let t0 = std::time::Instant::now();
     let sampler = std::thread::spawn(move || {
         let mut tick: u32 = 0;
+        let mut saw_valid_sample = false;
+        let mut last_valid_sample = std::time::Instant::now();
         while !s2.load(Ordering::SeqCst) {
+            let mut valid_sample = false;
             if let Some(r) = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml().into_iter().next() {
                 if let (Some(c), Some(p)) = (r.core_clock_mhz, r.power_w) {
+                    valid_sample = true;
+                    saw_valid_sample = true;
+                    last_valid_sample = std::time::Instant::now();
                     // Discovery discards ramp-up for steady-state power. Qualification keeps the
                     // opening/transition samples because the phase changes are the workload.
                     if matches!(purpose, RenderStressPurpose::VfQualification(_, _))
@@ -1095,6 +1171,14 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
                         }
                     }
                 }
+            }
+            if !valid_sample
+                && prehang_stall_signal(
+                    saw_valid_sample,
+                    last_valid_sample.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                )
+            {
+                prehang_for_sampler.store(true, Ordering::SeqCst);
             }
             // Voltage via NVAPI is heavier (re-inits), so sample it sparsely.
             tick += 1;
@@ -1149,6 +1233,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     let _ = sampler.join();
 
     let volt_mv = volt.load(Ordering::SeqCst);
+    let prehang_stall_detected = prehang_stall.load(Ordering::SeqCst);
     let duration_ms = t0.elapsed().as_millis() as u64;
     let v = samples.lock().map(|g| g.clone()).unwrap_or_default();
     let qualification_coverage = match purpose {
@@ -1171,6 +1256,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
             volt_sample_count,
             duration_ms,
             qualification_coverage,
+            prehang_stall_detected,
             ..Measured::degenerate(res, volt_mv)
         };
     }
@@ -1211,6 +1297,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
         end_temp_c,
         avg_temp_c,
         qualification_coverage,
+        prehang_stall_detected,
     }
 }
 
@@ -3459,6 +3546,7 @@ pub(crate) struct SingleDwell {
     pub duration_ms: u64,
     pub sample_count: u32,
     pub qualification_coverage: Option<F2QualificationCoverage>,
+    pub prehang_stall_detected: bool,
 }
 
 /// Run ONE game-power load dwell via the validated [`load_and_measure`] path (fresh wgpu context,
@@ -3502,6 +3590,7 @@ fn single_dwell_from_measured(m: Measured) -> SingleDwell {
         duration_ms: m.duration_ms,
         sample_count: m.sample_count,
         qualification_coverage: m.qualification_coverage,
+        prehang_stall_detected: m.prehang_stall_detected,
     }
 }
 
@@ -4612,7 +4701,7 @@ fn measure_multiclock_undervolt_forge(
     prog.running = true;
     prog.phase = "power".into();
     prog.is_undervolt = true; // Apply IPC routes these points through the anchored F2 writer.
-    prog.mode = Some(mode.label().to_string());
+    prog.mode = Some(mode.id().to_string());
     prog.frontier_complete = false;
     prog.learning_saved = true;
     prog.power_limit_w = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()
@@ -4650,11 +4739,21 @@ fn measure_multiclock_undervolt_forge(
     };
 
     let safe_record = store.load_record();
-    if safe_record.safe_mode || store.is_boot_flag_armed() {
+    if safe_record.safe_mode {
         prog.running = false;
-        prog.phase = "done".into();
+        prog.phase = "incomplete".into();
         prog.note = Some(
-            "Forja F2 recusada pelo Safe Loop — Safe Mode ou recuperação pendente; nenhum hardware foi alterado."
+            "Forja F2 recusada pelo Safe Loop — Safe Mode ativo; nenhum hardware foi alterado."
+                .into(),
+        );
+        set(progress, prog);
+        return;
+    }
+    if store.is_boot_flag_armed() {
+        prog.running = false;
+        prog.phase = "interrupted".into();
+        prog.note = Some(
+            "Forja F2 aguardando recuperação da execução interrompida; nenhum hardware foi alterado."
                 .into(),
         );
         set(progress, prog);
@@ -4663,7 +4762,7 @@ fn measure_multiclock_undervolt_forge(
     // Discovery must observe the stock live clock domain, not a previously applied/capped profile.
     if let Err(e) = final_reset(store, true) {
         prog.running = false;
-        prog.phase = "done".into();
+        prog.phase = "incomplete".into();
         prog.note = Some(format!(
             "Forja F2 abortada antes da descoberta — não foi possível confirmar stock: {e}"
         ));
@@ -4675,7 +4774,7 @@ fn measure_multiclock_undervolt_forge(
     if !gpu::vf_curve_supported() {
         let _ = final_reset(store, true);
         prog.running = false;
-        prog.phase = "done".into();
+        prog.phase = "incomplete".into();
         prog.note = Some(
             "Forja F2 abortada com segurança — API de curva V/F moderna não suportada neste GPU/driver. GPU no stock, nada aplicado."
                 .into(),
@@ -4690,7 +4789,7 @@ fn measure_multiclock_undervolt_forge(
         Err(e) => {
             let _ = final_reset(store, true);
             prog.running = false;
-            prog.phase = "done".into();
+            prog.phase = "incomplete".into();
             prog.note = Some(format!(
                 "Forja F2 abortada com segurança (curva V/F sem cluster de núcleo sano): {e} — GPU no stock, nada aplicado."
             ));
@@ -4707,7 +4806,7 @@ fn measure_multiclock_undervolt_forge(
     else {
         let _ = final_reset(store, true);
         prog.running = false;
-        prog.phase = "done".into();
+        prog.phase = "incomplete".into();
         prog.note = Some(
             "Forja F2 abortada com segurança — sem pontos de curva V/F base sãos. GPU no stock, nada aplicado."
                 .into(),
@@ -4731,7 +4830,7 @@ fn measure_multiclock_undervolt_forge(
             Err(e) => {
                 let _ = final_reset(store, true);
                 prog.running = false;
-                prog.phase = "done".into();
+                prog.phase = "incomplete".into();
                 prog.note = Some(format!(
                     "Forja F2 abortada antes da qualificação FSGL3 — stock não produziu golden determinístico: {e}. GPU no stock, nada aplicado."
                 ));
@@ -4747,7 +4846,7 @@ fn measure_multiclock_undervolt_forge(
     if targets.is_empty() {
         let _ = final_reset(store, true);
         prog.running = false;
-        prog.phase = "done".into();
+        prog.phase = "incomplete".into();
         prog.note = Some(
             "Forja F2 abortada com segurança — nenhum clock candidato derivável. GPU no stock, nada aplicado."
                 .into(),
@@ -5021,7 +5120,20 @@ fn measure_multiclock_undervolt_forge(
                 entry.target_mhz <= max && f2_clock_within_cmax_floor(entry.target_mhz, max)
             })
             .collect::<Vec<_>>();
-        let pts = nidavellir_core::f2_observation::frontier_to_points(&frontier);
+        let mut pts = nidavellir_core::f2_observation::frontier_to_points(&frontier);
+        apply_f2_margin_policy(&mut pts, &f2_inputs.sane_base_curve);
+        for (point, _) in &pts {
+            if let (Some(boundary), Some(apply), Some(margin)) = (
+                point.boundary_voltage_mv,
+                point.vf_table_voltage_mv,
+                point.apply_margin_mv,
+            ) {
+                prog.log.push(format!(
+                    "{} MHz: fronteira {boundary} mV → Apply {apply} mV (margem física +{margin} mV).",
+                    point.target_clock_mhz.unwrap_or(point.clock_mhz)
+                ));
+            }
+        }
         let profiles = synthesize_forge_profiles(&pts, &ForgePolicy::balanced());
         prog.log.extend(profiles.log.clone());
         prog.power_bound_collapse = profiles.power_bound_collapse;
@@ -5098,13 +5210,39 @@ fn measure_multiclock_undervolt_forge(
     prog.current_clock_mhz = None;
     prog.current_voltage_mv = None;
     prog.running = false;
-    prog.phase = "done".into();
+    prog.phase = f2_terminal_phase(
+        forge_complete,
+        forge_aborted,
+        retain_boot_flag,
+        prog.profiles_qualified,
+        prog.godforge.is_some(),
+    )
+    .into();
     // Every candidate is already durable in f2_observations.jsonl. Persist the UI checkpoint too so
     // a partial/failed run remains inspectable after a service restart. Previous completed profiles
     // stay attached until a newer complete frontier replaces them. NO auto-apply.
     save_forge_state(&gpu_key, &prog);
     set(progress, prog);
     info!("F2 undervolt forge finished");
+}
+
+#[cfg(windows)]
+fn f2_terminal_phase(
+    forge_complete: bool,
+    forge_aborted: bool,
+    retain_boot_flag: bool,
+    profiles_qualified: bool,
+    has_profile: bool,
+) -> &'static str {
+    if retain_boot_flag {
+        "interrupted"
+    } else if forge_complete && !forge_aborted && profiles_qualified && has_profile {
+        "finished"
+    } else if forge_complete && !forge_aborted && has_profile {
+        "provisional"
+    } else {
+        "incomplete"
+    }
 }
 
 #[cfg(test)]
@@ -5173,6 +5311,57 @@ mod tests {
             (2..=POWER_SWEEP_MAX_VALIDATION_PASSES).contains(&lpass),
             "long passes must exceed 1 yet stay within the defensive cap"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_terminal_phase_reserves_finished_for_ready_profiles() {
+        assert_eq!(
+            f2_terminal_phase(true, false, false, true, true),
+            "finished"
+        );
+        assert_eq!(
+            f2_terminal_phase(true, false, false, false, true),
+            "provisional"
+        );
+        assert_eq!(
+            f2_terminal_phase(false, true, true, false, false),
+            "interrupted"
+        );
+        assert_eq!(
+            f2_terminal_phase(false, true, false, false, false),
+            "incomplete"
+        );
+        assert_eq!(PowerSweepMode::Fast.id(), "fast");
+        assert_eq!(PowerSweepMode::Standard.id(), "standard");
+        assert_eq!(PowerSweepMode::Long.id(), "long");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_apply_margin_snaps_up_to_real_bin_and_clamps_to_valid_anchor() {
+        let curve = vec![
+            (0, 875, 1650),
+            (1, 881, 1665),
+            (2, 887, 1680),
+            (3, 893, 1695),
+            (4, 900, 1800),
+        ];
+        assert_eq!(f2_apply_anchor_with_margin(&curve, 1800, 875), 887);
+        assert_eq!(f2_apply_anchor_with_margin(&curve, 1800, 887), 893);
+
+        let point = PowerSweepPoint {
+            voltage_mv: 875,
+            vf_table_voltage_mv: Some(875),
+            boundary_voltage_mv: Some(875),
+            target_clock_mhz: Some(1800),
+            ..Default::default()
+        };
+        let mut points = vec![(point, 0.95)];
+        apply_f2_margin_policy(&mut points, &curve);
+        assert_eq!(points[0].0.boundary_voltage_mv, Some(875));
+        assert_eq!(points[0].0.vf_table_voltage_mv, Some(887));
+        assert_eq!(points[0].0.apply_margin_mv, Some(12));
     }
 
     #[cfg(windows)]
@@ -5818,6 +6007,7 @@ mod tests {
             end_temp_c: Some(66.0),
             avg_temp_c: Some(63.0),
             qualification_coverage: None,
+            prehang_stall_detected: false,
         }
     }
 
@@ -7763,6 +7953,8 @@ mod tests {
         assert_eq!(p.voltage_mv, 843);
         assert_eq!(p.measured_voltage_mv, None);
         assert_eq!(p.vf_table_voltage_mv, None);
+        assert_eq!(p.boundary_voltage_mv, None);
+        assert_eq!(p.apply_margin_mv, None);
         // The richer dwell-stat fields also default cleanly on legacy points.
         assert_eq!(p.p5_clock_mhz, None);
         assert_eq!(p.voltage_sample_count, None);
@@ -7776,6 +7968,14 @@ mod tests {
         assert_eq!(p5_clock_mhz(&cs), Some(1700));
         assert_eq!(p5_clock_mhz(&[1830]), Some(1830)); // single sample
         assert_eq!(p5_clock_mhz(&[]), None); // empty
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prehang_stall_signal_requires_a_prior_valid_sample_and_threshold() {
+        assert!(!prehang_stall_signal(false, PREHANG_STALL_MS * 2));
+        assert!(!prehang_stall_signal(true, PREHANG_STALL_MS - 1));
+        assert!(prehang_stall_signal(true, PREHANG_STALL_MS));
     }
 
     #[test]
