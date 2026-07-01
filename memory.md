@@ -8,21 +8,24 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-07-01) — F2 power calibration uses the applied-bin saturation peak
+## Latest (2026-07-01) — F2 frontier and profile calibration use sustained p99 power
 - Discovery keeps the existing textured `PowerRender`; the compute-only `POWER_SHADER` remains
-  outside the live F2 path. The measured mean and highest post-ramp power sample now remain distinct
+  outside the live F2 path. Mean, sustained p99 and the highest post-ramp sample remain distinct
   through `SingleDwell`, the F2 step report, append-only observations and `PowerSweepPoint`.
-- `F2_DISCOVERY_CONTRACT_VERSION = 2`. Legacy/v1 positive discovery evidence cannot seed the new
-  frontier because it lacks apply-bin peak and thermal-validity telemetry; negative evidence remains
-  conservative.
+- `POWER_PEAK_PERCENTILE = 99`; p99 uses every retained post-ramp power sample. Fewer than 100 samples
+  fall back explicitly to the measured raw maximum; zero samples produce no value and fail closed.
+- `F2_DISCOVERY_CONTRACT_VERSION = 3`. Legacy/v1/v2 positive and power-bound evidence cannot seed the
+  new frontier because it lacks p99; negative evidence remains conservative.
 - Profile synthesis first applies the unchanged +12 mV policy, then resolves a current reset-clean
-  PowerRender observation for that exact apply bin. It scores Godforge/Brokkr's/Deep Calm with sampled
-  peak power and the p5 clock observed at the apply bin, not boundary-bin mean power.
-- Power-bound `ClockDrop` remains valid calibration telemetry but never becomes stability evidence.
+  PowerRender observation for that exact apply bin. It scores Godforge/Brokkr's/Deep Calm with p99
+  power and the p5 clock observed at the apply bin, not boundary-bin mean or a one-sample maximum.
+- A discovery `ClockDrop` whose p99 remains at 99%+ of the numeric cap is `PowerBoundClockDrop` and
+  continues voltage descent even after the clock previously sustained. It remains calibration
+  telemetry, never stability evidence; off-cap `ClockDrop` retains the normal boundary behavior.
   NVML software/hardware thermal slowdown makes a discovery dwell `Inconclusive`, not a bad undervolt.
-- UI cards and Forge Progress show the measured saturation peak with an explicit “not a hard power
-  limit” caveat. Additive `PowerSweepPoint.max_temp_c` and `thermal_throttled` fields expose thermal
-  validity. FSGL3/goldens, qualification contract v4 and Leva 1 margin/recovery semantics are unchanged.
+- UI cards and Forge Progress show sustained p99 with an explicit “not a hard power limit” caveat;
+  raw mean/maximum remain available. Apply rejects restored F2 profiles without valid p99.
+  FSGL3/goldens, qualification contract v4 and Leva 1 margin/recovery semantics are unchanged.
 - Code validation passed; hardware calibration at 1920 MHz @ 931 mV remains the operator gate.
 
 ## Latest (2026-06-30) — F2 margin boundary, continuity and supervised recovery

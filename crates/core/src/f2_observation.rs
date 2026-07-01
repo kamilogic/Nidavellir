@@ -24,9 +24,9 @@ use crate::safe_loop::default_data_dir;
 pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 /// Current homogeneous PowerRender discovery contract.
 ///
-/// v2 preserves mean and sampled-peak power separately and carries thermal validity so profile
-/// synthesis can calibrate the exact apply-margin bin instead of reusing boundary-bin averages.
-pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 2;
+/// v3 preserves mean, sustained-p99 and sampled-peak power separately and carries thermal validity
+/// so frontier decisions and exact apply-margin-bin calibration use the same sustained metric.
+pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 3;
 /// Current FailureSeekingGameLoop qualification contract.
 pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 4;
 
@@ -290,6 +290,9 @@ pub struct F2Observation {
     /// Highest post-ramp power sample captured by the discovery dwell.
     #[serde(default)]
     pub max_watts: Option<u32>,
+    /// Sustained high-power percentile captured from the retained post-ramp dwell samples.
+    #[serde(default)]
+    pub power_p99_w: Option<f32>,
     /// Fraction of steady-state samples where the NVIDIA power-cap flag was active.
     #[serde(default)]
     pub power_capped_frac: Option<f32>,
@@ -357,6 +360,8 @@ pub struct F2FrontierEntry {
     pub watts: Option<u32>,
     #[serde(default)]
     pub max_watts: Option<u32>,
+    #[serde(default)]
+    pub power_p99_w: Option<f32>,
     #[serde(default)]
     pub avg_clock_mhz: Option<u32>,
     #[serde(default)]
@@ -448,9 +453,9 @@ pub fn last_good_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<&F
         .min_by_key(|o| o.anchor_mv)
 }
 
-/// True when an observation can define the current PowerRender discovery frontier. Discovery v2
-/// changes the power-calibration evidence contract, so legacy and v1 positives cannot seed the
-/// current frontier. Negative observations remain version-independent and conservative.
+/// True when an observation can define the current PowerRender discovery frontier. Discovery v3
+/// changes the power-bound/calibration evidence contract, so legacy, v1 and v2 positives cannot
+/// seed the current frontier. Negative observations remain version-independent and conservative.
 pub fn is_current_discovery_evidence(o: &F2Observation) -> bool {
     o.evidence_kind == F2EvidenceKind::Discovery
         && o.discovery_contract_version == Some(F2_DISCOVERY_CONTRACT_VERSION)
@@ -587,6 +592,7 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
         offset_mhz: best.offset_mhz,
         watts: best.watts,
         max_watts: best.max_watts,
+        power_p99_w: best.power_p99_w,
         avg_clock_mhz: best.avg_clock_mhz,
         sustained_clock_mhz: best.sustained_clock_mhz,
         power_capped_frac: best.power_capped_frac,
@@ -636,9 +642,10 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
     let clock = entry.avg_clock_mhz.unwrap_or(entry.target_mhz);
     let power = entry.watts.unwrap_or(0) as f32;
     let max_power = entry.max_watts.unwrap_or(entry.watts.unwrap_or(0)) as f32;
+    let power_p99 = entry.power_p99_w.filter(|power| power.is_finite() && *power > 0.0);
     let sustained_clock = entry.sustained_clock_mhz.unwrap_or(clock);
-    let perf_per_watt = if max_power > 0.0 {
-        sustained_clock as f64 / max_power as f64
+    let perf_per_watt = if let Some(power_p99) = power_p99 {
+        sustained_clock as f64 / power_p99 as f64
     } else {
         0.0
     };
@@ -648,6 +655,7 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
         offset_mhz: entry.offset_mhz,
         power_w: power,
         max_power_w: max_power,
+        power_p99_w: power_p99,
         // In F1, a power-bound point means the voltage probe did not reveal a useful tuning
         // boundary, so synthesis excludes it. In F2 the anchored target was explicitly sustained;
         // being at the cap is valid Cmax evidence and must not disqualify the forged point.
@@ -668,11 +676,11 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
     (point, entry.confidence)
 }
 
-/// Highest sampled-power discovery observation for one exact target/apply anchor. Only current v2,
+/// Highest sustained-p99 discovery observation for one exact target/apply anchor. Only current v3,
 /// reset-clean, thermally valid PowerRender evidence is eligible. A power-bound clock drop remains
 /// valid power/clock telemetry for the apply bin, but it is never promoted into stability evidence.
-/// Repeated measurements deliberately choose the largest sampled peak so a profile is calibrated
-/// conservatively rather than averaging away a real worst-case draw.
+/// Repeated measurements deliberately choose the largest measured p99 so a profile is calibrated
+/// conservatively without promoting one-sample spikes into the sustained-power contract.
 pub fn current_discovery_observation_at_anchor<'a>(
     obs: &'a [F2Observation],
     target_mhz: u32,
@@ -696,8 +704,14 @@ pub fn current_discovery_observation_at_anchor<'a>(
                 && o.sustained_clock_mhz.is_some()
                 && o.watts.is_some_and(|watts| watts > 0)
                 && o.max_watts.is_some_and(|watts| watts > 0)
+                && o.power_p99_w
+                    .is_some_and(|power| power.is_finite() && power > 0.0)
         })
-        .max_by_key(|o| o.max_watts.unwrap_or(0))
+        .max_by(|a, b| {
+            a.power_p99_w
+                .unwrap_or(0.0)
+                .total_cmp(&b.power_p99_w.unwrap_or(0.0))
+        })
 }
 
 /// Bridge a whole learned frontier to the `(PowerSweepPoint, confidence)` pairing the existing
@@ -815,6 +829,7 @@ mod tests {
             sustained_clock_mhz: Some(target + 15),
             watts: Some(180),
             max_watts: Some(188),
+            power_p99_w: Some(186.0),
             power_capped_frac: Some(0.0),
             max_temp_c: Some(68.0),
             thermal_throttled: false,
@@ -1163,6 +1178,7 @@ mod tests {
         assert_eq!(p.p5_clock_mhz, Some(1815));
         assert_eq!(p.power_w, 180.0);
         assert_eq!(p.max_power_w, 188.0);
+        assert_eq!(p.power_p99_w, Some(186.0));
         assert_eq!(p.max_temp_c, Some(68.0));
         assert_eq!(p.confidence, Some(conf));
         assert_eq!(p.validation_count, Some(0));
@@ -1173,11 +1189,13 @@ mod tests {
     }
 
     #[test]
-    fn discovery_v2_rejects_old_positive_evidence() {
+    fn discovery_v3_rejects_v2_positive_evidence() {
         let mut old = obs(1800, 962, F2ObsOutcome::Validated);
-        old.discovery_contract_version = Some(F2_DISCOVERY_CONTRACT_VERSION - 1);
+        old.discovery_contract_version = Some(2);
+        old.power_p99_w = None;
         assert!(!is_current_discovery_evidence(&old));
-        assert!(last_discovery_good_for_target(&[old], 1800).is_none());
+        assert!(last_discovery_good_for_target(&[old.clone()], 1800).is_none());
+        assert!(learned_frontier(&[old]).is_empty());
 
         let mut legacy = obs(1800, 962, F2ObsOutcome::Validated);
         legacy.evidence_kind = F2EvidenceKind::Legacy;
@@ -1187,26 +1205,31 @@ mod tests {
     }
 
     #[test]
-    fn apply_anchor_power_uses_highest_current_thermal_safe_peak() {
-        let mut lower_peak = obs(1800, 975, F2ObsOutcome::Validated);
-        lower_peak.max_watts = Some(188);
-        let mut higher_peak = lower_peak.clone();
-        higher_peak.max_watts = Some(196);
-        higher_peak.watts = Some(190);
-        higher_peak.outcome = F2ObsOutcome::PowerBoundClockDrop;
-        let mut throttled = higher_peak.clone();
+    fn apply_anchor_power_uses_highest_current_thermal_safe_p99() {
+        let mut lower_p99 = obs(1800, 975, F2ObsOutcome::Validated);
+        lower_p99.max_watts = Some(205);
+        lower_p99.power_p99_w = Some(188.0);
+        let mut higher_p99 = lower_p99.clone();
+        higher_p99.max_watts = Some(198);
+        higher_p99.power_p99_w = Some(196.0);
+        higher_p99.watts = Some(190);
+        higher_p99.outcome = F2ObsOutcome::PowerBoundClockDrop;
+        let mut throttled = higher_p99.clone();
         throttled.max_watts = Some(200);
+        throttled.power_p99_w = Some(200.0);
         throttled.thermal_throttled = true;
-        let mut old = higher_peak.clone();
+        let mut old = higher_p99.clone();
         old.max_watts = Some(199);
+        old.power_p99_w = Some(199.0);
         old.discovery_contract_version = Some(F2_DISCOVERY_CONTRACT_VERSION - 1);
 
-        let observations = [lower_peak, higher_peak, throttled, old];
+        let observations = [lower_p99, higher_p99, throttled, old];
         let selected =
             current_discovery_observation_at_anchor(&observations, 1800, 975, "RTX 3060 Ti")
                 .unwrap();
         assert_eq!(selected.watts, Some(190));
-        assert_eq!(selected.max_watts, Some(196));
+        assert_eq!(selected.max_watts, Some(198));
+        assert_eq!(selected.power_p99_w, Some(196.0));
         assert!(!selected.thermal_throttled);
     }
 

@@ -37,13 +37,14 @@ headless client used for sweeps/benchmarks. Requests/responses are the
   then enumerates every real live-VF clock from the highest bin downward. For each clock, it raises a
   lower-voltage anchor to the target and caps higher bins to that target, then runs
   the fail-closed dwell/reset motor until the voltage boundary or physical floor.
-  Power-bound clock drops before sustain continue the same clock; the first sustained
+  Power-bound clock drops continue the same clock whenever sustained p99 remains at the cap, even
+  after that clock previously sustained; the first sustained
   clock is Cmax. The complete profile frontier spans Cmax→90% Cmax so Deep Calm is selected from
   measured data. Fast produces a provisional map; Standard/Long capture three stock render goldens
   with fresh contexts, then use FSGL3 A+B 2×60 s as the default interleaved per-bin qualifier.
   Discovery keeps the homogeneous power render so p5, power-limit and `ClockDrop` stay comparable.
-  Discovery contract v2 preserves mean/peak watts and thermal validity separately; after the +12 mV
-  apply policy snaps to a physical bin, profile synthesis uses that exact bin's sampled peak and p5;
+  Discovery contract v3 preserves mean/p99/raw-peak watts and thermal validity separately; after the
+  +12 mV apply policy snaps to a physical bin, profile synthesis uses that exact bin's p99 and p5;
   qualification uses TextureRop/MixedGame-biased transients, deliberate droop bursts and on-GPU
   verification of every rendered frame. A rejected FSGL3 candidate stops descent at the last
   FSGL3-qualified physical bin. F2 Apply fails closed until current-contract v4 FSGL3 A+B succeeds;

@@ -1183,6 +1183,7 @@ pub struct F2DwellResult {
     pub p5_clock_mhz: u32,
     pub power_w: f32,
     pub max_power_w: f32,
+    pub power_p99_w: Option<f32>,
     pub power_capped_frac: f32,
     pub max_temp_c: Option<f32>,
     pub thermal_throttled: bool,
@@ -1240,15 +1241,26 @@ pub enum F2DiscoveryDecision {
 /// primary signal requested by F2 (99–100% of the cap); the sampled cap flag is only a fallback when
 /// the driver did not expose a usable numeric limit.
 pub fn f2_near_power_limit(
-    power_w: Option<u32>,
+    power_p99_w: Option<f32>,
     power_limit_w: Option<f32>,
     power_capped_frac: Option<f32>,
 ) -> bool {
-    match (power_w, power_limit_w) {
-        (Some(power), Some(limit)) if limit.is_finite() && limit > 0.0 => {
-            power as f32 / limit >= 0.99
+    let Some(power_p99) = power_p99_w.filter(|power| power.is_finite() && *power > 0.0) else {
+        return false;
+    };
+    match power_limit_w {
+        Some(limit) if limit.is_finite() && limit > 0.0 => {
+            power_p99 / limit >= 0.99
         }
         _ => power_capped_frac.is_some_and(|f| f.is_finite() && f >= 0.5),
+    }
+}
+
+fn f2_power_bound_clock_drop(outcome: &F2Outcome, near_power_limit: bool) -> F2Outcome {
+    if matches!(outcome, F2Outcome::ClockDrop) && near_power_limit {
+        F2Outcome::PowerBoundClockDrop
+    } else {
+        outcome.clone()
     }
 }
 
@@ -1265,8 +1277,8 @@ pub fn f2_discovery_decision(
         F2Outcome::Validated if had_sustainable_point => F2DiscoveryDecision::ContinueVoltage,
         F2Outcome::Validated => F2DiscoveryDecision::MarkSustainableAndContinue,
         F2Outcome::PowerBoundClockDrop => F2DiscoveryDecision::ContinueVoltage,
-        F2Outcome::ClockDrop if had_sustainable_point => F2DiscoveryDecision::BoundaryFound,
         F2Outcome::ClockDrop if near_power_limit => F2DiscoveryDecision::ContinueVoltage,
+        F2Outcome::ClockDrop if had_sustainable_point => F2DiscoveryDecision::BoundaryFound,
         F2Outcome::ClockDrop => F2DiscoveryDecision::NextClockUnsustainable,
         F2Outcome::SilentError | F2Outcome::Unstable if had_sustainable_point => {
             F2DiscoveryDecision::BoundaryFound
@@ -1336,6 +1348,7 @@ pub struct F2StepReport {
     pub p5_clock_mhz: Option<u32>,
     pub power_w: Option<u32>,
     pub max_power_w: Option<u32>,
+    pub power_p99_w: Option<f32>,
     pub power_capped_frac: Option<f32>,
     pub max_temp_c: Option<f32>,
     pub thermal_throttled: bool,
@@ -1384,6 +1397,7 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
         p5_clock_mhz: None,
         power_w: None,
         max_power_w: None,
+        power_p99_w: None,
         power_capped_frac: None,
         max_temp_c: None,
         thermal_throttled: false,
@@ -1427,6 +1441,7 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
     r.p5_clock_mhz = Some(d.p5_clock_mhz);
     r.power_w = Some(d.power_w.round() as u32);
     r.max_power_w = Some(d.max_power_w.round() as u32);
+    r.power_p99_w = d.power_p99_w;
     r.power_capped_frac = Some(d.power_capped_frac);
     r.max_temp_c = d.max_temp_c;
     r.thermal_throttled = d.thermal_throttled;
@@ -2016,6 +2031,9 @@ fn classify_f2_stress_dwell(
     } else if purpose == F2StressPurpose::PowerDiscovery && s.thermal_throttled {
         // Thermal slowdown invalidates power calibration without proving voltage instability.
         F2DwellOutcome::Inconclusive
+    } else if purpose == F2StressPurpose::PowerDiscovery && s.power_p99_w.is_none() {
+        // Discovery cannot make a power-bound decision or calibrate an applied bin without p99.
+        F2DwellOutcome::Inconclusive
     } else if purpose.is_qualification()
         && s.qualification_coverage
             .as_ref()
@@ -2168,11 +2186,12 @@ impl F2Ops for RealF2Ops<'_> {
         }
         info!(
             "undervolt-probe dwell: {outcome:?} avg_clock={} MHz p5={} MHz \
-             power_avg={:.0} W power_peak={:.0} W max_temp={:?} C \
+             power_avg={:.0} W power_p99={:?} W power_peak={:.0} W max_temp={:?} C \
              thermal_throttled={} silent_error={}",
             s.avg_clock_mhz,
             s.p5_clock_mhz,
             s.power_w,
+            s.power_p99_w,
             s.max_power_w,
             s.max_temp_c,
             s.thermal_throttled,
@@ -2184,6 +2203,7 @@ impl F2Ops for RealF2Ops<'_> {
             p5_clock_mhz: s.p5_clock_mhz,
             power_w: s.power_w,
             max_power_w: s.max_power_w,
+            power_p99_w: s.power_p99_w,
             power_capped_frac: s.power_capped_frac,
             max_temp_c: s.max_temp_c,
             thermal_throttled: s.thermal_throttled,
@@ -3869,7 +3889,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     use std::sync::atomic::Ordering;
 
     use nidavellir_core::f2_observation::{
-        first_bad_for_target, last_discovery_good_for_target, now_rfc3339, F2ObsMode,
+        first_bad_for_target, is_current_discovery_evidence, last_discovery_good_for_target,
+        now_rfc3339, F2ObsMode,
     };
 
     let mut logs = Vec::new();
@@ -3898,10 +3919,11 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     let prior_power_bound_mv = compatible_prior
         .iter()
         .filter(|o| {
-            matches!(
-                o.outcome,
-                nidavellir_core::f2_observation::F2ObsOutcome::PowerBoundClockDrop
-            )
+            is_current_discovery_evidence(o)
+                && matches!(
+                    o.outcome,
+                    nidavellir_core::f2_observation::F2ObsOutcome::PowerBoundClockDrop
+                )
         })
         .map(|o| o.anchor_mv)
         .min();
@@ -4083,14 +4105,13 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             line: format!("Testing {target_mhz} MHz @ {anchor_mv} mV — dwell em andamento…"),
         });
         let mut report = run_confirmed_f2_step(&mut ops);
-        let near_cap = f2_near_power_limit(report.power_w, power_limit_w, report.power_capped_frac);
-        if matches!(report.outcome, F2Outcome::ClockDrop) && !had_sustainable && near_cap {
-            report.outcome = F2Outcome::PowerBoundClockDrop;
-        }
+        let near_cap =
+            f2_near_power_limit(report.power_p99_w, power_limit_w, report.power_capped_frac);
+        report.outcome = f2_power_bound_clock_drop(&report.outcome, near_cap);
 
         logs.push(format!(
-            "{target_mhz} MHz @ {anchor_mv} mV: {:?}, p5={:?} MHz, power={:?} W, cap_near={near_cap}",
-            report.outcome, report.p5_clock_mhz, report.power_w
+            "{target_mhz} MHz @ {anchor_mv} mV: {:?}, p5={:?} MHz, power_avg={:?} W, power_p99={:?} W, cap_near={near_cap}",
+            report.outcome, report.p5_clock_mhz, report.power_w, report.power_p99_w
         ));
         ctx.timestamp = now_rfc3339();
         let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
@@ -4112,10 +4133,10 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             anchor_mv: Some(anchor_mv),
             outcome: Some(format!("{:?}", report.outcome)),
             line: format!(
-                "{target_mhz} MHz @ {anchor_mv} mV → {:?} · p5 {} MHz · {} W · aprendizado salvo",
+                "{target_mhz} MHz @ {anchor_mv} mV → {:?} · p5 {} MHz · p99 {:.0} W · aprendizado salvo",
                 report.outcome,
                 report.p5_clock_mhz.unwrap_or(0),
-                report.power_w.unwrap_or(0)
+                report.power_p99_w.unwrap_or(0.0)
             ),
         });
 
@@ -4325,20 +4346,22 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     let power_bound_clock_drops: Vec<u32> = scoped
         .iter()
         .filter(|o| {
-            matches!(
-                o.outcome,
-                nidavellir_core::f2_observation::F2ObsOutcome::PowerBoundClockDrop
-            )
+            is_current_discovery_evidence(o)
+                && matches!(
+                    o.outcome,
+                    nidavellir_core::f2_observation::F2ObsOutcome::PowerBoundClockDrop
+                )
         })
         .map(|o| o.anchor_mv)
         .collect();
     let validated_voltages: Vec<u32> = scoped
         .iter()
         .filter(|o| {
-            matches!(
-                o.outcome,
-                nidavellir_core::f2_observation::F2ObsOutcome::Validated
-            )
+            is_current_discovery_evidence(o)
+                && matches!(
+                    o.outcome,
+                    nidavellir_core::f2_observation::F2ObsOutcome::Validated
+                )
         })
         .map(|o| o.anchor_mv)
         .collect();
@@ -4710,7 +4733,11 @@ mod tests {
 
     #[test]
     fn discovery_keeps_high_clock_while_clock_drop_is_power_bound() {
-        assert!(f2_near_power_limit(Some(199), Some(200.0), Some(0.0)));
+        assert!(f2_near_power_limit(Some(199.0), Some(200.0), Some(0.0)));
+        assert_eq!(
+            f2_power_bound_clock_drop(&F2Outcome::ClockDrop, true),
+            F2Outcome::PowerBoundClockDrop
+        );
         assert_eq!(
             f2_discovery_decision(&F2Outcome::ClockDrop, false, true),
             F2DiscoveryDecision::ContinueVoltage
@@ -4721,8 +4748,33 @@ mod tests {
         );
         assert_eq!(
             f2_discovery_decision(&F2Outcome::ClockDrop, true, true),
-            F2DiscoveryDecision::BoundaryFound
+            F2DiscoveryDecision::ContinueVoltage
         );
+        assert_eq!(
+            f2_discovery_decision(&F2Outcome::PowerBoundClockDrop, true, true),
+            F2DiscoveryDecision::ContinueVoltage
+        );
+    }
+
+    #[test]
+    fn power_bound_classification_uses_p99_not_mean() {
+        let power_avg_w = 174.0;
+        let power_p99_w = 200.0;
+        assert!(power_avg_w / 200.0 < 0.99);
+        assert!(f2_near_power_limit(
+            Some(power_p99_w),
+            Some(200.0),
+            Some(0.0)
+        ));
+
+        let misleading_avg_w = 200.0;
+        let off_cap_p99_w = 180.0;
+        assert!(misleading_avg_w / 200.0 >= 0.99);
+        assert!(!f2_near_power_limit(
+            Some(off_cap_p99_w),
+            Some(200.0),
+            Some(1.0)
+        ));
     }
 
     #[test]
@@ -4757,7 +4809,11 @@ mod tests {
 
     #[test]
     fn discovery_abandons_unsustained_clock_once_off_cap() {
-        assert!(!f2_near_power_limit(Some(185), Some(200.0), Some(1.0)));
+        assert!(!f2_near_power_limit(Some(185.0), Some(200.0), Some(1.0)));
+        assert_eq!(
+            f2_power_bound_clock_drop(&F2Outcome::ClockDrop, false),
+            F2Outcome::ClockDrop
+        );
         assert_eq!(
             f2_discovery_decision(&F2Outcome::ClockDrop, false, false),
             F2DiscoveryDecision::NextClockUnsustainable
@@ -4778,6 +4834,7 @@ mod tests {
             p5_clock_mhz: 1200,
             power_w: 120.0,
             max_power_w: 130.0,
+            power_p99_w: Some(128.0),
             power_capped_frac: 0.0,
             max_temp_c: Some(68.0),
             thermal_throttled: false,
@@ -4813,6 +4870,12 @@ mod tests {
         let mut thermal = stable_low_p5;
         thermal.p5_clock_mhz = 1800;
         thermal.thermal_throttled = true;
+        assert_eq!(
+            classify_f2_stress_dwell(&thermal, 1800, F2StressPurpose::PowerDiscovery),
+            F2DwellOutcome::Inconclusive
+        );
+        thermal.thermal_throttled = false;
+        thermal.power_p99_w = None;
         assert_eq!(
             classify_f2_stress_dwell(&thermal, 1800, F2StressPurpose::PowerDiscovery),
             F2DwellOutcome::Inconclusive
@@ -4951,11 +5014,15 @@ mod tests {
 
     #[test]
     fn power_cap_flag_is_only_fallback_when_numeric_limit_is_missing() {
-        assert!(f2_near_power_limit(None, None, Some(0.75)));
-        assert!(!f2_near_power_limit(None, None, Some(0.25)));
+        assert!(f2_near_power_limit(Some(150.0), None, Some(0.75)));
+        assert!(!f2_near_power_limit(Some(150.0), None, Some(0.25)));
         assert!(
-            !f2_near_power_limit(Some(180), Some(200.0), Some(1.0)),
-            "a valid 90% numeric reading must not be overridden by the cap-flag fallback"
+            !f2_near_power_limit(None, None, Some(1.0)),
+            "missing p99 must never be replaced by the cap flag"
+        );
+        assert!(
+            !f2_near_power_limit(Some(180.0), Some(200.0), Some(1.0)),
+            "a valid 90% p99 reading must not be overridden by the cap-flag fallback"
         );
     }
 
@@ -5282,6 +5349,7 @@ mod tests {
             // Dummy headline stats; the single-step state machine only branches on `outcome`.
             F2DwellResult { outcome: self.dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
                 max_power_w: 191.0,
+                power_p99_w: Some(189.0),
                 power_capped_frac: 0.0,
                 max_temp_c: Some(62.0),
                 thermal_throttled: false,
@@ -5307,6 +5375,9 @@ mod tests {
         assert_eq!(r.outcome, F2Outcome::Validated);
         assert!(r.armed && r.applied && r.validated && r.boot_flag_cleared);
         assert_eq!(r.reset_ok, Some(true));
+        assert_eq!(r.power_w, Some(183));
+        assert_eq!(r.max_power_w, Some(191));
+        assert_eq!(r.power_p99_w, Some(189.0));
         assert!(!r.blacklisted);
     }
 
@@ -5586,6 +5657,7 @@ mod tests {
             self.log.push(format!("dwell{}", self.cur));
             F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
                 max_power_w: 191.0,
+                power_p99_w: Some(189.0),
                 power_capped_frac: 0.0,
                 max_temp_c: Some(62.0),
                 thermal_throttled: false,
@@ -5796,6 +5868,7 @@ mod tests {
             self.log.push(format!("dwell{}", self.cur));
             F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
                 max_power_w: 191.0,
+                power_p99_w: Some(189.0),
                 power_capped_frac: 0.0,
                 max_temp_c: Some(62.0),
                 thermal_throttled: false,

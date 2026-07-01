@@ -91,8 +91,22 @@
   }
 
   function profilePower(point) {
+    const p99 = Number(point?.power_p99_w);
+    if (Number.isFinite(p99) && p99 > 0) return p99;
     const peak = Number(point?.max_power_w);
     return Number.isFinite(peak) && peak > 0 ? peak : Number(point?.power_w ?? 0);
+  }
+
+  function profilePowerLabel(point) {
+    const p99 = Number(point?.power_p99_w);
+    return Number.isFinite(p99) && p99 > 0 ? "W sustained p99" : "W peak";
+  }
+
+  function profilePowerNote(point) {
+    const p99 = Number(point?.power_p99_w);
+    return Number.isFinite(p99) && p99 > 0
+      ? "Measured sustained p99 power. Not a hard power limit; other workloads can vary."
+      : "Measured saturation peak. Not a hard power limit; other workloads can vary.";
   }
 
   function duration(value) {
@@ -261,7 +275,7 @@
         {#if measuredVoltage(latestPoint)}
           <small>{measuredVoltage(latestPoint)}</small>
         {/if}
-        <small>{fixed(profilePower(latestPoint))} W peak / {fixed(latestPoint.perf_per_watt, 1)} MHz/W / {latestPoint.stable ? "stable" : "failed"}</small>
+        <small>{fixed(profilePower(latestPoint))} {profilePowerLabel(latestPoint)} / {fixed(latestPoint.perf_per_watt, 1)} MHz/W / {latestPoint.stable ? "stable" : "failed"}</small>
         {#if confidenceSummary(latestPoint)}
           <small class="confidence">{confidenceSummary(latestPoint)}</small>
         {/if}
@@ -310,8 +324,8 @@
             {#if measuredVoltage(point)}
               <small>{measuredVoltage(point)}</small>
             {/if}
-            <small>{fixed(profilePower(point))} W peak / {fixed(point.perf_per_watt, 1)} MHz/W</small>
-            <small class="power-note">Measured saturation peak. Not a hard power limit; other workloads can vary.</small>
+            <small>{fixed(profilePower(point))} {profilePowerLabel(point)} / {fixed(point.perf_per_watt, 1)} MHz/W</small>
+            <small class="power-note">{profilePowerNote(point)}</small>
             {#if confidenceSummary(point)}
               <small class="confidence">{confidenceSummary(point)}</small>
             {/if}

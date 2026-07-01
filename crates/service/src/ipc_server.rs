@@ -513,6 +513,14 @@ fn apply_undervolt_profile(
     let Some(p) = pt else {
         return IpcResponse::failure("Run the forge first (no point for this profile)");
     };
+    if !p
+        .power_p99_w
+        .is_some_and(|power| power.is_finite() && power > 0.0)
+    {
+        return IpcResponse::failure(
+            "F2 profile has no measured sustained-p99 power — run Forge again under discovery v3",
+        );
+    }
     let (target_mhz, anchor_mv) = undervolt_apply_params(&p);
     let mem = crate::gpu_apply::load_applied().unwrap_or_default().mem_offset_mhz;
     let msg = match crate::gpu_apply::apply_and_persist_undervolt(
@@ -668,6 +676,31 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("provisional")
+        );
+    }
+
+    #[test]
+    fn qualified_f2_profile_without_p99_cannot_be_applied() {
+        let qualified = PowerSweepProgress {
+            is_undervolt: true,
+            profiles_qualified: true,
+            ..Default::default()
+        };
+        let legacy_point = PowerSweepPoint {
+            target_clock_mhz: Some(1800),
+            vf_table_voltage_mv: Some(900),
+            power_p99_w: None,
+            ..Default::default()
+        };
+        let response =
+            apply_forge_profile(&dummy_store(), &qualified, Some(legacy_point), "Brokkr's Best");
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sustained-p99")
         );
     }
 

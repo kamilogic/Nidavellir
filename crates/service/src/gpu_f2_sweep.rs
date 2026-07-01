@@ -115,6 +115,7 @@ pub fn observation_from_anchored_step(
         sustained_clock_mhz: report.p5_clock_mhz,
         watts: report.power_w,
         max_watts: report.max_power_w,
+        power_p99_w: report.power_p99_w,
         power_capped_frac: report.power_capped_frac,
         max_temp_c: report.max_temp_c,
         thermal_throttled: report.thermal_throttled,
@@ -547,6 +548,7 @@ mod tests {
             p5_clock_mhz: Some(1815),
             power_w: Some(180),
             max_power_w: Some(188),
+            power_p99_w: Some(186.0),
             power_capped_frac: Some(0.5),
             max_temp_c: Some(68.0),
             thermal_throttled: false,
@@ -578,6 +580,8 @@ mod tests {
         assert_eq!(o.verifier_result, F2ObsVerifier::RaiseVerified);
         assert_eq!(o.dwell_result, F2ObsDwell::Stable);
         assert_eq!((o.avg_clock_mhz, o.sustained_clock_mhz, o.watts), (Some(1815), Some(1815), Some(180)));
+        assert_eq!(o.max_watts, Some(188));
+        assert_eq!(o.power_p99_w, Some(186.0));
         assert_eq!(o.outcome, F2ObsOutcome::Validated);
         assert!(o.reset_to_stock_ok && o.boot_flag_cleared);
         assert!(o.confidence.unwrap() >= 0.85);

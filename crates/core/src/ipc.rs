@@ -88,6 +88,10 @@ pub struct PowerSweepPoint {
     pub power_w: f32,
     /// Peak sampled power (W) — the spike headroom indicator.
     pub max_power_w: f32,
+    /// Sustained high-power percentile (W) used by F2 frontier decisions and profile calibration.
+    /// `None` for legacy/F1 points and observations that predate discovery contract v3.
+    #[serde(default)]
+    pub power_p99_w: Option<f32>,
     /// Std-dev of power (W) — workload spikiness, for the Brokkr's headroom calc.
     pub power_std_w: f32,
     /// Fraction of samples (0–1) the card was power-capped (SW_POWER_CAP).
@@ -618,6 +622,7 @@ mod tests {
         assert_eq!(p.target_clock_mhz, None);
         assert_eq!(p.confidence, None);
         assert_eq!(p.validation_count, None);
+        assert_eq!(p.power_p99_w, None);
         assert_eq!(p.clock_mhz, 1785);
     }
 

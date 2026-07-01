@@ -34,9 +34,14 @@ use tracing::{info, warn};
 
 // Long enough for power to RAMP UP and stabilize (real loads like Heaven take
 // seconds to reach their sustained draw — it's a ramp, not a spike). We discard
-// the ramp and take the WORST CASE (max), not the mean.
+// the ramp and retain mean, sustained high-percentile and raw-maximum power separately.
 const DWELL_MS: u64 = 15000;
 const RAMP_DISCARD_MS: u128 = 6000;
+/// Sustained high-power percentile used by F2 frontier decisions and profile calibration.
+pub(crate) const POWER_PEAK_PERCENTILE: u32 = 99;
+/// With fewer than 100 retained samples, a 99th percentile cannot discard a full top 1%.
+/// The explicit conservative fallback is therefore the measured raw maximum.
+const POWER_PEAK_MIN_SAMPLES: usize = 100;
 /// Plausible GPU core-voltage range (mV). Samples outside are dropped from the
 /// measured-voltage stats as sensor glitches (a 0 mV / out-of-range read is noise).
 const VOLT_SANE_MIN_MV: u32 = 500;
@@ -679,6 +684,7 @@ struct Measured {
     clock_mhz: u32,
     power_w: f32,
     max_power_w: f32,
+    power_p99_w: Option<f32>,
     power_std_w: f32,
     capped_frac: f32,
     /// Max core voltage observed under load (mV) — for the descent's safe start.
@@ -715,6 +721,7 @@ impl Measured {
             clock_mhz: 0,
             power_w: 0.0,
             max_power_w: 0.0,
+            power_p99_w: None,
             power_std_w: 0.0,
             capped_frac: 0.0,
             volt_mv,
@@ -752,6 +759,32 @@ fn p5_clock_mhz(clocks: &[u32]) -> Option<u32> {
     s.sort_unstable();
     let idx = (((s.len() - 1) as f64) * 0.05).floor() as usize;
     Some(s[idx])
+}
+
+/// Sustained high-power percentile from every retained post-ramp dwell sample.
+///
+/// Uses the nearest-rank definition. For fewer than [`POWER_PEAK_MIN_SAMPLES`] samples,
+/// p99 cannot discard a complete top 1%, so the measured raw maximum is returned. Empty or
+/// wholly non-finite input returns `None`; callers must fail closed rather than invent power.
+fn sustained_power_percentile(samples: &[f32]) -> Option<f32> {
+    let mut sorted: Vec<f32> = samples
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f32::total_cmp);
+    if sorted.len() < POWER_PEAK_MIN_SAMPLES {
+        return sorted.last().copied();
+    }
+    let percentile = POWER_PEAK_PERCENTILE as usize;
+    let rank = percentile
+        .saturating_mul(sorted.len())
+        .saturating_add(99)
+        / 100;
+    sorted.get(rank.saturating_sub(1).min(sorted.len() - 1)).copied()
 }
 
 /// Aggregate already-validated voltage samples → `(min, avg, max, count)`.
@@ -1119,17 +1152,23 @@ fn calibrate_f2_profile_power(
         .ok_or_else(|| {
             format!(
                 "{target_mhz} MHz @ {apply_mv} mV has no current, reset-clean, thermally valid \
-                 discovery-v2 power measurement"
+                 discovery-v3 sustained-p99 power measurement"
             )
         })?;
         let mean_power = measured.watts.unwrap_or(0) as f32;
         let peak_power = measured.max_watts.unwrap_or(0) as f32;
+        let power_p99 = measured.power_p99_w.ok_or_else(|| {
+            format!(
+                "{target_mhz} MHz @ {apply_mv} mV has no measured sustained-p99 power"
+            )
+        })?;
         point.clock_mhz = measured.avg_clock_mhz.unwrap_or(point.clock_mhz);
         point.p5_clock_mhz = measured.sustained_clock_mhz.or(point.p5_clock_mhz);
         let sustained_clock = point.p5_clock_mhz.unwrap_or(point.clock_mhz);
         point.power_w = mean_power;
         point.max_power_w = peak_power;
-        point.perf_per_watt = sustained_clock as f64 / peak_power as f64;
+        point.power_p99_w = Some(power_p99);
+        point.perf_per_watt = sustained_clock as f64 / power_p99 as f64;
         point.dwell_duration_ms = measured.dwell_duration_ms;
         point.dwell_sample_count = measured.sample_count;
         point.max_temp_c = measured.max_temp_c;
@@ -1308,6 +1347,8 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     let clock = (v.iter().map(|s| s.0 as u64).sum::<u64>() / v.len() as u64) as u32;
     let mean_p = v.iter().map(|s| s.1).sum::<f32>() / n;
     let max_p = v.iter().map(|s| s.1).fold(0.0f32, f32::max);
+    let powers: Vec<f32> = v.iter().map(|s| s.1).collect();
+    let power_p99 = sustained_power_percentile(&powers);
     let var = v.iter().map(|s| (s.1 - mean_p).powi(2)).sum::<f32>() / n;
     let std_p = var.sqrt();
     let capped = v.iter().filter(|s| s.2).count() as f32 / n;
@@ -1328,6 +1369,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
         clock_mhz: clock,
         power_w: mean_p,
         max_power_w: max_p,
+        power_p99_w: power_p99,
         power_std_w: std_p,
         capped_frac: capped,
         volt_mv,
@@ -1927,10 +1969,10 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
     // Sustained clock = p5 when available (dip-aware), else average (legacy fallback).
     let sustained = |p: &PowerSweepPoint| p.p5_clock_mhz.unwrap_or(p.clock_mhz);
     // F2 profiles are applied above their learned boundary. Their selection budget is therefore the
-    // sampled peak measured at the exact apply-margin bin. Legacy/F1 points retain mean-power scoring.
+    // sustained p99 measured at the exact apply-margin bin. Legacy/F1 points retain mean-power scoring.
     let profile_power = |p: &PowerSweepPoint| {
-        if p.boundary_voltage_mv.is_some() && p.max_power_w > 0.0 {
-            p.max_power_w
+        if p.boundary_voltage_mv.is_some() {
+            p.power_p99_w.unwrap_or(0.0)
         } else {
             p.power_w
         }
@@ -3608,6 +3650,7 @@ pub(crate) struct SingleDwell {
     pub p5_clock_mhz: u32,
     pub power_w: f32,
     pub max_power_w: f32,
+    pub power_p99_w: Option<f32>,
     pub power_capped_frac: f32,
     pub max_temp_c: Option<f32>,
     pub thermal_throttled: bool,
@@ -3655,6 +3698,7 @@ fn single_dwell_from_measured(m: Measured) -> SingleDwell {
         p5_clock_mhz: m.p5_clock_mhz,
         power_w: m.power_w,
         max_power_w: m.max_power_w,
+        power_p99_w: m.power_p99_w,
         power_capped_frac: m.capped_frac,
         max_temp_c: m.max_temp_c,
         thermal_throttled: m.thermal_throttled,
@@ -5461,14 +5505,14 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn f2_profile_power_calibration_uses_the_apply_bin_measurement() {
+    fn f2_profile_power_calibration_uses_apply_bin_p99_and_preserves_avg_peak() {
         use nidavellir_core::f2_observation::{
             F2EvidenceKind, F2ObsDwell, F2ObsMode, F2ObsOutcome, F2ObsVerifier,
             F2_DISCOVERY_CONTRACT_VERSION,
         };
 
         let measured = F2Observation {
-            run_id: "power-v2".into(),
+            run_id: "power-v3".into(),
             timestamp: "2026-07-01T00:00:00Z".into(),
             gpu_key: Some("GPU-1".into()),
             evidence_kind: F2EvidenceKind::Discovery,
@@ -5491,6 +5535,7 @@ mod tests {
             sustained_clock_mhz: Some(1875),
             watts: Some(188),
             max_watts: Some(200),
+            power_p99_w: Some(198.0),
             power_capped_frac: Some(1.0),
             max_temp_c: Some(72.0),
             thermal_throttled: false,
@@ -5522,14 +5567,20 @@ mod tests {
         };
         let mut points = vec![(point, 0.95)];
 
-        calibrate_f2_profile_power(&mut points, &[measured], "GPU-1").unwrap();
+        calibrate_f2_profile_power(&mut points, std::slice::from_ref(&measured), "GPU-1").unwrap();
         let calibrated = points[0].0;
         assert_eq!(calibrated.clock_mhz, 1882);
         assert_eq!(calibrated.p5_clock_mhz, Some(1875));
         assert_eq!(calibrated.power_w, 188.0);
         assert_eq!(calibrated.max_power_w, 200.0);
+        assert_eq!(calibrated.power_p99_w, Some(198.0));
         assert_eq!(calibrated.max_temp_c, Some(72.0));
-        assert!((calibrated.perf_per_watt - 9.375).abs() < f64::EPSILON);
+        assert!((calibrated.perf_per_watt - 1875.0 / 198.0).abs() < f64::EPSILON);
+
+        let mut missing_p99 = measured;
+        missing_p99.power_p99_w = None;
+        let err = calibrate_f2_profile_power(&mut points, &[missing_p99], "GPU-1").unwrap_err();
+        assert!(err.contains("discovery-v3 sustained-p99"));
     }
 
     #[cfg(windows)]
@@ -5807,23 +5858,26 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn f2_synthesis_scores_sampled_peak_at_apply_bin() {
+    fn f2_synthesis_scores_sustained_p99_at_apply_bin() {
         let mut godforge = fp(1950, 150.0);
         godforge.max_power_w = 200.0;
+        godforge.power_p99_w = Some(198.0);
         godforge.boundary_voltage_mv = Some(950);
         godforge.p5_clock_mhz = Some(1950);
 
         let mut near = fp(1920, 145.0);
         near.max_power_w = 170.0;
+        near.power_p99_w = Some(168.0);
         near.boundary_voltage_mv = Some(925);
         near.p5_clock_mhz = Some(1920);
-        near.perf_per_watt = 1920.0 / 170.0;
+        near.perf_per_watt = 1920.0 / 168.0;
 
         let mut deeper = fp(1875, 120.0);
         deeper.max_power_w = 150.0;
+        deeper.power_p99_w = Some(148.0);
         deeper.boundary_voltage_mv = Some(900);
         deeper.p5_clock_mhz = Some(1875);
-        deeper.perf_per_watt = 1875.0 / 150.0;
+        deeper.perf_per_watt = 1875.0 / 148.0;
 
         let profiles = synthesize_forge_profiles(
             &[(godforge, 0.95), (near, 0.95), (deeper, 0.95)],
@@ -5832,7 +5886,7 @@ mod tests {
         assert_eq!(
             profiles.brokkrs.unwrap().clock_mhz,
             1920,
-            "sampled-peak R must beat the mean-power choice"
+            "sustained-p99 R must beat the mean-power choice"
         );
     }
 
@@ -6191,6 +6245,7 @@ mod tests {
             clock_mhz: 1815,
             power_w: 180.0,
             max_power_w: 188.0,
+            power_p99_w: Some(186.0),
             power_std_w: 2.0,
             capped_frac: 0.2,
             volt_mv: 869,
@@ -8169,6 +8224,25 @@ mod tests {
         assert_eq!(p5_clock_mhz(&cs), Some(1700));
         assert_eq!(p5_clock_mhz(&[1830]), Some(1830)); // single sample
         assert_eq!(p5_clock_mhz(&[]), None); // empty
+    }
+
+    #[test]
+    fn sustained_power_p99_discards_one_sample_spike_and_documents_small_n_fallback() {
+        assert_eq!(POWER_PEAK_PERCENTILE, 99);
+
+        let mut full_window = vec![200.0; POWER_PEAK_MIN_SAMPLES - 1];
+        full_window.push(500.0);
+        assert_eq!(sustained_power_percentile(&full_window), Some(200.0));
+
+        let mut short_window = vec![200.0; POWER_PEAK_MIN_SAMPLES - 2];
+        short_window.push(500.0);
+        assert_eq!(
+            sustained_power_percentile(&short_window),
+            Some(500.0),
+            "n < 100 falls back to the measured raw maximum"
+        );
+        assert_eq!(sustained_power_percentile(&[]), None);
+        assert_eq!(sustained_power_percentile(&[f32::NAN]), None);
     }
 
     #[cfg(windows)]

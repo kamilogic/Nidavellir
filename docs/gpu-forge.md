@@ -54,8 +54,10 @@ The live F2 Forge deliberately asks two different questions with two different r
 
 - **Discovery / Fast:** the steady eight-instance textured `PowerRender` determines Cmax,
   near-power-limit behavior, sustained p5 and the voltage boundary. Its homogeneous load keeps
-  clock/power measurements comparable across physical VF bins. Discovery v2 keeps mean power and the
-  highest post-ramp sample separate and records maximum temperature plus NVML thermal slowdown.
+  clock/power measurements comparable across physical VF bins. Discovery v3 keeps mean power,
+  sustained p99 and the highest post-ramp sample separate and records maximum temperature plus NVML
+  thermal slowdown. P99 uses nearest-rank over every retained post-ramp sample; fewer than 100
+  samples fall back to raw max, and no valid sample leaves p99 absent.
 - **Standard / Long qualification:** FSGL3 A+B is the default interleaved per-bin qualifier. Before
   descent, stock captures deterministic power, boost and texture/ROP checksums with one fresh
   `GpuCtx` per render configuration. FSGL3 biases TextureRop/MixedGame, crosses the same eight
@@ -74,6 +76,10 @@ last FSGL3-qualified bin as the accepted boundary. (Fast keeps descending to the
 it is provisional and never qualifies.) Negative observations make the learned frontier automatically
 select the deepest bin that still has current FSGL3 A+B evidence.
 
+A discovery `ClockDrop` remains power-bound when p99 is at least 99% of the numeric board cap. It is
+then labeled `PowerBoundClockDrop` and voltage descent continues even if that clock sustained at a
+shallower bin. Once p99 leaves the cap, the normal clock-drop boundary applies.
+
 The qualifier is an orthogonal rejection test, not a replacement for power characterization.
 Its aggregate p5 includes intentional light phases and therefore cannot create `ClockDrop`; that
 classification remains exclusive to the steady discovery render. Qualification evidence is versioned
@@ -86,7 +92,7 @@ certify a particular game without supervised calibration.
 
 **Applied-bin power calibration.** The learned boundary and the applied point are deliberately
 different: Leva 1 adds +12 mV and snaps upward to a physical VF bin. Profile synthesis therefore
-resolves the current PowerRender observation for that exact apply bin and uses its sampled peak and
+resolves the current PowerRender observation for that exact apply bin and uses its sustained p99 and
 p5 for Godforge/Brokkr's/Deep Calm scoring. A reset-clean power-bound clock drop can supply this
 calibration telemetry without becoming stability evidence. A missing, old-contract or thermally
 throttled apply-bin measurement fails closed with no new profile.

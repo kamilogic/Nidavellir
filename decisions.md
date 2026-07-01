@@ -2,19 +2,22 @@
 
 Durable technical decisions and their rationale. Newest first.
 
-## F2 profiles use apply-bin sampled peak power, not boundary-bin mean power (2026-07-01)
+## F2 frontier and profiles use apply-bin sustained p99 power (2026-07-01)
 - **Decision**: keep the existing textured `PowerRender`. Do not replace it with compute-only
   `POWER_SHADER`, which previously underloaded board power relative to the render/game regime.
-- **Measurement contract**: preserve `power_w` as steady-state mean and `max_power_w` as the highest
-  post-ramp sample. Discovery contract v2 persists both plus maximum temperature and NVML thermal
-  slowdown; old positive discovery evidence is not reusable under v2.
+- **Measurement contract**: preserve `power_w` as steady-state mean, `power_p99_w` as sustained
+  high-percentile power and `max_power_w` as the raw highest post-ramp sample. p99 uses nearest-rank
+  over all retained samples; `n < 100` explicitly falls back to raw max and empty input remains absent.
+  Discovery contract v3 excludes v2 positives/power-bound resume evidence.
 - **Profile contract**: apply the unchanged +12 mV margin first, then calibrate power and sustained p5
-  from the exact physical apply bin. F2 selection uses that peak for R and MHz/W. A reset-clean
-  power-bound clock drop is valid calibration telemetry, not qualification evidence.
+  from the exact physical apply bin. F2 selection uses p99 for R and MHz/W.
+- **Boundary contract**: `ClockDrop` at 99%+ of the numeric cap by p99 becomes
+  `PowerBoundClockDrop` and continues descent even after a prior sustained point; off-cap clock drop
+  remains a boundary. Power-bound observations are calibration telemetry, not qualification evidence.
 - **Thermal contract**: software/hardware thermal slowdown invalidates the discovery measurement as
   `Inconclusive`; it never marks the voltage unstable.
-- **UI contract**: cards say “measured saturation peak” and explicitly state it is not a hard power
-  limit. `max_temp_c` and `thermal_throttled` are additive IPC fields.
+- **UI contract**: cards say “sustained p99” and explicitly state it is not a hard power limit.
+  Legacy payloads fall back to raw peak/mean; raw peak remains available as a separate diagnostic.
 - **Unchanged**: FSGL3 A+B goldens/qualification contract v4, Leva 1 recovery, early-stop and +12 mV
   application policy. Hardware calibration remains pending.
 
