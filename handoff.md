@@ -23,8 +23,12 @@ Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 - **Compatibility**: discovery contract is v3; qualification remains FSGL3 contract v4. v2 positives
   and avg-classified power-bound records cannot enter new synthesis/resume; negatives stay conservative.
   Apply rejects any restored F2 profile without valid p99.
-- **Hardware next**: same-anchor 1920 MHz @ 931 mV comparison against the known game scene, checking
-  p99/raw-peak watts, p5, cap fraction, maximum temperature and thermal-throttle flag before a full Forge.
+- **Hardware checkpoint**: a Standard run held p99 near the 200 W cap and continued 1950 MHz from
+  1150 mV through 950 mV, where discovery first validated. FSGL3 A then reset-clean rejected that
+  target on the unchanged heavy-phase p5 guardrail. A control-flow bug incorrectly ended the entire
+  ladder; the rejection now completes only 1950 MHz so lower clocks can discover the qualified Cmax.
+- **Hardware next**: rerun Standard and confirm the ladder advances below a reset-clean rejected clock,
+  then compare the forged apply-bin p99/raw peak against the known game scene.
 
 ## Latest backend checkpoint (2026-06-30) — margin boundary + continuous recovery (code-complete, NOT HW-tested)
 - **Margin stop**: equivalent FSGL3 heavy phases produce one robust p5 per dwell; A/B histories stay

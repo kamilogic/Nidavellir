@@ -26,7 +26,10 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 - UI cards and Forge Progress show sustained p99 with an explicit “not a hard power limit” caveat;
   raw mean/maximum remain available. Apply rejects restored F2 profiles without valid p99.
   FSGL3/goldens, qualification contract v4 and Leva 1 margin/recovery semantics are unchanged.
-- Code validation passed; hardware calibration at 1920 MHz @ 931 mV remains the operator gate.
+- Hardware on 2026-07-01 confirmed p99 kept a 1950 MHz descent moving through power-bound clock
+  drops while the cap stayed near 200 W. The first reset-clean FSGL3 rejection exposed a ladder
+  control bug: `completed = false` stopped every lower clock. It now completes only that target and
+  continues toward the real qualified Cmax; FSGL3/p5 policy itself is unchanged. Hardware rerun pending.
 
 ## Latest (2026-06-30) — F2 margin boundary, continuity and supervised recovery
 - FSGL3 qualification now derives a like-for-like heavy-phase p5 signal per A/B pattern. A candidate

@@ -3407,6 +3407,18 @@ enum F2QualificationOutcome {
 }
 
 #[cfg(windows)]
+impl F2QualificationOutcome {
+    /// Whether qualification reached a reset-clean terminal result for this clock. A rejection is
+    /// local evidence against the current target; it must not abort discovery of lower clocks.
+    fn completes_clock(&self) -> bool {
+        matches!(
+            self,
+            Self::Qualified | Self::Rejected(_) | Self::Inconclusive
+        )
+    }
+}
+
+#[cfg(windows)]
 #[derive(Default)]
 struct F2QualificationMarginHistory {
     pattern_a: Vec<u32>,
@@ -4155,7 +4167,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                     // measures its power and gates the next qualification); if it fails we stop here with
                     // the last qualified bin as the boundary — the heavy qualifier never runs more than
                     // one bin below a proven point, so an over-aggressive bin can no longer TDR here.
-                    match qualify_anchored_candidate(
+                    let qualification_outcome = qualify_anchored_candidate(
                         store,
                         obs_store,
                         &mut qual_ctx,
@@ -4173,15 +4185,20 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                         &mut logs,
                         &mut executed_steps,
                         on_progress,
-                    ) {
+                    );
+                    let qualification_completed = qualification_outcome.completes_clock();
+                    match qualification_outcome {
                         F2QualificationOutcome::Qualified => {
                             last_qualified_index = Some(i);
-                            completed = true;
+                            completed = qualification_completed;
                             stop_reason = "Qualified".into();
                             // Fall through: descend one real bin lower on the next iteration.
                         }
                         F2QualificationOutcome::Rejected(reason) => {
-                            completed = last_qualified_index.is_some();
+                            // A reset-clean FSGL3 rejection completes only this clock. Even when no
+                            // shallower bin qualified, the outer ladder must continue to a lower
+                            // target and discover the real Cmax instead of aborting the whole Forge.
+                            completed = qualification_completed;
                             stop_reason = if last_qualified_index.is_some() {
                                 format!(
                                     "QualifiedBoundary: {anchor_mv} mV rejeitado abaixo do último qualificado ({reason})"
@@ -4195,7 +4212,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                             // Coverage ambiguity is local to this clock. Preserve any shallower
                             // qualified boundary, skip the remainder of this clock and let the
                             // outer multi-clock Forge continue.
-                            completed = true;
+                            completed = qualification_completed;
                             stop_reason = if last_qualified_index.is_some() {
                                 "QualifiedBoundaryInconclusiveDeeper".into()
                             } else {
@@ -4979,6 +4996,21 @@ mod tests {
         assert_eq!(qualification_gate_patterns(1), vec![F2QualificationPattern::A]);
         assert_eq!(qualification_next_higher_candidate_index(3), Some(2));
         assert_eq!(qualification_next_higher_candidate_index(0), None);
+    }
+
+    #[test]
+    fn reset_clean_qualification_rejection_completes_only_current_clock() {
+        assert!(F2QualificationOutcome::Qualified.completes_clock());
+        assert!(F2QualificationOutcome::Rejected("ClockDrop".into()).completes_clock());
+        assert!(F2QualificationOutcome::Inconclusive.completes_clock());
+        assert!(!F2QualificationOutcome::Cancelled.completes_clock());
+        assert!(
+            !F2QualificationOutcome::Aborted {
+                stop_reason: "DeviceLost".into(),
+                retain_boot_flag: true,
+            }
+            .completes_clock()
+        );
     }
 
     #[test]
