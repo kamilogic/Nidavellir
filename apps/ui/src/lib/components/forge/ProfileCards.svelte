@@ -51,8 +51,13 @@
 
   function secondary(m) {
     const pp = powerProfile(m);
-    if (pp) return `${pp.power_w.toFixed(0)} W / ${pp.perf_per_watt.toFixed(1)} MHz/W`;
+    if (pp) return `${profilePower(pp).toFixed(0)} W peak / ${pp.perf_per_watt.toFixed(1)} MHz/W`;
     return "Appears after the first completed Forge GPU run.";
+  }
+
+  function profilePower(point) {
+    const peak = Number(point?.max_power_w);
+    return Number.isFinite(peak) && peak > 0 ? peak : Number(point?.power_w ?? 0);
   }
 
   function curveAnchor(point) {
@@ -207,7 +212,8 @@
             {#if measuredVoltage(p)}
               <div class="prof-sub">{measuredVoltage(p)}</div>
             {/if}
-            <div class="prof-sub">{p.power_w.toFixed(0)} W / {p.perf_per_watt.toFixed(1)} MHz/W</div>
+            <div class="prof-sub power-reading">{profilePower(p).toFixed(0)} W peak / {p.perf_per_watt.toFixed(1)} MHz/W</div>
+            <div class="prof-sub power-note">Measured saturation peak. Not a hard power limit; other workloads can vary.</div>
             {#if confidenceSummary(p)}
               <div class="prof-sub confidence">{confidenceSummary(p)}</div>
             {/if}
@@ -292,7 +298,10 @@
           {#if measuredVoltage(point)}
             <small>{measuredVoltage(point)}</small>
           {/if}
-          <small>{secondary(item)}</small>
+          <small class="power-reading">{secondary(item)}</small>
+          {#if hasData(item)}
+            <small class="power-note">Measured saturation peak. Not a hard power limit; other workloads can vary.</small>
+          {/if}
           {#if confidenceSummary(point)}
             <small class="confidence">{confidenceSummary(point)}</small>
           {/if}
@@ -491,6 +500,12 @@
   .confidence {
     color: var(--forge-green) !important;
     font-variant-numeric: tabular-nums;
+  }
+  .power-reading {
+    font-variant-numeric: tabular-nums;
+  }
+  .power-note {
+    text-wrap: pretty;
   }
   .btn {
     border: 1px solid var(--border);

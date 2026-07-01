@@ -1030,6 +1030,26 @@ No new IPC method is required. Manual Stop must not be auto-resumed. Pre-hang te
 safety state and must not be inferred from logs.
 
 
+\## Backend → Frontend (2026-07-01): applied-bin saturation peak and thermal validity
+
+The live F2 payload remains backward-compatible. Existing `power_w` keeps its documented meaning as
+steady-state mean power. `max_power_w` now carries the real highest post-ramp PowerRender sample all
+the way through discovery v2 and is the headline profile/card power.
+
+\- Profile watts are calibrated at `vf_table_voltage_mv` after the unchanged application margin, not
+  at `boundary_voltage_mv`.
+
+\- F2 `perf_per_watt` and profile selection use apply-bin p5 divided by apply-bin `max_power_w`.
+
+\- Two optional/additive `PowerSweepPoint` fields are available: `max_temp_c: Option<f32>` and
+  `thermal_throttled: bool`. Thermally throttled discovery is not eligible for profile calibration.
+
+\- Card copy must describe `max_power_w` as a measured saturation peak and state that it is not a hard
+  power limit. Frontend must continue tolerating old payloads by falling back to `power_w`.
+
+\- No method changed. FSGL3/golden qualification and `profiles_qualified` semantics are unchanged.
+
+
 
 (No other active backend → frontend requests)
 

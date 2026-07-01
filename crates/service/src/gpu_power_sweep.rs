@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
 use nidavellir_core::f2_observation::{
-    F2QualificationCoverage, F2QualificationPattern, F2QualificationPhaseMetric,
+    F2Observation, F2QualificationCoverage, F2QualificationPattern, F2QualificationPhaseMetric,
     F2QualificationStrength, F2QualificationVerdict,
 };
 use nidavellir_core::gpu_sweep::StabilityResult;
@@ -700,6 +700,8 @@ struct Measured {
     start_temp_c: Option<f32>,
     end_temp_c: Option<f32>,
     avg_temp_c: Option<f32>,
+    max_temp_c: Option<f32>,
+    thermal_throttled: bool,
     qualification_coverage: Option<F2QualificationCoverage>,
     prehang_stall_detected: bool,
 }
@@ -727,6 +729,8 @@ impl Measured {
             start_temp_c: None,
             end_temp_c: None,
             avg_temp_c: None,
+            max_temp_c: None,
+            thermal_throttled: false,
             qualification_coverage: None,
             prehang_stall_detected: false,
         }
@@ -809,7 +813,7 @@ enum RenderStressPurpose {
 }
 
 #[cfg(windows)]
-type PhaseSample = (u32, f32, bool, Option<f32>, u8);
+type PhaseSample = (u32, f32, bool, Option<f32>, u8, bool);
 
 #[cfg(windows)]
 fn avg_power_for_phases(samples: &[PhaseSample], phases: &[VfQualifierPhase]) -> Option<f32> {
@@ -1096,6 +1100,45 @@ fn apply_f2_margin_policy(
 }
 
 #[cfg(windows)]
+fn calibrate_f2_profile_power(
+    points: &mut [(PowerSweepPoint, f64)],
+    observations: &[F2Observation],
+    gpu_key: &str,
+) -> Result<(), String> {
+    for (point, _) in points {
+        let target_mhz = point.target_clock_mhz.unwrap_or(point.clock_mhz);
+        let apply_mv = point
+            .vf_table_voltage_mv
+            .ok_or_else(|| format!("{target_mhz} MHz has no apply VF bin"))?;
+        let measured = nidavellir_core::f2_observation::current_discovery_observation_at_anchor(
+            observations,
+            target_mhz,
+            apply_mv,
+            gpu_key,
+        )
+        .ok_or_else(|| {
+            format!(
+                "{target_mhz} MHz @ {apply_mv} mV has no current, reset-clean, thermally valid \
+                 discovery-v2 power measurement"
+            )
+        })?;
+        let mean_power = measured.watts.unwrap_or(0) as f32;
+        let peak_power = measured.max_watts.unwrap_or(0) as f32;
+        point.clock_mhz = measured.avg_clock_mhz.unwrap_or(point.clock_mhz);
+        point.p5_clock_mhz = measured.sustained_clock_mhz.or(point.p5_clock_mhz);
+        let sustained_clock = point.p5_clock_mhz.unwrap_or(point.clock_mhz);
+        point.power_w = mean_power;
+        point.max_power_w = peak_power;
+        point.perf_per_watt = sustained_clock as f64 / peak_power as f64;
+        point.dwell_duration_ms = measured.dwell_duration_ms;
+        point.dwell_sample_count = measured.sample_count;
+        point.max_temp_c = measured.max_temp_c;
+        point.thermal_throttled = measured.thermal_throttled;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
     fn capture(label: &str, workload: VfWorkload) -> Result<u32, String> {
         let ctx = nidavellir_gpu_stress::GpuCtx::new()
@@ -1167,6 +1210,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
                                 r.power_capped == Some(true),
                                 r.temperature_c,
                                 phase_for_sampler.load(Ordering::SeqCst),
+                                r.thermal_throttled == Some(true),
                             ));
                         }
                     }
@@ -1271,12 +1315,14 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     let min_clock = clocks.iter().copied().min().unwrap_or(0);
     let p5_clock = p5_clock_mhz(&clocks).unwrap_or(0);
     let temps: Vec<f32> = v.iter().filter_map(|s| s.3).collect();
-    let (start_temp_c, end_temp_c, avg_temp_c) = if temps.is_empty() {
-        (None, None, None)
+    let (start_temp_c, end_temp_c, avg_temp_c, max_temp_c) = if temps.is_empty() {
+        (None, None, None, None)
     } else {
         let avg = temps.iter().sum::<f32>() / temps.len() as f32;
-        (Some(temps[0]), Some(temps[temps.len() - 1]), Some(avg))
+        let max = temps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        (Some(temps[0]), Some(temps[temps.len() - 1]), Some(avg), Some(max))
     };
+    let thermal_throttled = v.iter().any(|s| s.5);
     Measured {
         result: res,
         clock_mhz: clock,
@@ -1296,6 +1342,8 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
         start_temp_c,
         end_temp_c,
         avg_temp_c,
+        max_temp_c,
+        thermal_throttled,
         qualification_coverage,
         prehang_stall_detected,
     }
@@ -1878,6 +1926,23 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
 
     // Sustained clock = p5 when available (dip-aware), else average (legacy fallback).
     let sustained = |p: &PowerSweepPoint| p.p5_clock_mhz.unwrap_or(p.clock_mhz);
+    // F2 profiles are applied above their learned boundary. Their selection budget is therefore the
+    // sampled peak measured at the exact apply-margin bin. Legacy/F1 points retain mean-power scoring.
+    let profile_power = |p: &PowerSweepPoint| {
+        if p.boundary_voltage_mv.is_some() && p.max_power_w > 0.0 {
+            p.max_power_w
+        } else {
+            p.power_w
+        }
+    };
+    let efficiency = |p: &PowerSweepPoint| {
+        let power = profile_power(p);
+        if power > 0.0 {
+            sustained(p) as f64 / power as f64
+        } else {
+            0.0
+        }
+    };
 
     // Godforge = highest sustainable clock (ties → the lowest power that holds it).
     let godforge = pool
@@ -1886,11 +1951,11 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
         .max_by(|a, b| {
             sustained(&a.0)
                 .cmp(&sustained(&b.0))
-                .then(b.0.power_w.partial_cmp(&a.0.power_w).unwrap_or(Ord::Equal))
+                .then(profile_power(&b.0).partial_cmp(&profile_power(&a.0)).unwrap_or(Ord::Equal))
         })
         .unwrap();
     let gc = sustained(&godforge.0) as f64;
-    let gp = godforge.0.power_w as f64;
+    let gp = profile_power(&godforge.0) as f64;
 
     // Collapse detection: a single distinct sustainable clock → can't differentiate on
     // clock (the failure mode of the old single-clock sweep). Still return valid profiles.
@@ -1915,7 +1980,7 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
         .copied()
         .filter(|(p, _)| sustained(p) as f64 >= dc_floor)
         .max_by(|a, b| {
-            a.0.perf_per_watt.partial_cmp(&b.0.perf_per_watt).unwrap_or(Ord::Equal)
+            efficiency(&a.0).partial_cmp(&efficiency(&b.0)).unwrap_or(Ord::Equal)
         })
         .unwrap_or(godforge);
 
@@ -1924,7 +1989,7 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
     let br_floor = gc * policy.brokkrs_min_clock_frac;
     let r_of = |p: &PowerSweepPoint| -> f64 {
         let clk_lost = (gc - sustained(p) as f64) / gc;
-        let pwr_saved = (gp - p.power_w as f64) / gp;
+        let pwr_saved = (gp - profile_power(p) as f64) / gp;
         if clk_lost > 0.0 { pwr_saved / clk_lost } else { 0.0 }
     };
     let brokkrs = pool
@@ -1932,7 +1997,7 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
         .copied()
         .filter(|(p, _)| {
             let s = sustained(p) as f64;
-            s >= br_floor && s < gc && (p.power_w as f64) < gp
+            s >= br_floor && s < gc && (profile_power(p) as f64) < gp
         })
         .max_by(|a, b| r_of(&a.0).partial_cmp(&r_of(&b.0)).unwrap_or(Ord::Equal))
         .unwrap_or(godforge);
@@ -1940,9 +2005,9 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
     log.push(format!(
         "FORGE: Godforge {}MHz/{:.0}W · Brokkr's {}MHz/{:.0}W (R={:.2}, floor {:.0}%) · \
          Deep Calm {}MHz/{:.0}W ({:.2} MHz/W, floor {:.0}%)",
-        sustained(&godforge.0), godforge.0.power_w,
-        sustained(&brokkrs.0), brokkrs.0.power_w, r_of(&brokkrs.0), policy.brokkrs_min_clock_frac * 100.0,
-        sustained(&deep_calm.0), deep_calm.0.power_w, deep_calm.0.perf_per_watt, policy.deep_calm_min_clock_frac * 100.0
+        sustained(&godforge.0), profile_power(&godforge.0),
+        sustained(&brokkrs.0), profile_power(&brokkrs.0), r_of(&brokkrs.0), policy.brokkrs_min_clock_frac * 100.0,
+        sustained(&deep_calm.0), profile_power(&deep_calm.0), efficiency(&deep_calm.0), policy.deep_calm_min_clock_frac * 100.0
     ));
 
     ForgeProfiles {
@@ -3542,7 +3607,10 @@ pub(crate) struct SingleDwell {
     pub avg_clock_mhz: u32,
     pub p5_clock_mhz: u32,
     pub power_w: f32,
+    pub max_power_w: f32,
     pub power_capped_frac: f32,
+    pub max_temp_c: Option<f32>,
+    pub thermal_throttled: bool,
     pub duration_ms: u64,
     pub sample_count: u32,
     pub qualification_coverage: Option<F2QualificationCoverage>,
@@ -3586,7 +3654,10 @@ fn single_dwell_from_measured(m: Measured) -> SingleDwell {
         avg_clock_mhz: m.clock_mhz,
         p5_clock_mhz: m.p5_clock_mhz,
         power_w: m.power_w,
+        max_power_w: m.max_power_w,
         power_capped_frac: m.capped_frac,
+        max_temp_c: m.max_temp_c,
+        thermal_throttled: m.thermal_throttled,
         duration_ms: m.duration_ms,
         sample_count: m.sample_count,
         qualification_coverage: m.qualification_coverage,
@@ -5122,6 +5193,22 @@ fn measure_multiclock_undervolt_forge(
             .collect::<Vec<_>>();
         let mut pts = nidavellir_core::f2_observation::frontier_to_points(&frontier);
         apply_f2_margin_policy(&mut pts, &f2_inputs.sane_base_curve);
+        let observations = obs_store.load_all();
+        let power_calibrated =
+            match calibrate_f2_profile_power(&mut pts, &observations, &gpu_key) {
+                Ok(()) => true,
+                Err(e) => {
+                    prog.godforge = None;
+                    prog.brokkrs = None;
+                    prog.deep_calm = None;
+                    prog.recommended = None;
+                    prog.profiles_qualified = false;
+                    prog.log.push(format!(
+                        "FORGE: calibração de potência recusada — {e}; nenhum perfil novo foi criado."
+                    ));
+                    false
+                }
+            };
         for (point, _) in &pts {
             if let (Some(boundary), Some(apply), Some(margin)) = (
                 point.boundary_voltage_mv,
@@ -5134,27 +5221,35 @@ fn measure_multiclock_undervolt_forge(
                 ));
             }
         }
-        let profiles = synthesize_forge_profiles(&pts, &ForgePolicy::balanced());
-        prog.log.extend(profiles.log.clone());
-        prog.power_bound_collapse = profiles.power_bound_collapse;
-        prog.godforge = profiles.godforge;
-        prog.brokkrs = profiles.brokkrs;
-        prog.deep_calm = profiles.deep_calm;
         prog.points = pts.into_iter().map(|(p, _)| p).collect();
-        prog.recommended = prog.brokkrs;
-        let required_confirmations = f2_required_qualification_passes(mode_policy) as u32;
-        prog.profiles_qualified = f2_profiles_meet_qualification(
-            mode_policy,
-            &[prog.godforge, prog.brokkrs, prog.deep_calm],
-            ForgePolicy::balanced().confidence_threshold,
-        );
-        if !prog.profiles_qualified {
-            prog.log.push(format!(
-                "FORGE: perfis provisórios — modo {} exige {} confirmação(ões) por ponto e confiança ≥ {:.2}; Apply permanece bloqueado.",
-                mode.label(),
-                required_confirmations,
-                ForgePolicy::balanced().confidence_threshold
-            ));
+        if power_calibrated {
+            let classified: Vec<(PowerSweepPoint, f64)> = prog
+                .points
+                .iter()
+                .copied()
+                .map(|point| (point, point.confidence.unwrap_or(0.0)))
+                .collect();
+            let profiles = synthesize_forge_profiles(&classified, &ForgePolicy::balanced());
+            prog.log.extend(profiles.log.clone());
+            prog.power_bound_collapse = profiles.power_bound_collapse;
+            prog.godforge = profiles.godforge;
+            prog.brokkrs = profiles.brokkrs;
+            prog.deep_calm = profiles.deep_calm;
+            prog.recommended = prog.brokkrs;
+            let required_confirmations = f2_required_qualification_passes(mode_policy) as u32;
+            prog.profiles_qualified = f2_profiles_meet_qualification(
+                mode_policy,
+                &[prog.godforge, prog.brokkrs, prog.deep_calm],
+                ForgePolicy::balanced().confidence_threshold,
+            );
+            if !prog.profiles_qualified {
+                prog.log.push(format!(
+                    "FORGE: perfis provisórios — modo {} exige {} confirmação(ões) por ponto e confiança ≥ {:.2}; Apply permanece bloqueado.",
+                    mode.label(),
+                    required_confirmations,
+                    ForgePolicy::balanced().confidence_threshold
+                ));
+            }
         }
     } else {
         prog.log.push(
@@ -5185,7 +5280,7 @@ fn measure_multiclock_undervolt_forge(
                 "{} MHz @ {} mV ({:.0} W)",
                 p.clock_mhz,
                 p.vf_table_voltage_mv.unwrap_or(p.voltage_mv),
-                p.power_w
+                p.max_power_w
             ),
             None => "—".into(),
         };
@@ -5366,6 +5461,79 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn f2_profile_power_calibration_uses_the_apply_bin_measurement() {
+        use nidavellir_core::f2_observation::{
+            F2EvidenceKind, F2ObsDwell, F2ObsMode, F2ObsOutcome, F2ObsVerifier,
+            F2_DISCOVERY_CONTRACT_VERSION,
+        };
+
+        let measured = F2Observation {
+            run_id: "power-v2".into(),
+            timestamp: "2026-07-01T00:00:00Z".into(),
+            gpu_key: Some("GPU-1".into()),
+            evidence_kind: F2EvidenceKind::Discovery,
+            discovery_contract_version: Some(F2_DISCOVERY_CONTRACT_VERSION),
+            qualification_contract_version: None,
+            qualification_coverage: None,
+            mode: F2ObsMode::LadderSweep,
+            target_mhz: 1920,
+            requested_start_mv: None,
+            anchor_mv: 943,
+            base_mhz: 1905,
+            offset_mhz: 15,
+            positive_offset_cap_mhz: 90,
+            higher_bins_capped: 10,
+            max_flatten_mhz: 120,
+            lower_bins_elastic: 40,
+            verifier_result: F2ObsVerifier::RaiseVerified,
+            dwell_result: F2ObsDwell::ClockDrop,
+            avg_clock_mhz: Some(1882),
+            sustained_clock_mhz: Some(1875),
+            watts: Some(188),
+            max_watts: Some(200),
+            power_capped_frac: Some(1.0),
+            max_temp_c: Some(72.0),
+            thermal_throttled: false,
+            dwell_duration_ms: Some(10_000),
+            sample_count: Some(130),
+            silent_error: false,
+            device_lost: false,
+            unstable: false,
+            clock_drop: true,
+            tdr_or_crash: false,
+            reset_to_stock_attempted: true,
+            reset_to_stock_ok: true,
+            boot_flag_cleared: true,
+            blacklisted: false,
+            outcome: F2ObsOutcome::PowerBoundClockDrop,
+            confidence: None,
+            notes: None,
+        };
+        let point = PowerSweepPoint {
+            clock_mhz: 1920,
+            p5_clock_mhz: Some(1920),
+            power_w: 170.0,
+            max_power_w: 180.0,
+            target_clock_mhz: Some(1920),
+            boundary_voltage_mv: Some(931),
+            vf_table_voltage_mv: Some(943),
+            apply_margin_mv: Some(12),
+            ..Default::default()
+        };
+        let mut points = vec![(point, 0.95)];
+
+        calibrate_f2_profile_power(&mut points, &[measured], "GPU-1").unwrap();
+        let calibrated = points[0].0;
+        assert_eq!(calibrated.clock_mhz, 1882);
+        assert_eq!(calibrated.p5_clock_mhz, Some(1875));
+        assert_eq!(calibrated.power_w, 188.0);
+        assert_eq!(calibrated.max_power_w, 200.0);
+        assert_eq!(calibrated.max_temp_c, Some(72.0));
+        assert!((calibrated.perf_per_watt - 9.375).abs() < f64::EPSILON);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn f2_modes_share_discovery_and_scale_qualification() {
         let fast = PowerSweepMode::Fast.f2_policy();
         let standard = PowerSweepMode::Standard.f2_policy();
@@ -5482,7 +5650,7 @@ mod tests {
                     | VfQualifierPhase::PowerClosing => 180.0,
                     _ => 145.0,
                 };
-                (0..4).map(move |_| (1800, power, false, None, phase.code()))
+                (0..4).map(move |_| (1800, power, false, None, phase.code(), false))
             })
             .collect();
 
@@ -5635,6 +5803,37 @@ mod tests {
         assert_eq!(p.godforge.unwrap().clock_mhz, 1830, "Godforge = highest clock");
         assert_eq!(p.brokkrs.unwrap().clock_mhz, 1815, "Brokkr's = best benefit/cost R");
         assert_eq!(p.deep_calm.unwrap().clock_mhz, 1740, "Deep Calm = best MHz/W");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_synthesis_scores_sampled_peak_at_apply_bin() {
+        let mut godforge = fp(1950, 150.0);
+        godforge.max_power_w = 200.0;
+        godforge.boundary_voltage_mv = Some(950);
+        godforge.p5_clock_mhz = Some(1950);
+
+        let mut near = fp(1920, 145.0);
+        near.max_power_w = 170.0;
+        near.boundary_voltage_mv = Some(925);
+        near.p5_clock_mhz = Some(1920);
+        near.perf_per_watt = 1920.0 / 170.0;
+
+        let mut deeper = fp(1875, 120.0);
+        deeper.max_power_w = 150.0;
+        deeper.boundary_voltage_mv = Some(900);
+        deeper.p5_clock_mhz = Some(1875);
+        deeper.perf_per_watt = 1875.0 / 150.0;
+
+        let profiles = synthesize_forge_profiles(
+            &[(godforge, 0.95), (near, 0.95), (deeper, 0.95)],
+            &ForgePolicy::balanced(),
+        );
+        assert_eq!(
+            profiles.brokkrs.unwrap().clock_mhz,
+            1920,
+            "sampled-peak R must beat the mean-power choice"
+        );
     }
 
     #[cfg(windows)]
@@ -6006,6 +6205,8 @@ mod tests {
             start_temp_c: Some(60.0),
             end_temp_c: Some(66.0),
             avg_temp_c: Some(63.0),
+            max_temp_c: Some(66.0),
+            thermal_throttled: false,
             qualification_coverage: None,
             prehang_stall_detected: false,
         }

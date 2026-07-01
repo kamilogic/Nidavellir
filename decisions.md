@@ -2,6 +2,22 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 profiles use apply-bin sampled peak power, not boundary-bin mean power (2026-07-01)
+- **Decision**: keep the existing textured `PowerRender`. Do not replace it with compute-only
+  `POWER_SHADER`, which previously underloaded board power relative to the render/game regime.
+- **Measurement contract**: preserve `power_w` as steady-state mean and `max_power_w` as the highest
+  post-ramp sample. Discovery contract v2 persists both plus maximum temperature and NVML thermal
+  slowdown; old positive discovery evidence is not reusable under v2.
+- **Profile contract**: apply the unchanged +12 mV margin first, then calibrate power and sustained p5
+  from the exact physical apply bin. F2 selection uses that peak for R and MHz/W. A reset-clean
+  power-bound clock drop is valid calibration telemetry, not qualification evidence.
+- **Thermal contract**: software/hardware thermal slowdown invalidates the discovery measurement as
+  `Inconclusive`; it never marks the voltage unstable.
+- **UI contract**: cards say “measured saturation peak” and explicitly state it is not a hard power
+  limit. `max_temp_c` and `thermal_throttled` are additive IPC fields.
+- **Unchanged**: FSGL3 A+B goldens/qualification contract v4, Leva 1 recovery, early-stop and +12 mV
+  application policy. Hardware calibration remains pending.
+
 ## F2 uses a margin boundary and treats supervised TDR as learning (2026-06-30)
 - **Decision**: qualification compares like-for-like FSGL3 heavy-phase p5 telemetry, separated by A/B
   pattern. A relative fall beyond 30 MHz after two stable references is a reset-clean `ClockDrop`,

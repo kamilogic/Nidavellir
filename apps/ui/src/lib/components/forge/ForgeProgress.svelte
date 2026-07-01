@@ -90,6 +90,11 @@
     return Number.isFinite(n) ? n.toFixed(digits) : "0";
   }
 
+  function profilePower(point) {
+    const peak = Number(point?.max_power_w);
+    return Number.isFinite(peak) && peak > 0 ? peak : Number(point?.power_w ?? 0);
+  }
+
   function duration(value) {
     const ms = Number(value);
     if (!Number.isFinite(ms) || ms < 0) return "Calculating…";
@@ -256,7 +261,7 @@
         {#if measuredVoltage(latestPoint)}
           <small>{measuredVoltage(latestPoint)}</small>
         {/if}
-        <small>{fixed(latestPoint.power_w)} W / {fixed(latestPoint.perf_per_watt, 1)} MHz/W / {latestPoint.stable ? "stable" : "failed"}</small>
+        <small>{fixed(profilePower(latestPoint))} W peak / {fixed(latestPoint.perf_per_watt, 1)} MHz/W / {latestPoint.stable ? "stable" : "failed"}</small>
         {#if confidenceSummary(latestPoint)}
           <small class="confidence">{confidenceSummary(latestPoint)}</small>
         {/if}
@@ -305,7 +310,8 @@
             {#if measuredVoltage(point)}
               <small>{measuredVoltage(point)}</small>
             {/if}
-            <small>{fixed(point.power_w)} W / {fixed(point.perf_per_watt, 1)} MHz/W</small>
+            <small>{fixed(profilePower(point))} W peak / {fixed(point.perf_per_watt, 1)} MHz/W</small>
+            <small class="power-note">Measured saturation peak. Not a hard power limit; other workloads can vary.</small>
             {#if confidenceSummary(point)}
               <small class="confidence">{confidenceSummary(point)}</small>
             {/if}
@@ -527,6 +533,9 @@
   .confidence {
     color: var(--forge-green) !important;
     font-variant-numeric: tabular-nums;
+  }
+  .power-note {
+    text-wrap: pretty;
   }
   .progress-grid {
     display: grid;

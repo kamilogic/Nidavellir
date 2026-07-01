@@ -54,7 +54,8 @@ The live F2 Forge deliberately asks two different questions with two different r
 
 - **Discovery / Fast:** the steady eight-instance textured `PowerRender` determines Cmax,
   near-power-limit behavior, sustained p5 and the voltage boundary. Its homogeneous load keeps
-  clock/power measurements comparable across physical VF bins.
+  clock/power measurements comparable across physical VF bins. Discovery v2 keeps mean power and the
+  highest post-ramp sample separate and records maximum temperature plus NVML thermal slowdown.
 - **Standard / Long qualification:** FSGL3 A+B is the default interleaved per-bin qualifier. Before
   descent, stock captures deterministic power, boost and texture/ROP checksums with one fresh
   `GpuCtx` per render configuration. FSGL3 biases TextureRop/MixedGame, crosses the same eight
@@ -82,6 +83,13 @@ legacy-qualified and discovery-only points remain provisional. Goldens are sessi
 written to Forge state. No manual bad-point registry is encoded, and Standard/Long never qualify an
 old `prior_good` boundary without current-run rediscovery first. No synthetic workload is claimed to
 certify a particular game without supervised calibration.
+
+**Applied-bin power calibration.** The learned boundary and the applied point are deliberately
+different: Leva 1 adds +12 mV and snaps upward to a physical VF bin. Profile synthesis therefore
+resolves the current PowerRender observation for that exact apply bin and uses its sampled peak and
+p5 for Godforge/Brokkr's/Deep Calm scoring. A reset-clean power-bound clock drop can supply this
+calibration telemetry without becoming stability evidence. A missing, old-contract or thermally
+throttled apply-bin measurement fails closed with no new profile.
 
 ## Problems hit → solutions
 

@@ -8,6 +8,23 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-01) — F2 power calibration uses the applied-bin saturation peak
+- Discovery keeps the existing textured `PowerRender`; the compute-only `POWER_SHADER` remains
+  outside the live F2 path. The measured mean and highest post-ramp power sample now remain distinct
+  through `SingleDwell`, the F2 step report, append-only observations and `PowerSweepPoint`.
+- `F2_DISCOVERY_CONTRACT_VERSION = 2`. Legacy/v1 positive discovery evidence cannot seed the new
+  frontier because it lacks apply-bin peak and thermal-validity telemetry; negative evidence remains
+  conservative.
+- Profile synthesis first applies the unchanged +12 mV policy, then resolves a current reset-clean
+  PowerRender observation for that exact apply bin. It scores Godforge/Brokkr's/Deep Calm with sampled
+  peak power and the p5 clock observed at the apply bin, not boundary-bin mean power.
+- Power-bound `ClockDrop` remains valid calibration telemetry but never becomes stability evidence.
+  NVML software/hardware thermal slowdown makes a discovery dwell `Inconclusive`, not a bad undervolt.
+- UI cards and Forge Progress show the measured saturation peak with an explicit “not a hard power
+  limit” caveat. Additive `PowerSweepPoint.max_temp_c` and `thermal_throttled` fields expose thermal
+  validity. FSGL3/goldens, qualification contract v4 and Leva 1 margin/recovery semantics are unchanged.
+- Code validation passed; hardware calibration at 1920 MHz @ 931 mV remains the operator gate.
+
 ## Latest (2026-06-30) — F2 margin boundary, continuity and supervised recovery
 - FSGL3 qualification now derives a like-for-like heavy-phase p5 signal per A/B pattern. A candidate
   becomes `ClockDrop` when that p5 falls more than `MARGIN_DROP_TOL_MHZ = 30` below the median of at

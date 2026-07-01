@@ -20,6 +20,8 @@ pub struct NvmlGpuReading {
     /// True if the GPU is currently throttling because it hit the power cap
     /// (SW_POWER_CAP) — the key signal that an undervolt can reclaim headroom.
     pub power_capped: Option<bool>,
+    /// True when NVML reports software or hardware thermal slowdown.
+    pub thermal_throttled: Option<bool>,
     pub source: SensorSource,
     pub quality: SensorQuality,
 }
@@ -99,8 +101,15 @@ pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
             .map(|t| t as f32);
         let power_w = device.power_usage().ok().map(|mw| mw as f32 / 1000.0);
         let power_limit_w = device.enforced_power_limit().ok().map(|mw| mw as f32 / 1000.0);
-        let power_capped = device.current_throttle_reasons().ok().map(|r| {
+        let throttle_reasons = device.current_throttle_reasons().ok();
+        let power_capped = throttle_reasons.as_ref().map(|r| {
             r.contains(nvml_wrapper::bitmasks::device::ThrottleReasons::SW_POWER_CAP)
+        });
+        let thermal_throttled = throttle_reasons.as_ref().map(|r| {
+            r.intersects(
+                nvml_wrapper::bitmasks::device::ThrottleReasons::SW_THERMAL_SLOWDOWN
+                    | nvml_wrapper::bitmasks::device::ThrottleReasons::HW_THERMAL_SLOWDOWN,
+            )
         });
 
         out.push(NvmlGpuReading {
@@ -116,6 +125,7 @@ pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
             power_w,
             power_limit_w,
             power_capped,
+            thermal_throttled,
             source: SensorSource::Nvml,
             quality: SensorQuality::Live,
         });

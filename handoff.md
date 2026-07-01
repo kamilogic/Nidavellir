@@ -9,6 +9,22 @@ Safe Mode crash budget, and an interrupted run resumes once when the UI reconnec
 means profiles are qualified. **NEXT = supervised Leva 1 hardware gate; Leva 2 remains blocked.**
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Latest backend/frontend checkpoint (2026-07-01) — applied-bin peak-power calibration (code-complete, NOT HW-tested)
+- **Workload unchanged**: live F2 discovery still uses the textured, bounded-frame `PowerRender`;
+  compute-only `POWER_SHADER` was not substituted.
+- **Discovery v2 telemetry**: mean and peak watts now persist separately, with maximum temperature and
+  NVML thermal-slowdown evidence. Thermally throttled discovery is `Inconclusive`; it does not
+  blacklist a voltage point.
+- **Applied-bin truth**: after the unchanged +12 mV margin snaps to a physical bin, synthesis resolves
+  that exact bin's current PowerRender observation. Power-bound clock drops may calibrate peak/p5 but
+  never qualify stability. Missing/current-invalid applied-bin evidence fails closed with no profiles.
+- **Selection/UI**: F2 Godforge/Brokkr's/Deep Calm score peak watts and apply-bin p5. Cards and Forge
+  Progress label the number as a measured saturation peak and state that it is not a hard power limit.
+- **Compatibility**: discovery contract is v2; qualification remains FSGL3 contract v4. Old positives
+  cannot enter the new frontier; negatives remain conservative.
+- **Hardware next**: same-anchor 1920 MHz @ 931 mV comparison against the known game scene, checking
+  peak watts, p5, cap fraction, maximum temperature and thermal-throttle flag before a full Forge.
+
 ## Latest backend checkpoint (2026-06-30) — margin boundary + continuous recovery (code-complete, NOT HW-tested)
 - **Margin stop**: equivalent FSGL3 heavy phases produce one robust p5 per dwell; A/B histories stay
   separate. `MARGIN_DROP_TOL_MHZ = 30` requires two prior stable references before the relative arm,

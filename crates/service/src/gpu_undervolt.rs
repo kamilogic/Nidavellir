@@ -1182,7 +1182,10 @@ pub struct F2DwellResult {
     pub avg_clock_mhz: u32,
     pub p5_clock_mhz: u32,
     pub power_w: f32,
+    pub max_power_w: f32,
     pub power_capped_frac: f32,
+    pub max_temp_c: Option<f32>,
+    pub thermal_throttled: bool,
     pub duration_ms: u64,
     pub sample_count: u32,
     pub qualification_coverage: Option<F2QualificationCoverage>,
@@ -1332,7 +1335,10 @@ pub struct F2StepReport {
     pub avg_clock_mhz: Option<u32>,
     pub p5_clock_mhz: Option<u32>,
     pub power_w: Option<u32>,
+    pub max_power_w: Option<u32>,
     pub power_capped_frac: Option<f32>,
+    pub max_temp_c: Option<f32>,
+    pub thermal_throttled: bool,
     pub dwell_duration_ms: Option<u64>,
     pub sample_count: Option<u32>,
     pub qualification_coverage: Option<F2QualificationCoverage>,
@@ -1377,7 +1383,10 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
         avg_clock_mhz: None,
         p5_clock_mhz: None,
         power_w: None,
+        max_power_w: None,
         power_capped_frac: None,
+        max_temp_c: None,
+        thermal_throttled: false,
         dwell_duration_ms: None,
         sample_count: None,
         qualification_coverage: None,
@@ -1417,7 +1426,10 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
     r.avg_clock_mhz = Some(d.avg_clock_mhz);
     r.p5_clock_mhz = Some(d.p5_clock_mhz);
     r.power_w = Some(d.power_w.round() as u32);
+    r.max_power_w = Some(d.max_power_w.round() as u32);
     r.power_capped_frac = Some(d.power_capped_frac);
+    r.max_temp_c = d.max_temp_c;
+    r.thermal_throttled = d.thermal_throttled;
     r.dwell_duration_ms = Some(d.duration_ms);
     r.sample_count = Some(d.sample_count);
     r.qualification_coverage = d.qualification_coverage.clone();
@@ -2001,6 +2013,9 @@ fn classify_f2_stress_dwell(
         F2DwellOutcome::SilentError
     } else if !s.stable {
         F2DwellOutcome::Unstable
+    } else if purpose == F2StressPurpose::PowerDiscovery && s.thermal_throttled {
+        // Thermal slowdown invalidates power calibration without proving voltage instability.
+        F2DwellOutcome::Inconclusive
     } else if purpose.is_qualification()
         && s.qualification_coverage
             .as_ref()
@@ -2152,15 +2167,26 @@ impl F2Ops for RealF2Ops<'_> {
             );
         }
         info!(
-            "undervolt-probe dwell: {outcome:?} avg_clock={} MHz p5={} MHz power={:.0} W silent_error={}",
-            s.avg_clock_mhz, s.p5_clock_mhz, s.power_w, s.silent_error
+            "undervolt-probe dwell: {outcome:?} avg_clock={} MHz p5={} MHz \
+             power_avg={:.0} W power_peak={:.0} W max_temp={:?} C \
+             thermal_throttled={} silent_error={}",
+            s.avg_clock_mhz,
+            s.p5_clock_mhz,
+            s.power_w,
+            s.max_power_w,
+            s.max_temp_c,
+            s.thermal_throttled,
+            s.silent_error
         );
         F2DwellResult {
             outcome,
             avg_clock_mhz: s.avg_clock_mhz,
             p5_clock_mhz: s.p5_clock_mhz,
             power_w: s.power_w,
+            max_power_w: s.max_power_w,
             power_capped_frac: s.power_capped_frac,
+            max_temp_c: s.max_temp_c,
+            thermal_throttled: s.thermal_throttled,
             duration_ms: s.duration_ms,
             sample_count: s.sample_count,
             qualification_coverage: s.qualification_coverage,
@@ -4751,7 +4777,10 @@ mod tests {
             avg_clock_mhz: 1500,
             p5_clock_mhz: 1200,
             power_w: 120.0,
+            max_power_w: 130.0,
             power_capped_frac: 0.0,
+            max_temp_c: Some(68.0),
+            thermal_throttled: false,
             duration_ms: 60_000,
             sample_count: 1_000,
             qualification_coverage: None,
@@ -4779,6 +4808,14 @@ mod tests {
                 )
             ),
             F2DwellOutcome::Stable
+        );
+
+        let mut thermal = stable_low_p5;
+        thermal.p5_clock_mhz = 1800;
+        thermal.thermal_throttled = true;
+        assert_eq!(
+            classify_f2_stress_dwell(&thermal, 1800, F2StressPurpose::PowerDiscovery),
+            F2DwellOutcome::Inconclusive
         );
     }
 
@@ -5244,7 +5281,10 @@ mod tests {
             self.log.push("dwell");
             // Dummy headline stats; the single-step state machine only branches on `outcome`.
             F2DwellResult { outcome: self.dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
+                max_power_w: 191.0,
                 power_capped_frac: 0.0,
+                max_temp_c: Some(62.0),
+                thermal_throttled: false,
                 duration_ms: 15_000,
                 sample_count: 300,
                 qualification_coverage: None,
@@ -5545,7 +5585,10 @@ mod tests {
         fn dwell(&mut self) -> F2DwellResult {
             self.log.push(format!("dwell{}", self.cur));
             F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
+                max_power_w: 191.0,
                 power_capped_frac: 0.0,
+                max_temp_c: Some(62.0),
+                thermal_throttled: false,
                 duration_ms: 15_000,
                 sample_count: 300,
                 qualification_coverage: None,
@@ -5752,7 +5795,10 @@ mod tests {
         fn dwell(&mut self) -> F2DwellResult {
             self.log.push(format!("dwell{}", self.cur));
             F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
+                max_power_w: 191.0,
                 power_capped_frac: 0.0,
+                max_temp_c: Some(62.0),
+                thermal_throttled: false,
                 duration_ms: 15_000,
                 sample_count: 300,
                 qualification_coverage: None,

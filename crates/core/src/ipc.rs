@@ -139,13 +139,18 @@ pub struct PowerSweepPoint {
     pub dwell_sample_count: Option<u32>,
     #[serde(default)]
     pub dwell_duration_ms: Option<u64>,
-    /// GPU temperature at the start/end of the steady-state window and its mean (°C).
+    /// GPU temperature at the start/end of the steady-state window plus mean/max (°C).
     #[serde(default)]
     pub start_temp_c: Option<f32>,
     #[serde(default)]
     pub end_temp_c: Option<f32>,
     #[serde(default)]
     pub avg_temp_c: Option<f32>,
+    #[serde(default)]
+    pub max_temp_c: Option<f32>,
+    /// Whether NVML reported software or hardware thermal slowdown during the dwell.
+    #[serde(default)]
+    pub thermal_throttled: bool,
     /// Overall dwell telemetry confidence (worst of clock/power/voltage quality).
     #[serde(default)]
     pub telemetry_quality: Option<DwellQuality>,
