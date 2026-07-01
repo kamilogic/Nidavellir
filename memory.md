@@ -8,20 +8,23 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
-## Latest (2026-07-01) — F2 frontier and profile calibration use sustained p99 power
+## Latest (2026-07-01) — F2 frontier and profile calibration use confirmed sustained p99 power
 - Discovery keeps the existing textured `PowerRender`; the compute-only `POWER_SHADER` remains
   outside the live F2 path. Mean, sustained p99 and the highest post-ramp sample remain distinct
   through `SingleDwell`, the F2 step report, append-only observations and `PowerSweepPoint`.
 - `POWER_PEAK_PERCENTILE = 99`; p99 uses every retained post-ramp power sample. Fewer than 100 samples
   fall back explicitly to the measured raw maximum; zero samples produce no value and fail closed.
-- `F2_DISCOVERY_CONTRACT_VERSION = 3`. Legacy/v1/v2 positive and power-bound evidence cannot seed the
-  new frontier because it lacks p99; negative evidence remains conservative.
+- `F2_DISCOVERY_CONTRACT_VERSION = 4`. v3 positive and power-bound evidence cannot seed the new
+  frontier. Adjacent-bin p99 jumps larger than both 8 W and 5% in the same p5 regime repeat the exact
+  bin up to three total attempts; two must agree and the highest measured p99 is retained. No
+  consensus is neutral/ineligible, never interpolated.
 - Profile synthesis first applies the unchanged +12 mV policy, then resolves a current reset-clean
   PowerRender observation for that exact apply bin. It scores Godforge/Brokkr's/Deep Calm with p99
   power and the p5 clock observed at the apply bin, not boundary-bin mean or a one-sample maximum.
 - A discovery `ClockDrop` whose p99 remains at 99%+ of the numeric cap is `PowerBoundClockDrop` and
   continues voltage descent even after the clock previously sustained. It remains calibration
   telemetry, never stability evidence; off-cap `ClockDrop` retains the normal boundary behavior.
+  `Validated` at cap also continues, and Standard/Long defer FSGL3 until confirmed p99 is off-cap.
   NVML software/hardware thermal slowdown makes a discovery dwell `Inconclusive`, not a bad undervolt.
 - UI cards and Forge Progress show sustained p99 with an explicit “not a hard power limit” caveat;
   raw mean/maximum remain available. Apply rejects restored F2 profiles without valid p99.

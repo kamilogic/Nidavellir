@@ -22,8 +22,9 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   Discovery keeps the homogeneous game-power render while qualification uses versioned
   stock-golden evidence, 100% frame checks and deliberate droop probes; an FSGL3 rejection stops the
   descent with the last FSGL3-qualified physical bin;
-  observations checkpoint/resume by GPU UUID; discovery v3 carries mean/p99/raw-peak watts plus
-  thermal validity, uses p99 for power-bound descent and synthesizes profiles from the exact
+  observations checkpoint/resume by GPU UUID; discovery v4 carries mean/p99/raw-peak watts plus
+  thermal/voltage/render validity, confirms anomalous p99 steps by exact-bin repeats, uses p99 for
+  power-bound descent and synthesizes profiles from the exact
   post-margin apply bin; partial UI progress is durable; adjacent clocks reuse
   one bin above the prior minimum and fall back to the prior power-bound boundary; deployable synthesis
   still requires the complete range and successful qualification.

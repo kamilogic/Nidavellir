@@ -1030,12 +1030,12 @@ No new IPC method is required. Manual Stop must not be auto-resumed. Pre-hang te
 safety state and must not be inferred from logs.
 
 
-\## Backend → Frontend (2026-07-01): applied-bin sustained p99 and thermal validity
+\## Backend → Frontend (2026-07-01): confirmed applied-bin sustained p99 and thermal validity
 
 The live F2 payload remains backward-compatible. Existing `power_w` keeps its documented meaning as
-steady-state mean power. `max_power_w` now carries the real highest post-ramp PowerRender sample all
-the way through discovery v3. Additive `power_p99_w: Option<f32>` carries the sustained p99 and is the
-headline F2 profile/card power.
+steady-state mean power. `max_power_w` carries the real highest post-ramp PowerRender sample.
+Additive `power_p99_w: Option<f32>` carries the sustained p99 and is the headline F2 profile/card
+power.
 
 \- Profile watts are calibrated at `vf_table_voltage_mv` after the unchanged application margin, not
   at `boundary_voltage_mv`.
@@ -1047,13 +1047,26 @@ headline F2 profile/card power.
   than 100 samples fall back to measured raw max. No valid sample leaves p99 absent and profile
   calibration fails closed.
 
+\- Discovery v4 compares adjacent PowerRender bins only while their p5 remains in the same clock
+  regime. A p99 jump larger than both 8 W and 5% repeats the exact physical bin, with a maximum of
+  three reset-clean attempts. At least two readings must agree; accepted groups use the highest
+  actually measured p99. No interpolation or synthetic monotonic correction is allowed.
+
+\- Additive observation telemetry records the attempt count/confirmation state, measured voltage
+  min/avg/max/count and workload frames/FPS. A group without consensus is power-telemetry
+  inconclusive and cannot enter synthesis or profile calibration.
+
+\- `Validated` discovery still at 99% or more of the numeric cap continues to the next lower voltage
+  bin. Standard/Long launch FSGL3 only from a confirmed off-cap discovery bin. FSGL3 itself, its
+  golden, retry/continuity/recovery behavior and PowerRender discovery load are unchanged.
+
 \- Two optional/additive `PowerSweepPoint` fields are available: `max_temp_c: Option<f32>` and
   `thermal_throttled: bool`. Thermally throttled discovery is not eligible for profile calibration.
 
 \- Card copy describes `power_p99_w` as measured sustained p99 and states that it is not a hard power
   limit. Frontend tolerates old payloads by falling back to `max_power_w`, then `power_w`.
 
-\- Discovery contract is v3; v2 positive/power-bound evidence cannot enter v3 synthesis or resume.
+\- Discovery contract is v4; v3 positive/power-bound evidence cannot enter v4 synthesis or resume.
   F2 Apply also rejects any restored profile that lacks a valid measured `power_p99_w`.
   No method changed. FSGL3/golden qualification contract v4 and `profiles_qualified` semantics are
   unchanged.

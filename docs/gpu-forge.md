@@ -54,10 +54,12 @@ The live F2 Forge deliberately asks two different questions with two different r
 
 - **Discovery / Fast:** the steady eight-instance textured `PowerRender` determines Cmax,
   near-power-limit behavior, sustained p5 and the voltage boundary. Its homogeneous load keeps
-  clock/power measurements comparable across physical VF bins. Discovery v3 keeps mean power,
-  sustained p99 and the highest post-ramp sample separate and records maximum temperature plus NVML
-  thermal slowdown. P99 uses nearest-rank over every retained post-ramp sample; fewer than 100
-  samples fall back to raw max, and no valid sample leaves p99 absent.
+  clock/power measurements comparable across physical VF bins. Discovery v4 keeps mean power,
+  sustained p99 and the highest post-ramp sample separate and records maximum temperature, measured
+  voltage, render coverage and NVML thermal slowdown. P99 uses nearest-rank over every retained
+  post-ramp sample; fewer than 100 samples fall back to raw max. An anomalous adjacent-bin p99 in the
+  same p5 regime repeats the exact bin up to three total attempts; two must agree and calibration
+  uses the highest measured p99. A bin without consensus is ineligible.
 - **Standard / Long qualification:** FSGL3 A+B is the default interleaved per-bin qualifier. Before
   descent, stock captures deterministic power, boost and texture/ROP checksums with one fresh
   `GpuCtx` per render configuration. FSGL3 biases TextureRop/MixedGame, crosses the same eight

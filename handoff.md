@@ -9,19 +9,21 @@ Safe Mode crash budget, and an interrupted run resumes once when the UI reconnec
 means profiles are qualified. **NEXT = supervised Leva 1 hardware gate; Leva 2 remains blocked.**
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend/frontend checkpoint (2026-07-01) — sustained-p99 frontier/calibration (code-complete, NOT HW-tested)
+## Latest backend/frontend checkpoint (2026-07-01) — confirmed sustained-p99 frontier/calibration (code-complete, NOT HW-tested)
 - **Workload unchanged**: live F2 discovery still uses the textured, bounded-frame `PowerRender`;
   compute-only `POWER_SHADER` was not substituted.
-- **Discovery v3 telemetry**: mean, sustained p99 and raw maximum watts persist separately, with
-  maximum temperature and NVML thermal-slowdown evidence. p99 uses every retained post-ramp sample;
-  fewer than 100 samples fall back to raw max, while no sample fails closed.
+- **Discovery v4 telemetry**: mean, sustained p99 and raw maximum watts persist separately, with
+  maximum temperature, NVML thermal-slowdown, measured-voltage and render coverage evidence. An
+  anomalous adjacent-bin p99 in the same p5 regime repeats the exact bin up to three total attempts;
+  two readings must agree and the highest measured p99 is retained. No consensus is ineligible.
 - **Applied-bin truth**: after the unchanged +12 mV margin snaps to a physical bin, synthesis resolves
   that exact bin's current PowerRender observation. Selection and cards use its p99 plus apply-bin p5;
   mean/raw maximum remain diagnostic. Missing/current-invalid p99 fails closed with no profiles.
 - **Boundary**: any discovery `ClockDrop` still at 99%+ of the cap by p99 is
   `PowerBoundClockDrop` and continues voltage descent, including after a prior sustained point.
-- **Compatibility**: discovery contract is v3; qualification remains FSGL3 contract v4. v2 positives
-  and avg-classified power-bound records cannot enter new synthesis/resume; negatives stay conservative.
+  `Validated` at cap also continues; Standard/Long only launch FSGL3 from a confirmed off-cap bin.
+- **Compatibility**: discovery contract is v4; qualification remains FSGL3 contract v4. v3 positives
+  and unconfirmed power telemetry cannot enter new synthesis/resume; negatives stay conservative.
   Apply rejects any restored F2 profile without valid p99.
 - **Hardware checkpoint**: a Standard run held p99 near the 200 W cap and continued 1950 MHz from
   1150 mV through 950 mV, where discovery first validated. FSGL3 A then reset-clean rejected that

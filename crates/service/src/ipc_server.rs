@@ -518,7 +518,7 @@ fn apply_undervolt_profile(
         .is_some_and(|power| power.is_finite() && power > 0.0)
     {
         return IpcResponse::failure(
-            "F2 profile has no measured sustained-p99 power — run Forge again under discovery v3",
+            "F2 profile has no confirmed sustained-p99 power — run Forge again under discovery v4",
         );
     }
     let (target_mhz, anchor_mv) = undervolt_apply_params(&p);

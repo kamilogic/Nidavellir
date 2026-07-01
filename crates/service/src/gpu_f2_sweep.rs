@@ -50,7 +50,10 @@ fn map_verifier(v: Option<PositiveOffsetVerification>) -> F2ObsVerifier {
 }
 
 /// Map the dwell verdict to the observation form.
-fn map_dwell(d: Option<F2DwellOutcome>) -> F2ObsDwell {
+fn map_dwell(d: Option<F2DwellOutcome>, discovery_power_inconclusive: bool) -> F2ObsDwell {
+    if discovery_power_inconclusive {
+        return F2ObsDwell::PowerTelemetryInconclusive;
+    }
     match d {
         Some(F2DwellOutcome::Stable) => F2ObsDwell::Stable,
         Some(F2DwellOutcome::SilentError) => F2ObsDwell::SilentError,
@@ -65,7 +68,10 @@ fn map_dwell(d: Option<F2DwellOutcome>) -> F2ObsDwell {
 /// Map the confirmed-step terminal outcome to the observation outcome. Arm/apply failures aborted before
 /// any stable/unstable result was learned, so they are an abort — NOT an instability that would bracket
 /// the voltage downward.
-fn map_outcome(o: &F2Outcome) -> F2ObsOutcome {
+fn map_outcome(o: &F2Outcome, discovery_power_inconclusive: bool) -> F2ObsOutcome {
+    if discovery_power_inconclusive {
+        return F2ObsOutcome::PowerTelemetryInconclusive;
+    }
     match o {
         F2Outcome::Validated => F2ObsOutcome::Validated,
         F2Outcome::VerifyFailed => F2ObsOutcome::VerifierFailed,
@@ -87,7 +93,9 @@ pub fn observation_from_anchored_step(
     anchored: &AnchoredPositiveOffsetPlan,
     report: &F2StepReport,
 ) -> F2Observation {
-    let outcome = map_outcome(&report.outcome);
+    let discovery_power_inconclusive = ctx.evidence_kind == F2EvidenceKind::Discovery
+        && matches!(report.outcome, F2Outcome::Inconclusive);
+    let outcome = map_outcome(&report.outcome, discovery_power_inconclusive);
     F2Observation {
         run_id: ctx.run_id.clone(),
         timestamp: ctx.timestamp.clone(),
@@ -110,12 +118,20 @@ pub fn observation_from_anchored_step(
         max_flatten_mhz: anchored.max_negative_flatten_mhz,
         lower_bins_elastic: anchored.elastic_below_bins,
         verifier_result: map_verifier(report.verify),
-        dwell_result: map_dwell(report.dwell),
+        dwell_result: map_dwell(report.dwell, discovery_power_inconclusive),
         avg_clock_mhz: report.avg_clock_mhz,
         sustained_clock_mhz: report.p5_clock_mhz,
         watts: report.power_w,
         max_watts: report.max_power_w,
         power_p99_w: report.power_p99_w,
+        power_p99_confirmed: report.power_p99_confirmed,
+        power_p99_attempts: report.power_p99_attempts,
+        measured_voltage_min_mv: report.measured_voltage_min_mv,
+        measured_voltage_avg_mv: report.measured_voltage_avg_mv,
+        measured_voltage_max_mv: report.measured_voltage_max_mv,
+        measured_voltage_sample_count: report.measured_voltage_sample_count,
+        render_frames: report.render_frames,
+        render_fps: report.render_fps,
         power_capped_frac: report.power_capped_frac,
         max_temp_c: report.max_temp_c,
         thermal_throttled: report.thermal_throttled,
@@ -549,9 +565,17 @@ mod tests {
             power_w: Some(180),
             max_power_w: Some(188),
             power_p99_w: Some(186.0),
+            power_p99_confirmed: true,
+            power_p99_attempts: 1,
             power_capped_frac: Some(0.5),
             max_temp_c: Some(68.0),
             thermal_throttled: false,
+            measured_voltage_min_mv: Some(974),
+            measured_voltage_avg_mv: Some(975),
+            measured_voltage_max_mv: Some(976),
+            measured_voltage_sample_count: 20,
+            render_frames: Some(900),
+            render_fps: Some(60.0),
             dwell_duration_ms: Some(15_000),
             sample_count: Some(300),
             qualification_coverage: None,
@@ -582,9 +606,65 @@ mod tests {
         assert_eq!((o.avg_clock_mhz, o.sustained_clock_mhz, o.watts), (Some(1815), Some(1815), Some(180)));
         assert_eq!(o.max_watts, Some(188));
         assert_eq!(o.power_p99_w, Some(186.0));
+        assert!(o.power_p99_confirmed);
+        assert_eq!(o.power_p99_attempts, 1);
+        assert_eq!(
+            (
+                o.measured_voltage_min_mv,
+                o.measured_voltage_avg_mv,
+                o.measured_voltage_max_mv,
+                o.measured_voltage_sample_count,
+            ),
+            (Some(974), Some(975), Some(976), 20)
+        );
+        assert_eq!((o.render_frames, o.render_fps), (Some(900), Some(60.0)));
         assert_eq!(o.outcome, F2ObsOutcome::Validated);
         assert!(o.reset_to_stock_ok && o.boot_flag_cleared);
         assert!(o.confidence.unwrap() >= 0.85);
+    }
+
+    #[test]
+    fn discovery_inconclusive_maps_to_power_telemetry_not_qualification() {
+        let discovery = observation_from_anchored_step(
+            &ctx(),
+            1800,
+            &anchored(975, 1785, 1800),
+            &step(
+                F2Outcome::Inconclusive,
+                Some(PositiveOffsetVerification::RaiseVerified),
+                Some(F2DwellOutcome::Inconclusive),
+            ),
+        );
+        assert_eq!(
+            discovery.outcome,
+            F2ObsOutcome::PowerTelemetryInconclusive
+        );
+        assert_eq!(
+            discovery.dwell_result,
+            F2ObsDwell::PowerTelemetryInconclusive
+        );
+
+        let mut qualification_ctx = ctx();
+        qualification_ctx.evidence_kind = F2EvidenceKind::Qualification;
+        qualification_ctx.discovery_contract_version = None;
+        let qualification = observation_from_anchored_step(
+            &qualification_ctx,
+            1800,
+            &anchored(975, 1785, 1800),
+            &step(
+                F2Outcome::Inconclusive,
+                Some(PositiveOffsetVerification::RaiseVerified),
+                Some(F2DwellOutcome::Inconclusive),
+            ),
+        );
+        assert_eq!(
+            qualification.outcome,
+            F2ObsOutcome::QualificationInconclusive
+        );
+        assert_eq!(
+            qualification.dwell_result,
+            F2ObsDwell::QualificationInconclusive
+        );
     }
 
     #[test]

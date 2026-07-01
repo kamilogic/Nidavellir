@@ -101,6 +101,21 @@ const F2_VERIFY_TOL_MHZ: u32 = 15;
 #[cfg(windows)]
 const F2_CLOCK_DROP_TOL_MHZ: u32 = 30;
 
+/// An adjacent PowerRender p99 step larger than both limits is remeasured at the exact same bin.
+/// The absolute floor catches the observed whole-dwell underload, while the relative limit scales
+/// with other board-power classes.
+#[cfg(windows)]
+const POWER_P99_RECHECK_ABS_W: f32 = 8.0;
+#[cfg(windows)]
+const POWER_P99_RECHECK_REL: f32 = 0.05;
+/// Initial dwell plus at most two reset-clean repeats at the same physical bin.
+#[cfg(windows)]
+const POWER_P99_MAX_ATTEMPTS: usize = 3;
+/// Adjacent p5 values must describe the same sustained-clock regime before power monotonicity is
+/// compared. One boost bin mirrors the verifier tolerance.
+#[cfg(windows)]
+const POWER_P99_EQUIVALENT_P5_TOL_MHZ: u32 = 15;
+
 /// Relative sustained-clock margin allowed between equivalent FSGL3 qualification passes. A
 /// candidate whose heavy-phase p5 falls farther than this below the median of prior stable
 /// candidates at the same target/pattern has reached the voltage-margin cliff even if it did not
@@ -1187,6 +1202,12 @@ pub struct F2DwellResult {
     pub power_capped_frac: f32,
     pub max_temp_c: Option<f32>,
     pub thermal_throttled: bool,
+    pub measured_voltage_min_mv: Option<u32>,
+    pub measured_voltage_avg_mv: Option<u32>,
+    pub measured_voltage_max_mv: Option<u32>,
+    pub measured_voltage_sample_count: u32,
+    pub render_frames: Option<u64>,
+    pub render_fps: Option<f64>,
     pub duration_ms: u64,
     pub sample_count: u32,
     pub qualification_coverage: Option<F2QualificationCoverage>,
@@ -1254,6 +1275,154 @@ pub fn f2_near_power_limit(
         }
         _ => power_capped_frac.is_some_and(|f| f.is_finite() && f >= 0.5),
     }
+}
+
+#[cfg(windows)]
+fn f2_power_p99_pair_consistent(a: f32, b: f32) -> bool {
+    let tolerance = POWER_P99_RECHECK_ABS_W.max(a.max(b) * POWER_P99_RECHECK_REL);
+    (a - b).abs() <= tolerance
+}
+
+#[cfg(windows)]
+fn f2_power_p99_requires_recheck(
+    previous: Option<(f32, u32)>,
+    report: &F2StepReport,
+) -> bool {
+    if !f2_power_measurement_usable(report) {
+        return false;
+    }
+    let Some((previous_p99, previous_p5)) = previous else {
+        return false;
+    };
+    let (Some(current_p99), Some(current_p5)) = (report.power_p99_w, report.p5_clock_mhz) else {
+        return false;
+    };
+    previous_p99.is_finite()
+        && previous_p99 > 0.0
+        && current_p99.is_finite()
+        && current_p99 > 0.0
+        && previous_p5.abs_diff(current_p5) <= POWER_P99_EQUIVALENT_P5_TOL_MHZ
+        && !f2_power_p99_pair_consistent(previous_p99, current_p99)
+}
+
+#[cfg(windows)]
+fn f2_power_measurement_usable(report: &F2StepReport) -> bool {
+    matches!(report.outcome, F2Outcome::Validated | F2Outcome::ClockDrop)
+        && report.reset_ok == Some(true)
+        && !report.thermal_throttled
+        && report
+            .power_p99_w
+            .is_some_and(|power| power.is_finite() && power > 0.0)
+}
+
+#[cfg(windows)]
+fn f2_power_attempts_have_consistent_pair(reports: &[F2StepReport]) -> bool {
+    let powers: Vec<f32> = reports
+        .iter()
+        .filter(|report| f2_power_measurement_usable(report))
+        .filter_map(|report| report.power_p99_w)
+        .collect();
+    powers.iter().enumerate().any(|(i, a)| {
+        powers
+            .iter()
+            .skip(i + 1)
+            .any(|b| f2_power_p99_pair_consistent(*a, *b))
+    })
+}
+
+/// Confirm a normal single dwell, or require a consistent pair after an anomalous adjacent-bin
+/// step. The returned power is deliberately the highest measured p99 in the accepted group: neither
+/// interpolation nor a synthetic monotonic correction is allowed.
+#[cfg(windows)]
+fn f2_confirm_power_attempts(reports: &mut [F2StepReport], rechecked: bool) -> Option<f32> {
+    let hard_failure = reports.iter().any(|report| {
+        matches!(
+            report.outcome,
+            F2Outcome::DeviceLost
+                | F2Outcome::ResetFailed
+                | F2Outcome::ArmFailed(_)
+                | F2Outcome::ApplyFailed(_)
+                | F2Outcome::VerifyFailed
+                | F2Outcome::SilentError
+                | F2Outcome::Unstable
+        )
+    });
+    let usable: Vec<(usize, f32)> = reports
+        .iter()
+        .enumerate()
+        .filter(|(_, report)| f2_power_measurement_usable(report))
+        .filter_map(|(index, report)| report.power_p99_w.map(|power| (index, power)))
+        .collect();
+    let consensus = if hard_failure {
+        false
+    } else if rechecked {
+        f2_power_attempts_have_consistent_pair(reports)
+    } else {
+        usable.len() == 1
+    };
+    let attempt_count = reports.len() as u32;
+    if !consensus {
+        for report in reports.iter_mut().filter(|report| f2_power_measurement_usable(report)) {
+            report.outcome = F2Outcome::Inconclusive;
+            report.power_p99_confirmed = false;
+            report.power_p99_attempts = attempt_count;
+        }
+        return None;
+    }
+    let conservative_p99 = usable
+        .iter()
+        .map(|(_, power)| *power)
+        .fold(f32::NEG_INFINITY, f32::max);
+    for (index, _) in usable {
+        reports[index].power_p99_confirmed = true;
+        reports[index].power_p99_attempts = attempt_count;
+    }
+    Some(conservative_p99)
+}
+
+#[cfg(windows)]
+fn f2_aggregate_power_attempts(
+    reports: &[F2StepReport],
+    conservative_p99: Option<f32>,
+) -> F2StepReport {
+    let mut aggregate = reports[0].clone();
+    if let Some(hard) = reports.iter().find(|report| {
+        matches!(
+            report.outcome,
+            F2Outcome::DeviceLost
+                | F2Outcome::ResetFailed
+                | F2Outcome::ArmFailed(_)
+                | F2Outcome::ApplyFailed(_)
+                | F2Outcome::VerifyFailed
+                | F2Outcome::SilentError
+                | F2Outcome::Unstable
+        )
+    }) {
+        aggregate.outcome = hard.outcome.clone();
+    } else if conservative_p99.is_none() {
+        aggregate.outcome = F2Outcome::Inconclusive;
+    } else if reports
+        .iter()
+        .any(|report| matches!(report.outcome, F2Outcome::ClockDrop))
+    {
+        aggregate.outcome = F2Outcome::ClockDrop;
+    } else {
+        aggregate.outcome = F2Outcome::Validated;
+    }
+    aggregate.power_p99_w = conservative_p99;
+    aggregate.power_p99_confirmed = conservative_p99.is_some();
+    aggregate.power_p99_attempts = reports.len() as u32;
+    aggregate.p5_clock_mhz = reports.iter().filter_map(|r| r.p5_clock_mhz).min();
+    aggregate.avg_clock_mhz = reports.iter().filter_map(|r| r.avg_clock_mhz).min();
+    aggregate.power_w = reports.iter().filter_map(|r| r.power_w).max();
+    aggregate.max_power_w = reports.iter().filter_map(|r| r.max_power_w).max();
+    aggregate.power_capped_frac = reports
+        .iter()
+        .filter_map(|r| r.power_capped_frac)
+        .reduce(f32::max);
+    aggregate.max_temp_c = reports.iter().filter_map(|r| r.max_temp_c).reduce(f32::max);
+    aggregate.thermal_throttled = reports.iter().any(|r| r.thermal_throttled);
+    aggregate
 }
 
 fn f2_power_bound_clock_drop(outcome: &F2Outcome, near_power_limit: bool) -> F2Outcome {
@@ -1349,9 +1518,18 @@ pub struct F2StepReport {
     pub power_w: Option<u32>,
     pub max_power_w: Option<u32>,
     pub power_p99_w: Option<f32>,
+    /// True only after discovery's v4 p99 consistency gate accepts this measurement group.
+    pub power_p99_confirmed: bool,
+    pub power_p99_attempts: u32,
     pub power_capped_frac: Option<f32>,
     pub max_temp_c: Option<f32>,
     pub thermal_throttled: bool,
+    pub measured_voltage_min_mv: Option<u32>,
+    pub measured_voltage_avg_mv: Option<u32>,
+    pub measured_voltage_max_mv: Option<u32>,
+    pub measured_voltage_sample_count: u32,
+    pub render_frames: Option<u64>,
+    pub render_fps: Option<f64>,
     pub dwell_duration_ms: Option<u64>,
     pub sample_count: Option<u32>,
     pub qualification_coverage: Option<F2QualificationCoverage>,
@@ -1398,9 +1576,17 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
         power_w: None,
         max_power_w: None,
         power_p99_w: None,
+        power_p99_confirmed: false,
+        power_p99_attempts: 0,
         power_capped_frac: None,
         max_temp_c: None,
         thermal_throttled: false,
+        measured_voltage_min_mv: None,
+        measured_voltage_avg_mv: None,
+        measured_voltage_max_mv: None,
+        measured_voltage_sample_count: 0,
+        render_frames: None,
+        render_fps: None,
         dwell_duration_ms: None,
         sample_count: None,
         qualification_coverage: None,
@@ -1445,6 +1631,12 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
     r.power_capped_frac = Some(d.power_capped_frac);
     r.max_temp_c = d.max_temp_c;
     r.thermal_throttled = d.thermal_throttled;
+    r.measured_voltage_min_mv = d.measured_voltage_min_mv;
+    r.measured_voltage_avg_mv = d.measured_voltage_avg_mv;
+    r.measured_voltage_max_mv = d.measured_voltage_max_mv;
+    r.measured_voltage_sample_count = d.measured_voltage_sample_count;
+    r.render_frames = d.render_frames;
+    r.render_fps = d.render_fps;
     r.dwell_duration_ms = Some(d.duration_ms);
     r.sample_count = Some(d.sample_count);
     r.qualification_coverage = d.qualification_coverage.clone();
@@ -2207,6 +2399,12 @@ impl F2Ops for RealF2Ops<'_> {
             power_capped_frac: s.power_capped_frac,
             max_temp_c: s.max_temp_c,
             thermal_throttled: s.thermal_throttled,
+            measured_voltage_min_mv: s.volt_min_mv,
+            measured_voltage_avg_mv: s.volt_avg_mv,
+            measured_voltage_max_mv: s.volt_max_mv,
+            measured_voltage_sample_count: s.volt_sample_count,
+            render_frames: s.render_frames,
+            render_fps: s.render_fps,
             duration_ms: s.duration_ms,
             sample_count: s.sample_count,
             qualification_coverage: s.qualification_coverage,
@@ -3407,6 +3605,17 @@ enum F2QualificationOutcome {
 }
 
 #[cfg(windows)]
+fn f2_should_qualify_discovery_candidate(
+    outcome: &F2Outcome,
+    near_power_limit: bool,
+    qualification_passes: usize,
+) -> bool {
+    matches!(outcome, F2Outcome::Validated)
+        && !near_power_limit
+        && qualification_passes > 0
+}
+
+#[cfg(windows)]
 impl F2QualificationOutcome {
     /// Whether qualification reached a reset-clean terminal result for this clock. A rejection is
     /// local evidence against the current target; it must not abort discovery of lower clocks.
@@ -3901,8 +4110,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     use std::sync::atomic::Ordering;
 
     use nidavellir_core::f2_observation::{
-        first_bad_for_target, is_current_discovery_evidence, last_discovery_good_for_target,
-        now_rfc3339, F2ObsMode,
+        first_bad_for_target, is_current_discovery_evidence, is_current_qualification_pass,
+        last_discovery_good_for_target, now_rfc3339, F2ObsMode,
     };
 
     let mut logs = Vec::new();
@@ -4058,6 +4267,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     let mut aborted = false;
     let mut retain_boot_flag = false;
     let mut executed_steps = 0usize;
+    let mut previous_confirmed_power: Option<(f32, u32)> = None;
     let mut stop_reason = if prior_bad_mv.is_some() {
         "KnownBoundaryResumed".to_string()
     } else {
@@ -4116,41 +4326,142 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             outcome: None,
             line: format!("Testing {target_mhz} MHz @ {anchor_mv} mV — dwell em andamento…"),
         });
-        let mut report = run_confirmed_f2_step(&mut ops);
+        let initial_report = run_confirmed_f2_step(&mut ops);
+        let rechecked =
+            f2_power_p99_requires_recheck(previous_confirmed_power, &initial_report);
+        let mut attempts = vec![initial_report];
+        if rechecked {
+            logs.push(format!(
+                "{target_mhz} MHz @ {anchor_mv} mV: salto p99 anômalo detectado; repetindo o mesmo bin até {} tentativas reset-clean",
+                POWER_P99_MAX_ATTEMPTS
+            ));
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(anchor_mv),
+                outcome: None,
+                line: format!(
+                    "{target_mhz} MHz @ {anchor_mv} mV → p99 anômalo; repetindo exatamente o mesmo bin…"
+                ),
+            });
+            while attempts.len() < POWER_P99_MAX_ATTEMPTS {
+                let attempt_number = attempts.len() + 1;
+                on_progress(F2ClockDiscoveryProgress {
+                    target_mhz,
+                    planned_steps: candidate_count,
+                    unpruned_steps,
+                    anchor_mv: Some(anchor_mv),
+                    outcome: None,
+                    line: format!(
+                        "Reteste p99 {attempt_number}/{POWER_P99_MAX_ATTEMPTS}: {target_mhz} MHz @ {anchor_mv} mV — dwell em andamento…"
+                    ),
+                });
+                let repeated = run_confirmed_f2_step(&mut ops);
+                let terminal_safety_failure = matches!(
+                    repeated.outcome,
+                    F2Outcome::DeviceLost
+                        | F2Outcome::ResetFailed
+                        | F2Outcome::ArmFailed(_)
+                        | F2Outcome::ApplyFailed(_)
+                        | F2Outcome::VerifyFailed
+                );
+                attempts.push(repeated);
+                if terminal_safety_failure
+                    || f2_power_attempts_have_consistent_pair(&attempts)
+                {
+                    break;
+                }
+            }
+        }
+        let conservative_p99 = f2_confirm_power_attempts(&mut attempts, rechecked);
+        let mut report = f2_aggregate_power_attempts(&attempts, conservative_p99);
         let near_cap =
             f2_near_power_limit(report.power_p99_w, power_limit_w, report.power_capped_frac);
         report.outcome = f2_power_bound_clock_drop(&report.outcome, near_cap);
+        for attempt in &mut attempts {
+            if attempt.power_p99_confirmed {
+                attempt.outcome = f2_power_bound_clock_drop(&attempt.outcome, near_cap);
+            }
+        }
 
+        if let (Some(power_p99), Some(p5)) = (conservative_p99, report.p5_clock_mhz) {
+            previous_confirmed_power = Some((power_p99, p5));
+        }
         logs.push(format!(
-            "{target_mhz} MHz @ {anchor_mv} mV: {:?}, p5={:?} MHz, power_avg={:?} W, power_p99={:?} W, cap_near={near_cap}",
-            report.outcome, report.p5_clock_mhz, report.power_w, report.power_p99_w
+            "{target_mhz} MHz @ {anchor_mv} mV: {:?}, attempts={}, p5={:?} MHz, power_avg={:?} W, power_p99_conservative={:?} W, cap_near={near_cap}",
+            report.outcome,
+            attempts.len(),
+            report.p5_clock_mhz,
+            report.power_w,
+            conservative_p99
         ));
-        ctx.timestamp = now_rfc3339();
-        let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
-            &ctx,
-            target_mhz,
-            &descent.candidates[i],
-            &report,
-        );
-        if let Err(e) = obs_store.append(&observation) {
-            aborted = true;
-            stop_reason = format!("ObservationPersistFailed: {e}");
+        for (attempt_index, attempt) in attempts.iter().enumerate() {
+            logs.push(format!(
+                "{target_mhz} MHz @ {anchor_mv} mV attempt {}/{}: {:?}, p5={:?} MHz, power_avg={:?} W, power_p99={:?} W, confirmed={}",
+                attempt_index + 1,
+                attempts.len(),
+                attempt.outcome,
+                attempt.p5_clock_mhz,
+                attempt.power_w,
+                attempt.power_p99_w,
+                attempt.power_p99_confirmed
+            ));
+            ctx.timestamp = now_rfc3339();
+            let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+                &ctx,
+                target_mhz,
+                &descent.candidates[i],
+                attempt,
+            );
+            if let Err(e) = obs_store.append(&observation) {
+                aborted = true;
+                stop_reason = format!("ObservationPersistFailed: {e}");
+                break;
+            }
+            executed_steps = executed_steps.saturating_add(1);
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(anchor_mv),
+                outcome: Some(format!("{:?}", attempt.outcome)),
+                line: format!(
+                    "{target_mhz} MHz @ {anchor_mv} mV · p99 {}/{} → {:?} · p5 {} MHz · p99 {:.0} W · {}",
+                    attempt_index + 1,
+                    attempts.len(),
+                    attempt.outcome,
+                    attempt.p5_clock_mhz.unwrap_or(0),
+                    attempt.power_p99_w.unwrap_or(0.0),
+                    if attempt.power_p99_confirmed {
+                        "medição confirmada"
+                    } else {
+                        "medição inconclusiva"
+                    }
+                ),
+            });
+        }
+        if aborted {
             break;
         }
-        executed_steps = executed_steps.saturating_add(1);
-        on_progress(F2ClockDiscoveryProgress {
-            target_mhz,
-            planned_steps: candidate_count,
-            unpruned_steps,
-            anchor_mv: Some(anchor_mv),
-            outcome: Some(format!("{:?}", report.outcome)),
-            line: format!(
-                "{target_mhz} MHz @ {anchor_mv} mV → {:?} · p5 {} MHz · p99 {:.0} W · aprendizado salvo",
-                report.outcome,
-                report.p5_clock_mhz.unwrap_or(0),
-                report.power_p99_w.unwrap_or(0.0)
-            ),
-        });
+        if rechecked {
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(anchor_mv),
+                outcome: Some(format!("{:?}", report.outcome)),
+                line: match conservative_p99 {
+                    Some(power) => format!(
+                        "{target_mhz} MHz @ {anchor_mv} mV → consenso p99 confirmado; valor conservador {power:.0} W"
+                    ),
+                    None => format!(
+                        "{target_mhz} MHz @ {anchor_mv} mV → p99 inconclusivo após {} tentativa(s); bin inelegível",
+                        attempts.len()
+                    ),
+                },
+            });
+        }
 
         let decision = f2_discovery_decision(&report.outcome, had_sustainable, near_cap);
         if matches!(decision, F2DiscoveryDecision::MarkSustainableAndContinue) {
@@ -4161,7 +4472,11 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             | F2DiscoveryDecision::MarkSustainableAndContinue => {
                 // Only an actual sustained (Validated) dwell is a qualification candidate; a pre-sustain
                 // power-bound clock drop just keeps the descent going lower.
-                if matches!(report.outcome, F2Outcome::Validated) && qualification_passes > 0 {
+                if f2_should_qualify_discovery_candidate(
+                    &report.outcome,
+                    near_cap,
+                    qualification_passes,
+                ) {
                     // Standard/Long: qualify THIS bin with FSGL3 A/B before going any
                     // deeper. If it passes we descend one real bin lower (next iteration's PowerRender
                     // measures its power and gates the next qualification); if it fails we stop here with
@@ -4235,6 +4550,15 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                             break;
                         }
                     }
+                }
+                if matches!(report.outcome, F2Outcome::Validated)
+                    && near_cap
+                    && qualification_passes > 0
+                {
+                    logs.push(format!(
+                        "{target_mhz} MHz @ {anchor_mv} mV: Validated ainda no cap (p99 {:?} W); FSGL3 adiado e descida continua",
+                        report.power_p99_w
+                    ));
                 }
                 // Fast (qualification_passes == 0) or a pre-sustain power-bound drop: keep descending.
                 // Fast leaves the deepest PowerRender-good point provisional; discovery observations
@@ -4396,8 +4720,11 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         && last_good_mv.is_none()
         && (executed_steps > 0 || stop_reason == "WarmStartNoPhysicalCandidates")
         && !aborted;
+    let has_current_qualification_pass =
+        scoped.iter().any(is_current_qualification_pass);
     F2ClockDiscoverySummary {
-        sustainable: last_good_mv.is_some(),
+        sustainable: last_good_mv.is_some()
+            && (qualification_passes == 0 || has_current_qualification_pass),
         last_good_mv,
         first_bad_mv,
         next_clock_start_mv,
@@ -4794,6 +5121,110 @@ mod tests {
         ));
     }
 
+    fn power_report(power_p99_w: f32, p5_clock_mhz: u32) -> F2StepReport {
+        F2StepReport {
+            outcome: F2Outcome::Validated,
+            armed: true,
+            applied: true,
+            verify: Some(PositiveOffsetVerification::RaiseVerified),
+            dwell: Some(F2DwellOutcome::Stable),
+            avg_clock_mhz: Some(p5_clock_mhz),
+            p5_clock_mhz: Some(p5_clock_mhz),
+            power_w: Some(power_p99_w.round() as u32),
+            max_power_w: Some(power_p99_w.ceil() as u32),
+            power_p99_w: Some(power_p99_w),
+            power_p99_confirmed: false,
+            power_p99_attempts: 0,
+            power_capped_frac: Some(0.0),
+            max_temp_c: Some(70.0),
+            thermal_throttled: false,
+            measured_voltage_min_mv: Some(886),
+            measured_voltage_avg_mv: Some(887),
+            measured_voltage_max_mv: Some(888),
+            measured_voltage_sample_count: 20,
+            render_frames: Some(600),
+            render_fps: Some(60.0),
+            dwell_duration_ms: Some(10_000),
+            sample_count: Some(100),
+            qualification_coverage: None,
+            reset_ok: Some(true),
+            boot_flag_cleared: true,
+            blacklisted: false,
+            validated: true,
+        }
+    }
+
+    #[test]
+    fn anomalous_adjacent_p99_step_requires_same_bin_recheck() {
+        let report = power_report(160.0, 1890);
+        assert!(f2_power_p99_requires_recheck(Some((183.0, 1890)), &report));
+        assert!(!f2_power_p99_requires_recheck(
+            Some((168.0, 1890)),
+            &report
+        ));
+        assert!(!f2_power_p99_requires_recheck(Some((183.0, 1920)), &report));
+    }
+
+    #[test]
+    fn repeated_p99_uses_consensus_and_conservative_measured_max() {
+        let mut reports = vec![
+            power_report(160.0, 1890),
+            power_report(180.0, 1890),
+            power_report(181.0, 1890),
+        ];
+        assert_eq!(f2_confirm_power_attempts(&mut reports, true), Some(181.0));
+        assert!(reports.iter().all(|report| report.power_p99_confirmed));
+        assert!(reports
+            .iter()
+            .all(|report| report.power_p99_attempts == 3));
+    }
+
+    #[test]
+    fn repeated_p99_without_consistent_pair_is_inconclusive() {
+        let mut reports = vec![
+            power_report(160.0, 1890),
+            power_report(180.0, 1890),
+            power_report(200.0, 1890),
+        ];
+        assert_eq!(f2_confirm_power_attempts(&mut reports, true), None);
+        assert!(reports
+            .iter()
+            .all(|report| report.outcome == F2Outcome::Inconclusive));
+        assert!(reports.iter().all(|report| !report.power_p99_confirmed));
+    }
+
+    #[test]
+    fn repeated_p99_never_confirms_positive_evidence_across_hard_failure() {
+        let mut failed = power_report(181.0, 1890);
+        failed.outcome = F2Outcome::SilentError;
+        failed.dwell = Some(F2DwellOutcome::SilentError);
+        let mut reports = vec![
+            power_report(180.0, 1890),
+            power_report(181.0, 1890),
+            failed,
+        ];
+        assert_eq!(f2_confirm_power_attempts(&mut reports, true), None);
+        assert!(reports.iter().all(|report| !report.power_p99_confirmed));
+        assert_eq!(
+            f2_aggregate_power_attempts(&reports, None).outcome,
+            F2Outcome::SilentError
+        );
+    }
+
+    #[test]
+    fn validated_at_cap_continues_discovery_before_fsgl3() {
+        assert!(!f2_should_qualify_discovery_candidate(
+            &F2Outcome::Validated,
+            true,
+            2
+        ));
+        assert!(f2_should_qualify_discovery_candidate(
+            &F2Outcome::Validated,
+            false,
+            2
+        ));
+    }
+
     #[test]
     fn next_clock_keeps_conservative_fallback() {
         assert_eq!(
@@ -4855,6 +5286,12 @@ mod tests {
             power_capped_frac: 0.0,
             max_temp_c: Some(68.0),
             thermal_throttled: false,
+            volt_min_mv: Some(949),
+            volt_avg_mv: Some(950),
+            volt_max_mv: Some(951),
+            volt_sample_count: 20,
+            render_frames: Some(3_600),
+            render_fps: Some(60.0),
             duration_ms: 60_000,
             sample_count: 1_000,
             qualification_coverage: None,
@@ -5385,6 +5822,12 @@ mod tests {
                 power_capped_frac: 0.0,
                 max_temp_c: Some(62.0),
                 thermal_throttled: false,
+                measured_voltage_min_mv: Some(949),
+                measured_voltage_avg_mv: Some(950),
+                measured_voltage_max_mv: Some(951),
+                measured_voltage_sample_count: 20,
+                render_frames: Some(900),
+                render_fps: Some(60.0),
                 duration_ms: 15_000,
                 sample_count: 300,
                 qualification_coverage: None,
@@ -5693,6 +6136,12 @@ mod tests {
                 power_capped_frac: 0.0,
                 max_temp_c: Some(62.0),
                 thermal_throttled: false,
+                measured_voltage_min_mv: Some(949),
+                measured_voltage_avg_mv: Some(950),
+                measured_voltage_max_mv: Some(951),
+                measured_voltage_sample_count: 20,
+                render_frames: Some(900),
+                render_fps: Some(60.0),
                 duration_ms: 15_000,
                 sample_count: 300,
                 qualification_coverage: None,
@@ -5904,6 +6353,12 @@ mod tests {
                 power_capped_frac: 0.0,
                 max_temp_c: Some(62.0),
                 thermal_throttled: false,
+                measured_voltage_min_mv: Some(949),
+                measured_voltage_avg_mv: Some(950),
+                measured_voltage_max_mv: Some(951),
+                measured_voltage_sample_count: 20,
+                render_frames: Some(900),
+                render_fps: Some(60.0),
                 duration_ms: 15_000,
                 sample_count: 300,
                 qualification_coverage: None,

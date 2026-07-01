@@ -708,6 +708,10 @@ struct Measured {
     avg_temp_c: Option<f32>,
     max_temp_c: Option<f32>,
     thermal_throttled: bool,
+    /// Workload-side render coverage. Diagnostic only; absent when the render panicked before
+    /// returning its report.
+    render_frames: Option<u64>,
+    render_fps: Option<f64>,
     qualification_coverage: Option<F2QualificationCoverage>,
     prehang_stall_detected: bool,
 }
@@ -738,6 +742,8 @@ impl Measured {
             avg_temp_c: None,
             max_temp_c: None,
             thermal_throttled: false,
+            render_frames: None,
+            render_fps: None,
             qualification_coverage: None,
             prehang_stall_detected: false,
         }
@@ -1152,7 +1158,7 @@ fn calibrate_f2_profile_power(
         .ok_or_else(|| {
             format!(
                 "{target_mhz} MHz @ {apply_mv} mV has no current, reset-clean, thermally valid \
-                 discovery-v3 sustained-p99 power measurement"
+                 discovery-v4 confirmed sustained-p99 power measurement"
             )
         })?;
         let mean_power = measured.watts.unwrap_or(0) as f32;
@@ -1303,14 +1309,19 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
             )
         }
     }));
-    let (res, phase_reports) = match render {
+    let (res, phase_reports, render_frames, render_fps) = match render {
         Ok(r) => {
             if let Some(phase) = r.failure_phase {
                 warn!("VF qualifier failed during phase {}", phase.label());
             }
-            (r.result, r.phase_reports)
+            (
+                r.result,
+                r.phase_reports,
+                Some(r.frames),
+                (r.fps.is_finite() && r.fps >= 0.0).then_some(r.fps),
+            )
         }
-        Err(_) => (StabilityResult::Crash, Vec::new()),
+        Err(_) => (StabilityResult::Crash, Vec::new(), None, None),
     };
     stop.store(true, Ordering::SeqCst);
     let _ = sampler.join();
@@ -1338,6 +1349,8 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
             volt_max_mv,
             volt_sample_count,
             duration_ms,
+            render_frames,
+            render_fps,
             qualification_coverage,
             prehang_stall_detected,
             ..Measured::degenerate(res, volt_mv)
@@ -1386,6 +1399,8 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
         avg_temp_c,
         max_temp_c,
         thermal_throttled,
+        render_frames,
+        render_fps,
         qualification_coverage,
         prehang_stall_detected,
     }
@@ -3654,6 +3669,12 @@ pub(crate) struct SingleDwell {
     pub power_capped_frac: f32,
     pub max_temp_c: Option<f32>,
     pub thermal_throttled: bool,
+    pub volt_min_mv: Option<u32>,
+    pub volt_avg_mv: Option<u32>,
+    pub volt_max_mv: Option<u32>,
+    pub volt_sample_count: u32,
+    pub render_frames: Option<u64>,
+    pub render_fps: Option<f64>,
     pub duration_ms: u64,
     pub sample_count: u32,
     pub qualification_coverage: Option<F2QualificationCoverage>,
@@ -3702,6 +3723,12 @@ fn single_dwell_from_measured(m: Measured) -> SingleDwell {
         power_capped_frac: m.capped_frac,
         max_temp_c: m.max_temp_c,
         thermal_throttled: m.thermal_throttled,
+        volt_min_mv: m.volt_min_mv,
+        volt_avg_mv: m.volt_avg_mv,
+        volt_max_mv: m.volt_max_mv,
+        volt_sample_count: m.volt_sample_count,
+        render_frames: m.render_frames,
+        render_fps: m.render_fps,
         duration_ms: m.duration_ms,
         sample_count: m.sample_count,
         qualification_coverage: m.qualification_coverage,
@@ -5512,7 +5539,7 @@ mod tests {
         };
 
         let measured = F2Observation {
-            run_id: "power-v3".into(),
+            run_id: "power-v4".into(),
             timestamp: "2026-07-01T00:00:00Z".into(),
             gpu_key: Some("GPU-1".into()),
             evidence_kind: F2EvidenceKind::Discovery,
@@ -5536,6 +5563,14 @@ mod tests {
             watts: Some(188),
             max_watts: Some(200),
             power_p99_w: Some(198.0),
+            power_p99_confirmed: true,
+            power_p99_attempts: 1,
+            measured_voltage_min_mv: Some(942),
+            measured_voltage_avg_mv: Some(943),
+            measured_voltage_max_mv: Some(944),
+            measured_voltage_sample_count: 16,
+            render_frames: Some(600),
+            render_fps: Some(60.0),
             power_capped_frac: Some(1.0),
             max_temp_c: Some(72.0),
             thermal_throttled: false,
@@ -5580,7 +5615,7 @@ mod tests {
         let mut missing_p99 = measured;
         missing_p99.power_p99_w = None;
         let err = calibrate_f2_profile_power(&mut points, &[missing_p99], "GPU-1").unwrap_err();
-        assert!(err.contains("discovery-v3 sustained-p99"));
+        assert!(err.contains("discovery-v4 confirmed sustained-p99"));
     }
 
     #[cfg(windows)]
@@ -6262,6 +6297,8 @@ mod tests {
             avg_temp_c: Some(63.0),
             max_temp_c: Some(66.0),
             thermal_throttled: false,
+            render_frames: Some(900),
+            render_fps: Some(60.0),
             qualification_coverage: None,
             prehang_stall_detected: false,
         }

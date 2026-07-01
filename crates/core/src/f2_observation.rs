@@ -24,9 +24,10 @@ use crate::safe_loop::default_data_dir;
 pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 /// Current homogeneous PowerRender discovery contract.
 ///
-/// v3 preserves mean, sustained-p99 and sampled-peak power separately and carries thermal validity
-/// so frontier decisions and exact apply-margin-bin calibration use the same sustained metric.
-pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 3;
+/// v4 preserves mean, sustained-p99 and sampled-peak power separately, validates suspicious p99
+/// steps with reset-clean repeated dwells, and carries render/voltage telemetry so frontier
+/// decisions and exact apply-margin-bin calibration use confirmed sustained-power evidence.
+pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 4;
 /// Current FailureSeekingGameLoop qualification contract.
 pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 4;
 
@@ -169,6 +170,9 @@ pub enum F2ObsDwell {
     Unstable,
     DeviceLost,
     ClockDrop,
+    /// Discovery completed reset-clean, but repeated PowerRender measurements did not establish a
+    /// consistent sustained-p99 value for this bin.
+    PowerTelemetryInconclusive,
     /// Dwell completed reset-clean, but the qualification did not collect enough current-contract
     /// coverage to prove the point.
     QualificationInconclusive,
@@ -198,6 +202,9 @@ pub enum F2ObsOutcome {
     PowerBoundClockDrop,
     /// The clock sagged below tolerance under load (held the dwell but not the clock).
     ClockDrop,
+    /// Discovery power telemetry could not be confirmed after the bounded repeat budget. This is
+    /// neither stability evidence nor a voltage failure.
+    PowerTelemetryInconclusive,
     /// The qualification workload ran reset-clean, but coverage was too weak to qualify or reject the
     /// point. This is not a voltage failure and must not become a bad-boundary veto.
     QualificationInconclusive,
@@ -293,6 +300,26 @@ pub struct F2Observation {
     /// Sustained high-power percentile captured from the retained post-ramp dwell samples.
     #[serde(default)]
     pub power_p99_w: Option<f32>,
+    /// The discovery p99 passed the v4 adjacent-bin/repeat consistency gate.
+    #[serde(default)]
+    pub power_p99_confirmed: bool,
+    /// Number of reset-clean PowerRender attempts used by the v4 consistency decision.
+    #[serde(default)]
+    pub power_p99_attempts: u32,
+    /// Ramp-filtered voltage telemetry from the dwell; diagnostic only and never fabricated.
+    #[serde(default)]
+    pub measured_voltage_min_mv: Option<u32>,
+    #[serde(default)]
+    pub measured_voltage_avg_mv: Option<u32>,
+    #[serde(default)]
+    pub measured_voltage_max_mv: Option<u32>,
+    #[serde(default)]
+    pub measured_voltage_sample_count: u32,
+    /// Render coverage captured by the workload itself, used to diagnose underloaded dwells.
+    #[serde(default)]
+    pub render_frames: Option<u64>,
+    #[serde(default)]
+    pub render_fps: Option<f64>,
     /// Fraction of steady-state samples where the NVIDIA power-cap flag was active.
     #[serde(default)]
     pub power_capped_frac: Option<f32>,
@@ -453,12 +480,13 @@ pub fn last_good_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<&F
         .min_by_key(|o| o.anchor_mv)
 }
 
-/// True when an observation can define the current PowerRender discovery frontier. Discovery v3
-/// changes the power-bound/calibration evidence contract, so legacy, v1 and v2 positives cannot
-/// seed the current frontier. Negative observations remain version-independent and conservative.
+/// True when an observation can define the current PowerRender discovery frontier. Discovery v4
+/// requires confirmed p99 evidence, so older or telemetry-inconclusive positives cannot seed the
+/// current frontier. Negative observations remain version-independent and conservative.
 pub fn is_current_discovery_evidence(o: &F2Observation) -> bool {
     o.evidence_kind == F2EvidenceKind::Discovery
         && o.discovery_contract_version == Some(F2_DISCOVERY_CONTRACT_VERSION)
+        && o.power_p99_confirmed
 }
 
 /// True only for a fully-covered pass from the current qualification contract. Legacy positives and
@@ -676,11 +704,11 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
     (point, entry.confidence)
 }
 
-/// Highest sustained-p99 discovery observation for one exact target/apply anchor. Only current v3,
-/// reset-clean, thermally valid PowerRender evidence is eligible. A power-bound clock drop remains
-/// valid power/clock telemetry for the apply bin, but it is never promoted into stability evidence.
-/// Repeated measurements deliberately choose the largest measured p99 so a profile is calibrated
-/// conservatively without promoting one-sample spikes into the sustained-power contract.
+/// Highest sustained-p99 discovery observation for one exact target/apply anchor. Only current v4,
+/// p99-confirmed, reset-clean, thermally valid PowerRender evidence is eligible. A power-bound clock
+/// drop remains valid power/clock telemetry for the apply bin, but it is never promoted into
+/// stability evidence. Repeated measurements deliberately choose the largest measured p99 so a
+/// profile is calibrated conservatively without inventing a monotonic correction.
 pub fn current_discovery_observation_at_anchor<'a>(
     obs: &'a [F2Observation],
     target_mhz: u32,
@@ -830,6 +858,14 @@ mod tests {
             watts: Some(180),
             max_watts: Some(188),
             power_p99_w: Some(186.0),
+            power_p99_confirmed: true,
+            power_p99_attempts: 1,
+            measured_voltage_min_mv: Some(anchor),
+            measured_voltage_avg_mv: Some(anchor),
+            measured_voltage_max_mv: Some(anchor),
+            measured_voltage_sample_count: 1,
+            render_frames: Some(900),
+            render_fps: Some(60.0),
             power_capped_frac: Some(0.0),
             max_temp_c: Some(68.0),
             thermal_throttled: false,
@@ -1189,13 +1225,17 @@ mod tests {
     }
 
     #[test]
-    fn discovery_v3_rejects_v2_positive_evidence() {
+    fn discovery_v4_rejects_v3_and_unconfirmed_positive_evidence() {
         let mut old = obs(1800, 962, F2ObsOutcome::Validated);
-        old.discovery_contract_version = Some(2);
-        old.power_p99_w = None;
+        old.discovery_contract_version = Some(3);
         assert!(!is_current_discovery_evidence(&old));
         assert!(last_discovery_good_for_target(&[old.clone()], 1800).is_none());
         assert!(learned_frontier(&[old]).is_empty());
+
+        let mut unconfirmed = obs(1800, 962, F2ObsOutcome::Validated);
+        unconfirmed.power_p99_confirmed = false;
+        assert!(!is_current_discovery_evidence(&unconfirmed));
+        assert!(learned_frontier(&[unconfirmed]).is_empty());
 
         let mut legacy = obs(1800, 962, F2ObsOutcome::Validated);
         legacy.evidence_kind = F2EvidenceKind::Legacy;
