@@ -12,7 +12,10 @@ Durable technical decisions and their rationale. Newest first.
   p99 in the same p5 regime repeats the exact bin up to three total attempts; two must agree and the
   highest measured p99 is retained. No consensus is ineligible, with no interpolation.
 - **Profile contract**: apply the unchanged +12 mV margin first, then calibrate power and sustained p5
-  from the exact physical apply bin. F2 selection uses p99 for R and MHz/W.
+  from the exact physical apply bin. If warm-start pruning skipped that exact target/bin pair, run a
+  supervised discovery-only PowerRender backfill there and apply the same v4 p99 consensus. Do not
+  rerun FSGL3: the higher-voltage Apply bin is already safer than the qualified boundary. F2
+  selection uses p99 for R and MHz/W.
 - **Boundary contract**: `ClockDrop` at 99%+ of the numeric cap by p99 becomes
   `PowerBoundClockDrop` and continues descent even after a prior sustained point; off-cap clock drop
   remains a boundary. A `Validated` point still at cap also continues descent and cannot launch FSGL3.

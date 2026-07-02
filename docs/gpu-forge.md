@@ -60,6 +60,9 @@ The live F2 Forge deliberately asks two different questions with two different r
   post-ramp sample; fewer than 100 samples fall back to raw max. An anomalous adjacent-bin p99 in the
   same p5 regime repeats the exact bin up to three total attempts; two must agree and calibration
   uses the highest measured p99. A bin without consensus is ineligible.
+  If cross-clock warm-start pruning skipped the later +12 mV Apply bin for that exact target, Forge
+  performs a discovery-only PowerRender backfill at that bin after the frontier completes. It does
+  not repeat FSGL3 because the Apply bin is above the already-qualified boundary.
 - **Standard / Long qualification:** FSGL3 A+B is the default interleaved per-bin qualifier. Before
   descent, stock captures deterministic power, boost and texture/ROP checksums with one fresh
   `GpuCtx` per render configuration. FSGL3 biases TextureRop/MixedGame, crosses the same eight

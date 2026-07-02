@@ -18,7 +18,9 @@ Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
   two readings must agree and the highest measured p99 is retained. No consensus is ineligible.
 - **Applied-bin truth**: after the unchanged +12 mV margin snaps to a physical bin, synthesis resolves
   that exact bin's current PowerRender observation. Selection and cards use its p99 plus apply-bin p5;
-  mean/raw maximum remain diagnostic. Missing/current-invalid p99 fails closed with no profiles.
+  mean/raw maximum remain diagnostic. If warm-start skipped the exact target/apply pair, Forge now
+  backfills it with discovery-only PowerRender under the same v4 p99 consensus; no FSGL3 rerun.
+  Missing/current-invalid p99 still fails closed with no profiles.
 - **Boundary**: any discovery `ClockDrop` still at 99%+ of the cap by p99 is
   `PowerBoundClockDrop` and continues voltage descent, including after a prior sustained point.
   `Validated` at cap also continues; Standard/Long only launch FSGL3 from a confirmed off-cap bin.

@@ -46,7 +46,9 @@ headless client used for sweeps/benchmarks. Requests/responses are the
   Discovery contract v4 preserves mean/p99/raw-peak watts and thermal validity separately, rechecks
   anomalous adjacent-bin p99 at the exact bin, and excludes unconfirmed/v3 positives. Standard/Long
   defer FSGL3 while confirmed p99 remains at cap. After the +12 mV apply policy snaps to a physical
-  bin, profile synthesis uses that exact bin's confirmed conservative p99 and p5;
+  bin, any missing exact-target/apply-bin power telemetry is backfilled with discovery-only
+  PowerRender (no repeated FSGL3), and profile synthesis uses that exact bin's confirmed conservative
+  p99 and p5;
   qualification uses TextureRop/MixedGame-biased transients, deliberate droop bursts and on-GPU
   verification of every rendered frame. A rejected FSGL3 candidate stops descent at the last
   FSGL3-qualified physical bin. F2 Apply fails closed until current-contract v4 FSGL3 A+B succeeds;

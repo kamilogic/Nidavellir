@@ -1060,6 +1060,11 @@ power.
   bin. Standard/Long launch FSGL3 only from a confirmed off-cap discovery bin. FSGL3 itself, its
   golden, retry/continuity/recovery behavior and PowerRender discovery load are unchanged.
 
+\- After the frontier is qualified and the Apply margin snaps upward, the backend fills any missing
+  exact target/apply-bin p99 with a supervised discovery-only PowerRender dwell. The same v4
+  anomaly/consensus rules apply. FSGL3 is not repeated, and failure to confirm this backfill leaves
+  profiles unavailable rather than inventing power.
+
 \- Two optional/additive `PowerSweepPoint` fields are available: `max_temp_c: Option<f32>` and
   `thermal_throttled: bool`. Thermally throttled discovery is not eligible for profile calibration.
 

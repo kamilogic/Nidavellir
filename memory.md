@@ -21,6 +21,9 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 - Profile synthesis first applies the unchanged +12 mV policy, then resolves a current reset-clean
   PowerRender observation for that exact apply bin. It scores Godforge/Brokkr's/Deep Calm with p99
   power and the p5 clock observed at the apply bin, not boundary-bin mean or a one-sample maximum.
+  When cross-clock warm-start pruning skipped that exact target/apply pair, Forge fills only the
+  missing power telemetry with supervised discovery-only PowerRender and the same v4 p99 consensus;
+  FSGL3 is not repeated.
 - A discovery `ClockDrop` whose p99 remains at 99%+ of the numeric cap is `PowerBoundClockDrop` and
   continues voltage descent even after the clock previously sustained. It remains calibration
   telemetry, never stability evidence; off-cap `ClockDrop` retains the normal boundary behavior.

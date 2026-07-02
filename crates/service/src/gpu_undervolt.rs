@@ -3559,6 +3559,39 @@ pub(crate) struct F2ClockDiscoveryProgress {
     pub line: String,
 }
 
+/// Result of filling one missing exact-Apply-bin PowerRender measurement after the qualified
+/// frontier is complete. This never runs FSGL3 and never promotes stability; it only contributes
+/// current-contract power telemetry for a bin that is already safer (higher voltage) than the
+/// qualified boundary.
+#[cfg(windows)]
+pub(crate) struct F2PowerCalibrationSummary {
+    pub confirmed: bool,
+    pub executed_steps: usize,
+    pub aborted: bool,
+    pub retain_boot_flag: bool,
+    pub stop_reason: String,
+    pub logs: Vec<String>,
+}
+
+#[cfg(windows)]
+fn plan_f2_power_calibration_candidate(
+    sane: &[(usize, u32, u32)],
+    target_mhz: u32,
+    apply_mv: u32,
+    reference_offset_mhz: i32,
+    limits: &PositiveOffsetLimits,
+) -> Result<AnchoredPositiveOffsetPlan, String> {
+    let anchor_index = select_exact_apply_anchor_bin(sane, target_mhz, apply_mv)
+        .ok_or_else(|| format!("{target_mhz} MHz @ {apply_mv} mV is not an exact valid F2 anchor"))?;
+    plan_bounded_anchored_positive_offset(
+        sane,
+        anchor_index,
+        target_mhz,
+        reference_offset_mhz,
+        limits,
+    )
+}
+
 fn f2_conservative_next_clock_start(
     power_bound_clock_drops: &[u32],
     validated_voltages: &[u32],
@@ -4079,6 +4112,280 @@ fn gate_anchored_candidate_fsgl3(
         }
     }
     F2QualificationOutcome::Qualified
+}
+
+/// Measure a missing exact Apply bin with the same supervised PowerRender motor and discovery-v4
+/// p99 consistency contract used by frontier descent. The qualified frontier is not changed and
+/// FSGL3 is deliberately not run again: this higher-voltage bin is measured only for card/profile
+/// power calibration. Every raw attempt is persisted; no consensus remains neutral and ineligible.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_confirmed_f2_power_calibration(
+    store: &SafeLoopStore,
+    obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
+    run_id: &str,
+    gpu_key: &str,
+    sane: &[(usize, u32, u32)],
+    limits: &PositiveOffsetLimits,
+    target_mhz: u32,
+    apply_mv: u32,
+    reference_offset_mhz: i32,
+    power_limit_w: Option<f32>,
+    discovery_dwell_ms: u64,
+    stop: &std::sync::atomic::AtomicBool,
+    on_progress: &mut dyn FnMut(F2ClockDiscoveryProgress),
+) -> F2PowerCalibrationSummary {
+    use std::sync::atomic::Ordering;
+
+    use nidavellir_core::f2_observation::{
+        is_current_discovery_evidence, now_rfc3339, F2ObsMode, F2ObsOutcome,
+    };
+
+    let mut logs = Vec::new();
+    if stop.load(Ordering::SeqCst) {
+        return F2PowerCalibrationSummary {
+            confirmed: false,
+            executed_steps: 0,
+            aborted: false,
+            retain_boot_flag: false,
+            stop_reason: "Cancelled".into(),
+            logs,
+        };
+    }
+    let candidate = match plan_f2_power_calibration_candidate(
+        sane,
+        target_mhz,
+        apply_mv,
+        reference_offset_mhz,
+        limits,
+    ) {
+        Ok(candidate) => candidate,
+        Err(e) => {
+            return F2PowerCalibrationSummary {
+                confirmed: false,
+                executed_steps: 0,
+                aborted: true,
+                retain_boot_flag: false,
+                stop_reason: format!("CalibrationPlanFailed: {e}"),
+                logs,
+            }
+        }
+    };
+    if let Some(reason) = confirmed_f2_refusal(
+        &store.load_record(),
+        store.is_boot_flag_armed(),
+        Some(1),
+        Some(&candidate.anchor),
+        limits,
+        target_mhz,
+    ) {
+        return F2PowerCalibrationSummary {
+            confirmed: false,
+            executed_steps: 0,
+            aborted: true,
+            retain_boot_flag: false,
+            stop_reason: format!("CalibrationSafetyGateRefused: {reason}"),
+            logs,
+        };
+    }
+
+    let previous_confirmed_power = obs_store
+        .query_by_target_for_gpu(target_mhz, gpu_key)
+        .into_iter()
+        .filter(|observation| {
+            is_current_discovery_evidence(observation)
+                && observation.reset_to_stock_ok
+                && observation.boot_flag_cleared
+                && !observation.thermal_throttled
+                && matches!(
+                    observation.outcome,
+                    F2ObsOutcome::Validated | F2ObsOutcome::PowerBoundClockDrop
+                )
+        })
+        .filter_map(|observation| {
+            Some((
+                observation.anchor_mv.abs_diff(apply_mv),
+                observation.power_p99_w?,
+                observation.sustained_clock_mhz?,
+            ))
+        })
+        .min_by_key(|(distance, _, _)| *distance)
+        .map(|(_, power_p99, p5)| (power_p99, p5));
+
+    let mut ops = RealF2Ops {
+        store,
+        curve: sane.to_vec(),
+        candidate: candidate.anchor,
+        anchored: Some(candidate.clone()),
+        mode: UndervoltMode::Anchored,
+        limits: *limits,
+        target_mhz,
+        prev_offset_mhz: reference_offset_mhz,
+        dwell_ms: discovery_dwell_ms,
+        stress_purpose: F2StressPurpose::PowerDiscovery,
+    };
+    on_progress(F2ClockDiscoveryProgress {
+        target_mhz,
+        planned_steps: POWER_P99_MAX_ATTEMPTS,
+        unpruned_steps: POWER_P99_MAX_ATTEMPTS,
+        anchor_mv: Some(apply_mv),
+        outcome: None,
+        line: format!(
+            "Calibração p99: {target_mhz} MHz @ {apply_mv} mV — PowerRender no bin exato de Apply…"
+        ),
+    });
+    let initial_report = run_confirmed_f2_step(&mut ops);
+    let rechecked =
+        f2_power_p99_requires_recheck(previous_confirmed_power, &initial_report);
+    let mut attempts = vec![initial_report];
+    if rechecked {
+        logs.push(format!(
+            "{target_mhz} MHz @ {apply_mv} mV calibration: salto p99 anômalo; repetindo o mesmo bin"
+        ));
+        while attempts.len() < POWER_P99_MAX_ATTEMPTS
+            && !stop.load(Ordering::SeqCst)
+        {
+            let attempt_number = attempts.len() + 1;
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: POWER_P99_MAX_ATTEMPTS,
+                unpruned_steps: POWER_P99_MAX_ATTEMPTS,
+                anchor_mv: Some(apply_mv),
+                outcome: None,
+                line: format!(
+                    "Calibração p99 {attempt_number}/{POWER_P99_MAX_ATTEMPTS}: {target_mhz} MHz @ {apply_mv} mV — repetindo PowerRender…"
+                ),
+            });
+            let repeated = run_confirmed_f2_step(&mut ops);
+            let terminal_failure = matches!(
+                repeated.outcome,
+                F2Outcome::DeviceLost
+                    | F2Outcome::ResetFailed
+                    | F2Outcome::ArmFailed(_)
+                    | F2Outcome::ApplyFailed(_)
+                    | F2Outcome::VerifyFailed
+                    | F2Outcome::SilentError
+                    | F2Outcome::Unstable
+            );
+            attempts.push(repeated);
+            if terminal_failure
+                || f2_power_attempts_have_consistent_pair(&attempts)
+            {
+                break;
+            }
+        }
+    }
+
+    let conservative_p99 = f2_confirm_power_attempts(&mut attempts, rechecked);
+    let mut aggregate = f2_aggregate_power_attempts(&attempts, conservative_p99);
+    let near_cap = f2_near_power_limit(
+        aggregate.power_p99_w,
+        power_limit_w,
+        aggregate.power_capped_frac,
+    );
+    aggregate.outcome = f2_power_bound_clock_drop(&aggregate.outcome, near_cap);
+    for attempt in &mut attempts {
+        if attempt.power_p99_confirmed {
+            attempt.outcome = f2_power_bound_clock_drop(&attempt.outcome, near_cap);
+        }
+    }
+
+    let mut ctx = crate::gpu_f2_sweep::ObsContext {
+        run_id: run_id.to_string(),
+        timestamp: now_rfc3339(),
+        gpu_key: Some(gpu_key.to_string()),
+        evidence_kind: nidavellir_core::f2_observation::F2EvidenceKind::Discovery,
+        discovery_contract_version: Some(
+            nidavellir_core::f2_observation::F2_DISCOVERY_CONTRACT_VERSION,
+        ),
+        qualification_contract_version: None,
+        qualification_coverage: None,
+        mode: F2ObsMode::LadderSweep,
+        requested_start_mv: Some(apply_mv),
+        positive_offset_cap_mhz: limits.abs_max_offset_mhz,
+    };
+    let mut executed_steps = 0usize;
+    for (attempt_index, attempt) in attempts.iter().enumerate() {
+        ctx.timestamp = now_rfc3339();
+        let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+            &ctx,
+            target_mhz,
+            &candidate,
+            attempt,
+        );
+        if let Err(e) = obs_store.append(&observation) {
+            return F2PowerCalibrationSummary {
+                confirmed: false,
+                executed_steps,
+                aborted: true,
+                retain_boot_flag: f2_outcome_retains_boot_flag(&aggregate.outcome),
+                stop_reason: format!("CalibrationObservationPersistFailed: {e}"),
+                logs,
+            };
+        }
+        executed_steps = executed_steps.saturating_add(1);
+        logs.push(format!(
+            "{target_mhz} MHz @ {apply_mv} mV calibration attempt {}/{}: {:?}, p5={:?} MHz, power_p99={:?} W, confirmed={}",
+            attempt_index + 1,
+            attempts.len(),
+            attempt.outcome,
+            attempt.p5_clock_mhz,
+            attempt.power_p99_w,
+            attempt.power_p99_confirmed
+        ));
+        on_progress(F2ClockDiscoveryProgress {
+            target_mhz,
+            planned_steps: POWER_P99_MAX_ATTEMPTS,
+            unpruned_steps: POWER_P99_MAX_ATTEMPTS,
+            anchor_mv: Some(apply_mv),
+            outcome: Some(format!("{:?}", attempt.outcome)),
+            line: format!(
+                "{target_mhz} MHz @ {apply_mv} mV · calibração p99 {}/{} → {:?} · p99 {:.0} W · {}",
+                attempt_index + 1,
+                attempts.len(),
+                attempt.outcome,
+                attempt.power_p99_w.unwrap_or(0.0),
+                if attempt.power_p99_confirmed {
+                    "medição confirmada"
+                } else {
+                    "medição inconclusiva"
+                }
+            ),
+        });
+    }
+
+    let confirmed = conservative_p99.is_some()
+        && matches!(
+            aggregate.outcome,
+            F2Outcome::Validated | F2Outcome::PowerBoundClockDrop
+        );
+    let aborted = matches!(
+        aggregate.outcome,
+        F2Outcome::DeviceLost
+            | F2Outcome::ResetFailed
+            | F2Outcome::ArmFailed(_)
+            | F2Outcome::ApplyFailed(_)
+            | F2Outcome::VerifyFailed
+    );
+    let retain_boot_flag = f2_outcome_retains_boot_flag(&aggregate.outcome);
+    let stop_reason = if confirmed {
+        format!(
+            "Confirmed p99 {:.3} W",
+            conservative_p99.unwrap_or_default()
+        )
+    } else if stop.load(Ordering::SeqCst) {
+        "Cancelled".into()
+    } else {
+        format!("{:?}", aggregate.outcome)
+    };
+    F2PowerCalibrationSummary {
+        confirmed,
+        executed_steps,
+        aborted,
+        retain_boot_flag,
+        stop_reason,
+        logs,
+    }
 }
 
 /// Run the live F2 discovery for one real target clock. Unlike the legacy CLI motor, this has no
@@ -4942,6 +5249,24 @@ mod tests {
     fn sweep_base() -> Vec<(usize, u32, u32)> {
         vec![(0, 850, 1740), (1, 900, 1755), (2, 950, 1770), (3, 1000, 1785), (4, 1062, 1810),
         ]
+    }
+
+    #[test]
+    fn power_calibration_plans_exact_apply_bin_from_qualified_boundary_offset() {
+        let limits = PositiveOffsetLimits::target_sweep_learning_horizon(850, 1800);
+        let candidate =
+            plan_f2_power_calibration_candidate(&sweep_base(), 1800, 1000, 45, &limits).unwrap();
+        assert_eq!(candidate.anchor.voltage_mv, 1000);
+        assert_eq!(candidate.anchor.offset_mhz, 15);
+        assert_eq!(candidate.anchor.prev_offset_mhz, 45);
+        assert!(plan_f2_power_calibration_candidate(
+            &sweep_base(),
+            1800,
+            987,
+            45,
+            &limits
+        )
+        .is_err());
     }
 
     #[test]

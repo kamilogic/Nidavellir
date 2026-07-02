@@ -1139,6 +1139,41 @@ fn apply_f2_margin_policy(
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct F2ApplyPowerBackfill {
+    target_mhz: u32,
+    apply_mv: u32,
+    reference_offset_mhz: i32,
+}
+
+#[cfg(windows)]
+fn missing_f2_apply_power_backfills(
+    points: &[(PowerSweepPoint, f64)],
+    observations: &[F2Observation],
+    gpu_key: &str,
+) -> Vec<F2ApplyPowerBackfill> {
+    points
+        .iter()
+        .filter_map(|(point, _)| {
+            let target_mhz = point.target_clock_mhz.unwrap_or(point.clock_mhz);
+            let apply_mv = point.vf_table_voltage_mv?;
+            nidavellir_core::f2_observation::current_discovery_observation_at_anchor(
+                observations,
+                target_mhz,
+                apply_mv,
+                gpu_key,
+            )
+            .is_none()
+            .then_some(F2ApplyPowerBackfill {
+                target_mhz,
+                apply_mv,
+                reference_offset_mhz: point.offset_mhz,
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
 fn calibrate_f2_profile_power(
     points: &mut [(PowerSweepPoint, f64)],
     observations: &[F2Observation],
@@ -5264,8 +5299,85 @@ fn measure_multiclock_undervolt_forge(
             .collect::<Vec<_>>();
         let mut pts = nidavellir_core::f2_observation::frontier_to_points(&frontier);
         apply_f2_margin_policy(&mut pts, &f2_inputs.sane_base_curve);
+        let initial_observations = obs_store.load_all();
+        let missing_power =
+            missing_f2_apply_power_backfills(&pts, &initial_observations, &gpu_key);
+        let mut backfill_ok = true;
+        if !missing_power.is_empty() {
+            prog.phase = "calibrate".into();
+            prog.total_steps_estimate = prog
+                .total_steps_estimate
+                .saturating_add(missing_power.len().try_into().unwrap_or(u32::MAX));
+            prog.log.push(format!(
+                "Calibração p99: {} bin(s) exato(s) de Apply sem medição v4; preenchendo somente essas lacunas com PowerRender.",
+                missing_power.len()
+            ));
+            set(progress, prog.clone());
+        }
+        for missing in missing_power {
+            if stop.load(Ordering::SeqCst) {
+                backfill_ok = false;
+                prog.log.push(
+                    "Calibração p99 cancelada; nenhum perfil novo será sintetizado.".into(),
+                );
+                break;
+            }
+            let mut on_calibration_progress =
+                |event: crate::gpu_undervolt::F2ClockDiscoveryProgress| {
+                    if event.outcome.is_some() {
+                        prog.completed_steps = prog.completed_steps.saturating_add(1);
+                        prog.learned_points = prog.learned_points.saturating_add(1);
+                        prog.total_steps_estimate =
+                            prog.total_steps_estimate.max(prog.completed_steps);
+                    }
+                    prog.current_clock_mhz = Some(event.target_mhz);
+                    prog.current_voltage_mv = event.anchor_mv;
+                    prog.last_outcome = event.outcome.clone();
+                    prog.elapsed_ms =
+                        started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                    prog.log.push(event.line);
+                    set(progress, prog.clone());
+                    if event.outcome.is_some() {
+                        save_forge_state(&gpu_key, &prog);
+                    }
+                };
+            let summary = crate::gpu_undervolt::run_confirmed_f2_power_calibration(
+                store,
+                &obs_store,
+                &run_id,
+                &gpu_key,
+                &f2_inputs.sane_base_curve,
+                &f2_inputs.limits,
+                missing.target_mhz,
+                missing.apply_mv,
+                missing.reference_offset_mhz,
+                power_limit,
+                mode_policy.discovery_dwell_ms,
+                stop,
+                &mut on_calibration_progress,
+            );
+            prog.log.extend(summary.logs);
+            prog.log.push(format!(
+                "Calibração p99 {} MHz @ {} mV → {} ({} tentativa(s)).",
+                missing.target_mhz,
+                missing.apply_mv,
+                summary.stop_reason,
+                summary.executed_steps
+            ));
+            if !summary.confirmed {
+                backfill_ok = false;
+                forge_aborted |= summary.aborted;
+                retain_boot_flag |= summary.retain_boot_flag;
+                prog.log.push(
+                    "FORGE: backfill p99 não confirmado; nenhum perfil novo será criado.".into(),
+                );
+                break;
+            }
+        }
+        prog.phase = "synthesize".into();
+        set(progress, prog.clone());
         let observations = obs_store.load_all();
-        let power_calibrated =
+        let power_calibrated = if backfill_ok {
             match calibrate_f2_profile_power(&mut pts, &observations, &gpu_key) {
                 Ok(()) => true,
                 Err(e) => {
@@ -5279,7 +5391,15 @@ fn measure_multiclock_undervolt_forge(
                     ));
                     false
                 }
-            };
+            }
+        } else {
+            prog.godforge = None;
+            prog.brokkrs = None;
+            prog.deep_calm = None;
+            prog.recommended = None;
+            prog.profiles_qualified = false;
+            false
+        };
         for (point, _) in &pts {
             if let (Some(boundary), Some(apply), Some(margin)) = (
                 point.boundary_voltage_mv,
@@ -5595,12 +5715,44 @@ mod tests {
             power_w: 170.0,
             max_power_w: 180.0,
             target_clock_mhz: Some(1920),
+            offset_mhz: 15,
             boundary_voltage_mv: Some(931),
             vf_table_voltage_mv: Some(943),
             apply_margin_mv: Some(12),
             ..Default::default()
         };
         let mut points = vec![(point, 0.95)];
+        assert!(missing_f2_apply_power_backfills(
+            &points,
+            std::slice::from_ref(&measured),
+            "GPU-1"
+        )
+        .is_empty());
+        let mut missing_point = point;
+        missing_point.vf_table_voltage_mv = Some(950);
+        assert_eq!(
+            missing_f2_apply_power_backfills(
+                &[(missing_point, 0.95)],
+                std::slice::from_ref(&measured),
+                "GPU-1"
+            ),
+            vec![F2ApplyPowerBackfill {
+                target_mhz: 1920,
+                apply_mv: 950,
+                reference_offset_mhz: 15,
+            }]
+        );
+        let mut thermally_invalid = measured.clone();
+        thermally_invalid.thermal_throttled = true;
+        assert_eq!(
+            missing_f2_apply_power_backfills(
+                &points,
+                std::slice::from_ref(&thermally_invalid),
+                "GPU-1"
+            )
+            .len(),
+            1
+        );
 
         calibrate_f2_profile_power(&mut points, std::slice::from_ref(&measured), "GPU-1").unwrap();
         let calibrated = points[0].0;

@@ -24,8 +24,9 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   descent with the last FSGL3-qualified physical bin;
   observations checkpoint/resume by GPU UUID; discovery v4 carries mean/p99/raw-peak watts plus
   thermal/voltage/render validity, confirms anomalous p99 steps by exact-bin repeats, uses p99 for
-  power-bound descent and synthesizes profiles from the exact
-  post-margin apply bin; partial UI progress is durable; adjacent clocks reuse
+  power-bound descent and synthesizes profiles from the exact post-margin apply bin, backfilling
+  only missing exact-bin PowerRender telemetry after frontier completion; partial UI progress is
+  durable; adjacent clocks reuse
   one bin above the prior minimum and fall back to the prior power-bound boundary; deployable synthesis
   still requires the complete range and successful qualification.
   Qualification now stops on a relative heavy-phase p5 margin collapse, retries weak coverage twice
