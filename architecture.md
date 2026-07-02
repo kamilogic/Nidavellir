@@ -42,6 +42,11 @@ headless client used for sweeps/benchmarks. Requests/responses are the
   clock is Cmax. The complete profile frontier spans Cmax→90% Cmax so Deep Calm is selected from
   measured data. Fast produces a provisional map; Standard/Long capture three stock render goldens
   with fresh contexts, then use FSGL3 A+B 2×60 s as the default interleaved per-bin qualifier.
+  Discovery predicts the next boundary from compatible same-GPU v4 history and a short isotonic
+  cross-clock trend, but starts one physical bin above it and remeasures all evidence. In a confirmed
+  power-bound region it may skip 4/2/1 bins by p5 deficit, bounded by 25 mV and the existing writer
+  offset-step cap. A reset-clean failure after a jump is recovered only upward by midpoint; after the
+  first approved off-cap point the exact boundary is finished one physical bin at a time.
   Discovery keeps the homogeneous power render so p5, power-limit and `ClockDrop` stay comparable.
   Discovery contract v4 preserves mean/p99/raw-peak watts and thermal validity separately, rechecks
   anomalous adjacent-bin p99 at the exact bin, and excludes unconfirmed/v3 positives. Standard/Long

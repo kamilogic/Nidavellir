@@ -8,6 +8,22 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-01) — adaptive F2 frontier search without weakening qualification
+- A prior compatible discovery-v4 boundary for the same GPU/clock is the strongest start predictor.
+  Otherwise the last 3–4 qualified clocks are projected with a non-increasing isotonic trend. The
+  Forge starts one physical voltage bin above the prediction; predictions never count as evidence.
+- Predictor inputs that disagree by more than 25 mV fall back to the existing sequential warm start.
+  A compatible historical offset may bound the writer's cross-run +15 MHz progression, but the
+  predicted bin still requires fresh PowerRender and FSGL3 evidence.
+- While confirmed p99 remains at 99%+ of cap, the p5 deficit selects a stride of 4 bins (>=90 MHz),
+  2 bins (45–89 MHz) or 1 bin. Every actual jump is additionally limited to 25 mV and the writer's
+  existing positive-offset step cap.
+- A reset-clean off-cap failure after a jump opens a safe/failed bracket and tests only upward
+  midpoints. Once an off-cap point passes FSGL3 A+B (or PowerRender in provisional Fast), discovery
+  returns to adjacent-bin descent and stops at the already-measured failure without retesting it.
+- Apply-bin p99 backfill, p99 anomaly consensus, thermal invalidation, FSGL3/goldens, Safe Loop,
+  qualification margins and the +12 mV Apply policy are unchanged. Hardware validation is pending.
+
 ## Latest (2026-07-01) — F2 frontier and profile calibration use confirmed sustained p99 power
 - Discovery keeps the existing textured `PowerRender`; the compute-only `POWER_SHADER` remains
   outside the live F2 path. Mean, sustained p99 and the highest post-ramp sample remain distinct

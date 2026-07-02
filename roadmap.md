@@ -15,7 +15,7 @@
 
 ## Now — Product model (see product.md)
 Reframed around 3 profiles forged from a clock×power frontier. Phases:
-- **Current F2 frontier (2026-06-30)** — code-complete: the live Forge starts at the highest real
+- **Current F2 frontier (2026-07-01)** — code-complete: the live Forge starts at the highest real
   clock, discovers Cmax through power-bound voltage descent, and characterizes every real bin through
   90% Cmax. Autonomous descent has no arbitrary step budget; Fast is provisional discovery;
   Standard/Long use FSGL3 A/B 2×60 s as the default interleaved per-bin qualifier.
@@ -26,9 +26,11 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   thermal/voltage/render validity, confirms anomalous p99 steps by exact-bin repeats, uses p99 for
   power-bound descent and synthesizes profiles from the exact post-margin apply bin, backfilling
   only missing exact-bin PowerRender telemetry after frontier completion; partial UI progress is
-  durable; adjacent clocks reuse
-  one bin above the prior minimum and fall back to the prior power-bound boundary; deployable synthesis
-  still requires the complete range and successful qualification.
+  durable. Compatible same-GPU v4 history and a short isotonic cross-clock trend predict the next
+  boundary, always starting one physical bin above it and falling back when inputs disagree by more
+  than 25 mV. Confirmed power-bound spans may advance 4/2/1 bins by p5 deficit under 25 mV and writer
+  offset-step guards; any jumped failure recovers upward before exact adjacent-bin qualification.
+  Deployable synthesis still requires the complete range and successful qualification.
   Qualification now stops on a relative heavy-phase p5 margin collapse, retries weak coverage twice
   and continues across clocks. Supervised F2 TDR recovery is learning rather than normal-use crash
   budget, interrupted runs resume on UI reconnect, and Apply requests +12 mV then snaps to a valid

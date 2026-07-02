@@ -2,6 +2,22 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 uses prediction plus asymmetric adaptive search (2026-07-01)
+- **Decision**: use compatible same-GPU discovery-v4 history first, then the non-increasing isotonic
+  trend of the last 3–4 qualified clocks, to suggest a boundary. Start one physical bin above it.
+  Predictions are scheduling hints only and never become observations, qualification or profile data.
+- **Contradiction guard**: if historical, previous-clock and trend suggestions span more than 25 mV,
+  keep the established sequential warm start. A compatible historical offset may serve only as the
+  cross-run baseline for the writer's existing +15 MHz progression gate.
+- **Power-bound stride**: while confirmed p99 is at 99%+ of cap, use the p5 deficit to request 4 bins
+  at >=90 MHz, 2 bins at 45–89 MHz, otherwise 1. The selected jump must also stay within 25 mV and
+  the positive-offset step cap; otherwise it shrinks automatically.
+- **Asymmetric recovery**: a reset-clean off-cap failure reached by a jump creates a shallower-safe /
+  deeper-failed bracket. Midpoints are tested only above the known failure. Once a point is approved,
+  descent becomes adjacent and the known failed bin terminates the boundary without another dwell.
+- **Unchanged**: p99 consensus and Apply-bin backfill, thermal invalidation, FSGL3/goldens, Safe Loop,
+  Leva 1 qualification/margin behavior and +12 mV Apply remain the same.
+
 ## F2 frontier and profiles use apply-bin sustained p99 power (2026-07-01)
 - **Decision**: keep the existing textured `PowerRender`. Do not replace it with compute-only
   `POWER_SHADER`, which previously underloaded board power relative to the render/game regime.

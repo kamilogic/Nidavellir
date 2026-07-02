@@ -1076,6 +1076,19 @@ power.
   No method changed. FSGL3/golden qualification contract v4 and `profiles_qualified` semantics are
   unchanged.
 
+\## Backend runtime note (2026-07-01): adaptive F2 scheduling (no IPC change)
+
+\- Compatible same-GPU discovery-v4 history and an isotonic trend over the last 3–4 qualified clocks
+  may suggest the next frontier. Forge begins one physical bin above the prediction; the prediction
+  is never evidence and is discarded when its inputs disagree by more than 25 mV.
+
+\- While confirmed p99 remains at 99%+ of cap, discovery may skip 4/2/1 physical bins according to
+  p5 deficit. Every jump remains bounded by 25 mV and the existing writer offset-step limit.
+
+\- A reset-clean failure reached by a jump causes upward-only midpoint recovery. After the first
+  approved off-cap point, discovery returns to adjacent-bin qualification. FSGL3, thermal handling,
+  Safe Loop, Apply-bin p99 backfill, profile payloads and Apply behavior are unchanged.
+
 
 
 (No other active backend → frontend requests)

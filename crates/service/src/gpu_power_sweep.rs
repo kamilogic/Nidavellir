@@ -4822,6 +4822,119 @@ fn f2_clock_within_cmax_floor(target_mhz: u32, cmax_mhz: u32) -> bool {
     target_mhz as u64 * 100 >= cmax_mhz as u64 * F2_CMAX_FLOOR_PERCENT
 }
 
+#[cfg(windows)]
+const F2_FRONTIER_PREDICTION_CONTRADICTION_MV: u32 = 25;
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct F2FrontierPrediction {
+    boundary_mv: u32,
+    start_mv: u32,
+    used_historical_boundary: bool,
+}
+
+#[cfg(windows)]
+fn f2_isotonic_trend_prediction(
+    recent_boundaries: &[(u32, u32)],
+    target_mhz: u32,
+) -> Option<u32> {
+    let recent = &recent_boundaries[recent_boundaries.len().saturating_sub(4)..];
+    if recent.len() < 2 {
+        return None;
+    }
+
+    // Pooled-adjacent-violators projection for the physical expectation that boundary voltage does
+    // not increase as target clock decreases. The projection suggests a start; it is never evidence.
+    let mut blocks: Vec<(f64, usize)> = Vec::with_capacity(recent.len());
+    for &(_, voltage_mv) in recent {
+        blocks.push((f64::from(voltage_mv), 1));
+        while blocks.len() >= 2 {
+            let right = blocks[blocks.len() - 1];
+            let left = blocks[blocks.len() - 2];
+            if left.0 / left.1 as f64 >= right.0 / right.1 as f64 {
+                break;
+            }
+            blocks.pop();
+            blocks.pop();
+            blocks.push((left.0 + right.0, left.1 + right.1));
+        }
+    }
+    let mut projected = Vec::with_capacity(recent.len());
+    for (sum, count) in blocks {
+        projected.extend(std::iter::repeat_n(sum / count as f64, count));
+    }
+
+    let mut slopes_mv_per_mhz = Vec::new();
+    for index in 1..recent.len() {
+        let clock_drop = recent[index - 1].0.saturating_sub(recent[index].0);
+        if clock_drop == 0 {
+            continue;
+        }
+        slopes_mv_per_mhz.push(
+            (projected[index - 1] - projected[index]).max(0.0) / f64::from(clock_drop),
+        );
+    }
+    if slopes_mv_per_mhz.is_empty() {
+        return None;
+    }
+    slopes_mv_per_mhz.sort_by(f64::total_cmp);
+    let slope = slopes_mv_per_mhz[slopes_mv_per_mhz.len() / 2];
+    let last_clock = recent.last()?.0;
+    let last_voltage = *projected.last()?;
+    let clock_drop = last_clock.saturating_sub(target_mhz);
+    Some(
+        (last_voltage - slope * f64::from(clock_drop))
+            .max(0.0)
+            .round() as u32,
+    )
+}
+
+#[cfg(windows)]
+fn f2_predict_frontier_start(
+    curve: &[(usize, u32, u32)],
+    limits: &nidavellir_gpu_nvapi::PositiveOffsetLimits,
+    target_mhz: u32,
+    historical_boundary_mv: Option<u32>,
+    recent_boundaries: &[(u32, u32)],
+) -> Option<F2FrontierPrediction> {
+    let previous_boundary_mv = recent_boundaries.last().map(|(_, mv)| *mv);
+    let trend_mv = f2_isotonic_trend_prediction(recent_boundaries, target_mhz);
+    let mut suggestions: Vec<u32> = [historical_boundary_mv, previous_boundary_mv, trend_mv]
+        .into_iter()
+        .flatten()
+        .collect();
+    if suggestions.is_empty() {
+        return None;
+    }
+    let min = *suggestions.iter().min()?;
+    let max = *suggestions.iter().max()?;
+    if max.abs_diff(min) > F2_FRONTIER_PREDICTION_CONTRADICTION_MV {
+        return None;
+    }
+    suggestions.sort_unstable();
+    let boundary_mv = historical_boundary_mv
+        .or(trend_mv)
+        .unwrap_or(suggestions[suggestions.len() / 2]);
+    let descent = crate::gpu_undervolt::plan_anchored_undervolt_descent(
+        curve,
+        target_mhz,
+        None,
+        limits,
+        usize::MAX,
+    );
+    let start_mv = descent
+        .candidates
+        .iter()
+        .map(|candidate| candidate.anchor.voltage_mv)
+        .filter(|voltage_mv| *voltage_mv > boundary_mv)
+        .min()?;
+    Some(F2FrontierPrediction {
+        boundary_mv,
+        start_mv,
+        used_historical_boundary: historical_boundary_mv.is_some(),
+    })
+}
+
 /// LIVE F2 ANCHORED-UNDERVOLT forge — the new primary method behind the live forge button (replaces the
 /// F1 flatten-down `run_power_sweep` for the button; F1 stays intact for cards it can differentiate).
 ///
@@ -4858,7 +4971,9 @@ fn measure_multiclock_undervolt_forge(
     use std::collections::{HashMap, HashSet};
     use std::time::Instant;
 
-    use nidavellir_core::f2_observation::{new_run_id, F2ObservationStore};
+    use nidavellir_core::f2_observation::{
+        last_discovery_good_for_target, new_run_id, F2ObservationStore,
+    };
     use nidavellir_gpu_nvapi as gpu;
 
     info!("F2 undervolt forge starting (anchored min-stable-voltage per clock) — mode {}", mode.label());
@@ -5110,6 +5225,7 @@ fn measure_multiclock_undervolt_forge(
     let mut retain_boot_flag = false;
     let mut next_clock_start_mv: Option<u32> = None;
     let mut conservative_start_mv: Option<u32> = None;
+    let mut recent_boundaries: Vec<(u32, u32)> = Vec::new();
     let mut adjusted_targets = HashSet::new();
     for (i, &target) in targets.iter().enumerate() {
         if let Some(max) = cmax {
@@ -5124,6 +5240,37 @@ fn measure_multiclock_undervolt_forge(
         if stop.load(Ordering::SeqCst) {
             prog.log.push("Parada solicitada — encerrando a forja F2.".into());
             break;
+        }
+        let historical_boundary_mv = last_discovery_good_for_target(
+            &obs_store.query_by_target_for_gpu(target, &gpu_key),
+            target,
+        )
+        .map(|observation| observation.anchor_mv);
+        let fallback_start_mv = next_clock_start_mv;
+        if let Some(prediction) = f2_predict_frontier_start(
+            &f2_inputs.sane_base_curve,
+            &f2_inputs.limits,
+            target,
+            historical_boundary_mv,
+            &recent_boundaries,
+        ) {
+            next_clock_start_mv = Some(prediction.start_mv);
+            prog.log.push(format!(
+                "{target} MHz: fronteira prevista em {} mV por {}; início um bin físico acima, {} mV. Previsão orienta a busca e não conta como evidência.",
+                prediction.boundary_mv,
+                if prediction.used_historical_boundary {
+                    "fronteira v4 anterior + tendência recente"
+                } else {
+                    "tendência isotônica recente"
+                },
+                prediction.start_mv
+            ));
+        } else if historical_boundary_mv.is_some() || !recent_boundaries.is_empty() {
+            next_clock_start_mv = fallback_start_mv;
+            prog.log.push(format!(
+                "{target} MHz: previsão ausente/contraditória (> {F2_FRONTIER_PREDICTION_CONTRADICTION_MV} mV); usando início sequencial conservador {:?} mV.",
+                fallback_start_mv
+            ));
         }
         prog.phase = "descend".into();
         prog.current_clock_mhz = Some(target);
@@ -5203,10 +5350,14 @@ fn measure_multiclock_undervolt_forge(
         let mut target_executed_steps = summary.executed_steps;
         let mut fallback_message = None;
         if summary.warm_start_rejected {
-            if let (Some(warm), Some(fallback)) = (attempted_start_mv, conservative_start_mv) {
-                if fallback > warm {
+            if let Some(warm) = attempted_start_mv {
+                let fallback = conservative_start_mv;
+                if fallback.is_none_or(|fallback_mv| fallback_mv > warm) {
                     fallback_message = Some(format!(
-                        "{target} MHz: warm-start em {warm} mV não sustentou; fallback conservador em {fallback} mV."
+                        "{target} MHz: warm-start em {warm} mV não sustentou; fallback conservador {}.",
+                        fallback
+                            .map(|mv| format!("em {mv} mV"))
+                            .unwrap_or_else(|| "desde o topo físico".into())
                     ));
                     let fallback_summary = crate::gpu_undervolt::run_confirmed_f2_clock_discovery(
                         store,
@@ -5216,7 +5367,7 @@ fn measure_multiclock_undervolt_forge(
                         &f2_inputs.sane_base_curve,
                         &f2_inputs.limits,
                         target,
-                        Some(fallback),
+                        fallback,
                         power_limit,
                         mode_policy.discovery_dwell_ms,
                         mode_policy.qualification_dwell_ms,
@@ -5281,6 +5432,11 @@ fn measure_multiclock_undervolt_forge(
             prog.log.push(format!(
                 "Cmax descoberto: {target} MHz sustentado. Continuando por todos os bins reais até 90%."
             ));
+        }
+        if summary.sustainable {
+            if let Some(boundary_mv) = summary.last_good_mv {
+                recent_boundaries.push((target, boundary_mv));
+            }
         }
         if i + 1 == targets.len() && cmax.is_some() {
             forge_complete = true;
@@ -5949,6 +6105,52 @@ mod tests {
         assert_eq!(f2_stock_clock_ceiling(&stock_curve).unwrap(), 1950);
         assert!(f2_clock_within_cmax_floor(1755, 1950));
         assert!(!f2_clock_within_cmax_floor(1740, 1950));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_frontier_prediction_prefers_compatible_v4_history_and_starts_one_bin_above() {
+        let curve: Vec<(usize, u32, u32)> =
+            [850, 856, 862, 868, 875, 881, 887, 893, 900, 906]
+                .into_iter()
+                .enumerate()
+                .map(|(index, voltage_mv)| (index, voltage_mv, 1800 + index as u32 * 5))
+                .collect();
+        let limits =
+            nidavellir_gpu_nvapi::PositiveOffsetLimits::hardware_frontier(850, 1935, 1800);
+        let recent = vec![(1920, 925), (1905, 918), (1890, 906), (1875, 906)];
+        assert_eq!(
+            f2_isotonic_trend_prediction(&recent, 1860),
+            Some(899)
+        );
+        let prediction =
+            f2_predict_frontier_start(&curve, &limits, 1860, Some(881), &recent).unwrap();
+        assert_eq!(
+            prediction,
+            F2FrontierPrediction {
+                boundary_mv: 881,
+                start_mv: 887,
+                used_historical_boundary: true,
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_frontier_prediction_falls_back_when_sources_contradict() {
+        let curve: Vec<(usize, u32, u32)> =
+            [850, 856, 862, 868, 875, 881, 887, 893, 900, 906]
+                .into_iter()
+                .enumerate()
+                .map(|(index, voltage_mv)| (index, voltage_mv, 1800 + index as u32 * 5))
+                .collect();
+        let limits =
+            nidavellir_gpu_nvapi::PositiveOffsetLimits::hardware_frontier(850, 1935, 1800);
+        let recent = vec![(1905, 918), (1890, 906), (1875, 906)];
+        assert!(
+            f2_predict_frontier_start(&curve, &limits, 1860, Some(850), &recent).is_none(),
+            "a >25 mV disagreement must preserve the sequential fallback"
+        );
     }
 
     #[cfg(windows)]

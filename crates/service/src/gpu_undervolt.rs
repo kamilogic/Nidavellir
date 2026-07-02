@@ -116,6 +116,14 @@ const POWER_P99_MAX_ATTEMPTS: usize = 3;
 #[cfg(windows)]
 const POWER_P99_EQUIVALENT_P5_TOL_MHZ: u32 = 15;
 
+/// Adaptive discovery may skip only across a confirmed power-bound region. Four physical bins are
+/// the largest requested stride, and the actual scheduler additionally enforces this voltage span
+/// plus the writer's positive-offset step cap from the last reset-clean candidate.
+#[cfg(windows)]
+const F2_ADAPTIVE_MAX_STRIDE_BINS: usize = 4;
+#[cfg(windows)]
+const F2_ADAPTIVE_MAX_VOLTAGE_DROP_MV: u32 = 25;
+
 /// Relative sustained-clock margin allowed between equivalent FSGL3 qualification passes. A
 /// candidate whose heavy-phase p5 falls farther than this below the median of prior stable
 /// candidates at the same target/pattern has reached the voltage-margin cliff even if it did not
@@ -1462,6 +1470,66 @@ pub fn f2_discovery_decision(
     }
 }
 
+#[cfg(windows)]
+fn f2_adaptive_power_bound_next_index(
+    candidates: &[AnchoredPositiveOffsetPlan],
+    current_index: usize,
+    target_mhz: u32,
+    p5_clock_mhz: Option<u32>,
+    reference_offset_mhz: i32,
+    step_max_offset_mhz: i32,
+) -> usize {
+    let deficit_mhz = target_mhz.saturating_sub(p5_clock_mhz.unwrap_or(target_mhz));
+    let requested_stride = if deficit_mhz >= 90 {
+        F2_ADAPTIVE_MAX_STRIDE_BINS
+    } else if deficit_mhz >= 45 {
+        2
+    } else {
+        1
+    };
+    let Some(current) = candidates.get(current_index) else {
+        return current_index;
+    };
+    for stride in (1..=requested_stride).rev() {
+        let next_index = current_index.saturating_add(stride);
+        let Some(next) = candidates.get(next_index) else {
+            continue;
+        };
+        let voltage_drop_mv = current
+            .anchor
+            .voltage_mv
+            .saturating_sub(next.anchor.voltage_mv);
+        let offset_step_mhz = next.anchor.offset_mhz.saturating_sub(reference_offset_mhz);
+        if voltage_drop_mv <= F2_ADAPTIVE_MAX_VOLTAGE_DROP_MV
+            && offset_step_mhz <= step_max_offset_mhz
+        {
+            return next_index;
+        }
+    }
+    current_index.saturating_add(1).min(candidates.len())
+}
+
+#[cfg(windows)]
+fn f2_recovery_midpoint(shallower_safe_index: usize, deeper_failed_index: usize) -> Option<usize> {
+    let gap = deeper_failed_index.saturating_sub(shallower_safe_index);
+    (gap > 1).then_some(shallower_safe_index + gap / 2)
+}
+
+#[cfg(windows)]
+fn f2_reset_clean_discovery_failure(
+    decision: F2DiscoveryDecision,
+    report: &F2StepReport,
+) -> bool {
+    report.reset_ok == Some(true)
+        && report.boot_flag_cleared
+        && matches!(
+            decision,
+            F2DiscoveryDecision::NextClockUnsustainable
+                | F2DiscoveryDecision::BoundaryFound
+                | F2DiscoveryDecision::NextClockAfterFailure
+        )
+}
+
 fn f2_outcome_retains_boot_flag(outcome: &F2Outcome) -> bool {
     matches!(outcome, F2Outcome::DeviceLost | F2Outcome::ResetFailed)
 }
@@ -2467,6 +2535,10 @@ struct RealF2MultiOps<'a> {
     /// observation's offset, or 0 when none). Candidate `i>0` chains off candidate `i-1` instead (it is
     /// only reached after `i-1` validated). See [`chained_prev_offset`].
     baseline_offset_mhz: i32,
+    /// Live adaptive discovery can select a non-adjacent candidate. In that case the writer must be
+    /// bounded against the last candidate that actually completed reset-clean, never the skipped
+    /// plan entry. Other multi-step callers keep the original adjacent chaining.
+    prev_offset_override_mhz: Option<i32>,
     dwell_ms: u64,
     stress_purpose: F2StressPurpose,
     /// The per-candidate motor for the currently-selected candidate (`None` until first `select`).
@@ -2522,10 +2594,12 @@ impl F2MultiStepOps for RealF2MultiOps<'_> {
         if candidate_blacklisted(&rec, self.target_mhz, &plan.anchor) {
             return Err(format!("candidate {i} intent is blacklisted"));
         }
-        // Chained descent: candidate `i` is only reached after `i-1` validated, so its single
-        // write-from-stock is bounded per-step against the last validated offset (candidate 0 uses the
-        // cross-run observation baseline). The absolute cap still bounds the absolute offset.
-        let prev_offset_mhz = chained_prev_offset(&self.candidates, i, self.baseline_offset_mhz);
+        // Ordinary chained descent uses candidate i-1. Adaptive live discovery supplies the offset
+        // of the last candidate that actually completed reset-clean, so skipped plan entries can
+        // never relax the per-step writer bound. The absolute cap still applies independently.
+        let prev_offset_mhz = self.prev_offset_override_mhz.unwrap_or_else(|| {
+            chained_prev_offset(&self.candidates, i, self.baseline_offset_mhz)
+        });
         let anchor = plan.anchor;
         self.cur = Some(RealF2Ops {
             store: self.store,
@@ -2921,6 +2995,7 @@ fn run_anchored_multi_step(
                     // Explicit --steps descent: no cross-run observation resume (within-run advancement
                     // still chains each candidate off the prior validated one via `select`).
                     baseline_offset_mhz: 0,
+                    prev_offset_override_mhz: None,
                     dwell_ms: F2_STANDARD_DWELL_MS,
                     stress_purpose: F2StressPurpose::PowerDiscovery,
                     cur: None,
@@ -3068,6 +3143,7 @@ fn run_anchored_target_sweep(
                     limits: *limits,
                     target_mhz: focus_target,
                     baseline_offset_mhz, // resume from the deepest prior validated same-target point
+                    prev_offset_override_mhz: None,
                     dwell_ms: F2_STANDARD_DWELL_MS,
                     stress_purpose: F2StressPurpose::PowerDiscovery,
                     cur: None,
@@ -3136,6 +3212,7 @@ fn run_anchored_target_sweep(
                                 limits: *limits,
                                 target_mhz: focus_target,
                                 baseline_offset_mhz: deepest_baseline,
+                                prev_offset_override_mhz: None,
                                 dwell_ms: F2_STANDARD_DWELL_MS,
                                 stress_purpose: F2StressPurpose::PowerDiscovery,
                                 cur: None,
@@ -3342,6 +3419,7 @@ fn run_anchored_ladder_sweep(
                         // Ladder keeps its conservative per-target voltage-FLOOR policy (no cross-run
                         // offset resume); within-run advancement still chains each candidate via `select`.
                         baseline_offset_mhz: 0,
+                        prev_offset_override_mhz: None,
                         dwell_ms: F2_STANDARD_DWELL_MS,
                         stress_purpose: F2StressPurpose::PowerDiscovery,
                         cur: None,
@@ -3817,6 +3895,7 @@ fn qualify_anchored_candidate(
                 limits: *limits,
                 target_mhz,
                 baseline_offset_mhz: 0,
+                prev_offset_override_mhz: None,
                 dwell_ms: attempt_dwell_ms,
                 stress_purpose: F2StressPurpose::Fsgl3Qualification(pattern, goldens),
                 cur: None,
@@ -4013,6 +4092,7 @@ fn gate_anchored_candidate_fsgl3(
                 limits: *limits,
                 target_mhz,
                 baseline_offset_mhz: 0,
+                prev_offset_override_mhz: None,
                 dwell_ms: final_gate_dwell_ms,
                 stress_purpose: F2StressPurpose::Fsgl3Qualification(pattern, goldens),
                 cur: None,
@@ -4389,10 +4469,11 @@ pub(crate) fn run_confirmed_f2_power_calibration(
 }
 
 /// Run the live F2 discovery for one real target clock. Unlike the legacy CLI motor, this has no
-/// arbitrary candidate cap: it walks adjacent real VF bins until the physical floor or the first
-/// terminal boundary. A pre-sustain clock drop continues only while the dwell remains at 99–100% of
-/// the numeric power limit. Every candidate still executes the proven arm→write→verify→dwell→reset
-/// sequence and is persisted immediately; any untrustworthy recovery state aborts the whole forge.
+/// arbitrary candidate cap: confirmed power-bound spans may skip bounded physical bins, while the
+/// first approved off-cap point and every recovery bracket return to exact local discovery. A
+/// pre-sustain clock drop continues only while p99 remains at 99–100% of the numeric power limit.
+/// Every executed candidate still runs arm→write→verify→dwell→reset and is persisted immediately;
+/// any untrustworthy recovery state aborts the whole forge.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_confirmed_f2_clock_discovery(
@@ -4441,8 +4522,30 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             )
         })
         .collect();
-    let prior_good_mv =
-        last_discovery_good_for_target(&compatible_prior, target_mhz).map(|o| o.anchor_mv);
+    let prior_good_observation =
+        last_discovery_good_for_target(&compatible_prior, target_mhz);
+    let prior_good_mv = prior_good_observation.map(|o| o.anchor_mv);
+    let prior_reference_offset_mhz = if start_mv.is_some() {
+        prior_good_observation.map(|o| o.offset_mhz).unwrap_or(0)
+    } else {
+        0
+    };
+    if start_mv.is_some() && descent.candidates.is_empty() && prior_good_observation.is_some() {
+        // A same-target v4 boundary may be far enough from stock that replanning directly at the
+        // predicted start hits the +15 MHz progression guard. Reuse only the already-compatible
+        // historical offset as the writer's cross-run baseline, while still executing fresh
+        // PowerRender+FSGL3 evidence at every selected bin.
+        descent = unpruned_descent.clone();
+        descent.start_mv = start_mv;
+        if let Some(start_mv) = start_mv {
+            descent
+                .candidates
+                .retain(|candidate| candidate.anchor.voltage_mv <= start_mv);
+        }
+        logs.push(format!(
+            "{target_mhz} MHz: previsão v4 usa offset histórico compatível +{prior_reference_offset_mhz} MHz apenas como limite de progressão; estabilidade será medida novamente"
+        ));
+    }
     let prior_bad_mv = first_bad_for_target(&compatible_prior, target_mhz).map(|o| o.anchor_mv);
     let prior_power_bound_mv = compatible_prior
         .iter()
@@ -4545,6 +4648,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         limits: *limits,
         target_mhz,
         baseline_offset_mhz: 0,
+        prev_offset_override_mhz: None,
         dwell_ms: discovery_dwell_ms,
         stress_purpose: F2StressPurpose::PowerDiscovery,
         cur: None,
@@ -4613,12 +4717,29 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     qual_ctx.qualification_coverage = None;
     let mut last_qualified_index: Option<usize> = None;
     let mut qualification_margin_history = F2QualificationMarginHistory::default();
+    let mut current_index = 0usize;
+    let mut reference_offset_mhz = prior_reference_offset_mhz;
+    let mut jumped_from_index: Option<usize> = None;
+    let mut recovery_bracket: Option<(usize, usize)> = None;
+    let mut known_failed_index: Option<usize> = None;
+    let mut local_sequential = false;
 
-    for i in 0..candidate_count {
+    while current_index < candidate_count {
+        let i = current_index;
+        if known_failed_index == Some(i) {
+            completed = true;
+            stop_reason = "AdaptiveKnownFailureBoundary".into();
+            logs.push(format!(
+                "{target_mhz} MHz @ {} mV: fronteira já medida como falha durante recuperação; sem novo dwell",
+                descent.candidates[i].anchor.voltage_mv
+            ));
+            break;
+        }
         if stop.load(Ordering::SeqCst) {
             stop_reason = "Cancelled".into();
             break;
         }
+        ops.prev_offset_override_mhz = Some(reference_offset_mhz);
         if let Err(e) = ops.select(i) {
             aborted = true;
             stop_reason = format!("SafetyPrecheckFailed: {e}");
@@ -4774,6 +4895,48 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         if matches!(decision, F2DiscoveryDecision::MarkSustainableAndContinue) {
             had_sustainable = true;
         }
+        if report.reset_ok == Some(true)
+            && report.boot_flag_cleared
+            && matches!(
+                report.outcome,
+                F2Outcome::Validated | F2Outcome::PowerBoundClockDrop
+            )
+        {
+            reference_offset_mhz = descent.candidates[i].anchor.offset_mhz;
+        }
+        let arrival_jump_origin = jumped_from_index;
+        if f2_reset_clean_discovery_failure(decision, &report) {
+            let shallower_safe_index = recovery_bracket
+                .map(|(safe, _)| safe)
+                .or(jumped_from_index);
+            if let Some(safe_index) = shallower_safe_index.filter(|safe| i > safe + 1) {
+                recovery_bracket = Some((safe_index, i));
+                jumped_from_index = None;
+                if let Some(midpoint) = f2_recovery_midpoint(safe_index, i) {
+                    logs.push(format!(
+                        "{target_mhz} MHz: falha reset-clean após salto {}→{}; recuperando para cima no bin intermediário {} mV",
+                        descent.candidates[safe_index].anchor.voltage_mv,
+                        anchor_mv,
+                        descent.candidates[midpoint].anchor.voltage_mv
+                    ));
+                    on_progress(F2ClockDiscoveryProgress {
+                        target_mhz,
+                        planned_steps: candidate_count,
+                        unpruned_steps,
+                        anchor_mv: Some(descent.candidates[midpoint].anchor.voltage_mv),
+                        outcome: None,
+                        line: format!(
+                            "{target_mhz} MHz: recuperação ascendente segura → {} mV (bisseção do intervalo conhecido)",
+                            descent.candidates[midpoint].anchor.voltage_mv
+                        ),
+                    });
+                    current_index = midpoint;
+                    continue;
+                }
+            }
+        } else {
+            jumped_from_index = None;
+        }
         match decision {
             F2DiscoveryDecision::ContinueVoltage
             | F2DiscoveryDecision::MarkSustainableAndContinue => {
@@ -4812,11 +4975,37 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                     match qualification_outcome {
                         F2QualificationOutcome::Qualified => {
                             last_qualified_index = Some(i);
+                            local_sequential = true;
+                            if let Some((_, failed_index)) = recovery_bracket.take() {
+                                known_failed_index = Some(failed_index);
+                                logs.push(format!(
+                                    "{target_mhz} MHz @ {anchor_mv} mV: recuperação encontrou ponto qualificado; fronteira volta a descer bin a bin"
+                                ));
+                            }
                             completed = qualification_completed;
                             stop_reason = "Qualified".into();
                             // Fall through: descend one real bin lower on the next iteration.
                         }
                         F2QualificationOutcome::Rejected(reason) => {
+                            let shallower_safe_index = recovery_bracket
+                                .map(|(safe, _)| safe)
+                                .or(arrival_jump_origin);
+                            if let Some(safe_index) =
+                                shallower_safe_index.filter(|safe| i > safe + 1)
+                            {
+                                recovery_bracket = Some((safe_index, i));
+                                jumped_from_index = None;
+                                reference_offset_mhz =
+                                    descent.candidates[safe_index].anchor.offset_mhz;
+                                if let Some(midpoint) = f2_recovery_midpoint(safe_index, i) {
+                                    logs.push(format!(
+                                        "{target_mhz} MHz @ {anchor_mv} mV: FSGL3 rejeitou após salto ({reason}); recuperando para cima em {} mV",
+                                        descent.candidates[midpoint].anchor.voltage_mv
+                                    ));
+                                    current_index = midpoint;
+                                    continue;
+                                }
+                            }
                             // A reset-clean FSGL3 rejection completes only this clock. Even when no
                             // shallower bin qualified, the outer ladder must continue to a lower
                             // target and discover the real Cmax instead of aborting the whole Forge.
@@ -4831,6 +5020,25 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                             break;
                         }
                         F2QualificationOutcome::Inconclusive => {
+                            let shallower_safe_index = recovery_bracket
+                                .map(|(safe, _)| safe)
+                                .or(arrival_jump_origin);
+                            if let Some(safe_index) =
+                                shallower_safe_index.filter(|safe| i > safe + 1)
+                            {
+                                recovery_bracket = Some((safe_index, i));
+                                jumped_from_index = None;
+                                reference_offset_mhz =
+                                    descent.candidates[safe_index].anchor.offset_mhz;
+                                if let Some(midpoint) = f2_recovery_midpoint(safe_index, i) {
+                                    logs.push(format!(
+                                        "{target_mhz} MHz @ {anchor_mv} mV: FSGL3 inconclusivo após salto; recuperando para cima em {} mV",
+                                        descent.candidates[midpoint].anchor.voltage_mv
+                                    ));
+                                    current_index = midpoint;
+                                    continue;
+                                }
+                            }
                             // Coverage ambiguity is local to this clock. Preserve any shallower
                             // qualified boundary, skip the remainder of this clock and let the
                             // outer multi-clock Forge continue.
@@ -4867,6 +5075,37 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                         report.power_p99_w
                     ));
                 }
+                if matches!(report.outcome, F2Outcome::Validated)
+                    && !near_cap
+                    && qualification_passes == 0
+                {
+                    local_sequential = true;
+                    if let Some((_, failed_index)) = recovery_bracket.take() {
+                        known_failed_index = Some(failed_index);
+                    }
+                }
+                if let Some((_, failed_index)) = recovery_bracket {
+                    if !local_sequential {
+                        recovery_bracket = Some((i, failed_index));
+                        if let Some(midpoint) = f2_recovery_midpoint(i, failed_index) {
+                            logs.push(format!(
+                                "{target_mhz} MHz: recuperação estreitou o intervalo seguro/falha para {}–{} mV; próximo teste {} mV",
+                                anchor_mv,
+                                descent.candidates[failed_index].anchor.voltage_mv,
+                                descent.candidates[midpoint].anchor.voltage_mv
+                            ));
+                            current_index = midpoint;
+                            continue;
+                        }
+                        completed = true;
+                        stop_reason = "AdaptiveRecoveryNoSustainablePoint".into();
+                        logs.push(format!(
+                            "{target_mhz} MHz: recuperação terminou entre bin power-bound {anchor_mv} mV e falha adjacente {} mV",
+                            descent.candidates[failed_index].anchor.voltage_mv
+                        ));
+                        break;
+                    }
+                }
                 // Fast (qualification_passes == 0) or a pre-sustain power-bound drop: keep descending.
                 // Fast leaves the deepest PowerRender-good point provisional; discovery observations
                 // carry it for synthesis.
@@ -4893,7 +5132,45 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 break;
             }
         }
-        if i + 1 == candidate_count {
+        let next_index = if local_sequential || !near_cap {
+            i.saturating_add(1)
+        } else {
+            f2_adaptive_power_bound_next_index(
+                &descent.candidates,
+                i,
+                target_mhz,
+                report.p5_clock_mhz,
+                reference_offset_mhz,
+                limits.step_max_offset_mhz,
+            )
+        };
+        if next_index > i + 1 {
+            jumped_from_index = Some(i);
+            logs.push(format!(
+                "{target_mhz} MHz @ {anchor_mv} mV: região power-bound confirmada (p5 {:?} MHz, p99 {:?} W); salto adaptativo de {} bins para {} mV",
+                report.p5_clock_mhz,
+                report.power_p99_w,
+                next_index - i,
+                descent.candidates[next_index].anchor.voltage_mv
+            ));
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(descent.candidates[next_index].anchor.voltage_mv),
+                outcome: None,
+                line: format!(
+                    "{target_mhz} MHz: power-bound sustentado; pulando {} bins com limites de 25 mV/+{} MHz → {} mV",
+                    next_index - i,
+                    limits.step_max_offset_mhz,
+                    descent.candidates[next_index].anchor.voltage_mv
+                ),
+            });
+        } else {
+            jumped_from_index = None;
+        }
+        current_index = next_index;
+        if current_index == candidate_count {
             completed = true;
         }
     }
@@ -4990,6 +5267,15 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         .collect();
     let last_good_mv =
         last_discovery_good_for_target(&scoped, target_mhz).map(|o| o.anchor_mv);
+    let current_run_last_good_mv = last_discovery_good_for_target(
+        &scoped
+            .iter()
+            .filter(|observation| observation.run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>(),
+        target_mhz,
+    )
+    .map(|o| o.anchor_mv);
     let first_bad_mv = first_bad_for_target(&scoped, target_mhz).map(|o| o.anchor_mv);
     let power_bound_clock_drops: Vec<u32> = scoped
         .iter()
@@ -5022,13 +5308,18 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         .collect();
     let next_clock_start_mv =
         f2_optimized_next_clock_start(&planned_voltages, last_good_mv, conservative_start_mv);
+    let has_current_qualification_pass = scoped.iter().any(|observation| {
+        observation.run_id == run_id && is_current_qualification_pass(observation)
+    });
     let warm_start_rejected = start_mv.is_some()
-        && prior_good_mv.is_none()
-        && last_good_mv.is_none()
+        && (refresh_discovery_for_qualification || prior_good_mv.is_none())
+        && (if qualification_passes > 0 {
+            !has_current_qualification_pass
+        } else {
+            current_run_last_good_mv.is_none()
+        })
         && (executed_steps > 0 || stop_reason == "WarmStartNoPhysicalCandidates")
         && !aborted;
-    let has_current_qualification_pass =
-        scoped.iter().any(is_current_qualification_pass);
     F2ClockDiscoverySummary {
         sustainable: last_good_mv.is_some()
             && (qualification_passes == 0 || has_current_qualification_pass),
@@ -5818,6 +6109,83 @@ mod tests {
             !f2_near_power_limit(Some(180.0), Some(200.0), Some(1.0)),
             "a valid 90% p99 reading must not be overridden by the cap-flag fallback"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn adaptive_power_bound_stride_respects_p5_voltage_and_offset_guards() {
+        let curve: Vec<(usize, u32, u32)> = [900, 906, 912, 918, 925, 931]
+            .into_iter()
+            .enumerate()
+            .map(|(index, voltage_mv)| (index, voltage_mv, 1770 + index as u32 * 3))
+            .collect();
+        let limits = PositiveOffsetLimits::hardware_frontier(900, 1800, 1770);
+        let candidates =
+            plan_anchored_undervolt_descent(&curve, 1800, None, &limits, usize::MAX).candidates;
+        assert_eq!(
+            f2_adaptive_power_bound_next_index(
+                &candidates,
+                0,
+                1800,
+                Some(1700),
+                candidates[0].anchor.offset_mhz,
+                limits.step_max_offset_mhz,
+            ),
+            4,
+            "a >=90 MHz deficit may skip four physical bins"
+        );
+        assert_eq!(
+            f2_adaptive_power_bound_next_index(
+                &candidates,
+                0,
+                1800,
+                Some(1740),
+                candidates[0].anchor.offset_mhz,
+                limits.step_max_offset_mhz,
+            ),
+            2,
+            "a 45-89 MHz deficit may skip two physical bins"
+        );
+        assert_eq!(
+            f2_adaptive_power_bound_next_index(
+                &candidates,
+                0,
+                1800,
+                Some(1770),
+                candidates[0].anchor.offset_mhz,
+                limits.step_max_offset_mhz,
+            ),
+            1,
+            "near the target discovery remains adjacent"
+        );
+
+        let wide_curve: Vec<(usize, u32, u32)> = [880, 890, 900, 910, 920, 930]
+            .into_iter()
+            .enumerate()
+            .map(|(index, voltage_mv)| (index, voltage_mv, 1770 + index as u32 * 3))
+            .collect();
+        let wide_candidates =
+            plan_anchored_undervolt_descent(&wide_curve, 1800, None, &limits, usize::MAX).candidates;
+        assert_eq!(
+            f2_adaptive_power_bound_next_index(
+                &wide_candidates,
+                0,
+                1800,
+                Some(1700),
+                wide_candidates[0].anchor.offset_mhz,
+                limits.step_max_offset_mhz,
+            ),
+            2,
+            "the 25 mV guard reduces a requested four-bin jump"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn adaptive_recovery_only_bisects_toward_the_safer_side() {
+        assert_eq!(f2_recovery_midpoint(2, 6), Some(4));
+        assert_eq!(f2_recovery_midpoint(4, 6), Some(5));
+        assert_eq!(f2_recovery_midpoint(5, 6), None);
     }
 
     #[test]
