@@ -534,12 +534,37 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
     };
     match decode_forge_state(&json, gpu_key) {
         ForgeStateLoad::Loaded(prog) => {
+            let mut prog = *prog;
+            if prog.is_undervolt && prog.profiles_qualified {
+                let observations =
+                    nidavellir_core::f2_observation::F2ObservationStore::system().load_all();
+                let mut profiles = [prog.godforge, prog.brokkrs, prog.deep_calm];
+                match publish_f2_profile_set_power_from_apply_qualification(
+                    &mut profiles,
+                    &observations,
+                    None,
+                    gpu_key,
+                ) {
+                    Ok(updated) if updated > 0 => {
+                        prog.godforge = profiles[0];
+                        prog.brokkrs = profiles[1];
+                        prog.deep_calm = profiles[2];
+                        prog.recommended = prog.brokkrs;
+                        prog.log.push(format!(
+                            "FORGE: p99 publicado restaurado pelo maior A+B aprovado ({updated} perfil(is) elevado(s))."
+                        ));
+                        save_forge_state(gpu_key, &prog);
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("forge_state p99 A+B refresh skipped: {e}"),
+                }
+            }
             info!(
                 "forge_state loaded (gpu='{}', {} points)",
                 gpu_key,
                 prog.points.len()
             );
-            Some(*prog)
+            Some(prog)
         }
         ForgeStateLoad::GpuMismatch { stored } => {
             info!(
@@ -954,7 +979,9 @@ fn f2_regime_dependent_apply_keys(
         .filter_map(|(point, _)| {
             let key = f2_apply_key(point)?;
             let support = f2_regime_support(point, frontier).ok()?;
-            (support.support_target_mhz == failed_key.0 && key.1 <= failed_key.1)
+            (key != failed_key
+                && support.support_target_mhz == failed_key.0
+                && key.1 <= failed_key.1)
                 .then_some(key)
         })
         .collect()
@@ -1424,6 +1451,68 @@ fn calibrate_f2_profile_power(
         point.thermal_throttled = measured.thermal_throttled;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn publish_f2_profile_power_from_apply_qualification(
+    point: &mut PowerSweepPoint,
+    observations: &[F2Observation],
+    run_id: Option<&str>,
+    gpu_key: &str,
+) -> Result<bool, String> {
+    let target_mhz = point.target_clock_mhz.unwrap_or(point.clock_mhz);
+    let apply_mv = point
+        .vf_table_voltage_mv
+        .ok_or_else(|| format!("{target_mhz} MHz has no exact Apply anchor"))?;
+    let discovery_p99 = point
+        .power_p99_w
+        .filter(|power| power.is_finite() && *power > 0.0)
+        .ok_or_else(|| format!("{target_mhz} MHz @ {apply_mv} mV has no calibrated p99"))?;
+    let qualification_p99 = match run_id {
+        Some(run_id) => {
+            nidavellir_core::f2_observation::current_apply_qualification_p99_at_anchor(
+                observations,
+                run_id,
+                target_mhz,
+                apply_mv,
+                gpu_key,
+            )
+        }
+        None => nidavellir_core::f2_observation::highest_apply_qualification_p99_at_anchor(
+            observations,
+            target_mhz,
+            apply_mv,
+            gpu_key,
+        ),
+    }
+    .ok_or_else(|| {
+        format!("{target_mhz} MHz @ {apply_mv} mV has no complete current A+B p99 measurement")
+    })?;
+    let published_p99 = discovery_p99.max(qualification_p99);
+    let changed = published_p99 > discovery_p99;
+    point.power_p99_w = Some(published_p99);
+    point.perf_per_watt =
+        point.p5_clock_mhz.unwrap_or(point.clock_mhz) as f64 / published_p99 as f64;
+    Ok(changed)
+}
+
+#[cfg(windows)]
+fn publish_f2_profile_set_power_from_apply_qualification(
+    profiles: &mut [Option<PowerSweepPoint>],
+    observations: &[F2Observation],
+    run_id: Option<&str>,
+    gpu_key: &str,
+) -> Result<usize, String> {
+    let mut changed = 0;
+    for point in profiles.iter_mut().flatten() {
+        changed += usize::from(publish_f2_profile_power_from_apply_qualification(
+            point,
+            observations,
+            run_id,
+            gpu_key,
+        )?);
+    }
+    Ok(changed)
 }
 
 #[cfg(windows)]
@@ -5960,13 +6049,54 @@ fn measure_multiclock_undervolt_forge(
                 final_profiles = Some(profiles);
                 break;
             }
-            if let Some(profiles) = final_profiles {
-                prog.log.extend(profiles.log.clone());
-                prog.power_bound_collapse = profiles.power_bound_collapse;
-                prog.godforge = profiles.godforge;
-                prog.brokkrs = profiles.brokkrs;
-                prog.deep_calm = profiles.deep_calm;
-                prog.recommended = prog.brokkrs;
+            if let Some(mut profiles) = final_profiles {
+                let observations = obs_store.load_all();
+                let mut selected_profiles = [
+                    profiles.godforge,
+                    profiles.brokkrs,
+                    profiles.deep_calm,
+                ];
+                match publish_f2_profile_set_power_from_apply_qualification(
+                    &mut selected_profiles,
+                    &observations,
+                    Some(&run_id),
+                    &gpu_key,
+                ) {
+                    Ok(updated) => {
+                        profiles.godforge = selected_profiles[0];
+                        profiles.brokkrs = selected_profiles[1];
+                        profiles.deep_calm = selected_profiles[2];
+                        prog.log.extend(profiles.log.clone());
+                        if let (Some(godforge), Some(brokkrs), Some(deep_calm)) = (
+                            profiles.godforge,
+                            profiles.brokkrs,
+                            profiles.deep_calm,
+                        ) {
+                            prog.log.push(format!(
+                                "FORGE: p99 publicado = máximo calibrado/FSGL3 A+B no Apply aprovado ({updated} perfil(is) elevado(s)) — Godforge {}@{} mV {:.0} W · Brokkr's {}@{} mV {:.0} W · Deep Calm {}@{} mV {:.0} W.",
+                                godforge.target_clock_mhz.unwrap_or(godforge.clock_mhz),
+                                godforge.vf_table_voltage_mv.unwrap_or(godforge.voltage_mv),
+                                godforge.power_p99_w.unwrap_or(0.0),
+                                brokkrs.target_clock_mhz.unwrap_or(brokkrs.clock_mhz),
+                                brokkrs.vf_table_voltage_mv.unwrap_or(brokkrs.voltage_mv),
+                                brokkrs.power_p99_w.unwrap_or(0.0),
+                                deep_calm.target_clock_mhz.unwrap_or(deep_calm.clock_mhz),
+                                deep_calm.vf_table_voltage_mv.unwrap_or(deep_calm.voltage_mv),
+                                deep_calm.power_p99_w.unwrap_or(0.0),
+                            ));
+                        }
+                        prog.power_bound_collapse = profiles.power_bound_collapse;
+                        prog.godforge = profiles.godforge;
+                        prog.brokkrs = profiles.brokkrs;
+                        prog.deep_calm = profiles.deep_calm;
+                        prog.recommended = prog.brokkrs;
+                    }
+                    Err(e) => {
+                        prog.log.push(format!(
+                            "FORGE: p99 final dos A+B aprovados indisponível — {e}; perfis recusados."
+                        ));
+                    }
+                }
             }
             prog.profiles_qualified = f2_profiles_meet_qualification(
                 mode_policy,
@@ -6197,7 +6327,9 @@ mod tests {
     fn f2_profile_power_calibration_uses_apply_bin_p99_and_preserves_avg_peak() {
         use nidavellir_core::f2_observation::{
             F2EvidenceKind, F2ObsDwell, F2ObsMode, F2ObsOutcome, F2ObsVerifier,
-            F2_DISCOVERY_CONTRACT_VERSION,
+            F2QualificationCoverage, F2QualificationPattern, F2QualificationStrength,
+            F2QualificationVerdict, F2_DISCOVERY_CONTRACT_VERSION,
+            F2_QUALIFICATION_CONTRACT_VERSION,
         };
 
         let measured = F2Observation {
@@ -6307,6 +6439,54 @@ mod tests {
         assert_eq!(calibrated.power_p99_w, Some(198.0));
         assert_eq!(calibrated.max_temp_c, Some(72.0));
         assert!((calibrated.perf_per_watt - 1875.0 / 198.0).abs() < f64::EPSILON);
+
+        let apply_pass = |pattern, power_p99_w| {
+            let mut observation = measured.clone();
+            observation.run_id = "forge-v6".into();
+            observation.evidence_kind = F2EvidenceKind::ApplyQualification;
+            observation.discovery_contract_version = None;
+            observation.qualification_contract_version =
+                Some(F2_QUALIFICATION_CONTRACT_VERSION);
+            observation.mode = F2ObsMode::ApplyQualification;
+            observation.dwell_result = F2ObsDwell::Stable;
+            observation.outcome = F2ObsOutcome::Validated;
+            observation.power_p99_w = Some(power_p99_w);
+            observation.qualification_coverage = Some(F2QualificationCoverage {
+                strength: F2QualificationStrength::Fsgl3,
+                pattern: Some(pattern),
+                pass_index: match pattern {
+                    F2QualificationPattern::A => 1,
+                    F2QualificationPattern::B => 2,
+                },
+                verdict: F2QualificationVerdict::Pass,
+                phases_completed: 8,
+                phases_expected: 8,
+                checksum_count: 8,
+                sample_count: 100,
+                compute_check_count: 1,
+                target_residency_frac: Some(1.0),
+                heavy_light_power_delta_w: Some(20.0),
+                failure_phase: None,
+                retry_count: 0,
+                reason: None,
+                phase_metrics: Vec::new(),
+            });
+            observation
+        };
+        let apply_observations = [
+            apply_pass(F2QualificationPattern::A, 201.25),
+            apply_pass(F2QualificationPattern::B, 203.5),
+        ];
+        let mut published = calibrated;
+        assert!(publish_f2_profile_power_from_apply_qualification(
+            &mut published,
+            &apply_observations,
+            Some("forge-v6"),
+            "GPU-1"
+        )
+        .unwrap());
+        assert_eq!(published.power_p99_w, Some(203.5));
+        assert!((published.perf_per_watt - 1875.0 / 203.5).abs() < f64::EPSILON);
 
         let mut missing_p99 = measured;
         missing_p99.power_p99_w = None;
@@ -6531,7 +6711,7 @@ mod tests {
 
         let dependent = f2_regime_dependent_apply_keys((1890, 918), &frontier);
         assert!(dependent.contains(&(1860, 893)));
-        assert!(dependent.contains(&(1890, 918)));
+        assert!(!dependent.contains(&(1890, 918)));
     }
 
     #[cfg(windows)]

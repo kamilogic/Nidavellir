@@ -781,6 +781,73 @@ pub fn current_discovery_observation_at_anchor<'a>(
         })
 }
 
+/// Highest sustained p99 measured by a complete, reset-clean FSGL3 A+B pair at one exact Apply
+/// anchor in one run. Partial pairs, failed/inconclusive passes, thermal throttling and old
+/// qualification contracts are excluded. The maximum across both approved patterns is returned so
+/// profile presentation cannot understate power already observed during its deployability soak.
+fn apply_qualification_p99_at_anchor(
+    obs: &[F2Observation],
+    run_id: Option<&str>,
+    target_mhz: u32,
+    anchor_mv: u32,
+    gpu_key: &str,
+) -> Option<f32> {
+    let mut runs = std::collections::BTreeMap::<&str, (bool, bool, f32)>::new();
+    for observation in obs.iter().filter(|o| {
+        run_id.is_none_or(|expected| o.run_id == expected)
+            && o.target_mhz == target_mhz
+            && o.anchor_mv == anchor_mv
+            && o.gpu_key.as_deref() == Some(gpu_key)
+            && is_current_apply_qualification_pass(o)
+            && o.reset_to_stock_ok
+            && o.boot_flag_cleared
+            && !o.thermal_throttled
+            && o.power_p99_w
+                .is_some_and(|power| power.is_finite() && power > 0.0)
+    }) {
+        let entry = runs
+            .entry(observation.run_id.as_str())
+            .or_insert((false, false, 0.0));
+        match observation
+            .qualification_coverage
+            .as_ref()
+            .and_then(|coverage| coverage.pattern)
+        {
+            Some(F2QualificationPattern::A) => entry.0 = true,
+            Some(F2QualificationPattern::B) => entry.1 = true,
+            None => continue,
+        }
+        let power = observation.power_p99_w.unwrap_or(0.0);
+        entry.2 = entry.2.max(power);
+    }
+    runs.into_values()
+        .filter(|(saw_a, saw_b, _)| *saw_a && *saw_b)
+        .map(|(_, _, power)| power)
+        .max_by(f32::total_cmp)
+}
+
+/// Highest sustained p99 from the complete approved A+B pair produced by one exact Forge run.
+pub fn current_apply_qualification_p99_at_anchor(
+    obs: &[F2Observation],
+    run_id: &str,
+    target_mhz: u32,
+    anchor_mv: u32,
+    gpu_key: &str,
+) -> Option<f32> {
+    apply_qualification_p99_at_anchor(obs, Some(run_id), target_mhz, anchor_mv, gpu_key)
+}
+
+/// Highest sustained p99 across every complete current-contract A+B run for one exact Apply pair.
+/// This restores the conservative published wattage when a qualified Forge snapshot is reloaded.
+pub fn highest_apply_qualification_p99_at_anchor(
+    obs: &[F2Observation],
+    target_mhz: u32,
+    anchor_mv: u32,
+    gpu_key: &str,
+) -> Option<f32> {
+    apply_qualification_p99_at_anchor(obs, None, target_mhz, anchor_mv, gpu_key)
+}
+
 /// Bridge a whole learned frontier to the `(PowerSweepPoint, confidence)` pairing the existing
 /// classifier consumes. Pure; builds data only.
 pub fn frontier_to_points(entries: &[F2FrontierEntry]) -> Vec<(PowerSweepPoint, f64)> {
@@ -1348,6 +1415,53 @@ mod tests {
         assert_eq!(selected.max_watts, Some(198));
         assert_eq!(selected.power_p99_w, Some(196.0));
         assert!(!selected.thermal_throttled);
+    }
+
+    #[test]
+    fn apply_qualification_power_requires_complete_clean_pair_and_uses_highest_p99() {
+        let mut a = apply_qualification_pass(
+            obs(1830, 862, F2ObsOutcome::Validated),
+            F2QualificationPattern::A,
+        );
+        a.run_id = "apply-v6".into();
+        a.power_p99_w = Some(172.25);
+        let mut b = apply_qualification_pass(
+            obs(1830, 862, F2ObsOutcome::Validated),
+            F2QualificationPattern::B,
+        );
+        b.run_id = "apply-v6".into();
+        b.power_p99_w = Some(172.587);
+        let mut throttled = b.clone();
+        throttled.power_p99_w = Some(180.0);
+        throttled.thermal_throttled = true;
+        let mut other_run_a = a.clone();
+        other_run_a.run_id = "other-run".into();
+        other_run_a.power_p99_w = Some(189.0);
+        let mut other_run_b = b.clone();
+        other_run_b.run_id = "other-run".into();
+        other_run_b.power_p99_w = Some(190.0);
+
+        let observations = [a.clone(), b, throttled, other_run_a, other_run_b];
+        assert_eq!(
+            current_apply_qualification_p99_at_anchor(
+                &observations,
+                "apply-v6",
+                1830,
+                862,
+                "RTX 3060 Ti"
+            ),
+            Some(172.587)
+        );
+        assert_eq!(
+            highest_apply_qualification_p99_at_anchor(&observations, 1830, 862, "RTX 3060 Ti"),
+            Some(190.0),
+            "restored snapshots use the highest complete approved run"
+        );
+        assert_eq!(
+            current_apply_qualification_p99_at_anchor(&[a], "apply-v6", 1830, 862, "RTX 3060 Ti"),
+            None,
+            "one approved pattern alone cannot publish soak power"
+        );
     }
 
     #[test]

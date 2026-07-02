@@ -1111,6 +1111,11 @@ power.
   aliases of the same p5 regime before backend re-synthesis; hard safety failures abort. No IPC
   method changed.
 
+\- After A+B approval, `power_p99_w` on each selected profile is the maximum of its confirmed
+  PowerRender calibration p99 and the p99 measured by the approved exact-Apply A+B pair. Frontier
+  scoring remains PowerRender-homogeneous. Restored qualified v6 snapshots refresh this published
+  value from `f2_observations.jsonl`; no new IPC field is required.
+
 
 
 (No other active backend → frontend requests)

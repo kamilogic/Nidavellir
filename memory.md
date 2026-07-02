@@ -15,6 +15,9 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   qualified 1890 regime requires 918 mV; synthesis uses the canonical support or a lower target.
 - Standard/Long require current A+B boundary evidence for both the candidate and its p5 regime.
   A failed/inconclusive exact Apply also blocks every lower-anchor candidate that aliases that regime.
+- Selected cards publish the larger sustained p99 measured by confirmed PowerRender calibration or
+  the approved exact-Apply FSGL3 A+B pair. Frontier scoring stays PowerRender-homogeneous; restored
+  qualified v6 snapshots refresh the conservative watt from the observation log.
 - Boundary FSGL3 evidence no longer makes the post-margin point deployable. Standard/Long first
   synthesize provisional candidates, then run a five-minute FSGL3 A and five-minute FSGL3 B at each
   unique exact `(target_clock_mhz, vf_table_voltage_mv)` selected by the three profiles.

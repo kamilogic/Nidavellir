@@ -117,7 +117,11 @@ that exact pair. Adding voltage can raise the sustained GPU Boost regime, so sta
 inherited from the lower boundary. Clock p95 is stored beside target, average and p5 to describe that
 upper sustained regime. Any inconclusive attempt creates debt and requires two consecutive clean
 passes for the pattern. A reset-clean rejection excludes only that candidate and re-synthesizes from
-the remaining measured points; hard failures still abort. Old pre-v6 profiles cannot be applied.
+the remaining measured points; hard failures still abort. Once A+B passes, the profile publishes the
+larger sustained p99 observed by its PowerRender calibration or either approved FSGL3 pattern. This
+does not change homogeneous frontier scoring, but prevents the card from understating power already
+measured at the exact deployable pair. Restored v6 snapshots refresh this value from the observation
+log. Old pre-v6 profiles cannot be applied.
 
 ## Problems hit → solutions
 

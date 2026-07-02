@@ -12,6 +12,11 @@ Durable technical decisions and their rationale. Newest first.
 - **Evidence inheritance**: Standard/Long require current A+B boundary evidence for the candidate and
   the supporting p5 regime. A rejected or inconclusive exact Apply blocks lower-anchor aliases of that
   same regime before re-synthesis.
+- **Published power**: after exact-Apply qualification, each selected profile publishes the larger of
+  its confirmed PowerRender p99 and the p99 observed across its approved FSGL3 A+B pair. Selection
+  remains based on homogeneous PowerRender frontier evidence; the card cannot understate a larger
+  sustained peak already measured by its deployability soak. Restored v6 snapshots refresh from the
+  append-only observations.
 - **Contract**: qualification v6 invalidates v5 profile selections. Target, p5, p95 and p99 remain
   separate facts; the ten-minute exact-Apply soak runs only after regime reconciliation.
 
