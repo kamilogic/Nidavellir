@@ -54,6 +54,10 @@ const FSGL3_GOLDEN_SAMPLE_MS: u64 = 2_000;
 /// actual deployable pair for ten minutes; inconclusive debt may extend it.
 #[cfg(windows)]
 const F2_APPLY_QUALIFICATION_DWELL_MS: u64 = 300_000;
+/// One physical NVIDIA clock step is tolerated between the configured curve target and sustained
+/// p5. A larger gap is a different electrical regime and must inherit that regime's Apply anchor.
+#[cfg(windows)]
+const F2_PROFILE_REGIME_TOL_MHZ: u32 = 15;
 /// Initial telemetry threshold for a missing-valid-NVML-sample stall. Leva 1 records the signal only;
 /// proactive reset remains disabled until the hardware gate proves the signal has acceptable
 /// precision and the stress loop has a safe cooperative-cancellation path.
@@ -461,7 +465,7 @@ fn decode_forge_state(json: &str, gpu_key: &str) -> ForgeStateLoad {
             prog.phase = "provisional".into();
         }
         prog.note = Some(
-            "Perfis F2 restaurados são anteriores à qualificação v5 no Apply exato; execute Forge novamente."
+            "Perfis F2 restaurados são anteriores à reconciliação de regime v6; execute Forge novamente."
                 .into(),
         );
     }
@@ -822,6 +826,137 @@ fn f2_unique_profile_points(
         .flatten()
         .copied()
         .filter(|point| f2_apply_key(point).is_some_and(|key| seen.insert(key)))
+        .collect()
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct F2RegimeSupport {
+    observed_p5_mhz: u32,
+    support_target_mhz: u32,
+    required_apply_mv: u32,
+}
+
+#[cfg(windows)]
+fn f2_boundary_point_is_qualified(
+    point: &PowerSweepPoint,
+    required_confirmations: u32,
+    confidence_threshold: f64,
+) -> bool {
+    point.validation_count.unwrap_or(0) >= required_confirmations
+        && point.confidence.unwrap_or(0.0) >= confidence_threshold
+}
+
+/// Resolve the electrical regime exercised by a calibrated point. When p5 is more than one physical
+/// clock bin above the configured target, the nearest measured target at/above p5 owns the regime.
+/// Required voltage is the conservative maximum Apply anchor across that upward target span.
+#[cfg(windows)]
+fn f2_regime_support(
+    point: &PowerSweepPoint,
+    frontier: &[(PowerSweepPoint, f64)],
+) -> Result<F2RegimeSupport, &'static str> {
+    let target_mhz = point
+        .target_clock_mhz
+        .ok_or("candidate has no configured target")?;
+    let observed_p5_mhz = point
+        .p5_clock_mhz
+        .filter(|clock| *clock > 0)
+        .ok_or("candidate has no measured p5")?;
+    let support_target_mhz = if observed_p5_mhz
+        > target_mhz.saturating_add(F2_PROFILE_REGIME_TOL_MHZ)
+    {
+        frontier
+            .iter()
+            .filter_map(|(candidate, _)| candidate.target_clock_mhz)
+            .filter(|candidate_target| *candidate_target >= observed_p5_mhz)
+            .min()
+            .ok_or("no measured target supports the observed p5 regime")?
+    } else {
+        target_mhz
+    };
+    let required_apply_mv = frontier
+        .iter()
+        .filter_map(|(candidate, _)| {
+            let candidate_target = candidate.target_clock_mhz?;
+            let apply_mv = candidate.vf_table_voltage_mv?;
+            (candidate_target >= target_mhz && candidate_target <= support_target_mhz)
+                .then_some(apply_mv)
+        })
+        .max()
+        .ok_or("observed p5 regime has no measured Apply anchor")?;
+    Ok(F2RegimeSupport {
+        observed_p5_mhz,
+        support_target_mhz,
+        required_apply_mv,
+    })
+}
+
+#[cfg(windows)]
+fn f2_regime_candidate_refusal(
+    point: &PowerSweepPoint,
+    frontier: &[(PowerSweepPoint, f64)],
+    require_boundary_qualification: bool,
+    required_confirmations: u32,
+    confidence_threshold: f64,
+) -> Option<String> {
+    if require_boundary_qualification
+        && !f2_boundary_point_is_qualified(
+            point,
+            required_confirmations,
+            confidence_threshold,
+        )
+    {
+        return Some("its own frontier boundary lacks current A+B qualification".into());
+    }
+    let support = match f2_regime_support(point, frontier) {
+        Ok(support) => support,
+        Err(reason) => return Some(reason.into()),
+    };
+    let support_point = frontier.iter().find_map(|(candidate, _)| {
+        (candidate.target_clock_mhz == Some(support.support_target_mhz)).then_some(candidate)
+    });
+    if require_boundary_qualification
+        && !support_point.is_some_and(|candidate| {
+            f2_boundary_point_is_qualified(
+                candidate,
+                required_confirmations,
+                confidence_threshold,
+            )
+        })
+    {
+        return Some(format!(
+            "{} MHz p5 maps to {} MHz, whose frontier is failed or inconclusive",
+            support.observed_p5_mhz, support.support_target_mhz
+        ));
+    }
+    let Some(apply_mv) = point.vf_table_voltage_mv else {
+        return Some("candidate has no exact Apply anchor".into());
+    };
+    (apply_mv < support.required_apply_mv).then(|| {
+        format!(
+            "{} MHz target sustains p5 {} MHz but Apply {} mV is below the {} mV required by the {} MHz regime",
+            point.target_clock_mhz.unwrap_or(point.clock_mhz),
+            support.observed_p5_mhz,
+            apply_mv,
+            support.required_apply_mv,
+            support.support_target_mhz
+        )
+    })
+}
+
+#[cfg(windows)]
+fn f2_regime_dependent_apply_keys(
+    failed_key: (u32, u32),
+    frontier: &[(PowerSweepPoint, f64)],
+) -> Vec<(u32, u32)> {
+    frontier
+        .iter()
+        .filter_map(|(point, _)| {
+            let key = f2_apply_key(point)?;
+            let support = f2_regime_support(point, frontier).ok()?;
+            (support.support_target_mhz == failed_key.0 && key.1 <= failed_key.1)
+                .then_some(key)
+        })
         .collect()
 }
 
@@ -5648,7 +5783,31 @@ fn measure_multiclock_undervolt_forge(
         let mut classified = pts;
         if power_calibrated {
             let exact_apply_required = f2_required_qualification_passes(mode_policy) > 0;
+            let required_confirmations =
+                f2_required_qualification_passes(mode_policy) as u32;
+            let confidence_threshold = ForgePolicy::balanced().confidence_threshold;
             let mut excluded_apply_pairs = std::collections::HashSet::new();
+            for (point, _) in &classified {
+                if let Some(reason) = f2_regime_candidate_refusal(
+                    point,
+                    &classified,
+                    exact_apply_required,
+                    required_confirmations,
+                    confidence_threshold,
+                ) {
+                    if let Some(key) = f2_apply_key(point) {
+                        excluded_apply_pairs.insert(key);
+                        prog.log.push(format!(
+                            "Reconciliação de regime: {} MHz target @ {} mV VF excluído — {reason}.",
+                            key.0, key.1
+                        ));
+                    } else {
+                        prog.log.push(format!(
+                            "Reconciliação de regime: candidato sem identidade Apply excluído — {reason}."
+                        ));
+                    }
+                }
+            }
             let mut final_profiles = None;
             loop {
                 let eligible = classified
@@ -5778,10 +5937,16 @@ fn measure_multiclock_undervolt_forge(
                         terminal = true;
                         break;
                     }
+                    let dependent_keys =
+                        f2_regime_dependent_apply_keys(key, &classified);
+                    let inherited_count = dependent_keys
+                        .iter()
+                        .filter(|dependent| excluded_apply_pairs.insert(**dependent))
+                        .count();
                     excluded_apply_pairs.insert(key);
                     prog.log.push(format!(
-                        "FORGE: candidato {} MHz target @ {} mV VF excluído; ressintetizando com os pontos restantes.",
-                        key.0, key.1
+                        "FORGE: candidato {} MHz target @ {} mV VF excluído; {} ponto(s) que herdam o mesmo regime p5 também bloqueado(s). Ressintetizando.",
+                        key.0, key.1, inherited_count
                     ));
                     changed = true;
                     break;
@@ -6274,6 +6439,126 @@ mod tests {
         assert_eq!(
             f2_unique_profile_points(&[Some(shared), Some(shared), Some(distinct)]).len(),
             2
+        );
+    }
+
+    #[cfg(windows)]
+    fn regime_point(
+        target_mhz: u32,
+        apply_mv: u32,
+        p5_clock_mhz: u32,
+        validation_count: u32,
+    ) -> (PowerSweepPoint, f64) {
+        (
+            PowerSweepPoint {
+                clock_mhz: p5_clock_mhz,
+                target_clock_mhz: Some(target_mhz),
+                vf_table_voltage_mv: Some(apply_mv),
+                p5_clock_mhz: Some(p5_clock_mhz),
+                power_w: 180.0,
+                max_power_w: 185.0,
+                power_p99_w: Some(182.0),
+                stable: true,
+                perf_per_watt: p5_clock_mhz as f64 / 182.0,
+                confidence: Some(0.99),
+                validation_count: Some(validation_count),
+                ..Default::default()
+            },
+            0.99,
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn profile_regime_rejects_1860_at_893_when_p5_sustains_1890() {
+        let frontier = vec![
+            regime_point(1860, 893, 1890, 2),
+            regime_point(1875, 900, 1875, 2),
+            regime_point(1890, 918, 1890, 2),
+        ];
+        let refusal =
+            f2_regime_candidate_refusal(&frontier[0].0, &frontier, true, 2, 0.85)
+                .expect("lower target must inherit the 1890 MHz regime");
+        assert!(refusal.contains("p5 1890 MHz"));
+        assert!(refusal.contains("below the 918 mV"));
+        assert!(
+            f2_regime_candidate_refusal(&frontier[2].0, &frontier, true, 2, 0.85)
+                .is_none(),
+            "the canonical 1890 MHz / 918 mV point remains eligible"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn profile_regime_accepts_one_bin_jitter_or_enough_voltage_margin() {
+        let one_bin = regime_point(1860, 893, 1875, 2);
+        let raised = regime_point(1860, 925, 1890, 2);
+        let support = regime_point(1890, 918, 1890, 2);
+        let one_bin_frontier = vec![one_bin, support];
+        assert!(
+            f2_regime_candidate_refusal(
+                &one_bin_frontier[0].0,
+                &one_bin_frontier,
+                true,
+                2,
+                0.85
+            )
+            .is_none()
+        );
+        let raised_frontier = vec![raised, support];
+        assert!(
+            f2_regime_candidate_refusal(
+                &raised_frontier[0].0,
+                &raised_frontier,
+                true,
+                2,
+                0.85
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn profile_regime_inherits_inconclusive_support_and_exact_apply_failure() {
+        let lower = regime_point(1860, 893, 1890, 2);
+        let inconclusive_support = regime_point(1890, 918, 1890, 1);
+        let frontier = vec![lower, inconclusive_support];
+        let refusal =
+            f2_regime_candidate_refusal(&frontier[0].0, &frontier, true, 2, 0.85)
+                .expect("inconclusive 1890 support must block the lower alias");
+        assert!(refusal.contains("failed or inconclusive"));
+
+        let dependent = f2_regime_dependent_apply_keys((1890, 918), &frontier);
+        assert!(dependent.contains(&(1860, 893)));
+        assert!(dependent.contains(&(1890, 918)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn profile_synthesis_uses_canonical_regime_after_alias_is_removed() {
+        let mut efficient = regime_point(1845, 887, 1845, 2);
+        efficient.0.power_p99_w = Some(168.0);
+        efficient.0.perf_per_watt = 1845.0 / 168.0;
+        let alias = regime_point(1860, 893, 1890, 2);
+        let canonical = regime_point(1890, 918, 1890, 2);
+        let frontier = vec![efficient, alias, canonical];
+        let eligible = frontier
+            .iter()
+            .copied()
+            .filter(|(point, _)| {
+                f2_regime_candidate_refusal(point, &frontier, true, 2, 0.85)
+                    .is_none()
+            })
+            .collect::<Vec<_>>();
+        assert!(!eligible
+            .iter()
+            .any(|(point, _)| point.target_clock_mhz == Some(1860)));
+        let profiles = synthesize_forge_profiles(&eligible, &ForgePolicy::balanced());
+        assert_eq!(
+            profiles.godforge.unwrap().target_clock_mhz,
+            Some(1890),
+            "performance must resolve to the canonical 1890/918 support"
         );
     }
 
@@ -9007,7 +9292,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn restored_pre_v5_f2_profiles_become_provisional() {
+    fn restored_pre_v6_f2_profiles_become_provisional() {
         let mut prog = idle();
         prog.is_undervolt = true;
         prog.phase = "finished".into();
@@ -9025,7 +9310,7 @@ mod tests {
                     .note
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("qualificação v5"));
+                    .contains("regime v6"));
             }
             other => panic!("expected Loaded, got {other:?}"),
         }

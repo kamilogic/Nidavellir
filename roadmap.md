@@ -30,10 +30,11 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   boundary, always starting one physical bin above it and falling back when inputs disagree by more
   than 25 mV. Confirmed power-bound spans may advance 4/2/1 bins by p5 deficit under 25 mV and writer
   offset-step guards; any jumped failure recovers upward before exact adjacent-bin qualification.
-   Deployable synthesis still requires the complete range and successful qualification. Contract v5
-   additionally soaks each unique selected post-margin Apply pair with FSGL3 A+B for 5 minutes per
-   pattern; reset-clean rejection re-synthesizes another measured candidate, and p95 exposes the upper
-   sustained clock regime reached at that exact pair.
+   Deployable synthesis still requires the complete range and successful qualification. Contract v6
+   reconciles any target/p5 gap beyond one 15 MHz bin against the higher regime's measured Apply
+   anchor, then soaks each unique selected post-margin pair with FSGL3 A+B for 5 minutes per pattern.
+   Reset-clean rejection blocks lower-anchor aliases and re-synthesizes another measured candidate;
+   p95 remains the visible upper sustained clock at that exact pair.
   Qualification now stops on a relative heavy-phase p5 margin collapse, retries weak coverage twice
   and continues across clocks. Supervised F2 TDR recovery is learning rather than normal-use crash
   budget, interrupted runs resume on UI reconnect, and Apply requests +12 mV then snaps to a valid

@@ -1062,7 +1062,7 @@ power.
 
 \- After the frontier is qualified and the Apply margin snaps upward, the backend fills any missing
   exact target/apply-bin p99 with a supervised discovery-only PowerRender dwell. The same v4
-  anomaly/consensus rules apply. This backfill itself does not promote stability; qualification v5
+  anomaly/consensus rules apply. This backfill itself does not promote stability; qualification
   later runs the separate exact-Apply FSGL3 gate. Failure to confirm the backfill leaves profiles
   unavailable rather than inventing power.
 
@@ -1074,7 +1074,7 @@ power.
 
 \- Discovery contract is v4; v3 positive/power-bound evidence cannot enter v4 synthesis or resume.
   F2 Apply also rejects any restored profile that lacks a valid measured `power_p99_w`. The
-  qualification-v4 sentence formerly here is superseded by the v5 exact-Apply contract below.
+  qualification-v4 sentence formerly here is superseded by the current contract below.
 
 \## Backend runtime note (2026-07-01): adaptive F2 scheduling (no IPC change)
 
@@ -1089,21 +1089,27 @@ power.
   approved off-cap point, discovery returns to adjacent-bin qualification. FSGL3, thermal handling,
   Safe Loop, Apply-bin p99 backfill, profile payloads and Apply behavior are unchanged.
 
-\## Backend → Frontend (2026-07-02): exact-Apply qualification v5
+\## Backend → Frontend (2026-07-02): electrical-regime reconciliation + exact-Apply v6
 
 \- `PowerSweepPoint` adds optional/backward-compatible `p95_clock_mhz`,
   `apply_qualified` (default `false`) and `apply_qualification_version`.
 
-\- The card keeps `target_clock_mhz` as the configured target. Display measured average, sustained
-  p5 and sustained p95 as separate facts; p95 is the upper sustained boost regime, not a target.
+\- The card keeps `target_clock_mhz` as the configured target. Display measured average, electrical
+  regime p5 and sustained p95 as separate facts; neither measured percentile is a configured target.
+
+\- A target/p5 gap beyond one 15 MHz physical bin maps to the nearest measured target at/above p5.
+  The candidate inherits the maximum Apply anchor across that span. Under-anchored aliases are
+  removed before synthesis; no profile power or voltage is interpolated.
 
 \- Standard/Long set `profiles_qualified == true` only after every selected unique profile point has
-  FSGL3 A+B evidence at its exact post-margin target/VF pair under qualification contract v5.
+  current A+B boundary evidence for its p5 regime and FSGL3 A+B evidence at its exact post-margin
+  target/VF pair under qualification contract v6.
   Old/restored points lack that seal and Apply rejects them.
 
 \- Exact Apply A and B run for five minutes each. Any inconclusive attempt requires two subsequent
-  consecutive clean passes for that pattern. A reset-clean rejection causes backend re-synthesis;
-  hard safety failures abort. No IPC method changed.
+  consecutive clean passes for that pattern. A reset-clean rejection also blocks lower-anchor
+  aliases of the same p5 regime before backend re-synthesis; hard safety failures abort. No IPC
+  method changed.
 
 
 

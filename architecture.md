@@ -57,8 +57,10 @@ headless client used for sweeps/benchmarks. Requests/responses are the
   retained beside target/avg/p5 to expose the higher sustained boost regime;
   qualification uses TextureRop/MixedGame-biased transients, deliberate droop bursts and on-GPU
   verification of every rendered frame. A rejected FSGL3 candidate stops descent at the last
-  FSGL3-qualified physical bin. Qualification contract v5 additionally requires exact-Apply A+B;
-  a reset-clean Apply rejection re-synthesizes another candidate and old payloads fail closed;
+  FSGL3-qualified physical bin. Qualification contract v6 first reconciles target against sustained
+  p5: aliases beyond one 15 MHz bin inherit the higher regime's conservative Apply anchor and
+  qualification state. It then requires exact-Apply A+B; a reset-clean rejection also blocks
+  lower-anchor aliases of that regime before re-synthesis, and old payloads fail closed;
   FSGL1/FSGL2 remain readable legacy evidence and retain their original stress behavior.
 - **Anchored VF undervolt** (`gpu-nvapi`): raises exactly one real lower-voltage
   anchor and caps higher-voltage bins to the target via per-point ClkVfPoints

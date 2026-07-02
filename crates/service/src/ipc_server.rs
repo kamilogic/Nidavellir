@@ -528,7 +528,7 @@ fn apply_undervolt_profile(
             )
     {
         return IpcResponse::failure(
-            "F2 profile was not qualified at its exact post-margin Apply pair — run Forge again under qualification v5",
+            "F2 profile was not reconciled and qualified under the current v6 contract — run Forge again",
         );
     }
     let (target_mhz, anchor_mv) = undervolt_apply_params(&p);
@@ -736,7 +736,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("exact post-margin Apply pair"));
+            .contains("current v6 contract"));
     }
 
     #[test]

@@ -30,9 +30,9 @@ pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 4;
 /// Current FailureSeekingGameLoop qualification contract.
 ///
-/// v5 adds a distinct long FSGL3 A+B gate for the exact post-margin Apply pair. Boundary
-/// qualification alone no longer makes a profile deployable.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 5;
+/// v6 keeps the v5 exact post-margin FSGL3 A+B gate and additionally requires profile synthesis to
+/// reconcile any configured-target/p5 alias with the higher sustained electrical regime.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 6;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.

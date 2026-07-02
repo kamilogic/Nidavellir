@@ -135,7 +135,7 @@
 
   function achievedClock(point) {
     if (point?.target_clock_mhz == null || point?.clock_mhz == null) return null;
-    const p5 = point.p5_clock_mhz != null ? ` · sustained p5 ${point.p5_clock_mhz} MHz` : "";
+    const p5 = point.p5_clock_mhz != null ? ` · electrical regime p5 ${point.p5_clock_mhz} MHz` : "";
     const p95 = point.p95_clock_mhz != null ? ` · sustained p95 ${point.p95_clock_mhz} MHz` : "";
     return `Measured avg: ${point.clock_mhz} MHz${p5}${p95}`;
   }

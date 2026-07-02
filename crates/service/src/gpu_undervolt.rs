@@ -4419,7 +4419,7 @@ pub(crate) fn run_confirmed_f2_apply_qualification(
 
 /// Measure a missing exact Apply bin with the same supervised PowerRender motor and discovery-v4
 /// p99 consistency contract used by frontier descent. The qualified frontier is not changed and
-/// this function contributes only card/profile power calibration; the separate post-synthesis v5
+/// this function contributes only card/profile power calibration; the separate post-synthesis
 /// gate proves exact-Apply stability. Every raw attempt is persisted; no consensus remains neutral
 /// and ineligible.
 #[cfg(windows)]

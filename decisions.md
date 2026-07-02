@@ -2,10 +2,23 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 profile identity follows sustained p5 electrical regime (2026-07-02)
+- **Decision**: tolerate one 15 MHz physical bin of target/p5 variance. Beyond that, p5 owns the
+  electrical regime. The candidate must carry at least the maximum measured Apply anchor through the
+  nearest target at/above p5; otherwise it is removed before synthesis.
+- **Profile behavior**: removing an under-anchored alias makes Godforge resolve to the canonical
+  higher-regime point and makes Brokkr's/Deep Calm fall to the next efficient self-consistent target.
+  Power is never interpolated and no synthetic point is created.
+- **Evidence inheritance**: Standard/Long require current A+B boundary evidence for the candidate and
+  the supporting p5 regime. A rejected or inconclusive exact Apply blocks lower-anchor aliases of that
+  same regime before re-synthesis.
+- **Contract**: qualification v6 invalidates v5 profile selections. Target, p5, p95 and p99 remain
+  separate facts; the ten-minute exact-Apply soak runs only after regime reconciliation.
+
 ## F2 deployability requires long qualification at the exact Apply pair (2026-07-02)
 - **Decision**: boundary qualification and post-margin deployability are separate claims. After
   synthesis, every unique selected `(target, Apply VF bin)` runs FSGL3 A+B for five minutes per
-  pattern. `F2_QUALIFICATION_CONTRACT_VERSION = 5`.
+  pattern. This introduced qualification v5; v6 retains the soak and adds regime reconciliation.
 - **Rationale**: adding voltage can move GPU Boost into a higher sustained-clock regime. A boundary
   pass at a lower bin therefore cannot be inherited by the `+12 mV` Apply point.
 - **Inconclusive debt**: after any inconclusive attempt, that pattern needs two consecutive clean
@@ -56,7 +69,7 @@ Durable technical decisions and their rationale. Newest first.
 - **UI contract**: cards say “sustained p99” and explicitly state it is not a hard power limit.
   Legacy payloads fall back to raw peak/mean; raw peak remains available as a separate diagnostic.
 - **Historical scope**: FSGL3 A+B goldens, Leva 1 recovery, early-stop and +12 mV application policy
-  were unchanged here. Qualification v5 later superseded v4 deployability.
+  were unchanged here. Later qualification contracts superseded v4 deployability.
 
 ## F2 uses a margin boundary and treats supervised TDR as learning (2026-06-30)
 - **Decision**: qualification compares like-for-like FSGL3 heavy-phase p5 telemetry, separated by A/B

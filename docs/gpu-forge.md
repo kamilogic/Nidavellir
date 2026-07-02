@@ -87,7 +87,7 @@ shallower bin. Once p99 leaves the cap, the normal clock-drop boundary applies.
 The qualifier is an orthogonal rejection test, not a replacement for power characterization.
 Its aggregate p5 includes intentional light phases and therefore cannot create `ClockDrop`; that
 classification remains exclusive to the steady discovery render. Qualification evidence is versioned
-separately from discovery evidence. Contract v5 keeps frontier `Qualification` and post-margin
+separately from discovery evidence. Contract v6 keeps frontier `Qualification` and post-margin
 `ApplyQualification` distinct; deployability requires both FSGL3 patterns at the exact selected
 target/VF pair. FSGL1/FSGL2,
 legacy-qualified and discovery-only points remain provisional. Goldens are session-only and are not
@@ -102,13 +102,22 @@ p5 for Godforge/Brokkr's/Deep Calm scoring. A reset-clean power-bound clock drop
 calibration telemetry without becoming stability evidence. A missing, old-contract or thermally
 throttled apply-bin measurement fails closed with no new profile.
 
-**Exact-Apply stability closure.** Standard/Long treat synthesized profiles as provisional until every
+**Electrical-regime reconciliation.** A calibrated profile may sustain a p5 above its configured
+target because the VF target is not a hard runtime clock lock. One 15 MHz physical bin is tolerated.
+Beyond that, synthesis maps p5 to the nearest measured target at/above it and requires the maximum
+Apply anchor across that span. For example, `1860@893` sustaining p5 1890 cannot alias a qualified
+1890 regime that requires 918 mV. It is excluded: performance resolves to the canonical support,
+while efficiency profiles fall to another measured self-consistent target. Standard/Long also require
+current A+B evidence for the supporting regime. Exact-Apply rejection/inconclusion blocks every
+lower-anchor alias of the same regime. No power or voltage is interpolated.
+
+**Exact-Apply stability closure.** Standard/Long treat reconciled profiles as provisional until every
 unique selected `(target, Apply VF bin)` completes a five-minute FSGL3 A and five-minute FSGL3 B at
 that exact pair. Adding voltage can raise the sustained GPU Boost regime, so stability is never
 inherited from the lower boundary. Clock p95 is stored beside target, average and p5 to describe that
 upper sustained regime. Any inconclusive attempt creates debt and requires two consecutive clean
 passes for the pattern. A reset-clean rejection excludes only that candidate and re-synthesizes from
-the remaining measured points; hard failures still abort. Old pre-v5 profiles cannot be applied.
+the remaining measured points; hard failures still abort. Old pre-v6 profiles cannot be applied.
 
 ## Problems hit → solutions
 
