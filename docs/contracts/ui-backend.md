@@ -1062,8 +1062,9 @@ power.
 
 \- After the frontier is qualified and the Apply margin snaps upward, the backend fills any missing
   exact target/apply-bin p99 with a supervised discovery-only PowerRender dwell. The same v4
-  anomaly/consensus rules apply. FSGL3 is not repeated, and failure to confirm this backfill leaves
-  profiles unavailable rather than inventing power.
+  anomaly/consensus rules apply. This backfill itself does not promote stability; qualification v5
+  later runs the separate exact-Apply FSGL3 gate. Failure to confirm the backfill leaves profiles
+  unavailable rather than inventing power.
 
 \- Two optional/additive `PowerSweepPoint` fields are available: `max_temp_c: Option<f32>` and
   `thermal_throttled: bool`. Thermally throttled discovery is not eligible for profile calibration.
@@ -1072,9 +1073,8 @@ power.
   limit. Frontend tolerates old payloads by falling back to `max_power_w`, then `power_w`.
 
 \- Discovery contract is v4; v3 positive/power-bound evidence cannot enter v4 synthesis or resume.
-  F2 Apply also rejects any restored profile that lacks a valid measured `power_p99_w`.
-  No method changed. FSGL3/golden qualification contract v4 and `profiles_qualified` semantics are
-  unchanged.
+  F2 Apply also rejects any restored profile that lacks a valid measured `power_p99_w`. The
+  qualification-v4 sentence formerly here is superseded by the v5 exact-Apply contract below.
 
 \## Backend runtime note (2026-07-01): adaptive F2 scheduling (no IPC change)
 
@@ -1088,6 +1088,22 @@ power.
 \- A reset-clean failure reached by a jump causes upward-only midpoint recovery. After the first
   approved off-cap point, discovery returns to adjacent-bin qualification. FSGL3, thermal handling,
   Safe Loop, Apply-bin p99 backfill, profile payloads and Apply behavior are unchanged.
+
+\## Backend → Frontend (2026-07-02): exact-Apply qualification v5
+
+\- `PowerSweepPoint` adds optional/backward-compatible `p95_clock_mhz`,
+  `apply_qualified` (default `false`) and `apply_qualification_version`.
+
+\- The card keeps `target_clock_mhz` as the configured target. Display measured average, sustained
+  p5 and sustained p95 as separate facts; p95 is the upper sustained boost regime, not a target.
+
+\- Standard/Long set `profiles_qualified == true` only after every selected unique profile point has
+  FSGL3 A+B evidence at its exact post-margin target/VF pair under qualification contract v5.
+  Old/restored points lack that seal and Apply rejects them.
+
+\- Exact Apply A and B run for five minutes each. Any inconclusive attempt requires two subsequent
+  consecutive clean passes for that pattern. A reset-clean rejection causes backend re-synthesis;
+  hard safety failures abort. No IPC method changed.
 
 
 

@@ -125,6 +125,10 @@ pub struct PowerSweepPoint {
     /// 5th-percentile sustained clock (MHz) — the "bad-case" clock.
     #[serde(default)]
     pub p5_clock_mhz: Option<u32>,
+    /// 95th-percentile sustained clock (MHz) — the upper sustained boost regime observed during
+    /// the same dwell. Kept separate from the configured target and the p5 stability floor.
+    #[serde(default)]
+    pub p95_clock_mhz: Option<u32>,
     /// Ramp-filtered + sanity-checked measured-voltage distribution (telemetry only).
     #[serde(default)]
     pub avg_measured_voltage_mv: Option<u32>,
@@ -171,6 +175,14 @@ pub struct PowerSweepPoint {
     /// Successful confirmations accumulated at this exact target/anchor point.
     #[serde(default)]
     pub validation_count: Option<u32>,
+    /// True only when FSGL3 A+B qualified this exact `(target_clock_mhz,
+    /// vf_table_voltage_mv)` Apply pair after the application margin was added.
+    #[serde(default)]
+    pub apply_qualified: bool,
+    /// Qualification contract that produced `apply_qualified`. Old/restored points default to
+    /// `None` and remain ineligible for F2 Apply.
+    #[serde(default)]
+    pub apply_qualification_version: Option<u32>,
 }
 
 /// Power-target sweep: for a range of locked voltages, the max stable clock and

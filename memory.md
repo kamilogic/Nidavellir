@@ -8,6 +8,20 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-02) — exact-Apply qualification closes the boost-regime gap
+- Boundary FSGL3 evidence no longer makes the post-margin point deployable. Standard/Long first
+  synthesize provisional candidates, then run a five-minute FSGL3 A and five-minute FSGL3 B at each
+  unique exact `(target_clock_mhz, vf_table_voltage_mv)` selected by the three profiles.
+- `F2_QUALIFICATION_CONTRACT_VERSION = 5`; exact passes are persisted as distinct
+  `ApplyQualification` evidence. Old/restored points default to unqualified and F2 Apply fails closed.
+- Any `Inconclusive` creates debt for that pattern and requires two consecutive clean passes.
+  Reset-clean rejection excludes only that target/Apply pair and re-synthesizes from remaining
+  measured candidates; device/reset/write failures still abort.
+- Clock p95 now flows beside target, average and p5 so the UI exposes the upper sustained boost regime
+  actually exercised at Apply. Exact-Apply failures do not rewrite the lower-voltage frontier bracket.
+- Code/tests only. The currently applied pre-v5 profile must be reset/re-forged before reuse; no
+  hardware write, Forge or game validation was run during this implementation.
+
 ## Latest (2026-07-01) — adaptive F2 frontier search without weakening qualification
 - A prior compatible discovery-v4 boundary for the same GPU/clock is the strongest start predictor.
   Otherwise the last 3–4 qualified clocks are projected with a non-increasing isotonic trend. The
@@ -39,7 +53,7 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   power and the p5 clock observed at the apply bin, not boundary-bin mean or a one-sample maximum.
   When cross-clock warm-start pruning skipped that exact target/apply pair, Forge fills only the
   missing power telemetry with supervised discovery-only PowerRender and the same v4 p99 consensus;
-  FSGL3 is not repeated.
+  the backfill itself does not qualify stability. The 2026-07-02 v5 gate now runs FSGL3 separately.
 - A discovery `ClockDrop` whose p99 remains at 99%+ of the numeric cap is `PowerBoundClockDrop` and
   continues voltage descent even after the clock previously sustained. It remains calibration
   telemetry, never stability evidence; off-cap `ClockDrop` retains the normal boundary behavior.
@@ -47,7 +61,7 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   NVML software/hardware thermal slowdown makes a discovery dwell `Inconclusive`, not a bad undervolt.
 - UI cards and Forge Progress show sustained p99 with an explicit “not a hard power limit” caveat;
   raw mean/maximum remain available. Apply rejects restored F2 profiles without valid p99.
-  FSGL3/goldens, qualification contract v4 and Leva 1 margin/recovery semantics are unchanged.
+  Qualification v4 was current for this checkpoint; v5 supersedes its deployability rule.
 - Hardware on 2026-07-01 confirmed p99 kept a 1950 MHz descent moving through power-bound clock
   drops while the cap stayed near 200 W. The first reset-clean FSGL3 rejection exposed a ladder
   control bug: `completed = false` stopped every lower clock. It now completes only that target and

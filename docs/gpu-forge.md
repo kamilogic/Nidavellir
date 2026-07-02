@@ -60,9 +60,8 @@ The live F2 Forge deliberately asks two different questions with two different r
   post-ramp sample; fewer than 100 samples fall back to raw max. An anomalous adjacent-bin p99 in the
   same p5 regime repeats the exact bin up to three total attempts; two must agree and calibration
   uses the highest measured p99. A bin without consensus is ineligible.
-  If cross-clock warm-start pruning skipped the later +12 mV Apply bin for that exact target, Forge
-  performs a discovery-only PowerRender backfill at that bin after the frontier completes. It does
-  not repeat FSGL3 because the Apply bin is above the already-qualified boundary.
+   If cross-clock warm-start pruning skipped the later +12 mV Apply bin for that exact target, Forge
+   performs a discovery-only PowerRender backfill at that bin after the frontier completes.
 - **Standard / Long qualification:** FSGL3 A+B is the default interleaved per-bin qualifier. Before
   descent, stock captures deterministic power, boost and texture/ROP checksums with one fresh
   `GpuCtx` per render configuration. FSGL3 biases TextureRop/MixedGame, crosses the same eight
@@ -88,8 +87,9 @@ shallower bin. Once p99 leaves the cap, the normal clock-drop boundary applies.
 The qualifier is an orthogonal rejection test, not a replacement for power characterization.
 Its aggregate p5 includes intentional light phases and therefore cannot create `ClockDrop`; that
 classification remains exclusive to the steady discovery render. Qualification evidence is versioned
-separately from discovery evidence; current Apply qualification counts only current-contract FSGL3
-passes and requires both distinct patterns A+B under qualification contract v4. FSGL1/FSGL2,
+separately from discovery evidence. Contract v5 keeps frontier `Qualification` and post-margin
+`ApplyQualification` distinct; deployability requires both FSGL3 patterns at the exact selected
+target/VF pair. FSGL1/FSGL2,
 legacy-qualified and discovery-only points remain provisional. Goldens are session-only and are not
 written to Forge state. No manual bad-point registry is encoded, and Standard/Long never qualify an
 old `prior_good` boundary without current-run rediscovery first. No synthetic workload is claimed to
@@ -101,6 +101,14 @@ resolves the current PowerRender observation for that exact apply bin and uses i
 p5 for Godforge/Brokkr's/Deep Calm scoring. A reset-clean power-bound clock drop can supply this
 calibration telemetry without becoming stability evidence. A missing, old-contract or thermally
 throttled apply-bin measurement fails closed with no new profile.
+
+**Exact-Apply stability closure.** Standard/Long treat synthesized profiles as provisional until every
+unique selected `(target, Apply VF bin)` completes a five-minute FSGL3 A and five-minute FSGL3 B at
+that exact pair. Adding voltage can raise the sustained GPU Boost regime, so stability is never
+inherited from the lower boundary. Clock p95 is stored beside target, average and p5 to describe that
+upper sustained regime. Any inconclusive attempt creates debt and requires two consecutive clean
+passes for the pattern. A reset-clean rejection excludes only that candidate and re-synthesizes from
+the remaining measured points; hard failures still abort. Old pre-v5 profiles cannot be applied.
 
 ## Problems hit → solutions
 

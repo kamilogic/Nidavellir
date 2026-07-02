@@ -50,6 +50,10 @@ const VOLT_SANE_MAX_MV: u32 = 1250;
 const F2_QUALIFIER_TARGET_TOL_MHZ: u32 = 30;
 #[cfg(windows)]
 const FSGL3_GOLDEN_SAMPLE_MS: u64 = 2_000;
+/// Each exact post-margin Apply pattern gets five minutes. A clean A+B gate therefore soaks the
+/// actual deployable pair for ten minutes; inconclusive debt may extend it.
+#[cfg(windows)]
+const F2_APPLY_QUALIFICATION_DWELL_MS: u64 = 300_000;
 /// Initial telemetry threshold for a missing-valid-NVML-sample stall. Leva 1 records the signal only;
 /// proactive reset remains disabled until the hardware gate proves the signal has acceptable
 /// precision and the stress loop has a safe cooperative-cancellation path.
@@ -287,6 +291,7 @@ fn f2_profiles_meet_qualification(
             point.confidence.unwrap_or(0.0) >= confidence_threshold
                 && point.validation_count.unwrap_or(0) >= required_confirmations
         })
+        && f2_profile_points_have_current_apply_qualification(profiles)
 }
 
 #[derive(Clone)]
@@ -443,6 +448,23 @@ fn decode_forge_state(json: &str, gpu_key: &str) -> ForgeStateLoad {
         };
     }
     let mut prog = file.progress;
+    if prog.is_undervolt
+        && prog.profiles_qualified
+        && !f2_profile_points_have_current_apply_qualification(&[
+            prog.godforge,
+            prog.brokkrs,
+            prog.deep_calm,
+        ])
+    {
+        prog.profiles_qualified = false;
+        if prog.phase == "finished" {
+            prog.phase = "provisional".into();
+        }
+        prog.note = Some(
+            "Perfis F2 restaurados são anteriores à qualificação v5 no Apply exato; execute Forge novamente."
+                .into(),
+        );
+    }
     if prog.running {
         prog.phase = "interrupted".into();
         prog.estimated_remaining_ms = None;
@@ -453,6 +475,19 @@ fn decode_forge_state(json: &str, gpu_key: &str) -> ForgeStateLoad {
     }
     prog.running = false;
     ForgeStateLoad::Loaded(Box::new(prog))
+}
+
+fn f2_profile_points_have_current_apply_qualification(
+    profiles: &[Option<PowerSweepPoint>],
+) -> bool {
+    profiles.iter().all(Option::is_some)
+        && profiles.iter().flatten().all(|point| {
+            point.apply_qualified
+                && point.apply_qualification_version
+                    == Some(
+                        nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
+                    )
+        })
 }
 
 #[cfg(windows)]
@@ -697,6 +732,7 @@ struct Measured {
     /// Sustained-clock distribution (post-ramp): lowest and 5th percentile.
     min_clock_mhz: u32,
     p5_clock_mhz: u32,
+    p95_clock_mhz: u32,
     /// Ramp-filtered + sanity-checked measured-voltage stats (telemetry only).
     volt_min_mv: Option<u32>,
     volt_avg_mv: Option<u32>,
@@ -733,6 +769,7 @@ impl Measured {
             duration_ms: 0,
             min_clock_mhz: 0,
             p5_clock_mhz: 0,
+            p95_clock_mhz: 0,
             volt_min_mv: None,
             volt_avg_mv: None,
             volt_max_mv: None,
@@ -765,6 +802,39 @@ fn p5_clock_mhz(clocks: &[u32]) -> Option<u32> {
     s.sort_unstable();
     let idx = (((s.len() - 1) as f64) * 0.05).floor() as usize;
     Some(s[idx])
+}
+
+#[cfg(windows)]
+fn f2_apply_key(point: &PowerSweepPoint) -> Option<(u32, u32)> {
+    Some((
+        point.target_clock_mhz.unwrap_or(point.clock_mhz),
+        point.vf_table_voltage_mv?,
+    ))
+}
+
+#[cfg(windows)]
+fn f2_unique_profile_points(
+    profiles: &[Option<PowerSweepPoint>],
+) -> Vec<PowerSweepPoint> {
+    let mut seen = std::collections::HashSet::new();
+    profiles
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|point| f2_apply_key(point).is_some_and(|key| seen.insert(key)))
+        .collect()
+}
+
+/// 95th-percentile (upper) sustained clock of a sample set. This is the high counterpart to p5 and
+/// describes the boost regime reached repeatedly rather than a single maximum sample.
+fn p95_clock_mhz(clocks: &[u32]) -> Option<u32> {
+    if clocks.is_empty() {
+        return None;
+    }
+    let mut s = clocks.to_vec();
+    s.sort_unstable();
+    let idx = (((s.len() - 1) as f64) * 0.95).ceil() as usize;
+    Some(s[idx.min(s.len() - 1)])
 }
 
 /// Sustained high-power percentile from every retained post-ramp dwell sample.
@@ -1205,6 +1275,9 @@ fn calibrate_f2_profile_power(
         })?;
         point.clock_mhz = measured.avg_clock_mhz.unwrap_or(point.clock_mhz);
         point.p5_clock_mhz = measured.sustained_clock_mhz.or(point.p5_clock_mhz);
+        point.p95_clock_mhz = measured
+            .sustained_upper_clock_mhz
+            .or(point.p95_clock_mhz);
         let sustained_clock = point.p5_clock_mhz.unwrap_or(point.clock_mhz);
         point.power_w = mean_power;
         point.max_power_w = peak_power;
@@ -1403,6 +1476,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     let clocks: Vec<u32> = v.iter().map(|s| s.0).collect();
     let min_clock = clocks.iter().copied().min().unwrap_or(0);
     let p5_clock = p5_clock_mhz(&clocks).unwrap_or(0);
+    let p95_clock = p95_clock_mhz(&clocks).unwrap_or(0);
     let temps: Vec<f32> = v.iter().filter_map(|s| s.3).collect();
     let (start_temp_c, end_temp_c, avg_temp_c, max_temp_c) = if temps.is_empty() {
         (None, None, None, None)
@@ -1425,6 +1499,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
         duration_ms,
         min_clock_mhz: min_clock,
         p5_clock_mhz: p5_clock,
+        p95_clock_mhz: p95_clock,
         volt_min_mv,
         volt_avg_mv,
         volt_max_mv,
@@ -3698,6 +3773,7 @@ pub(crate) struct SingleDwell {
     pub stable: bool,
     pub avg_clock_mhz: u32,
     pub p5_clock_mhz: u32,
+    pub p95_clock_mhz: u32,
     pub power_w: f32,
     pub max_power_w: f32,
     pub power_p99_w: Option<f32>,
@@ -3752,6 +3828,7 @@ fn single_dwell_from_measured(m: Measured) -> SingleDwell {
         stable: matches!(m.result, StabilityResult::Stable),
         avg_clock_mhz: m.clock_mhz,
         p5_clock_mhz: m.p5_clock_mhz,
+        p95_clock_mhz: m.p95_clock_mhz,
         power_w: m.power_w,
         max_power_w: m.max_power_w,
         power_p99_w: m.power_p99_w,
@@ -5568,22 +5645,164 @@ fn measure_multiclock_undervolt_forge(
                 ));
             }
         }
-        prog.points = pts.into_iter().map(|(p, _)| p).collect();
+        let mut classified = pts;
         if power_calibrated {
-            let classified: Vec<(PowerSweepPoint, f64)> = prog
-                .points
-                .iter()
-                .copied()
-                .map(|point| (point, point.confidence.unwrap_or(0.0)))
-                .collect();
-            let profiles = synthesize_forge_profiles(&classified, &ForgePolicy::balanced());
-            prog.log.extend(profiles.log.clone());
-            prog.power_bound_collapse = profiles.power_bound_collapse;
-            prog.godforge = profiles.godforge;
-            prog.brokkrs = profiles.brokkrs;
-            prog.deep_calm = profiles.deep_calm;
-            prog.recommended = prog.brokkrs;
-            let required_confirmations = f2_required_qualification_passes(mode_policy) as u32;
+            let exact_apply_required = f2_required_qualification_passes(mode_policy) > 0;
+            let mut excluded_apply_pairs = std::collections::HashSet::new();
+            let mut final_profiles = None;
+            loop {
+                let eligible = classified
+                    .iter()
+                    .copied()
+                    .filter(|(point, _)| {
+                        f2_apply_key(point)
+                            .is_some_and(|key| !excluded_apply_pairs.contains(&key))
+                    })
+                    .collect::<Vec<_>>();
+                if eligible.is_empty() {
+                    prog.log.push(
+                        "FORGE: nenhum candidato permaneceu após a qualificação no Apply exato."
+                            .into(),
+                    );
+                    break;
+                }
+                let profiles =
+                    synthesize_forge_profiles(&eligible, &ForgePolicy::balanced());
+                if !exact_apply_required {
+                    final_profiles = Some(profiles);
+                    break;
+                }
+                let selected = f2_unique_profile_points(&[
+                    profiles.godforge,
+                    profiles.brokkrs,
+                    profiles.deep_calm,
+                ]);
+                if selected.len() < 3
+                    && [profiles.godforge, profiles.brokkrs, profiles.deep_calm]
+                        .iter()
+                        .any(Option::is_none)
+                {
+                    prog.log.push(
+                        "FORGE: síntese não produziu os três perfis; Apply permanece bloqueado."
+                            .into(),
+                    );
+                    break;
+                }
+                let mut changed = false;
+                let mut terminal = false;
+                for selected_point in selected {
+                    let Some(key) = f2_apply_key(&selected_point) else {
+                        terminal = true;
+                        prog.log.push(
+                            "FORGE: perfil selecionado sem par target/Apply exato; recusado.".into(),
+                        );
+                        break;
+                    };
+                    let already_qualified = classified.iter().any(|(point, _)| {
+                        f2_apply_key(point) == Some(key)
+                            && point.apply_qualified
+                            && point.apply_qualification_version
+                                == Some(
+                                    nidavellir_core::f2_observation::
+                                        F2_QUALIFICATION_CONTRACT_VERSION,
+                                )
+                    });
+                    if already_qualified {
+                        continue;
+                    }
+
+                    prog.phase = "apply-qualify".into();
+                    prog.total_steps_estimate =
+                        prog.total_steps_estimate.saturating_add(2);
+                    prog.log.push(format!(
+                        "Qualificação Apply exato: {} MHz target @ {} mV VF — FSGL3 A+B, 5 min por padrão.",
+                        key.0, key.1
+                    ));
+                    set(progress, prog.clone());
+                    let mut on_apply_qualification_progress =
+                        |event: crate::gpu_undervolt::F2ClockDiscoveryProgress| {
+                            if event.outcome.is_some() {
+                                prog.completed_steps = prog.completed_steps.saturating_add(1);
+                                prog.learned_points = prog.learned_points.saturating_add(1);
+                                prog.total_steps_estimate =
+                                    prog.total_steps_estimate.max(prog.completed_steps);
+                            }
+                            prog.current_clock_mhz = Some(event.target_mhz);
+                            prog.current_voltage_mv = event.anchor_mv;
+                            prog.last_outcome = event.outcome.clone();
+                            prog.elapsed_ms =
+                                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                            prog.log.push(event.line);
+                            set(progress, prog.clone());
+                            if event.outcome.is_some() {
+                                save_forge_state(&gpu_key, &prog);
+                            }
+                        };
+                    let summary =
+                        crate::gpu_undervolt::run_confirmed_f2_apply_qualification(
+                            store,
+                            &obs_store,
+                            &run_id,
+                            &gpu_key,
+                            &f2_inputs.sane_base_curve,
+                            &f2_inputs.limits,
+                            key.0,
+                            key.1,
+                            selected_point.offset_mhz,
+                            F2_APPLY_QUALIFICATION_DWELL_MS,
+                            render_goldens,
+                            stop,
+                            &mut on_apply_qualification_progress,
+                        );
+                    prog.log.extend(summary.logs);
+                    prog.log.push(format!(
+                        "Qualificação Apply exato {} MHz @ {} mV → {} ({} dwell(s)).",
+                        key.0, key.1, summary.stop_reason, summary.executed_steps
+                    ));
+                    retain_boot_flag |= summary.retain_boot_flag;
+                    if summary.qualified {
+                        for (point, _) in &mut classified {
+                            if f2_apply_key(point) == Some(key) {
+                                point.apply_qualified = true;
+                                point.apply_qualification_version = Some(
+                                    nidavellir_core::f2_observation::
+                                        F2_QUALIFICATION_CONTRACT_VERSION,
+                                );
+                            }
+                        }
+                        changed = true;
+                        continue;
+                    }
+                    if summary.aborted || summary.cancelled {
+                        forge_aborted |= summary.aborted;
+                        terminal = true;
+                        break;
+                    }
+                    excluded_apply_pairs.insert(key);
+                    prog.log.push(format!(
+                        "FORGE: candidato {} MHz target @ {} mV VF excluído; ressintetizando com os pontos restantes.",
+                        key.0, key.1
+                    ));
+                    changed = true;
+                    break;
+                }
+                if terminal {
+                    break;
+                }
+                if changed {
+                    continue;
+                }
+                final_profiles = Some(profiles);
+                break;
+            }
+            if let Some(profiles) = final_profiles {
+                prog.log.extend(profiles.log.clone());
+                prog.power_bound_collapse = profiles.power_bound_collapse;
+                prog.godforge = profiles.godforge;
+                prog.brokkrs = profiles.brokkrs;
+                prog.deep_calm = profiles.deep_calm;
+                prog.recommended = prog.brokkrs;
+            }
             prog.profiles_qualified = f2_profiles_meet_qualification(
                 mode_policy,
                 &[prog.godforge, prog.brokkrs, prog.deep_calm],
@@ -5591,13 +5810,13 @@ fn measure_multiclock_undervolt_forge(
             );
             if !prog.profiles_qualified {
                 prog.log.push(format!(
-                    "FORGE: perfis provisórios — modo {} exige {} confirmação(ões) por ponto e confiança ≥ {:.2}; Apply permanece bloqueado.",
+                    "FORGE: perfis provisórios — modo {} exige fronteira qualificada, confiança ≥ {:.2} e FSGL3 A+B no par exato de Apply; Apply permanece bloqueado.",
                     mode.label(),
-                    required_confirmations,
                     ForgePolicy::balanced().confidence_threshold
                 ));
             }
         }
+        prog.points = classified.into_iter().map(|(p, _)| p).collect();
     } else {
         prog.log.push(
             "Fronteira parcial encerrada: observações preservadas; perfis definitivos anteriores mantidos."
@@ -5624,10 +5843,12 @@ fn measure_multiclock_undervolt_forge(
     if forge_complete && prog.godforge.is_some() {
         let fmt = |o: Option<PowerSweepPoint>| match o {
             Some(p) => format!(
-                "{} MHz @ {} mV ({:.0} W)",
-                p.clock_mhz,
+                "{} MHz target · p5 {} / p95 {} MHz · Apply VF {} mV · p99 {:.0} W",
+                p.target_clock_mhz.unwrap_or(p.clock_mhz),
+                p.p5_clock_mhz.unwrap_or(p.clock_mhz),
+                p.p95_clock_mhz.unwrap_or(p.clock_mhz),
                 p.vf_table_voltage_mv.unwrap_or(p.voltage_mv),
-                p.max_power_w
+                p.power_p99_w.unwrap_or(p.max_power_w)
             ),
             None => "—".into(),
         };
@@ -5836,6 +6057,7 @@ mod tests {
             dwell_result: F2ObsDwell::ClockDrop,
             avg_clock_mhz: Some(1882),
             sustained_clock_mhz: Some(1875),
+            sustained_upper_clock_mhz: Some(1890),
             watts: Some(188),
             max_watts: Some(200),
             power_p99_w: Some(198.0),
@@ -5914,6 +6136,7 @@ mod tests {
         let calibrated = points[0].0;
         assert_eq!(calibrated.clock_mhz, 1882);
         assert_eq!(calibrated.p5_clock_mhz, Some(1875));
+        assert_eq!(calibrated.p95_clock_mhz, Some(1890));
         assert_eq!(calibrated.power_w, 188.0);
         assert_eq!(calibrated.max_power_w, 200.0);
         assert_eq!(calibrated.power_p99_w, Some(198.0));
@@ -5975,6 +6198,10 @@ mod tests {
         let qualified = PowerSweepPoint {
             confidence: Some(0.99),
             validation_count: Some(2),
+            apply_qualified: true,
+            apply_qualification_version: Some(
+                nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
+            ),
             ..Default::default()
         };
         let mut profiles = [Some(qualified); 3];
@@ -5989,8 +6216,24 @@ mod tests {
             0.85
         ));
         profiles[0] = Some(PowerSweepPoint {
+            apply_qualification_version: Some(
+                nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION - 1,
+            ),
+            ..qualified
+        });
+        assert!(!f2_profiles_meet_qualification(
+            PowerSweepMode::Standard.f2_policy(),
+            &profiles,
+            0.85
+        ));
+        profiles[0] = Some(qualified);
+        profiles[0] = Some(PowerSweepPoint {
             confidence: Some(0.99),
             validation_count: Some(1),
+            apply_qualified: true,
+            apply_qualification_version: Some(
+                nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
+            ),
             ..Default::default()
         });
         assert!(!f2_profiles_meet_qualification(
@@ -6002,6 +6245,10 @@ mod tests {
         profiles[2] = Some(PowerSweepPoint {
             confidence: Some(0.84),
             validation_count: Some(2),
+            apply_qualified: true,
+            apply_qualification_version: Some(
+                nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
+            ),
             ..Default::default()
         });
         assert!(!f2_profiles_meet_qualification(
@@ -6009,6 +6256,25 @@ mod tests {
             &profiles,
             0.85
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_apply_gate_deduplicates_shared_profile_points_by_target_and_bin() {
+        let shared = PowerSweepPoint {
+            target_clock_mhz: Some(1860),
+            vf_table_voltage_mv: Some(893),
+            ..Default::default()
+        };
+        let distinct = PowerSweepPoint {
+            target_clock_mhz: Some(1890),
+            vf_table_voltage_mv: Some(912),
+            ..Default::default()
+        };
+        assert_eq!(
+            f2_unique_profile_points(&[Some(shared), Some(shared), Some(distinct)]).len(),
+            2
+        );
     }
 
     #[cfg(windows)]
@@ -6642,6 +6908,7 @@ mod tests {
             duration_ms: 15_000,
             min_clock_mhz: 1770,
             p5_clock_mhz: 1800,
+            p95_clock_mhz: 1830,
             volt_min_mv: Some(840),
             volt_avg_mv: Some(862),
             volt_max_mv: Some(869),
@@ -8618,6 +8885,15 @@ mod tests {
     }
 
     #[test]
+    fn p95_clock_reports_upper_sustained_regime_without_using_raw_max_only() {
+        let mut clocks = vec![1890; 95];
+        clocks.extend([1905, 1905, 1920, 1950, 2100]);
+        assert_eq!(p95_clock_mhz(&clocks), Some(1905));
+        assert_eq!(p95_clock_mhz(&[1890]), Some(1890));
+        assert_eq!(p95_clock_mhz(&[]), None);
+    }
+
+    #[test]
     fn sustained_power_p99_discards_one_sample_spike_and_documents_small_n_fallback() {
         assert_eq!(POWER_PEAK_PERCENTILE, 99);
 
@@ -8724,6 +9000,32 @@ mod tests {
                 assert_eq!(p.godforge.unwrap().clock_mhz, 1830);
                 assert_eq!(p.brokkrs.unwrap().clock_mhz, 1815);
                 assert_eq!(p.stock_clock_mhz, 1786);
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restored_pre_v5_f2_profiles_become_provisional() {
+        let mut prog = idle();
+        prog.is_undervolt = true;
+        prog.phase = "finished".into();
+        prog.profiles_qualified = true;
+        prog.godforge = Some(fp(1890, 190.0));
+        prog.brokkrs = Some(fp(1860, 180.0));
+        prog.deep_calm = Some(fp(1800, 160.0));
+
+        let json = encode_forge_state("RTX-TEST", &prog).expect("encode");
+        match decode_forge_state(&json, "RTX-TEST") {
+            ForgeStateLoad::Loaded(restored) => {
+                assert!(!restored.profiles_qualified);
+                assert_eq!(restored.phase, "provisional");
+                assert!(restored
+                    .note
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("qualificação v5"));
             }
             other => panic!("expected Loaded, got {other:?}"),
         }

@@ -2,6 +2,21 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 deployability requires long qualification at the exact Apply pair (2026-07-02)
+- **Decision**: boundary qualification and post-margin deployability are separate claims. After
+  synthesis, every unique selected `(target, Apply VF bin)` runs FSGL3 A+B for five minutes per
+  pattern. `F2_QUALIFICATION_CONTRACT_VERSION = 5`.
+- **Rationale**: adding voltage can move GPU Boost into a higher sustained-clock regime. A boundary
+  pass at a lower bin therefore cannot be inherited by the `+12 mV` Apply point.
+- **Inconclusive debt**: after any inconclusive attempt, that pattern needs two consecutive clean
+  passes. One retry can no longer erase the weak-coverage signal.
+- **Failure semantics**: reset-clean rejection excludes only the exact candidate and re-synthesizes
+  from measured alternatives. It does not become a monotone frontier failure. Hard device, reset,
+  write and verification failures still abort under Safe Loop.
+- **Identity contract**: retain configured target, measured average, sustained p5 and sustained p95
+  separately. Profile watts remain exact-bin sustained p99. F2 Apply requires the additive,
+  versioned exact-Apply qualification seal, so restored v4 points fail closed.
+
 ## F2 uses prediction plus asymmetric adaptive search (2026-07-01)
 - **Decision**: use compatible same-GPU discovery-v4 history first, then the non-increasing isotonic
   trend of the last 3–4 qualified clocks, to suggest a boundary. Start one physical bin above it.
@@ -27,10 +42,10 @@ Durable technical decisions and their rationale. Newest first.
   Discovery contract v4 excludes v3 positives/power-bound resume evidence. An anomalous adjacent-bin
   p99 in the same p5 regime repeats the exact bin up to three total attempts; two must agree and the
   highest measured p99 is retained. No consensus is ineligible, with no interpolation.
-- **Profile contract**: apply the unchanged +12 mV margin first, then calibrate power and sustained p5
+- **Profile contract (superseded for stability by the 2026-07-02 decision)**: apply the unchanged +12 mV margin first, then calibrate power and sustained p5
   from the exact physical apply bin. If warm-start pruning skipped that exact target/bin pair, run a
   supervised discovery-only PowerRender backfill there and apply the same v4 p99 consensus. Do not
-  rerun FSGL3: the higher-voltage Apply bin is already safer than the qualified boundary. F2
+  rerun FSGL3 under the original v4 assumption that the higher-voltage Apply bin was safer. F2
   selection uses p99 for R and MHz/W.
 - **Boundary contract**: `ClockDrop` at 99%+ of the numeric cap by p99 becomes
   `PowerBoundClockDrop` and continues descent even after a prior sustained point; off-cap clock drop
@@ -40,8 +55,8 @@ Durable technical decisions and their rationale. Newest first.
   `Inconclusive`; it never marks the voltage unstable.
 - **UI contract**: cards say “sustained p99” and explicitly state it is not a hard power limit.
   Legacy payloads fall back to raw peak/mean; raw peak remains available as a separate diagnostic.
-- **Unchanged**: FSGL3 A+B goldens/qualification contract v4, Leva 1 recovery, early-stop and +12 mV
-  application policy. Hardware calibration remains pending.
+- **Historical scope**: FSGL3 A+B goldens, Leva 1 recovery, early-stop and +12 mV application policy
+  were unchanged here. Qualification v5 later superseded v4 deployability.
 
 ## F2 uses a margin boundary and treats supervised TDR as learning (2026-06-30)
 - **Decision**: qualification compares like-for-like FSGL3 heavy-phase p5 telemetry, separated by A/B

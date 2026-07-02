@@ -1204,6 +1204,7 @@ pub struct F2DwellResult {
     pub outcome: F2DwellOutcome,
     pub avg_clock_mhz: u32,
     pub p5_clock_mhz: u32,
+    pub p95_clock_mhz: u32,
     pub power_w: f32,
     pub max_power_w: f32,
     pub power_p99_w: Option<f32>,
@@ -1583,6 +1584,7 @@ pub struct F2StepReport {
     /// (rounded). `None` when no dwell was reached (arm/apply/verify failed before the dwell).
     pub avg_clock_mhz: Option<u32>,
     pub p5_clock_mhz: Option<u32>,
+    pub p95_clock_mhz: Option<u32>,
     pub power_w: Option<u32>,
     pub max_power_w: Option<u32>,
     pub power_p99_w: Option<f32>,
@@ -1641,6 +1643,7 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
         dwell: None,
         avg_clock_mhz: None,
         p5_clock_mhz: None,
+        p95_clock_mhz: None,
         power_w: None,
         max_power_w: None,
         power_p99_w: None,
@@ -1693,6 +1696,7 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
     r.dwell = Some(d.outcome);
     r.avg_clock_mhz = Some(d.avg_clock_mhz);
     r.p5_clock_mhz = Some(d.p5_clock_mhz);
+    r.p95_clock_mhz = Some(d.p95_clock_mhz);
     r.power_w = Some(d.power_w.round() as u32);
     r.max_power_w = Some(d.max_power_w.round() as u32);
     r.power_p99_w = d.power_p99_w;
@@ -2248,6 +2252,7 @@ pub fn confirmed_multi_report_lines(
 enum F2StressPurpose {
     PowerDiscovery,
     Fsgl3Qualification(F2QualificationPattern, RenderGoldens),
+    ApplyQualification(F2QualificationPattern, RenderGoldens),
 }
 
 #[cfg(windows)]
@@ -2265,12 +2270,19 @@ impl F2StressPurpose {
             F2StressPurpose::Fsgl3Qualification(F2QualificationPattern::B, _) => {
                 Some(VfQualifierPattern::Fsgl3B)
             }
+            F2StressPurpose::ApplyQualification(F2QualificationPattern::A, _) => {
+                Some(VfQualifierPattern::Fsgl3A)
+            }
+            F2StressPurpose::ApplyQualification(F2QualificationPattern::B, _) => {
+                Some(VfQualifierPattern::Fsgl3B)
+            }
         }
     }
 
     fn render_goldens(self) -> Option<RenderGoldens> {
         match self {
             F2StressPurpose::Fsgl3Qualification(_, goldens) => Some(goldens),
+            F2StressPurpose::ApplyQualification(_, goldens) => Some(goldens),
             F2StressPurpose::PowerDiscovery => None,
         }
     }
@@ -2288,8 +2300,13 @@ fn classify_f2_stress_dwell(
         F2DwellOutcome::SilentError
     } else if !s.stable {
         F2DwellOutcome::Unstable
-    } else if purpose == F2StressPurpose::PowerDiscovery && s.thermal_throttled {
-        // Thermal slowdown invalidates power calibration without proving voltage instability.
+    } else if matches!(
+        purpose,
+        F2StressPurpose::PowerDiscovery | F2StressPurpose::ApplyQualification(_, _)
+    ) && s.thermal_throttled
+    {
+        // Thermal slowdown invalidates power calibration and exact-Apply qualification without
+        // proving voltage instability.
         F2DwellOutcome::Inconclusive
     } else if purpose == F2StressPurpose::PowerDiscovery && s.power_p99_w.is_none() {
         // Discovery cannot make a power-bound decision or calibrate an applied bin without p99.
@@ -2445,11 +2462,12 @@ impl F2Ops for RealF2Ops<'_> {
             );
         }
         info!(
-            "undervolt-probe dwell: {outcome:?} avg_clock={} MHz p5={} MHz \
+            "undervolt-probe dwell: {outcome:?} avg_clock={} MHz p5={} MHz p95={} MHz \
              power_avg={:.0} W power_p99={:?} W power_peak={:.0} W max_temp={:?} C \
              thermal_throttled={} silent_error={}",
             s.avg_clock_mhz,
             s.p5_clock_mhz,
+            s.p95_clock_mhz,
             s.power_w,
             s.power_p99_w,
             s.max_power_w,
@@ -2461,6 +2479,7 @@ impl F2Ops for RealF2Ops<'_> {
             outcome,
             avg_clock_mhz: s.avg_clock_mhz,
             p5_clock_mhz: s.p5_clock_mhz,
+            p95_clock_mhz: s.p95_clock_mhz,
             power_w: s.power_w,
             max_power_w: s.max_power_w,
             power_p99_w: s.power_p99_w,
@@ -3638,14 +3657,27 @@ pub(crate) struct F2ClockDiscoveryProgress {
 }
 
 /// Result of filling one missing exact-Apply-bin PowerRender measurement after the qualified
-/// frontier is complete. This never runs FSGL3 and never promotes stability; it only contributes
-/// current-contract power telemetry for a bin that is already safer (higher voltage) than the
-/// qualified boundary.
+/// frontier is complete. This step never promotes stability; it only contributes current-contract
+/// power telemetry. The distinct exact-Apply FSGL3 gate runs after synthesis.
 #[cfg(windows)]
 pub(crate) struct F2PowerCalibrationSummary {
     pub confirmed: bool,
     pub executed_steps: usize,
     pub aborted: bool,
+    pub retain_boot_flag: bool,
+    pub stop_reason: String,
+    pub logs: Vec<String>,
+}
+
+/// Result of the long FSGL3 A+B gate at the exact post-margin Apply pair selected for a profile.
+/// A reset-clean rejection is local to this candidate and lets synthesis choose another point; hard
+/// device/reset/write failures still abort the Forge.
+#[cfg(windows)]
+pub(crate) struct F2ApplyQualificationSummary {
+    pub qualified: bool,
+    pub executed_steps: usize,
+    pub aborted: bool,
+    pub cancelled: bool,
     pub retain_boot_flag: bool,
     pub stop_reason: String,
     pub logs: Vec<String>,
@@ -3825,6 +3857,14 @@ fn qualification_attempt_dwell_ms(base_dwell_ms: u64, retry_count: usize) -> u64
 #[cfg(windows)]
 fn qualification_should_retry_inconclusive(retry_count: usize) -> bool {
     retry_count < INCONCLUSIVE_RETRY_BUDGET
+}
+
+#[cfg(windows)]
+fn apply_qualification_pattern_complete(
+    inconclusive_count: usize,
+    consecutive_clean_passes: usize,
+) -> bool {
+    inconclusive_count == 0 || consecutive_clean_passes >= 2
 }
 
 #[cfg(windows)]
@@ -4062,6 +4102,7 @@ fn gate_anchored_candidate_fsgl3(
     final_gate_dwell_ms: u64,
     final_gate_passes: usize,
     render_goldens: Option<RenderGoldens>,
+    exact_apply: bool,
     stop: &std::sync::atomic::AtomicBool,
     logs: &mut Vec<String>,
     executed_steps: &mut usize,
@@ -4081,6 +4122,7 @@ fn gate_anchored_candidate_fsgl3(
     for (pattern_index, pattern) in patterns.iter().copied().enumerate() {
         let pass_index = (pattern_index + 1) as u32;
         let mut inconclusive_retries = 0usize;
+        let mut clean_passes_after_inconclusive = 0usize;
         loop {
             if stop.load(Ordering::SeqCst) {
                 return F2QualificationOutcome::Cancelled;
@@ -4094,7 +4136,11 @@ fn gate_anchored_candidate_fsgl3(
                 baseline_offset_mhz: 0,
                 prev_offset_override_mhz: None,
                 dwell_ms: final_gate_dwell_ms,
-                stress_purpose: F2StressPurpose::Fsgl3Qualification(pattern, goldens),
+                stress_purpose: if exact_apply {
+                    F2StressPurpose::ApplyQualification(pattern, goldens)
+                } else {
+                    F2StressPurpose::Fsgl3Qualification(pattern, goldens)
+                },
                 cur: None,
             };
             if let Err(e) = validation_ops.select(0) {
@@ -4164,7 +4210,23 @@ fn gate_anchored_candidate_fsgl3(
                 ),
             });
             match &report.outcome {
-                F2Outcome::Validated => break,
+                F2Outcome::Validated => {
+                    if exact_apply && inconclusive_retries > 0 {
+                        clean_passes_after_inconclusive += 1;
+                        if !apply_qualification_pattern_complete(
+                            inconclusive_retries,
+                            clean_passes_after_inconclusive,
+                        ) {
+                            logs.push(format!(
+                                "{target_mhz} MHz @ {} mV FSGL3 {}: dívida inconclusiva preservada; exigindo mais um passe limpo consecutivo",
+                                candidate.anchor.voltage_mv,
+                                qualification_pattern_label(pattern)
+                            ));
+                            continue;
+                        }
+                    }
+                    break;
+                }
                 F2Outcome::DeviceLost
                 | F2Outcome::ResetFailed
                 | F2Outcome::ArmFailed(_)
@@ -4176,12 +4238,23 @@ fn gate_anchored_candidate_fsgl3(
                     };
                 }
                 F2Outcome::Inconclusive => {
-                    if inconclusive_retries == 0 {
+                    let may_retry = if exact_apply {
+                        qualification_should_retry_inconclusive(inconclusive_retries)
+                    } else {
+                        inconclusive_retries == 0
+                    };
+                    if may_retry {
                         inconclusive_retries += 1;
+                        clean_passes_after_inconclusive = 0;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV FSGL3 {} inconclusivo; repetindo uma vez",
+                            "{target_mhz} MHz @ {} mV FSGL3 {} inconclusivo; {}",
                             candidate.anchor.voltage_mv,
-                            qualification_pattern_label(pattern)
+                            qualification_pattern_label(pattern),
+                            if exact_apply {
+                                "dívida registrada, agora são exigidos dois passes limpos consecutivos"
+                            } else {
+                                "repetindo uma vez"
+                            }
                         ));
                         continue;
                     }
@@ -4194,10 +4267,161 @@ fn gate_anchored_candidate_fsgl3(
     F2QualificationOutcome::Qualified
 }
 
+/// Qualify the exact `(target_mhz, apply_mv)` pair selected after the +Apply margin. Unlike the
+/// frontier gate, this proof is stored as `ApplyQualification` evidence and an inconclusive attempt
+/// creates debt: that pattern then needs two consecutive clean passes before it can qualify.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_confirmed_f2_apply_qualification(
+    store: &SafeLoopStore,
+    obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
+    run_id: &str,
+    gpu_key: &str,
+    sane: &[(usize, u32, u32)],
+    limits: &PositiveOffsetLimits,
+    target_mhz: u32,
+    apply_mv: u32,
+    reference_offset_mhz: i32,
+    qualification_dwell_ms: u64,
+    render_goldens: Option<RenderGoldens>,
+    stop: &std::sync::atomic::AtomicBool,
+    on_progress: &mut dyn FnMut(F2ClockDiscoveryProgress),
+) -> F2ApplyQualificationSummary {
+    use std::sync::atomic::Ordering;
+
+    use nidavellir_core::f2_observation::{
+        now_rfc3339, F2EvidenceKind, F2ObsMode, F2_QUALIFICATION_CONTRACT_VERSION,
+    };
+
+    let mut logs = Vec::new();
+    if stop.load(Ordering::SeqCst) {
+        return F2ApplyQualificationSummary {
+            qualified: false,
+            executed_steps: 0,
+            aborted: false,
+            cancelled: true,
+            retain_boot_flag: false,
+            stop_reason: "Cancelled".into(),
+            logs,
+        };
+    }
+    let candidate = match plan_f2_power_calibration_candidate(
+        sane,
+        target_mhz,
+        apply_mv,
+        reference_offset_mhz,
+        limits,
+    ) {
+        Ok(candidate) => candidate,
+        Err(e) => {
+            return F2ApplyQualificationSummary {
+                qualified: false,
+                executed_steps: 0,
+                aborted: true,
+                cancelled: false,
+                retain_boot_flag: false,
+                stop_reason: format!("ApplyQualificationPlanFailed: {e}"),
+                logs,
+            }
+        }
+    };
+    if let Some(reason) = confirmed_f2_refusal(
+        &store.load_record(),
+        store.is_boot_flag_armed(),
+        Some(1),
+        Some(&candidate.anchor),
+        limits,
+        target_mhz,
+    ) {
+        return F2ApplyQualificationSummary {
+            qualified: false,
+            executed_steps: 0,
+            aborted: true,
+            cancelled: false,
+            retain_boot_flag: false,
+            stop_reason: format!("ApplyQualificationSafetyGateRefused: {reason}"),
+            logs,
+        };
+    }
+
+    let mut ctx = crate::gpu_f2_sweep::ObsContext {
+        run_id: run_id.to_string(),
+        timestamp: now_rfc3339(),
+        gpu_key: Some(gpu_key.to_string()),
+        evidence_kind: F2EvidenceKind::ApplyQualification,
+        discovery_contract_version: None,
+        qualification_contract_version: Some(F2_QUALIFICATION_CONTRACT_VERSION),
+        qualification_coverage: None,
+        mode: F2ObsMode::ApplyQualification,
+        requested_start_mv: Some(apply_mv),
+        positive_offset_cap_mhz: limits.abs_max_offset_mhz,
+    };
+    let mut executed_steps = 0usize;
+    let outcome = gate_anchored_candidate_fsgl3(
+        store,
+        obs_store,
+        &mut ctx,
+        sane,
+        limits,
+        target_mhz,
+        &candidate,
+        2,
+        2,
+        qualification_dwell_ms,
+        2,
+        render_goldens,
+        true,
+        stop,
+        &mut logs,
+        &mut executed_steps,
+        on_progress,
+    );
+    let (qualified, aborted, cancelled, retain_boot_flag, stop_reason) = match outcome {
+        F2QualificationOutcome::Qualified => (
+            true,
+            false,
+            false,
+            false,
+            "ExactApplyQualified".to_string(),
+        ),
+        F2QualificationOutcome::Rejected(reason) => (
+            false,
+            false,
+            false,
+            false,
+            format!("ExactApplyRejected: {reason}"),
+        ),
+        F2QualificationOutcome::Inconclusive => (
+            false,
+            false,
+            false,
+            false,
+            "ExactApplyInconclusive".to_string(),
+        ),
+        F2QualificationOutcome::Cancelled => {
+            (false, false, true, false, "Cancelled".to_string())
+        }
+        F2QualificationOutcome::Aborted {
+            stop_reason,
+            retain_boot_flag,
+        } => (false, true, false, retain_boot_flag, stop_reason),
+    };
+    F2ApplyQualificationSummary {
+        qualified,
+        executed_steps,
+        aborted,
+        cancelled,
+        retain_boot_flag,
+        stop_reason,
+        logs,
+    }
+}
+
 /// Measure a missing exact Apply bin with the same supervised PowerRender motor and discovery-v4
 /// p99 consistency contract used by frontier descent. The qualified frontier is not changed and
-/// FSGL3 is deliberately not run again: this higher-voltage bin is measured only for card/profile
-/// power calibration. Every raw attempt is persisted; no consensus remains neutral and ineligible.
+/// this function contributes only card/profile power calibration; the separate post-synthesis v5
+/// gate proves exact-Apply stability. Every raw attempt is persisted; no consensus remains neutral
+/// and ineligible.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_confirmed_f2_power_calibration(
@@ -5197,6 +5421,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 final_gate_dwell_ms,
                 final_gate_passes,
                 render_goldens,
+                false,
                 stop,
                 &mut logs,
                 &mut executed_steps,
@@ -5746,6 +5971,7 @@ mod tests {
             dwell: Some(F2DwellOutcome::Stable),
             avg_clock_mhz: Some(p5_clock_mhz),
             p5_clock_mhz: Some(p5_clock_mhz),
+            p95_clock_mhz: Some(p5_clock_mhz),
             power_w: Some(power_p99_w.round() as u32),
             max_power_w: Some(power_p99_w.ceil() as u32),
             power_p99_w: Some(power_p99_w),
@@ -5896,6 +6122,7 @@ mod tests {
             stable: true,
             avg_clock_mhz: 1500,
             p5_clock_mhz: 1200,
+            p95_clock_mhz: 1800,
             power_w: 120.0,
             max_power_w: 130.0,
             power_p99_w: Some(128.0),
@@ -6030,6 +6257,9 @@ mod tests {
         assert!(qualification_should_retry_inconclusive(0));
         assert!(qualification_should_retry_inconclusive(1));
         assert!(!qualification_should_retry_inconclusive(2));
+        assert!(apply_qualification_pattern_complete(0, 1));
+        assert!(!apply_qualification_pattern_complete(1, 1));
+        assert!(apply_qualification_pattern_complete(1, 2));
     }
 
     #[test]
@@ -6509,7 +6739,7 @@ mod tests {
         fn dwell(&mut self) -> F2DwellResult {
             self.log.push("dwell");
             // Dummy headline stats; the single-step state machine only branches on `outcome`.
-            F2DwellResult { outcome: self.dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
+            F2DwellResult { outcome: self.dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, p95_clock_mhz: 1815, power_w: 183.0,
                 max_power_w: 191.0,
                 power_p99_w: Some(189.0),
                 power_capped_frac: 0.0,
@@ -6823,7 +7053,7 @@ mod tests {
         fn verify(&mut self) -> PositiveOffsetVerification { self.log.push(format!("verify{}", self.cur)); self.s().verify }
         fn dwell(&mut self) -> F2DwellResult {
             self.log.push(format!("dwell{}", self.cur));
-            F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
+            F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, p95_clock_mhz: 1815, power_w: 183.0,
                 max_power_w: 191.0,
                 power_p99_w: Some(189.0),
                 power_capped_frac: 0.0,
@@ -7040,7 +7270,7 @@ mod tests {
         fn verify(&mut self) -> PositiveOffsetVerification { self.log.push(format!("verify{}", self.cur)); self.s().verify }
         fn dwell(&mut self) -> F2DwellResult {
             self.log.push(format!("dwell{}", self.cur));
-            F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, power_w: 183.0,
+            F2DwellResult { outcome: self.s().dwell, avg_clock_mhz: 1815, p5_clock_mhz: 1815, p95_clock_mhz: 1815, power_w: 183.0,
                 max_power_w: 191.0,
                 power_p99_w: Some(189.0),
                 power_capped_frac: 0.0,

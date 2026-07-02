@@ -521,6 +521,16 @@ fn apply_undervolt_profile(
             "F2 profile has no confirmed sustained-p99 power — run Forge again under discovery v4",
         );
     }
+    if !p.apply_qualified
+        || p.apply_qualification_version
+            != Some(
+                nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
+            )
+    {
+        return IpcResponse::failure(
+            "F2 profile was not qualified at its exact post-margin Apply pair — run Forge again under qualification v5",
+        );
+    }
     let (target_mhz, anchor_mv) = undervolt_apply_params(&p);
     let mem = crate::gpu_apply::load_applied().unwrap_or_default().mem_offset_mhz;
     let msg = match crate::gpu_apply::apply_and_persist_undervolt(
@@ -702,6 +712,31 @@ mod tests {
                 .unwrap_or_default()
                 .contains("sustained-p99")
         );
+    }
+
+    #[test]
+    fn old_f2_profile_without_exact_apply_qualification_cannot_be_applied() {
+        let qualified = PowerSweepProgress {
+            is_undervolt: true,
+            profiles_qualified: true,
+            ..Default::default()
+        };
+        let old_point = PowerSweepPoint {
+            target_clock_mhz: Some(1860),
+            vf_table_voltage_mv: Some(893),
+            power_p99_w: Some(180.0),
+            apply_qualified: false,
+            apply_qualification_version: None,
+            ..Default::default()
+        };
+        let response =
+            apply_forge_profile(&dummy_store(), &qualified, Some(old_point), "Brokkr's Best");
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("exact post-margin Apply pair"));
     }
 
     #[test]

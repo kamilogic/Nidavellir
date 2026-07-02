@@ -84,8 +84,14 @@
 
   function achievedClock(point) {
     if (point?.target_clock_mhz == null || point?.clock_mhz == null) return null;
-    const p5 = point.p5_clock_mhz != null ? ` · p5 ${point.p5_clock_mhz} MHz` : "";
-    return `Measured: ${point.clock_mhz} MHz${p5}`;
+    const p5 = point.p5_clock_mhz != null ? ` · sustained p5 ${point.p5_clock_mhz} MHz` : "";
+    const p95 = point.p95_clock_mhz != null ? ` · sustained p95 ${point.p95_clock_mhz} MHz` : "";
+    return `Measured avg: ${point.clock_mhz} MHz${p5}${p95}`;
+  }
+
+  function applyQualification(point) {
+    if (!point?.apply_qualified) return null;
+    return `Exact Apply qualified · FSGL3 v${point.apply_qualification_version ?? "current"}`;
   }
 
   function measuredVoltage(point) {
@@ -219,6 +225,9 @@
             <div class="prof-sub">Optimized boost curve</div>
             {#if achievedClock(p)}
               <div class="prof-sub">{achievedClock(p)}</div>
+            {/if}
+            {#if applyQualification(p)}
+              <div class="prof-sub confidence">{applyQualification(p)}</div>
             {/if}
             {#if curveAnchor(p)}
               <div class="prof-sub">{curveAnchor(p)}</div>

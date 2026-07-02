@@ -29,7 +29,10 @@ pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 /// decisions and exact apply-margin-bin calibration use confirmed sustained-power evidence.
 pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 4;
 /// Current FailureSeekingGameLoop qualification contract.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 4;
+///
+/// v5 adds a distinct long FSGL3 A+B gate for the exact post-margin Apply pair. Boundary
+/// qualification alone no longer makes a profile deployable.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 5;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -40,6 +43,7 @@ pub enum F2EvidenceKind {
     Legacy,
     Discovery,
     Qualification,
+    ApplyQualification,
 }
 
 /// Whether a stable qualification dwell exercised every required phase strongly enough to count.
@@ -146,6 +150,8 @@ pub enum F2ObsMode {
     TargetSweep,
     /// A multi-target ladder of target sweeps.
     LadderSweep,
+    /// Long FSGL3 qualification of the exact post-margin Apply pair selected for a profile.
+    ApplyQualification,
 }
 
 /// The verifier verdict, in an owned serializable form (the service-side `PositiveOffsetVerification`
@@ -292,6 +298,10 @@ pub struct F2Observation {
     /// Sustained (p5) clock under load.
     #[serde(default)]
     pub sustained_clock_mhz: Option<u32>,
+    /// Upper sustained (p95) clock under the same load. This reveals the boost regime exercised by
+    /// an exact Apply pair without conflating it with the configured target.
+    #[serde(default)]
+    pub sustained_upper_clock_mhz: Option<u32>,
     #[serde(default)]
     pub watts: Option<u32>,
     /// Highest post-ramp power sample captured by the discovery dwell.
@@ -393,6 +403,8 @@ pub struct F2FrontierEntry {
     pub avg_clock_mhz: Option<u32>,
     #[serde(default)]
     pub sustained_clock_mhz: Option<u32>,
+    #[serde(default)]
+    pub sustained_upper_clock_mhz: Option<u32>,
     #[serde(default)]
     pub power_capped_frac: Option<f32>,
     #[serde(default)]
@@ -504,6 +516,22 @@ pub fn is_current_qualification_pass(o: &F2Observation) -> bool {
             })
 }
 
+/// True only for a fully-covered pass at the exact post-margin Apply pair under the current
+/// qualification contract. Kept separate from frontier qualification so an Apply failure caused by
+/// a higher boost regime does not rewrite the learned voltage boundary.
+pub fn is_current_apply_qualification_pass(o: &F2Observation) -> bool {
+    o.evidence_kind == F2EvidenceKind::ApplyQualification
+        && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
+        && o.outcome.is_validated()
+        && o.qualification_coverage
+            .as_ref()
+            .is_some_and(|coverage| {
+                coverage.strength == F2QualificationStrength::Fsgl3
+                    && coverage.pattern.is_some()
+                    && coverage.verdict == F2QualificationVerdict::Pass
+            })
+}
+
 /// Lowest-voltage stable point proven by the current, homogeneous discovery contract. Negative
 /// observations remain version-independent and invalidate the same/deeper voltage as before.
 pub fn last_discovery_good_for_target(
@@ -525,7 +553,11 @@ pub fn last_discovery_good_for_target(
 /// undervolt that already failed (the closest failure below the validated region). `None` if none bad.
 pub fn first_bad_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<&F2Observation> {
     obs.iter()
-        .filter(|o| o.target_mhz == target_mhz && o.outcome.is_bad())
+        .filter(|o| {
+            o.target_mhz == target_mhz
+                && o.evidence_kind != F2EvidenceKind::ApplyQualification
+                && o.outcome.is_bad()
+        })
         .max_by_key(|o| o.anchor_mv)
 }
 
@@ -552,7 +584,12 @@ pub fn bracket_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<Volt
 /// to hold the clock) implies `V` and everything LOWER is at least as risky.
 pub fn is_known_bad(obs: &[F2Observation], target_mhz: u32, anchor_mv: u32) -> bool {
     obs.iter()
-        .any(|o| o.target_mhz == target_mhz && o.outcome.is_bad() && o.anchor_mv >= anchor_mv)
+        .any(|o| {
+            o.target_mhz == target_mhz
+                && o.evidence_kind != F2EvidenceKind::ApplyQualification
+                && o.outcome.is_bad()
+                && o.anchor_mv >= anchor_mv
+        })
 }
 
 /// The validated descent baseline for chained same-target descent: the DEEPEST (lowest-voltage,
@@ -623,6 +660,7 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
         power_p99_w: best.power_p99_w,
         avg_clock_mhz: best.avg_clock_mhz,
         sustained_clock_mhz: best.sustained_clock_mhz,
+        sustained_upper_clock_mhz: best.sustained_upper_clock_mhz,
         power_capped_frac: best.power_capped_frac,
         dwell_duration_ms: best.dwell_duration_ms,
         sample_count: best.sample_count,
@@ -694,6 +732,7 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
         boundary_voltage_mv: Some(entry.best_anchor_mv),
         apply_margin_mv: Some(0),
         p5_clock_mhz: entry.sustained_clock_mhz,
+        p95_clock_mhz: entry.sustained_upper_clock_mhz,
         max_temp_c: entry.max_temp_c,
         thermal_throttled: entry.thermal_throttled,
         target_clock_mhz: Some(entry.target_mhz),
@@ -855,6 +894,7 @@ mod tests {
             },
             avg_clock_mhz: Some(target + 15),
             sustained_clock_mhz: Some(target + 15),
+            sustained_upper_clock_mhz: Some(target + 15),
             watts: Some(180),
             max_watts: Some(188),
             power_p99_w: Some(186.0),
@@ -917,6 +957,16 @@ mod tests {
             reason: None,
             phase_metrics: Vec::new(),
         });
+        o
+    }
+
+    fn apply_qualification_pass(
+        o: F2Observation,
+        pattern: F2QualificationPattern,
+    ) -> F2Observation {
+        let mut o = qualification_pass_with_pattern(o, pattern);
+        o.evidence_kind = F2EvidenceKind::ApplyQualification;
+        o.mode = F2ObsMode::ApplyQualification;
         o
     }
 
@@ -1195,6 +1245,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_qualification_is_current_but_does_not_rewrite_frontier_failure_bracket() {
+        let discovery = obs(1800, 881, F2ObsOutcome::Validated);
+        let apply_pass = apply_qualification_pass(
+            obs(1800, 893, F2ObsOutcome::Validated),
+            F2QualificationPattern::A,
+        );
+        assert!(is_current_apply_qualification_pass(&apply_pass));
+        assert!(!is_current_qualification_pass(&apply_pass));
+
+        let mut apply_failure = apply_qualification_pass(
+            obs(1800, 893, F2ObsOutcome::SilentError),
+            F2QualificationPattern::B,
+        );
+        apply_failure.qualification_coverage.as_mut().unwrap().verdict =
+            F2QualificationVerdict::Fail;
+        let observations = [discovery, apply_pass, apply_failure];
+        assert_eq!(
+            last_discovery_good_for_target(&observations, 1800)
+                .unwrap()
+                .anchor_mv,
+            881
+        );
+        assert!(first_bad_for_target(&observations, 1800).is_none());
+    }
+
+    #[test]
     fn bridge_builds_classifier_compatible_points() {
         let mut capped = obs(1800, 962, F2ObsOutcome::Validated);
         capped.power_capped_frac = Some(1.0);
@@ -1212,6 +1288,7 @@ mod tests {
         assert_eq!(p.target_clock_mhz, Some(1800));
         assert_eq!(p.clock_mhz, 1815);
         assert_eq!(p.p5_clock_mhz, Some(1815));
+        assert_eq!(p.p95_clock_mhz, Some(1815));
         assert_eq!(p.power_w, 180.0);
         assert_eq!(p.max_power_w, 188.0);
         assert_eq!(p.power_p99_w, Some(186.0));
