@@ -29,6 +29,8 @@
   let forgeMode = $state("standard");
   let hardwareLoaded = $state(false);
   let autoResumeAttempted = $state(false);
+  let refreshInFlight = false;
+  let lastSlowRefreshAt = 0;
 
   const powerRunning = $derived(Boolean(powerSweep?.running));
   const memRunning = $derived(Boolean(memSweep?.running));
@@ -162,26 +164,39 @@
     }
   }
 
-  async function refresh() {
+  async function refresh(forceSlow = false) {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
     try {
-      const v = await serviceCall("GetGpuValidation");
-      validation = v?.data?.type === "GpuValidation" ? v.data : validation;
-      const ms = await serviceCall("GetMemSweepProgress");
-      memSweep = ms?.data?.type === "MemSweep" ? ms.data : memSweep;
-      const ap = await serviceCall("GetAppliedProfile");
-      applied = ap?.data?.type === "GpuApply" ? ap.data : applied;
-      const bm = await serviceCall("GetBenchmarkProgress");
-      benchmark = bm?.data?.type === "Benchmark" ? bm.data : benchmark;
-      const ps = await serviceCall("GetPowerSweepProgress");
+      const now = Date.now();
+      const slowDue = forceSlow || !powerRunning || now - lastSlowRefreshAt >= 3000;
+      const [ps, sl] = await Promise.all([
+        serviceCall("GetPowerSweepProgress"),
+        serviceCall("GetSafeLoopStatus"),
+      ]);
       powerSweep = ps?.data?.type === "PowerSweep" ? ps.data : powerSweep;
-      const sl = await serviceCall("GetSafeLoopStatus");
       safeLoop = sl?.data?.type === "SafeLoop" ? sl.data : safeLoop;
+      if (slowDue) {
+        const [v, ms, ap, bm] = await Promise.all([
+          serviceCall("GetGpuValidation"),
+          serviceCall("GetMemSweepProgress"),
+          serviceCall("GetAppliedProfile"),
+          serviceCall("GetBenchmarkProgress"),
+        ]);
+        validation = v?.data?.type === "GpuValidation" ? v.data : validation;
+        memSweep = ms?.data?.type === "MemSweep" ? ms.data : memSweep;
+        applied = ap?.data?.type === "GpuApply" ? ap.data : applied;
+        benchmark = bm?.data?.type === "Benchmark" ? bm.data : benchmark;
+        lastSlowRefreshAt = now;
+      }
       error = null;
       if (powerSweep?.phase === "interrupted" && !powerSweep?.running && !autoResumeAttempted) {
         void autoRecoverInterruptedPower();
       }
     } catch (e) {
       error = String(e);
+    } finally {
+      refreshInFlight = false;
     }
   }
 
@@ -278,7 +293,15 @@
       await refresh();
     }
   };
-  const stopPower = () => call("StopPowerSweep", setPower);
+  const stopPower = async () => {
+    if (!powerSweep?.running || powerSweep?.phase === "stopping") return;
+    powerSweep = {
+      ...powerSweep,
+      phase: "stopping",
+      note: "Stopping Forge and restoring stock safely…",
+    };
+    await call("StopPowerSweep", setPower);
+  };
   const POWER_APPLY = {
     godforge: "ApplyPowerGodforge",
     brokkrs: "ApplyPowerBrokkrs",

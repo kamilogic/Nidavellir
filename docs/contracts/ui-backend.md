@@ -1116,6 +1116,32 @@ power.
   scoring remains PowerRender-homogeneous. Restored qualified v6 snapshots refresh this published
   value from `f2_observations.jsonl`; no new IPC field is required.
 
+\## Backend ↔ Frontend (2026-07-03): automated qualification v7 + cooperative Stop
+
+\- Qualification contract v7 replaces deployable FSGL3 A+B evidence with three automatic patterns:
+  `high_fps`, `texture` and `transitions`. Standard/Long require all three at the frontier and at
+  every selected exact Apply pair. Older positive qualification evidence remains readable but cannot
+  unlock Apply.
+
+\- Electrical support now uses measured `p95_clock_mhz` with zero physical-bin tolerance. `p5` remains
+  the sustained performance floor; `p95` selects the highest sustained electrical regime whose
+  measured Apply anchor and current v7 qualification must cover the candidate. Missing support,
+  missing p95 or missing exact p99 fails closed. The highest p95 from the exact-Apply v7 set is
+  reconciled again before profiles become final; a newly exposed higher regime causes re-synthesis.
+
+\- `StopPowerSweep` is cooperative inside discovery and qualification GPU loops. Backend progress
+  changes immediately to `phase == "stopping"` while the current bounded batch drains and the normal
+  checked stock reset runs. A cancellation can never become positive or bad-point evidence.
+
+\- No IPC payload field or method was removed. During a running Forge, the UI prevents overlapping
+  refreshes, polls `GetPowerSweepProgress` + `GetSafeLoopStatus` at the existing fast cadence, and
+  refreshes secondary diagnostics every 3 seconds. The Stop control updates optimistically to
+  “Stopping…” and ignores repeated clicks.
+
+\- The IPC-visible Forge log is bounded to its latest 240 lines to avoid cloning/serializing an
+  unbounded payload. Completed measurement and qualification evidence remains durable in
+  `f2_observations.jsonl`.
+
 
 
 (No other active backend → frontend requests)

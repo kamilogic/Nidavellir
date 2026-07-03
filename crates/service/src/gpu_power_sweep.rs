@@ -49,15 +49,11 @@ const VOLT_SANE_MAX_MV: u32 = 1250;
 #[cfg(windows)]
 const F2_QUALIFIER_TARGET_TOL_MHZ: u32 = 30;
 #[cfg(windows)]
-const FSGL3_GOLDEN_SAMPLE_MS: u64 = 2_000;
-/// Each exact post-margin Apply pattern gets five minutes. A clean A+B gate therefore soaks the
-/// actual deployable pair for ten minutes; inconclusive debt may extend it.
+const V7_GOLDEN_SAMPLE_MS: u64 = 2_000;
+/// Each exact post-margin Apply pattern gets five minutes. A clean v7 three-pattern gate therefore
+/// soaks the actual deployable pair for fifteen minutes; inconclusive debt may extend it.
 #[cfg(windows)]
 const F2_APPLY_QUALIFICATION_DWELL_MS: u64 = 300_000;
-/// One physical NVIDIA clock step is tolerated between the configured curve target and sustained
-/// p5. A larger gap is a different electrical regime and must inherit that regime's Apply anchor.
-#[cfg(windows)]
-const F2_PROFILE_REGIME_TOL_MHZ: u32 = 15;
 /// Initial telemetry threshold for a missing-valid-NVML-sample stall. Leva 1 records the signal only;
 /// proactive reset remains disabled until the hardware gate proves the signal has acceptable
 /// precision and the stress loop has a safe cooperative-cancellation path.
@@ -252,14 +248,14 @@ impl PowerSweepMode {
             PowerSweepMode::Standard => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
                 qualification_dwell_ms: 60_000,
-                qualification_passes: 2,
+                qualification_passes: 3,
                 final_gate_dwell_ms: 0,
                 final_gate_passes: 0,
             },
             PowerSweepMode::Long => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
                 qualification_dwell_ms: 60_000,
-                qualification_passes: 2,
+                qualification_passes: 3,
                 final_gate_dwell_ms: 0,
                 final_gate_passes: 0,
             },
@@ -321,6 +317,14 @@ impl PowerSweepHandle {
     }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        if let Ok(mut progress) = self.progress.lock() {
+            if progress.running && progress.phase != "stopping" {
+                progress.phase = "stopping".into();
+                progress.note = Some(
+                    "Parando o Forge e restaurando a GPU para stock com segurança…".into(),
+                );
+            }
+        }
     }
     /// Explicit reset/recovery path: unblock the UI after a panic/TDR-interrupted worker and mark the
     /// visible Forge state as clean. Used only after the operator requested stock reset.
@@ -399,6 +403,9 @@ impl PowerSweepHandle {
 const FORGE_STATE_SCHEMA: u32 = 1;
 /// Keep only the last N log lines in the snapshot (the live log can be long).
 const FORGE_STATE_LOG_TAIL: usize = 40;
+/// Bound the IPC-visible log so polling does not repeatedly clone and serialize an unbounded run.
+/// Every completed evidence point remains durable in `f2_observations.jsonl`.
+const FORGE_LIVE_LOG_TAIL: usize = 240;
 
 /// On-disk wrapper around a completed `PowerSweepProgress`, tagged with the GPU
 /// it was forged on and a schema version for forward-compatible rejection.
@@ -465,7 +472,7 @@ fn decode_forge_state(json: &str, gpu_key: &str) -> ForgeStateLoad {
             prog.phase = "provisional".into();
         }
         prog.note = Some(
-            "Perfis F2 restaurados são anteriores à reconciliação de regime v6; execute Forge novamente."
+            "Perfis F2 restaurados são anteriores à qualificação automática v7; execute Forge novamente."
                 .into(),
         );
     }
@@ -551,12 +558,12 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
                         prog.deep_calm = profiles[2];
                         prog.recommended = prog.brokkrs;
                         prog.log.push(format!(
-                            "FORGE: p99 publicado restaurado pelo maior A+B aprovado ({updated} perfil(is) elevado(s))."
+                            "FORGE: p99 publicado restaurado pelo maior conjunto v7 aprovado ({updated} perfil(is) elevado(s))."
                         ));
                         save_forge_state(gpu_key, &prog);
                     }
                     Ok(_) => {}
-                    Err(e) => warn!("forge_state p99 A+B refresh skipped: {e}"),
+                    Err(e) => warn!("forge_state p99 v7 refresh skipped: {e}"),
                 }
             }
             info!(
@@ -655,7 +662,11 @@ pub fn load_restored_progress() -> Option<PowerSweepProgress> {
 }
 
 #[cfg(windows)]
-fn set(progress: &Arc<Mutex<PowerSweepProgress>>, p: PowerSweepProgress) {
+fn set(progress: &Arc<Mutex<PowerSweepProgress>>, mut p: PowerSweepProgress) {
+    if p.log.len() > FORGE_LIVE_LOG_TAIL {
+        let drop = p.log.len() - FORGE_LIVE_LOG_TAIL;
+        p.log.drain(0..drop);
+    }
     if let Ok(mut g) = progress.lock() {
         *g = p;
     }
@@ -745,6 +756,7 @@ fn classify_failure(
 #[allow(dead_code)]
 struct Measured {
     result: StabilityResult,
+    cancelled: bool,
     clock_mhz: u32,
     power_w: f32,
     max_power_w: f32,
@@ -787,6 +799,7 @@ impl Measured {
     fn degenerate(result: StabilityResult, volt_mv: u32) -> Self {
         Measured {
             result,
+            cancelled: false,
             clock_mhz: 0,
             power_w: 0.0,
             max_power_w: 0.0,
@@ -857,7 +870,7 @@ fn f2_unique_profile_points(
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct F2RegimeSupport {
-    observed_p5_mhz: u32,
+    observed_p95_mhz: u32,
     support_target_mhz: u32,
     required_apply_mv: u32,
 }
@@ -872,8 +885,9 @@ fn f2_boundary_point_is_qualified(
         && point.confidence.unwrap_or(0.0) >= confidence_threshold
 }
 
-/// Resolve the electrical regime exercised by a calibrated point. When p5 is more than one physical
-/// clock bin above the configured target, the nearest measured target at/above p5 owns the regime.
+/// Resolve the electrical regime exercised by a calibrated point. Any sustained upper-clock regime
+/// above the configured target maps to the nearest measured target at/above p95; there is no
+/// one-bin deployability tolerance.
 /// Required voltage is the conservative maximum Apply anchor across that upward target span.
 #[cfg(windows)]
 fn f2_regime_support(
@@ -883,19 +897,17 @@ fn f2_regime_support(
     let target_mhz = point
         .target_clock_mhz
         .ok_or("candidate has no configured target")?;
-    let observed_p5_mhz = point
-        .p5_clock_mhz
+    let observed_p95_mhz = point
+        .p95_clock_mhz
         .filter(|clock| *clock > 0)
-        .ok_or("candidate has no measured p5")?;
-    let support_target_mhz = if observed_p5_mhz
-        > target_mhz.saturating_add(F2_PROFILE_REGIME_TOL_MHZ)
-    {
+        .ok_or("candidate has no measured p95")?;
+    let support_target_mhz = if observed_p95_mhz > target_mhz {
         frontier
             .iter()
             .filter_map(|(candidate, _)| candidate.target_clock_mhz)
-            .filter(|candidate_target| *candidate_target >= observed_p5_mhz)
+            .filter(|candidate_target| *candidate_target >= observed_p95_mhz)
             .min()
-            .ok_or("no measured target supports the observed p5 regime")?
+            .ok_or("no measured target supports the observed p95 regime")?
     } else {
         target_mhz
     };
@@ -908,9 +920,9 @@ fn f2_regime_support(
                 .then_some(apply_mv)
         })
         .max()
-        .ok_or("observed p5 regime has no measured Apply anchor")?;
+        .ok_or("observed p95 regime has no measured Apply anchor")?;
     Ok(F2RegimeSupport {
-        observed_p5_mhz,
+        observed_p95_mhz,
         support_target_mhz,
         required_apply_mv,
     })
@@ -931,7 +943,7 @@ fn f2_regime_candidate_refusal(
             confidence_threshold,
         )
     {
-        return Some("its own frontier boundary lacks current A+B qualification".into());
+        return Some("its own frontier boundary lacks current v7 qualification".into());
     }
     let support = match f2_regime_support(point, frontier) {
         Ok(support) => support,
@@ -950,8 +962,8 @@ fn f2_regime_candidate_refusal(
         })
     {
         return Some(format!(
-            "{} MHz p5 maps to {} MHz, whose frontier is failed or inconclusive",
-            support.observed_p5_mhz, support.support_target_mhz
+            "{} MHz p95 maps to {} MHz, whose frontier is failed or inconclusive",
+            support.observed_p95_mhz, support.support_target_mhz
         ));
     }
     let Some(apply_mv) = point.vf_table_voltage_mv else {
@@ -959,9 +971,9 @@ fn f2_regime_candidate_refusal(
     };
     (apply_mv < support.required_apply_mv).then(|| {
         format!(
-            "{} MHz target sustains p5 {} MHz but Apply {} mV is below the {} mV required by the {} MHz regime",
+            "{} MHz target sustains p95 {} MHz but Apply {} mV is below the {} mV required by the {} MHz regime",
             point.target_clock_mhz.unwrap_or(point.clock_mhz),
-            support.observed_p5_mhz,
+            support.observed_p95_mhz,
             apply_mv,
             support.required_apply_mv,
             support.support_target_mhz
@@ -1151,6 +1163,21 @@ fn f2_pattern_from_stress(
             Some(F2QualificationPattern::B),
             "fsgl3-b",
         ),
+        VfQualifierPattern::V7HighFps => (
+            F2QualificationStrength::Fsgl4,
+            Some(F2QualificationPattern::HighFps),
+            "v7-high-fps",
+        ),
+        VfQualifierPattern::V7Texture => (
+            F2QualificationStrength::Fsgl4,
+            Some(F2QualificationPattern::Texture),
+            "v7-texture",
+        ),
+        VfQualifierPattern::V7Transitions => (
+            F2QualificationStrength::Fsgl4,
+            Some(F2QualificationPattern::Transitions),
+            "v7-transitions",
+        ),
     }
 }
 
@@ -1323,7 +1350,12 @@ fn qualification_coverage_from_run(
 
 #[cfg(windows)]
 fn load_and_measure(ms: u64) -> Measured {
-    load_and_measure_for(ms, RenderStressPurpose::PowerCharacterization, None)
+    load_and_measure_for(
+        ms,
+        RenderStressPurpose::PowerCharacterization,
+        None,
+        None,
+    )
 }
 
 #[cfg(windows)]
@@ -1486,7 +1518,7 @@ fn publish_f2_profile_power_from_apply_qualification(
         ),
     }
     .ok_or_else(|| {
-        format!("{target_mhz} MHz @ {apply_mv} mV has no complete current A+B p99 measurement")
+        format!("{target_mhz} MHz @ {apply_mv} mV has no complete current v7 p99 measurement")
     })?;
     let published_p99 = discovery_p99.max(qualification_p99);
     let changed = published_p99 > discovery_p99;
@@ -1520,7 +1552,7 @@ fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
     fn capture(label: &str, workload: VfWorkload) -> Result<u32, String> {
         let ctx = nidavellir_gpu_stress::GpuCtx::new()
             .map_err(|e| format!("{label}: GpuCtx init failed: {e}"))?;
-        ctx.capture_one_golden(workload, FSGL3_GOLDEN_SAMPLE_MS)
+        ctx.capture_one_golden(workload, V7_GOLDEN_SAMPLE_MS)
             .map_err(|e| format!("{label}: {e}"))
     }
 
@@ -1532,7 +1564,12 @@ fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
 }
 
 #[cfg(windows)]
-fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Option<u32>) -> Measured {
+fn load_and_measure_for(
+    ms: u64,
+    purpose: RenderStressPurpose,
+    target_mhz: Option<u32>,
+    cancel: Option<&AtomicBool>,
+) -> Measured {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicU32, AtomicU8};
     // FRESH wgpu context per measurement. The FurMark-class render reliably runs
@@ -1544,7 +1581,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
         Ok(c) => c,
         Err(_) => return Measured::degenerate(StabilityResult::Crash, 0),
     };
-    let stop = Arc::new(AtomicBool::new(false));
+    let sampler_stop = Arc::new(AtomicBool::new(false));
     // Collect raw samples in the sampler thread for precise stats (mean/max/std + the
     // richer min/p5/temperature stats). Tuple: (clock_mhz, power_w, capped, temp_c, qualifier_phase).
     let samples: Arc<Mutex<Vec<PhaseSample>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1556,7 +1593,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     // apply key (which snaps `volt_mv`) is unaffected.
     let volts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let (s2, smp, vlt, vsmp, phase_for_sampler, prehang_for_sampler) = (
-        stop.clone(),
+        sampler_stop.clone(),
         samples.clone(),
         volt.clone(),
         volts.clone(),
@@ -1631,13 +1668,17 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     // cap instead of TDRing — measuring the real power-limited regime the undervolt
     // actually helps in.
     let render = catch_unwind(AssertUnwindSafe(|| match purpose {
-        RenderStressPurpose::PowerCharacterization => ctx.run_render_stress(ms),
+        RenderStressPurpose::PowerCharacterization => match cancel {
+            Some(token) => ctx.run_render_stress_with_cancel(ms, token),
+            None => ctx.run_render_stress(ms),
+        },
         RenderStressPurpose::VfQualification(pattern, goldens) => {
-            ctx.run_vf_qualifier_stress_with_phase_pattern_and_goldens(
+            ctx.run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel(
                 ms,
                 phase_state.as_ref(),
                 pattern,
                 Some(goldens),
+                cancel,
             )
         }
     }));
@@ -1655,7 +1696,8 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
         }
         Err(_) => (StabilityResult::Crash, Vec::new(), None, None),
     };
-    stop.store(true, Ordering::SeqCst);
+    let cancelled = cancel.is_some_and(|token| token.load(Ordering::SeqCst));
+    sampler_stop.store(true, Ordering::SeqCst);
     let _ = sampler.join();
 
     let volt_mv = volt.load(Ordering::SeqCst);
@@ -1676,6 +1718,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     };
     if v.is_empty() {
         return Measured {
+            cancelled,
             volt_min_mv,
             volt_avg_mv,
             volt_max_mv,
@@ -1712,6 +1755,7 @@ fn load_and_measure_for(ms: u64, purpose: RenderStressPurpose, target_mhz: Optio
     let thermal_throttled = v.iter().any(|s| s.5);
     Measured {
         result: res,
+        cancelled,
         clock_mhz: clock,
         power_w: mean_p,
         max_power_w: max_p,
@@ -3992,6 +4036,7 @@ pub(crate) fn reset_to_stock() {
 /// `gpu_power_sweep` stays F1-focused.
 #[cfg(windows)]
 pub(crate) struct SingleDwell {
+    pub cancelled: bool,
     pub crashed: bool,
     pub silent_error: bool,
     pub stable: bool,
@@ -4021,8 +4066,16 @@ pub(crate) struct SingleDwell {
 /// simplified outcome. Reused by the F2 confirmed single step so it shares the hardware-tested
 /// measurement path rather than duplicating it. No VF write / no apply happens here.
 #[cfg(windows)]
-pub(crate) fn single_load_dwell(dwell_ms: u64) -> SingleDwell {
-    let m = load_and_measure(dwell_ms);
+pub(crate) fn single_load_dwell_with_cancel(
+    dwell_ms: u64,
+    cancel: Option<&AtomicBool>,
+) -> SingleDwell {
+    let m = load_and_measure_for(
+        dwell_ms,
+        RenderStressPurpose::PowerCharacterization,
+        None,
+        cancel,
+    );
     single_dwell_from_measured(m)
 }
 
@@ -4030,16 +4083,18 @@ pub(crate) fn single_load_dwell(dwell_ms: u64) -> SingleDwell {
 /// render used by discovery; callers must also avoid interpreting aggregate light/medium-phase
 /// telemetry as a sustained-clock boundary.
 #[cfg(windows)]
-pub(crate) fn single_qualifier_dwell(
+pub(crate) fn single_qualifier_dwell_with_cancel(
     dwell_ms: u64,
     target_mhz: u32,
     pattern: VfQualifierPattern,
     goldens: RenderGoldens,
+    cancel: Option<&AtomicBool>,
 ) -> SingleDwell {
     let m = load_and_measure_for(
         dwell_ms,
         RenderStressPurpose::VfQualification(pattern, goldens),
         Some(target_mhz),
+        cancel,
     );
     single_dwell_from_measured(m)
 }
@@ -4047,6 +4102,7 @@ pub(crate) fn single_qualifier_dwell(
 #[cfg(windows)]
 fn single_dwell_from_measured(m: Measured) -> SingleDwell {
     SingleDwell {
+        cancelled: m.cancelled,
         crashed: matches!(m.result, StabilityResult::Crash),
         silent_error: matches!(m.result, StabilityResult::SilentError),
         stable: matches!(m.result, StabilityResult::Stable),
@@ -5412,11 +5468,11 @@ fn measure_multiclock_undervolt_forge(
     let qualification_needs_goldens =
         mode_policy.qualification_passes > 0 || mode_policy.final_gate_passes > 0;
     let render_goldens = if qualification_needs_goldens {
-        prog.log.push("FSGL3: capturando golden stock para power/boost/texture-ROP…".into());
+        prog.log.push("Qualificação v7: capturando golden stock para power/boost/texture-ROP…".into());
         set(progress, prog.clone());
         match capture_fsgl3_render_goldens() {
             Ok(goldens) => {
-                prog.log.push("FSGL3: golden stock capturado; qualificação pode começar.".into());
+                prog.log.push("Qualificação v7: golden stock capturado; os três padrões podem começar.".into());
                 set(progress, prog.clone());
                 Some(goldens)
             }
@@ -5425,10 +5481,10 @@ fn measure_multiclock_undervolt_forge(
                 prog.running = false;
                 prog.phase = "incomplete".into();
                 prog.note = Some(format!(
-                    "Forja F2 abortada antes da qualificação FSGL3 — stock não produziu golden determinístico: {e}. GPU no stock, nada aplicado."
+                    "Forja F2 abortada antes da qualificação v7 — stock não produziu golden determinístico: {e}. GPU no stock, nada aplicado."
                 ));
                 set(progress, prog);
-                warn!("f2-forge: FSGL3 golden capture failed: {e}");
+                warn!("f2-forge: v7 golden capture failed: {e}");
                 return;
             }
         }
@@ -5502,7 +5558,7 @@ fn measure_multiclock_undervolt_forge(
     };
     prog.estimated_remaining_ms = Some(estimated_work_ms);
     prog.log.push(format!(
-        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, FSGL3 qualificação {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
+        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, qualificação v7 {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
         targets.len(), targets[0],
         mode.label(),
         mode_policy.discovery_dwell_ms / 1000,
@@ -5961,9 +6017,9 @@ fn measure_multiclock_undervolt_forge(
 
                     prog.phase = "apply-qualify".into();
                     prog.total_steps_estimate =
-                        prog.total_steps_estimate.saturating_add(2);
+                        prog.total_steps_estimate.saturating_add(3);
                     prog.log.push(format!(
-                        "Qualificação Apply exato: {} MHz target @ {} mV VF — FSGL3 A+B, 5 min por padrão.",
+                        "Qualificação Apply exato: {} MHz target @ {} mV VF — v7 High-FPS + Texture + Transitions, 5 min por padrão.",
                         key.0, key.1
                     ));
                     set(progress, prog.clone());
@@ -6009,13 +6065,58 @@ fn measure_multiclock_undervolt_forge(
                     ));
                     retain_boot_flag |= summary.retain_boot_flag;
                     if summary.qualified {
+                        let observations = obs_store.load_all();
+                        let Some(apply_p95) =
+                            nidavellir_core::f2_observation::
+                                current_apply_qualification_p95_clock_at_anchor(
+                                    &observations,
+                                    &run_id,
+                                    key.0,
+                                    key.1,
+                                    &gpu_key,
+                                )
+                        else {
+                            excluded_apply_pairs.insert(key);
+                            prog.log.push(format!(
+                                "FORGE: candidato {} MHz target @ {} mV VF recusado — conjunto v7 completo sem p95 sustentado mensurável.",
+                                key.0, key.1
+                            ));
+                            changed = true;
+                            break;
+                        };
                         for (point, _) in &mut classified {
                             if f2_apply_key(point) == Some(key) {
+                                point.p95_clock_mhz =
+                                    Some(point.p95_clock_mhz.unwrap_or(0).max(apply_p95));
                                 point.apply_qualified = true;
                                 point.apply_qualification_version = Some(
                                     nidavellir_core::f2_observation::
                                         F2_QUALIFICATION_CONTRACT_VERSION,
                                 );
+                            }
+                        }
+                        if let Some((point, _)) =
+                            classified.iter().find(|(point, _)| f2_apply_key(point) == Some(key))
+                        {
+                            if let Some(reason) = f2_regime_candidate_refusal(
+                                point,
+                                &classified,
+                                true,
+                                required_confirmations,
+                                confidence_threshold,
+                            ) {
+                                let dependent_keys =
+                                    f2_regime_dependent_apply_keys(key, &classified);
+                                for dependent in dependent_keys {
+                                    excluded_apply_pairs.insert(dependent);
+                                }
+                                excluded_apply_pairs.insert(key);
+                                prog.log.push(format!(
+                                    "FORGE: p95 do conjunto v7 elevou o regime de {} MHz @ {} mV; candidato recusado — {reason}. Ressintetizando.",
+                                    key.0, key.1
+                                ));
+                                changed = true;
+                                break;
                             }
                         }
                         changed = true;
@@ -6073,7 +6174,7 @@ fn measure_multiclock_undervolt_forge(
                             profiles.deep_calm,
                         ) {
                             prog.log.push(format!(
-                                "FORGE: p99 publicado = máximo calibrado/FSGL3 A+B no Apply aprovado ({updated} perfil(is) elevado(s)) — Godforge {}@{} mV {:.0} W · Brokkr's {}@{} mV {:.0} W · Deep Calm {}@{} mV {:.0} W.",
+                                "FORGE: p99 publicado = máximo calibrado/conjunto v7 no Apply aprovado ({updated} perfil(is) elevado(s)) — Godforge {}@{} mV {:.0} W · Brokkr's {}@{} mV {:.0} W · Deep Calm {}@{} mV {:.0} W.",
                                 godforge.target_clock_mhz.unwrap_or(godforge.clock_mhz),
                                 godforge.vf_table_voltage_mv.unwrap_or(godforge.voltage_mv),
                                 godforge.power_p99_w.unwrap_or(0.0),
@@ -6093,7 +6194,7 @@ fn measure_multiclock_undervolt_forge(
                     }
                     Err(e) => {
                         prog.log.push(format!(
-                            "FORGE: p99 final dos A+B aprovados indisponível — {e}; perfis recusados."
+                            "FORGE: p99 final do conjunto v7 aprovado indisponível — {e}; perfis recusados."
                         ));
                     }
                 }
@@ -6105,7 +6206,7 @@ fn measure_multiclock_undervolt_forge(
             );
             if !prog.profiles_qualified {
                 prog.log.push(format!(
-                    "FORGE: perfis provisórios — modo {} exige fronteira qualificada, confiança ≥ {:.2} e FSGL3 A+B no par exato de Apply; Apply permanece bloqueado.",
+                    "FORGE: perfis provisórios — modo {} exige fronteira qualificada, confiança ≥ {:.2} e o conjunto v7 no par exato de Apply; Apply permanece bloqueado.",
                     mode.label(),
                     ForgePolicy::balanced().confidence_threshold
                 ));
@@ -6442,7 +6543,7 @@ mod tests {
 
         let apply_pass = |pattern, power_p99_w| {
             let mut observation = measured.clone();
-            observation.run_id = "forge-v6".into();
+            observation.run_id = "forge-v7".into();
             observation.evidence_kind = F2EvidenceKind::ApplyQualification;
             observation.discovery_contract_version = None;
             observation.qualification_contract_version =
@@ -6452,11 +6553,14 @@ mod tests {
             observation.outcome = F2ObsOutcome::Validated;
             observation.power_p99_w = Some(power_p99_w);
             observation.qualification_coverage = Some(F2QualificationCoverage {
-                strength: F2QualificationStrength::Fsgl3,
+                strength: F2QualificationStrength::Fsgl4,
                 pattern: Some(pattern),
                 pass_index: match pattern {
                     F2QualificationPattern::A => 1,
                     F2QualificationPattern::B => 2,
+                    F2QualificationPattern::HighFps => 1,
+                    F2QualificationPattern::Texture => 2,
+                    F2QualificationPattern::Transitions => 3,
                 },
                 verdict: F2QualificationVerdict::Pass,
                 phases_completed: 8,
@@ -6474,19 +6578,20 @@ mod tests {
             observation
         };
         let apply_observations = [
-            apply_pass(F2QualificationPattern::A, 201.25),
-            apply_pass(F2QualificationPattern::B, 203.5),
+            apply_pass(F2QualificationPattern::HighFps, 201.25),
+            apply_pass(F2QualificationPattern::Texture, 203.5),
+            apply_pass(F2QualificationPattern::Transitions, 204.0),
         ];
         let mut published = calibrated;
         assert!(publish_f2_profile_power_from_apply_qualification(
             &mut published,
             &apply_observations,
-            Some("forge-v6"),
+            Some("forge-v7"),
             "GPU-1"
         )
         .unwrap());
-        assert_eq!(published.power_p99_w, Some(203.5));
-        assert!((published.perf_per_watt - 1875.0 / 203.5).abs() < f64::EPSILON);
+        assert_eq!(published.power_p99_w, Some(204.0));
+        assert!((published.perf_per_watt - 1875.0 / 204.0).abs() < f64::EPSILON);
 
         let mut missing_p99 = measured;
         missing_p99.power_p99_w = None;
@@ -6524,7 +6629,7 @@ mod tests {
                 standard.final_gate_dwell_ms,
                 standard.final_gate_passes
             ),
-            (60_000, 2, 0, 0)
+            (60_000, 3, 0, 0)
         );
         assert_eq!(
             (
@@ -6533,7 +6638,7 @@ mod tests {
                 long.final_gate_dwell_ms,
                 long.final_gate_passes
             ),
-            (60_000, 2, 0, 0)
+            (60_000, 3, 0, 0)
         );
     }
 
@@ -6542,7 +6647,7 @@ mod tests {
     fn f2_apply_qualification_requires_mode_evidence_on_all_profiles() {
         let qualified = PowerSweepPoint {
             confidence: Some(0.99),
-            validation_count: Some(2),
+            validation_count: Some(3),
             apply_qualified: true,
             apply_qualification_version: Some(
                 nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
@@ -6589,7 +6694,7 @@ mod tests {
         profiles[0] = Some(qualified);
         profiles[2] = Some(PowerSweepPoint {
             confidence: Some(0.84),
-            validation_count: Some(2),
+            validation_count: Some(3),
             apply_qualified: true,
             apply_qualification_version: Some(
                 nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
@@ -6635,6 +6740,7 @@ mod tests {
                 target_clock_mhz: Some(target_mhz),
                 vf_table_voltage_mv: Some(apply_mv),
                 p5_clock_mhz: Some(p5_clock_mhz),
+                p95_clock_mhz: Some(p5_clock_mhz),
                 power_w: 180.0,
                 max_power_w: 185.0,
                 power_p99_w: Some(182.0),
@@ -6650,19 +6756,19 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn profile_regime_rejects_1860_at_893_when_p5_sustains_1890() {
+    fn profile_regime_rejects_1860_at_893_when_p95_sustains_1890() {
         let frontier = vec![
-            regime_point(1860, 893, 1890, 2),
-            regime_point(1875, 900, 1875, 2),
-            regime_point(1890, 918, 1890, 2),
+            regime_point(1860, 893, 1890, 3),
+            regime_point(1875, 900, 1875, 3),
+            regime_point(1890, 918, 1890, 3),
         ];
         let refusal =
-            f2_regime_candidate_refusal(&frontier[0].0, &frontier, true, 2, 0.85)
+            f2_regime_candidate_refusal(&frontier[0].0, &frontier, true, 3, 0.85)
                 .expect("lower target must inherit the 1890 MHz regime");
-        assert!(refusal.contains("p5 1890 MHz"));
+        assert!(refusal.contains("p95 1890 MHz"));
         assert!(refusal.contains("below the 918 mV"));
         assert!(
-            f2_regime_candidate_refusal(&frontier[2].0, &frontier, true, 2, 0.85)
+            f2_regime_candidate_refusal(&frontier[2].0, &frontier, true, 3, 0.85)
                 .is_none(),
             "the canonical 1890 MHz / 918 mV point remains eligible"
         );
@@ -6670,20 +6776,22 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn profile_regime_accepts_one_bin_jitter_or_enough_voltage_margin() {
-        let one_bin = regime_point(1860, 893, 1875, 2);
-        let raised = regime_point(1860, 925, 1890, 2);
-        let support = regime_point(1890, 918, 1890, 2);
-        let one_bin_frontier = vec![one_bin, support];
+    fn profile_regime_rejects_one_bin_alias_unless_voltage_covers_the_regime() {
+        let one_bin = regime_point(1860, 893, 1875, 3);
+        let one_bin_support = regime_point(1875, 900, 1875, 3);
+        let raised = regime_point(1860, 925, 1890, 3);
+        let support = regime_point(1890, 918, 1890, 3);
+        let one_bin_frontier = vec![one_bin, one_bin_support];
         assert!(
             f2_regime_candidate_refusal(
                 &one_bin_frontier[0].0,
                 &one_bin_frontier,
                 true,
-                2,
+                3,
                 0.85
             )
-            .is_none()
+            .is_some(),
+            "v7 has zero sustained-regime bin tolerance"
         );
         let raised_frontier = vec![raised, support];
         assert!(
@@ -6691,7 +6799,7 @@ mod tests {
                 &raised_frontier[0].0,
                 &raised_frontier,
                 true,
-                2,
+                3,
                 0.85
             )
             .is_none()
@@ -6701,11 +6809,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn profile_regime_inherits_inconclusive_support_and_exact_apply_failure() {
-        let lower = regime_point(1860, 893, 1890, 2);
-        let inconclusive_support = regime_point(1890, 918, 1890, 1);
+        let lower = regime_point(1860, 893, 1890, 3);
+        let inconclusive_support = regime_point(1890, 918, 1890, 2);
         let frontier = vec![lower, inconclusive_support];
         let refusal =
-            f2_regime_candidate_refusal(&frontier[0].0, &frontier, true, 2, 0.85)
+            f2_regime_candidate_refusal(&frontier[0].0, &frontier, true, 3, 0.85)
                 .expect("inconclusive 1890 support must block the lower alias");
         assert!(refusal.contains("failed or inconclusive"));
 
@@ -6717,17 +6825,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn profile_synthesis_uses_canonical_regime_after_alias_is_removed() {
-        let mut efficient = regime_point(1845, 887, 1845, 2);
+        let mut efficient = regime_point(1845, 887, 1845, 3);
         efficient.0.power_p99_w = Some(168.0);
         efficient.0.perf_per_watt = 1845.0 / 168.0;
-        let alias = regime_point(1860, 893, 1890, 2);
-        let canonical = regime_point(1890, 918, 1890, 2);
+        let alias = regime_point(1860, 893, 1890, 3);
+        let canonical = regime_point(1890, 918, 1890, 3);
         let frontier = vec![efficient, alias, canonical];
         let eligible = frontier
             .iter()
             .copied()
             .filter(|(point, _)| {
-                f2_regime_candidate_refusal(point, &frontier, true, 2, 0.85)
+                f2_regime_candidate_refusal(point, &frontier, true, 3, 0.85)
                     .is_none()
             })
             .collect::<Vec<_>>();
@@ -7362,6 +7470,7 @@ mod tests {
     fn m_good(result: StabilityResult) -> Measured {
         Measured {
             result,
+            cancelled: false,
             clock_mhz: 1815,
             power_w: 180.0,
             max_power_w: 188.0,
@@ -9472,7 +9581,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn restored_pre_v6_f2_profiles_become_provisional() {
+    fn restored_pre_v7_f2_profiles_become_provisional() {
         let mut prog = idle();
         prog.is_undervolt = true;
         prog.phase = "finished".into();
@@ -9490,7 +9599,7 @@ mod tests {
                     .note
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("regime v6"));
+                    .contains("v7"));
             }
             other => panic!("expected Loaded, got {other:?}"),
         }

@@ -14,6 +14,7 @@
   const isUndervolt = $derived(Boolean(powerSweep?.is_undervolt));
   const profilesQualified = $derived(!isUndervolt || Boolean(powerSweep?.profiles_qualified));
   const isInterrupted = $derived(powerSweep?.phase === "interrupted");
+  const isStopping = $derived(powerSweep?.phase === "stopping");
   const phase = $derived.by(() => {
     if (isInterrupted) return "Interrupted";
     return powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : "Not running";
@@ -190,12 +191,12 @@
         />
       {/if}
       <span class="run-state" class:live={powerRunning} class:interrupted={isInterrupted}>
-        {powerRunning ? "Running" : isInterrupted ? "Interrupted" : hasRun ? "Stopped" : "Idle"}
+        {isStopping ? "Stopping" : powerRunning ? "Running" : isInterrupted ? "Interrupted" : hasRun ? "Stopped" : "Idle"}
       </span>
       {#if powerRunning}
-        <button class="btn stop" onclick={onStopPower}>
+        <button class="btn stop" onclick={onStopPower} disabled={isStopping}>
           <Square size={14} strokeWidth={1.9} />
-          <span>Stop forging</span>
+          <span>{isStopping ? "Stopping…" : "Stop forging"}</span>
         </button>
       {/if}
     </div>

@@ -140,6 +140,9 @@ pub enum VfQualifierPattern {
     Fsgl2B,
     Fsgl3A,
     Fsgl3B,
+    V7HighFps,
+    V7Texture,
+    V7Transitions,
 }
 
 impl VfQualifierPattern {
@@ -150,6 +153,9 @@ impl VfQualifierPattern {
             Self::Fsgl2B => "fsgl2-b",
             Self::Fsgl3A => "fsgl3-a",
             Self::Fsgl3B => "fsgl3-b",
+            Self::V7HighFps => "v7-high-fps",
+            Self::V7Texture => "v7-texture",
+            Self::V7Transitions => "v7-transitions",
         }
     }
 }
@@ -292,6 +298,55 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 4),
     ];
+    const V7_HIGH_FPS: [(VfQualifierPhase, VfWorkload, u64); 15] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 12),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 4),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 12),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 12),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 3),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 12),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 5),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 4),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 6),
+    ];
+    const V7_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 12] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 3),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 5),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 7),
+    ];
+    const V7_TRANSITIONS: [(VfQualifierPhase, VfWorkload, u64); 16] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 5),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 5),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 6),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 5),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 8),
+    ];
 
     let template: &[(VfQualifierPhase, VfWorkload, u64)] = match pattern {
         VfQualifierPattern::Fsgl1 => &FSGL1,
@@ -299,6 +354,9 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         VfQualifierPattern::Fsgl2B => &FSGL2_B,
         VfQualifierPattern::Fsgl3A => &FSGL3_A,
         VfQualifierPattern::Fsgl3B => &FSGL3_B,
+        VfQualifierPattern::V7HighFps => &V7_HIGH_FPS,
+        VfQualifierPattern::V7Texture => &V7_TEXTURE,
+        VfQualifierPattern::V7Transitions => &V7_TRANSITIONS,
     };
     let total_weight = template.iter().map(|(_, _, weight)| *weight).sum::<u64>();
     let mut assigned = 0u64;
@@ -809,6 +867,17 @@ impl GpuCtx {
     /// so after K dispatches every lane has had `iters*K` LCG rounds). Verified
     /// via LCG jump-ahead, so the CPU reference is O(log n) regardless of load.
     pub fn run_alu(&self, name: &str, elements: u32, iters: u32, target_ms: u64) -> StageReport {
+        self.run_alu_with_cancel(name, elements, iters, target_ms, None)
+    }
+
+    pub fn run_alu_with_cancel(
+        &self,
+        name: &str,
+        elements: u32,
+        iters: u32,
+        target_ms: u64,
+        cancel: Option<&AtomicBool>,
+    ) -> StageReport {
         let start = std::time::Instant::now();
         let input: Vec<u32> = (0..elements).collect();
         let byte_size = (elements as usize * 4) as u64;
@@ -846,7 +915,9 @@ impl GpuCtx {
         let groups = elements.div_ceil(64);
         let mut k: u64 = 0;
         // Keep the queue fed back-to-back; bound depth with an occasional wait.
-        while (start.elapsed().as_millis() as u64) < target_ms {
+        while (start.elapsed().as_millis() as u64) < target_ms
+            && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+        {
             let mut enc = self.device.create_command_encoder(&Default::default());
             {
                 let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1521,7 +1592,31 @@ impl GpuCtx {
     /// compute-only validation passes. Returns the verdict plus the rendered
     /// frame count / FPS — the benchmark uses the FPS as its performance metric.
     pub fn run_render_stress(&self, target_ms: u64) -> RenderResult {
-        self.run_render_profile(target_ms, VfWorkload::PowerRender, None, false, false, None)
+        self.run_render_profile(
+            target_ms,
+            VfWorkload::PowerRender,
+            None,
+            false,
+            false,
+            None,
+            None,
+        )
+    }
+
+    pub fn run_render_stress_with_cancel(
+        &self,
+        target_ms: u64,
+        cancel: &AtomicBool,
+    ) -> RenderResult {
+        self.run_render_profile(
+            target_ms,
+            VfWorkload::PowerRender,
+            None,
+            false,
+            false,
+            None,
+            Some(cancel),
+        )
     }
 
     pub fn capture_one_golden(
@@ -1743,12 +1838,32 @@ impl GpuCtx {
         pattern: VfQualifierPattern,
         goldens: Option<RenderGoldens>,
     ) -> RenderResult {
+        self.run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel(
+            target_ms,
+            phase_state,
+            pattern,
+            goldens,
+            None,
+        )
+    }
+
+    pub fn run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel(
+        &self,
+        target_ms: u64,
+        phase_state: &AtomicU8,
+        pattern: VfQualifierPattern,
+        goldens: Option<RenderGoldens>,
+        cancel: Option<&AtomicBool>,
+    ) -> RenderResult {
         let started = std::time::Instant::now();
         let mut frames = 0u64;
         let mut reports = Vec::new();
         let plan = vf_qualifier_plan(target_ms, pattern);
 
         for segment in plan {
+            if cancel.is_some_and(|token| token.load(Ordering::SeqCst)) {
+                break;
+            }
             phase_state.store(segment.phase.code(), Ordering::SeqCst);
             let single = [segment.workload];
             let mixed = [
@@ -1770,7 +1885,13 @@ impl GpuCtx {
                 assigned = assigned.saturating_add(duration_ms);
                 let result = match workload {
                     VfWorkload::ComputeBurst => {
-                        let stage = self.run_alu("VF qualifier compute burst", 262_144, 256, duration_ms);
+                        let stage = self.run_alu_with_cancel(
+                            "VF qualifier compute burst",
+                            262_144,
+                            256,
+                            duration_ms,
+                            cancel,
+                        );
                         RenderResult {
                             result: stage.result,
                             frames: 0,
@@ -1793,6 +1914,7 @@ impl GpuCtx {
                         matches!(other, VfWorkload::IdlePulse),
                         true,
                         goldens.and_then(|g| golden_for_workload(g, other)),
+                        cancel,
                     ),
                 };
                 frames = frames.saturating_add(result.frames);
@@ -1822,6 +1944,7 @@ impl GpuCtx {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_render_profile(
         &self,
         target_ms: u64,
@@ -1830,6 +1953,7 @@ impl GpuCtx {
         idle_pulses: bool,
         full_workload_duration: bool,
         golden: Option<u32>,
+        cancel: Option<&AtomicBool>,
     ) -> RenderResult {
         let start = std::time::Instant::now();
         let mut frames: u64 = 0;
@@ -2010,7 +2134,9 @@ impl GpuCtx {
         let mut last_idle = workload_start;
         let golden_mode = golden.is_some();
 
-        while (workload_start.elapsed().as_millis() as u64) < target_ms {
+        while (workload_start.elapsed().as_millis() as u64) < target_ms
+            && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+        {
             if golden_mode && frames > 0 && frames.is_multiple_of(DROOP_BURST) {
                 self.device.poll(wgpu::Maintain::Wait);
                 std::thread::sleep(std::time::Duration::from_millis(DROOP_GAP_MS));
@@ -2114,7 +2240,11 @@ impl GpuCtx {
             }
             self.device.poll(wgpu::Maintain::Wait);
         }
-        if golden_mode && !diverged && !self.crashed.load(Ordering::SeqCst) {
+        if golden_mode
+            && !diverged
+            && !self.crashed.load(Ordering::SeqCst)
+            && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+        {
             self.device.poll(wgpu::Maintain::Wait);
             if golden_mismatch_buf
                 .as_ref()
@@ -2386,6 +2516,51 @@ mod tests {
         assert!(b.iter().any(|segment| segment.workload == VfWorkload::MixedGame));
         assert_eq!(VfQualifierPattern::Fsgl3A.label(), "fsgl3-a");
         assert_eq!(VfQualifierPattern::Fsgl3B.label(), "fsgl3-b");
+    }
+
+    #[test]
+    fn v7_patterns_preserve_duration_and_bias_distinct_failure_modes() {
+        let high_fps = vf_qualifier_plan(60_000, VfQualifierPattern::V7HighFps);
+        let texture = vf_qualifier_plan(60_000, VfQualifierPattern::V7Texture);
+        let transitions = vf_qualifier_plan(60_000, VfQualifierPattern::V7Transitions);
+        for plan in [&high_fps, &texture, &transitions] {
+            assert_eq!(
+                plan.iter().map(|segment| segment.duration_ms).sum::<u64>(),
+                60_000
+            );
+            assert_eq!(
+                plan.first().map(|segment| segment.phase),
+                Some(VfQualifierPhase::PowerOpening)
+            );
+            assert_eq!(
+                plan.last().map(|segment| segment.phase),
+                Some(VfQualifierPhase::PowerClosing)
+            );
+        }
+        let duration_for = |plan: &[VfQualifierSegment], workload| {
+            plan.iter()
+                .filter(|segment| segment.workload == workload)
+                .map(|segment| segment.duration_ms)
+                .sum::<u64>()
+        };
+        assert!(
+            duration_for(&high_fps, VfWorkload::BoostEdge)
+                > duration_for(&texture, VfWorkload::BoostEdge)
+        );
+        assert!(
+            duration_for(&texture, VfWorkload::TextureRop)
+                > duration_for(&high_fps, VfWorkload::TextureRop)
+        );
+        assert!(
+            transitions
+                .iter()
+                .filter(|segment| segment.workload == VfWorkload::IdlePulse)
+                .count()
+                >= 5
+        );
+        assert_eq!(VfQualifierPattern::V7HighFps.label(), "v7-high-fps");
+        assert_eq!(VfQualifierPattern::V7Texture.label(), "v7-texture");
+        assert_eq!(VfQualifierPattern::V7Transitions.label(), "v7-transitions");
     }
 
     #[test]

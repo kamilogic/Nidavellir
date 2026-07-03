@@ -30,9 +30,9 @@ pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 4;
 /// Current FailureSeekingGameLoop qualification contract.
 ///
-/// v6 keeps the v5 exact post-margin FSGL3 A+B gate and additionally requires profile synthesis to
-/// reconcile any configured-target/p5 alias with the higher sustained electrical regime.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 6;
+/// v7 requires the High-FPS, Texture and Transitions qualification set and reconciles the exact
+/// sustained-p95 electrical regime before a point may be applied.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 7;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -55,8 +55,8 @@ pub enum F2QualificationVerdict {
     Inconclusive,
 }
 
-/// Strength of the qualification evidence. FSGL1/FSGL2 remain readable for compatibility; FSGL3 is
-/// the current deployable qualifier required for Apply.
+/// Strength of the qualification evidence. Older strengths remain readable for compatibility;
+/// FSGL4 is the current three-pattern v7 qualifier required for Apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum F2QualificationStrength {
@@ -64,14 +64,19 @@ pub enum F2QualificationStrength {
     Fsgl1,
     Fsgl2,
     Fsgl3,
+    Fsgl4,
 }
 
-/// Deterministic A/B pattern used by the current deployable qualifier.
+/// Deterministic workload pattern. A/B remain readable for legacy observations; v7 deployability
+/// requires HighFps + Texture + Transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum F2QualificationPattern {
     A,
     B,
+    HighFps,
+    Texture,
+    Transitions,
 }
 
 /// Per-phase telemetry captured during a qualification dwell. Optional values remain absent when a
@@ -150,7 +155,7 @@ pub enum F2ObsMode {
     TargetSweep,
     /// A multi-target ladder of target sweeps.
     LadderSweep,
-    /// Long FSGL3 qualification of the exact post-margin Apply pair selected for a profile.
+    /// Long current-contract qualification of the exact post-margin Apply pair selected for a profile.
     ApplyQualification,
 }
 
@@ -510,8 +515,8 @@ pub fn is_current_qualification_pass(o: &F2Observation) -> bool {
         && o.qualification_coverage
             .as_ref()
             .is_some_and(|coverage| {
-                coverage.strength == F2QualificationStrength::Fsgl3
-                    && coverage.pattern.is_some()
+                coverage.strength == F2QualificationStrength::Fsgl4
+                    && coverage.pattern.is_some_and(is_v7_qualification_pattern)
                     && coverage.verdict == F2QualificationVerdict::Pass
             })
 }
@@ -526,10 +531,19 @@ pub fn is_current_apply_qualification_pass(o: &F2Observation) -> bool {
         && o.qualification_coverage
             .as_ref()
             .is_some_and(|coverage| {
-                coverage.strength == F2QualificationStrength::Fsgl3
-                    && coverage.pattern.is_some()
+                coverage.strength == F2QualificationStrength::Fsgl4
+                    && coverage.pattern.is_some_and(is_v7_qualification_pattern)
                     && coverage.verdict == F2QualificationVerdict::Pass
             })
+}
+
+fn is_v7_qualification_pattern(pattern: F2QualificationPattern) -> bool {
+    matches!(
+        pattern,
+        F2QualificationPattern::HighFps
+            | F2QualificationPattern::Texture
+            | F2QualificationPattern::Transitions
+    )
 }
 
 /// Lowest-voltage stable point proven by the current, homogeneous discovery contract. Negative
@@ -635,20 +649,20 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
                 && (is_current_discovery_evidence(o) || is_current_qualification_pass(o))
         })
         .collect();
-    let has_fsgl3_a = evidence_at_best.iter().any(|o| {
-        is_current_qualification_pass(o)
-            && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
-                == Some(F2QualificationPattern::A)
-    });
-    let has_fsgl3_b = evidence_at_best.iter().any(|o| {
-        is_current_qualification_pass(o)
-            && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
-                == Some(F2QualificationPattern::B)
-    });
-    let qualification_count = [has_fsgl3_a, has_fsgl3_b]
-        .into_iter()
-        .filter(|present| *present)
-        .count();
+    let qualification_count = [
+        F2QualificationPattern::HighFps,
+        F2QualificationPattern::Texture,
+        F2QualificationPattern::Transitions,
+    ]
+    .into_iter()
+    .filter(|pattern| {
+        evidence_at_best.iter().any(|o| {
+            is_current_qualification_pass(o)
+                && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
+                    == Some(*pattern)
+        })
+    })
+    .count();
     let observation_count = obs.iter().filter(|o| o.target_mhz == target_mhz).count();
     let bracket = bracket_for_target(obs, target_mhz);
     Some(F2FrontierEntry {
@@ -781,9 +795,9 @@ pub fn current_discovery_observation_at_anchor<'a>(
         })
 }
 
-/// Highest sustained p99 measured by a complete, reset-clean FSGL3 A+B pair at one exact Apply
-/// anchor in one run. Partial pairs, failed/inconclusive passes, thermal throttling and old
-/// qualification contracts are excluded. The maximum across both approved patterns is returned so
+/// Highest sustained p99 measured by a complete, reset-clean v7 three-pattern set at one exact Apply
+/// anchor in one run. Partial sets, failed/inconclusive passes, thermal throttling and old
+/// qualification contracts are excluded. The maximum across all approved patterns is returned so
 /// profile presentation cannot understate power already observed during its deployability soak.
 fn apply_qualification_p99_at_anchor(
     obs: &[F2Observation],
@@ -792,7 +806,7 @@ fn apply_qualification_p99_at_anchor(
     anchor_mv: u32,
     gpu_key: &str,
 ) -> Option<f32> {
-    let mut runs = std::collections::BTreeMap::<&str, (bool, bool, f32)>::new();
+    let mut runs = std::collections::BTreeMap::<&str, (bool, bool, bool, f32)>::new();
     for observation in obs.iter().filter(|o| {
         run_id.is_none_or(|expected| o.run_id == expected)
             && o.target_mhz == target_mhz
@@ -807,26 +821,27 @@ fn apply_qualification_p99_at_anchor(
     }) {
         let entry = runs
             .entry(observation.run_id.as_str())
-            .or_insert((false, false, 0.0));
+            .or_insert((false, false, false, 0.0));
         match observation
             .qualification_coverage
             .as_ref()
             .and_then(|coverage| coverage.pattern)
         {
-            Some(F2QualificationPattern::A) => entry.0 = true,
-            Some(F2QualificationPattern::B) => entry.1 = true,
-            None => continue,
+            Some(F2QualificationPattern::HighFps) => entry.0 = true,
+            Some(F2QualificationPattern::Texture) => entry.1 = true,
+            Some(F2QualificationPattern::Transitions) => entry.2 = true,
+            _ => continue,
         }
         let power = observation.power_p99_w.unwrap_or(0.0);
-        entry.2 = entry.2.max(power);
+        entry.3 = entry.3.max(power);
     }
     runs.into_values()
-        .filter(|(saw_a, saw_b, _)| *saw_a && *saw_b)
-        .map(|(_, _, power)| power)
+        .filter(|(high_fps, texture, transitions, _)| *high_fps && *texture && *transitions)
+        .map(|(_, _, _, power)| power)
         .max_by(f32::total_cmp)
 }
 
-/// Highest sustained p99 from the complete approved A+B pair produced by one exact Forge run.
+/// Highest sustained p99 from the complete approved v7 set produced by one exact Forge run.
 pub fn current_apply_qualification_p99_at_anchor(
     obs: &[F2Observation],
     run_id: &str,
@@ -837,7 +852,48 @@ pub fn current_apply_qualification_p99_at_anchor(
     apply_qualification_p99_at_anchor(obs, Some(run_id), target_mhz, anchor_mv, gpu_key)
 }
 
-/// Highest sustained p99 across every complete current-contract A+B run for one exact Apply pair.
+/// Highest sustained p95 clock reached by a complete, reset-clean v7 set at one exact Apply pair.
+/// Missing telemetry in any required pattern fails closed.
+pub fn current_apply_qualification_p95_clock_at_anchor(
+    obs: &[F2Observation],
+    run_id: &str,
+    target_mhz: u32,
+    anchor_mv: u32,
+    gpu_key: &str,
+) -> Option<u32> {
+    let mut high_fps = false;
+    let mut texture = false;
+    let mut transitions = false;
+    let mut highest = 0u32;
+    for observation in obs.iter().filter(|o| {
+        o.run_id == run_id
+            && o.target_mhz == target_mhz
+            && o.anchor_mv == anchor_mv
+            && o.gpu_key.as_deref() == Some(gpu_key)
+            && is_current_apply_qualification_pass(o)
+            && o.reset_to_stock_ok
+            && o.boot_flag_cleared
+            && !o.thermal_throttled
+    }) {
+        let clock = observation
+            .sustained_upper_clock_mhz
+            .filter(|clock| *clock > 0)?;
+        match observation
+            .qualification_coverage
+            .as_ref()
+            .and_then(|coverage| coverage.pattern)
+        {
+            Some(F2QualificationPattern::HighFps) => high_fps = true,
+            Some(F2QualificationPattern::Texture) => texture = true,
+            Some(F2QualificationPattern::Transitions) => transitions = true,
+            _ => continue,
+        }
+        highest = highest.max(clock);
+    }
+    (high_fps && texture && transitions && highest > 0).then_some(highest)
+}
+
+/// Highest sustained p99 across every complete current-contract v7 run for one exact Apply pair.
 /// This restores the conservative published wattage when a qualified Forge snapshot is reloaded.
 pub fn highest_apply_qualification_p99_at_anchor(
     obs: &[F2Observation],
@@ -994,7 +1050,7 @@ mod tests {
     }
 
     fn qualification_pass(o: F2Observation) -> F2Observation {
-        qualification_pass_with_pattern(o, F2QualificationPattern::A)
+        qualification_pass_with_pattern(o, F2QualificationPattern::HighFps)
     }
 
     fn qualification_pass_with_pattern(
@@ -1005,11 +1061,14 @@ mod tests {
         o.discovery_contract_version = None;
         o.qualification_contract_version = Some(F2_QUALIFICATION_CONTRACT_VERSION);
         o.qualification_coverage = Some(F2QualificationCoverage {
-            strength: F2QualificationStrength::Fsgl3,
+            strength: F2QualificationStrength::Fsgl4,
             pattern: Some(pattern),
             pass_index: match pattern {
                 F2QualificationPattern::A => 1,
                 F2QualificationPattern::B => 2,
+                F2QualificationPattern::HighFps => 1,
+                F2QualificationPattern::Texture => 2,
+                F2QualificationPattern::Transitions => 3,
             },
             verdict: F2QualificationVerdict::Pass,
             phases_completed: 8,
@@ -1298,17 +1357,25 @@ mod tests {
     }
 
     #[test]
-    fn learned_frontier_counts_distinct_fsgl3_patterns() {
+    fn learned_frontier_counts_distinct_v7_patterns() {
         let discovery = obs(1800, 962, F2ObsOutcome::Validated);
-        let a1 = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::A);
-        let a2 = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::A);
-        let only_a = frontier_entry_for_target(&[discovery.clone(), a1, a2], 1800).unwrap();
-        assert_eq!(only_a.validation_count, 1);
+        let high_fps_1 =
+            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::HighFps);
+        let high_fps_2 =
+            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::HighFps);
+        let only_high_fps =
+            frontier_entry_for_target(&[discovery.clone(), high_fps_1, high_fps_2], 1800).unwrap();
+        assert_eq!(only_high_fps.validation_count, 1);
 
-        let a = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::A);
-        let b = qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::B);
-        let a_and_b = frontier_entry_for_target(&[discovery, a, b], 1800).unwrap();
-        assert_eq!(a_and_b.validation_count, 2);
+        let high_fps =
+            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::HighFps);
+        let texture =
+            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::Texture);
+        let transitions =
+            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::Transitions);
+        let complete =
+            frontier_entry_for_target(&[discovery, high_fps, texture, transitions], 1800).unwrap();
+        assert_eq!(complete.validation_count, 3);
     }
 
     #[test]
@@ -1316,14 +1383,14 @@ mod tests {
         let discovery = obs(1800, 881, F2ObsOutcome::Validated);
         let apply_pass = apply_qualification_pass(
             obs(1800, 893, F2ObsOutcome::Validated),
-            F2QualificationPattern::A,
+            F2QualificationPattern::HighFps,
         );
         assert!(is_current_apply_qualification_pass(&apply_pass));
         assert!(!is_current_qualification_pass(&apply_pass));
 
         let mut apply_failure = apply_qualification_pass(
             obs(1800, 893, F2ObsOutcome::SilentError),
-            F2QualificationPattern::B,
+            F2QualificationPattern::Texture,
         );
         apply_failure.qualification_coverage.as_mut().unwrap().verdict =
             F2QualificationVerdict::Fail;
@@ -1418,47 +1485,81 @@ mod tests {
     }
 
     #[test]
-    fn apply_qualification_power_requires_complete_clean_pair_and_uses_highest_p99() {
-        let mut a = apply_qualification_pass(
+    fn apply_qualification_power_requires_complete_clean_set_and_uses_highest_p99() {
+        let mut high_fps = apply_qualification_pass(
             obs(1830, 862, F2ObsOutcome::Validated),
-            F2QualificationPattern::A,
+            F2QualificationPattern::HighFps,
         );
-        a.run_id = "apply-v6".into();
-        a.power_p99_w = Some(172.25);
-        let mut b = apply_qualification_pass(
+        high_fps.run_id = "apply-v7".into();
+        high_fps.power_p99_w = Some(172.25);
+        let mut texture = apply_qualification_pass(
             obs(1830, 862, F2ObsOutcome::Validated),
-            F2QualificationPattern::B,
+            F2QualificationPattern::Texture,
         );
-        b.run_id = "apply-v6".into();
-        b.power_p99_w = Some(172.587);
-        let mut throttled = b.clone();
+        texture.run_id = "apply-v7".into();
+        texture.power_p99_w = Some(172.587);
+        let mut transitions = apply_qualification_pass(
+            obs(1830, 862, F2ObsOutcome::Validated),
+            F2QualificationPattern::Transitions,
+        );
+        transitions.run_id = "apply-v7".into();
+        transitions.power_p99_w = Some(173.125);
+        transitions.sustained_upper_clock_mhz = Some(1890);
+        let mut throttled = texture.clone();
         throttled.power_p99_w = Some(180.0);
         throttled.thermal_throttled = true;
-        let mut other_run_a = a.clone();
-        other_run_a.run_id = "other-run".into();
-        other_run_a.power_p99_w = Some(189.0);
-        let mut other_run_b = b.clone();
-        other_run_b.run_id = "other-run".into();
-        other_run_b.power_p99_w = Some(190.0);
+        let mut other_run_high_fps = high_fps.clone();
+        other_run_high_fps.run_id = "other-run".into();
+        other_run_high_fps.power_p99_w = Some(189.0);
+        let mut other_run_texture = texture.clone();
+        other_run_texture.run_id = "other-run".into();
+        other_run_texture.power_p99_w = Some(190.0);
+        let mut other_run_transitions = transitions.clone();
+        other_run_transitions.run_id = "other-run".into();
+        other_run_transitions.power_p99_w = Some(191.0);
 
-        let observations = [a.clone(), b, throttled, other_run_a, other_run_b];
+        let observations = [
+            high_fps.clone(),
+            texture,
+            transitions,
+            throttled,
+            other_run_high_fps,
+            other_run_texture,
+            other_run_transitions,
+        ];
         assert_eq!(
             current_apply_qualification_p99_at_anchor(
                 &observations,
-                "apply-v6",
+                "apply-v7",
                 1830,
                 862,
                 "RTX 3060 Ti"
             ),
-            Some(172.587)
+            Some(173.125)
+        );
+        assert_eq!(
+            current_apply_qualification_p95_clock_at_anchor(
+                &observations,
+                "apply-v7",
+                1830,
+                862,
+                "RTX 3060 Ti"
+            ),
+            Some(1890)
         );
         assert_eq!(
             highest_apply_qualification_p99_at_anchor(&observations, 1830, 862, "RTX 3060 Ti"),
-            Some(190.0),
+            Some(191.0),
             "restored snapshots use the highest complete approved run"
         );
         assert_eq!(
-            current_apply_qualification_p99_at_anchor(&[a], "apply-v6", 1830, 862, "RTX 3060 Ti"),
+            current_apply_qualification_p99_at_anchor(
+                &[high_fps],
+                "apply-v7",
+                1830,
+                862,
+                "RTX 3060 Ti"
+            ),
             None,
             "one approved pattern alone cannot publish soak power"
         );

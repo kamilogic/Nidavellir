@@ -8,6 +8,26 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-03) — automated qualification v7, strict p95 regime and responsive Forge
+- `F2_QUALIFICATION_CONTRACT_VERSION = 7`. Standard/Long and exact Apply now require three
+  independent deterministic patterns: High-FPS, Texture and Transitions. Legacy FSGL1/2/3 positives
+  remain readable but cannot unlock Apply.
+- Discovery remains the homogeneous textured PowerRender and keeps confirmed sustained-p99 power
+  calibration unchanged. The v7 patterns add rapid boost cadence, texture/ROP-heavy mixed graphics
+  and repeated idle→burst→heavy transitions with stock-golden verification.
+- P5 remains the performance floor; p95 is now the electrical support regime. Any sustained p95 above
+  the configured target maps to the nearest measured target with zero one-bin tolerance, inherits the
+  conservative Apply voltage across that span and requires current three-pattern evidence. Exact-Apply
+  v7 p95 is reconciled again after the soak, so a higher regime discovered there forces re-synthesis.
+- Live GPU loops receive the Forge cancellation token. Stop immediately reports `stopping`, checks
+  cancellation between bounded frames/dispatches, records no positive/bad evidence from cancellation,
+  and still executes the checked stock reset.
+- Forge UI refreshes cannot overlap. While running, progress/safety keep the 500 ms cadence and
+  secondary diagnostics move to 3 s; Stop changes optimistically to “Stopping…”. The IPC-visible log
+  is capped at 240 lines while completed evidence remains in `f2_observations.jsonl`.
+- Code/tests only in this checkpoint. No Forge, VF write, Apply or hardware stress was run
+  automatically; the next gate is a supervised v7 Forge on the RTX 3060 Ti.
+
 ## Latest (2026-07-02) — profile synthesis reconciles the sustained electrical regime
 - Profile candidates tolerate at most one 15 MHz physical bin between configured target and p5. A
   larger gap maps to the nearest measured target at/above p5 and inherits the conservative maximum

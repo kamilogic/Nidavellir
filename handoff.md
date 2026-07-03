@@ -1,13 +1,28 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-06-30: the F2 live Forge uses PowerRender discovery plus
-FSGL3 A/B golden qualification and now stops voltage descent on a relative heavy-phase p5 margin
-collapse before a TDR where possible. Coverage ambiguity retries twice with longer dwell and then
-skips only that clock. Supervised F2 TDR recovery blacklists/recedes without consuming the normal-use
-Safe Mode crash budget, and an interrupted run resumes once when the UI reconnects. Apply requests
-12 mV above the learned boundary, snaps to a valid physical VF bin and exposes both values. `finished`
-means profiles are qualified. **NEXT = supervised Leva 1 hardware gate; Leva 2 remains blocked.**
+How to pick this up cold. State as of 2026-07-03: the F2 live Forge keeps homogeneous PowerRender
+discovery/p99 calibration, but deployability now requires qualification contract v7: High-FPS,
+Texture and Transitions at the boundary and exact Apply. P5 remains the performance floor; p95 owns
+the electrical support regime with zero bin tolerance. Stop is cooperative inside GPU loops and the
+UI avoids overlapping polling. Apply still requests 12 mV above the learned boundary, snaps to a
+valid physical VF bin and exposes both values. `finished` means current v7 profiles are qualified.
+**NEXT = supervised v7 hardware gate; Leva 2 remains blocked.**
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## Latest backend/frontend checkpoint (2026-07-03) — qualification v7 + cooperative cancellation
+- **Automated oracle:** Standard/Long use three deterministic patterns targeting high frame cadence,
+  texture/ROP/mixed graphics pressure and rapid load transitions. Each retains stock-golden
+  verification; older FSGL evidence is excluded from v7 Apply.
+- **Strict regime:** synthesis uses measured p95, not p5, to identify electrical support. Any higher
+  sustained regime must have a measured target/Apply anchor and all three current qualification
+  patterns; no one-bin alias tolerance remains.
+- **Responsive Stop:** cancellation reaches discovery and qualification render/compute loops,
+  prevents new bounded batches, returns through normal checked stock reset and cannot blacklist or
+  validate the interrupted point.
+- **UI/IPC load:** refresh cycles do not overlap; secondary diagnostics poll every 3 s during Forge;
+  Stop displays `stopping` immediately; live log payload is capped at 240 lines while JSONL evidence
+  remains complete.
+- **Hardware status:** code/tests only. No VF write, Forge or Apply was run automatically.
 
 ## Latest backend/frontend checkpoint (2026-07-01) — confirmed sustained-p99 frontier/calibration (code-complete, NOT HW-tested)
 - **Workload unchanged**: live F2 discovery still uses the textured, bounded-frame `PowerRender`;

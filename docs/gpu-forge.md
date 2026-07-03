@@ -5,8 +5,9 @@ work: how it characterizes, validates, applies and persists CPU/GPU profiles,
 the methodology, the problems we hit, and how we solved them.
 
 > Status: **real hardware** (NVIDIA / NVAPI). No simulation. Verified on an
-> RTX 3060 Ti + i7-13700K dev rig. Final stability is always confirmed in a real
-> game/benchmark — see "Honest limits".
+> RTX 3060 Ti + i7-13700K dev rig. Deployability is decided automatically by the
+> conservative qualification contract; normal users are not required to supply
+> manual voltage knowledge or validate profiles in games.
 
 ## Components
 
@@ -62,23 +63,25 @@ The live F2 Forge deliberately asks two different questions with two different r
   uses the highest measured p99. A bin without consensus is ineligible.
    If cross-clock warm-start pruning skipped the later +12 mV Apply bin for that exact target, Forge
    performs a discovery-only PowerRender backfill at that bin after the frontier completes.
-- **Standard / Long qualification:** FSGL3 A+B is the default interleaved per-bin qualifier. Before
+- **Standard / Long qualification:** contract v7 runs three interleaved per-bin patterns:
+  **High-FPS**, **Texture** and **Transitions**. Before
   descent, stock captures deterministic power, boost and texture/ROP checksums with one fresh
-  `GpuCtx` per render configuration. FSGL3 biases TextureRop/MixedGame, crosses the same eight
-  telemetry phases, and verifies every rendered frame on-GPU against the matching stock golden.
+  `GpuCtx` per render configuration. The patterns respectively bias rapid boost/submission cadence,
+  texture/ROP/mixed graphics pressure, and repeated idle→burst→heavy transitions. They cross the
+  same eight telemetry phases and verify every rendered frame on-GPU against the matching stock golden.
   Six-frame bursts separated by 4 ms deliberately probe the first frame after a current step.
-  FSGL1/FSGL2 remain available with their original self-reference/250 ms behavior.
+  FSGL1/FSGL2/FSGL3 remain readable as legacy evidence but cannot unlock v7 Apply.
 
 **Interleaved per-bin descent (Standard / Long).** Discovery does not run `PowerRender` all the way to
 the deepest survivable bin and only then qualify it — `PowerRender` tolerates more than the
 failure-seeking qualifier (and than real games), so the deepest PowerRender point is often too aggressive
 and qualifying it there risks a TDR. Instead, the descent stops at the FIRST sustained (under-cap)
-point, qualifies it with FSGL3 pattern A and pattern B, and only then steps one real VF bin lower:
-`PowerRender` there measures that bin's power and gates whether to attempt FSGL3 at all. Each deeper
-bin is FSGL3-qualified before going lower; the first FSGL3 failure stops the descent and leaves the
-last FSGL3-qualified bin as the accepted boundary. (Fast keeps descending to the PowerRender floor —
+point, qualifies it with all three v7 patterns, and only then steps one real VF bin lower:
+`PowerRender` there measures that bin's power and gates whether to attempt v7 at all. Each deeper
+bin is v7-qualified before going lower; the first v7 failure stops the descent and leaves the
+last v7-qualified bin as the accepted boundary. (Fast keeps descending to the PowerRender floor —
 it is provisional and never qualifies.) Negative observations make the learned frontier automatically
-select the deepest bin that still has current FSGL3 A+B evidence.
+select the deepest bin that still has current three-pattern evidence.
 
 A discovery `ClockDrop` remains power-bound when p99 is at least 99% of the numeric board cap. It is
 then labeled `PowerBoundClockDrop` and voltage descent continues even if that clock sustained at a
@@ -87,13 +90,14 @@ shallower bin. Once p99 leaves the cap, the normal clock-drop boundary applies.
 The qualifier is an orthogonal rejection test, not a replacement for power characterization.
 Its aggregate p5 includes intentional light phases and therefore cannot create `ClockDrop`; that
 classification remains exclusive to the steady discovery render. Qualification evidence is versioned
-separately from discovery evidence. Contract v6 keeps frontier `Qualification` and post-margin
-`ApplyQualification` distinct; deployability requires both FSGL3 patterns at the exact selected
-target/VF pair. FSGL1/FSGL2,
+separately from discovery evidence. Contract v7 keeps frontier `Qualification` and post-margin
+`ApplyQualification` distinct; deployability requires High-FPS + Texture + Transitions at the exact
+selected target/VF pair. FSGL1/FSGL2/FSGL3,
 legacy-qualified and discovery-only points remain provisional. Goldens are session-only and are not
 written to Forge state. No manual bad-point registry is encoded, and Standard/Long never qualify an
-old `prior_good` boundary without current-run rediscovery first. No synthetic workload is claimed to
-certify a particular game without supervised calibration.
+old `prior_good` boundary without current-run rediscovery first. This is conservative automated
+qualification, not a mathematical proof over every future driver/workload; profile generation does
+not depend on user-supplied technical values or a post-Forge game-validation step.
 
 **Applied-bin power calibration.** The learned boundary and the applied point are deliberately
 different: Leva 1 adds +12 mV and snaps upward to a physical VF bin. Profile synthesis therefore
@@ -102,26 +106,35 @@ p5 for Godforge/Brokkr's/Deep Calm scoring. A reset-clean power-bound clock drop
 calibration telemetry without becoming stability evidence. A missing, old-contract or thermally
 throttled apply-bin measurement fails closed with no new profile.
 
-**Electrical-regime reconciliation.** A calibrated profile may sustain a p5 above its configured
-target because the VF target is not a hard runtime clock lock. One 15 MHz physical bin is tolerated.
-Beyond that, synthesis maps p5 to the nearest measured target at/above it and requires the maximum
-Apply anchor across that span. For example, `1860@893` sustaining p5 1890 cannot alias a qualified
+**Electrical-regime reconciliation.** A calibrated profile may sustain a p95 above its configured
+target because the VF target is not a hard runtime clock lock. Contract v7 has zero deployable-bin
+tolerance: synthesis maps any higher sustained p95 to the nearest measured target at/above it and requires the maximum
+Apply anchor across that span. For example, `1860@893` sustaining p95 1890 cannot alias a qualified
 1890 regime that requires 918 mV. It is excluded: performance resolves to the canonical support,
 while efficiency profiles fall to another measured self-consistent target. Standard/Long also require
-current A+B evidence for the supporting regime. Exact-Apply rejection/inconclusion blocks every
+current three-pattern evidence for the supporting regime. Exact-Apply rejection/inconclusion blocks every
 lower-anchor alias of the same regime. No power or voltage is interpolated.
 
 **Exact-Apply stability closure.** Standard/Long treat reconciled profiles as provisional until every
-unique selected `(target, Apply VF bin)` completes a five-minute FSGL3 A and five-minute FSGL3 B at
-that exact pair. Adding voltage can raise the sustained GPU Boost regime, so stability is never
+unique selected `(target, Apply VF bin)` completes five minutes each of High-FPS, Texture and
+Transitions at that exact pair. Adding voltage can raise the sustained GPU Boost regime, so stability is never
 inherited from the lower boundary. Clock p95 is stored beside target, average and p5 to describe that
-upper sustained regime. Any inconclusive attempt creates debt and requires two consecutive clean
+upper sustained regime. After the three exact-Apply patterns pass, their highest measured p95 is fed
+back through the same strict regime reconciliation; a newly exposed higher regime triggers automatic
+re-synthesis instead of being silently accepted. Any inconclusive attempt creates debt and requires two consecutive clean
 passes for the pattern. A reset-clean rejection excludes only that candidate and re-synthesizes from
-the remaining measured points; hard failures still abort. Once A+B passes, the profile publishes the
-larger sustained p99 observed by its PowerRender calibration or either approved FSGL3 pattern. This
+the remaining measured points; hard failures still abort. Once the v7 set passes, the profile publishes the
+larger sustained p99 observed by its PowerRender calibration or any approved v7 pattern. This
 does not change homogeneous frontier scoring, but prevents the card from understating power already
-measured at the exact deployable pair. Restored v6 snapshots refresh this value from the observation
-log. Old pre-v6 profiles cannot be applied.
+measured at the exact deployable pair. Old pre-v7 qualification cannot be applied.
+
+**Cooperative cancellation and UI headroom.** Every live discovery/qualification render receives
+the Forge cancellation token and checks it between bounded GPU frames/dispatches. Stop immediately
+enters `stopping`, submits no new batches, drains the current bounded work and performs the normal
+checked stock reset. Cancellation is recorded as inconclusive/cancelled, never as bad or validated
+evidence. The UI prevents overlapping refreshes, polls only progress/safety at 500 ms while Forge is
+active, refreshes secondary diagnostics every 3 s, and the service caps the IPC-visible log tail
+while retaining completed evidence in `f2_observations.jsonl`.
 
 ## Problems hit → solutions
 
