@@ -110,7 +110,7 @@ const POWER_P99_RECHECK_ABS_W: f32 = 8.0;
 const POWER_P99_RECHECK_REL: f32 = 0.05;
 /// Initial dwell plus at most two reset-clean repeats at the same physical bin.
 #[cfg(windows)]
-const POWER_P99_MAX_ATTEMPTS: usize = 3;
+pub(crate) const POWER_P99_MAX_ATTEMPTS: usize = 3;
 /// Adjacent p5 values must describe the same sustained-clock regime before power monotonicity is
 /// compared. One boost bin mirrors the verifier tolerance.
 #[cfg(windows)]

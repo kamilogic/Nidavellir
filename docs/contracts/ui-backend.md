@@ -1143,6 +1143,40 @@ power.
   `f2_observations.jsonl`.
 
 
+\## Backend ↔ Frontend (2026-07-03): stage-aware Forge time ceiling
+
+The Forge Progress UI now presents the live remaining estimate, elapsed wall time, current estimated
+run total and a separate conservative total ceiling. It does not infer Cmax or tuning policy from log
+copy.
+
+\- `elapsed_ms`, `estimated_remaining_ms`, `completed_steps`, `total_steps_estimate` and `phase`
+  backward-compatible. `estimated_remaining_ms` should remain the backend's current best remaining
+  estimate: frontier discovery keeps its elapsed/step self-correction, while calibration and final
+  Apply use their explicit stage durations.
+
+\- These additive/defaulted fields are now part of `PowerSweepProgress`:
+  - `estimated_total_upper_ms: Option<u64>` — conservative estimated wall time from run start through
+    completion. It must include work not yet appended to `total_steps_estimate`, including possible
+    exact-bin power backfills and, until profile synthesis deduplicates them, up to three unique
+    exact-Apply v7 qualification pairs.
+  - `cmax_clock_mhz: Option<u32>` — first reset-clean sustainable real clock found by the current run.
+  - `frontier_floor_clock_mhz: Option<u32>` — lowest real clock included by the 90%-of-Cmax rule.
+  - `frontier_clock_count: Option<u32>` — number of real clocks in that inclusive physical domain.
+
+\- Before Cmax, the three frontier fields and `estimated_total_upper_ms` remain `None`: a trustworthy
+  inclusive 90% domain does not exist yet. As soon as Cmax is known, publish all four together and
+  compute the upper estimate from the exact real-clock domain.
+
+\- The upper estimate is not a deadline: inconclusive debt, retries or a newly exposed p95 support
+  regime may raise it. It may tighten downward as uncertainty is removed, must never be below
+  `elapsed_ms`, and must be refreshed when Cmax is found, a target plan is pruned/completed,
+  calibration gaps are known, final Apply pairs are deduplicated, or a retry is scheduled.
+
+\- Frontend fallback remains intentional for legacy/interrupted payloads: when
+  `estimated_total_upper_ms` is absent, the UI shows “Refining” rather than manufacturing a maximum
+  from duplicated tuning constants.
+
+
 
 (No other active backend → frontend requests)
 

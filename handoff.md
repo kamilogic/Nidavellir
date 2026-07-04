@@ -9,6 +9,17 @@ valid physical VF bin and exposes both values. `finished` means current v7 profi
 **NEXT = supervised v7 hardware gate; Leva 2 remains blocked.**
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Latest backend/frontend checkpoint (2026-07-03) — stage-aware Forge time model
+- **Structured plan:** progress now publishes Cmax, the inclusive 90%-floor real clock, real-clock
+  count and a conservative absolute total ceiling. All fields are additive/defaulted.
+- **Phase-aware ceiling:** pre-Cmax remains explicitly `Refining`; post-Cmax uses the exact physical
+  domain. Frontier discovery/qualification, possible three-attempt p99 backfills and up to three
+  exact-Apply v7 pairs are accounted separately, then tightened as each stage becomes concrete.
+- **UI:** Forge Progress separates live remaining, estimated run total, maximum estimated total and
+  elapsed wall time, with readable stage copy and no inference from technical logs.
+- **Safety/status:** progress-only change. No tuning algorithm, qualification decision, hardware
+  write or Safe Loop behavior changed; no Forge was run automatically.
+
 ## Latest backend/frontend checkpoint (2026-07-03) — qualification v7 + cooperative cancellation
 - **Automated oracle:** Standard/Long use three deterministic patterns targeting high frame cadence,
   texture/ROP/mixed graphics pressure and rapid load transitions. Each retains stock-golden

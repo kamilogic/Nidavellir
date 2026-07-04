@@ -372,6 +372,7 @@ impl PowerSweepHandle {
                     prog.running = false;
                     prog.phase = "interrupted".into();
                     prog.estimated_remaining_ms = None;
+                    prog.estimated_total_upper_ms = None;
                     prog.profiles_qualified = false;
                     prog
                         .log
@@ -479,6 +480,7 @@ fn decode_forge_state(json: &str, gpu_key: &str) -> ForgeStateLoad {
     if prog.running {
         prog.phase = "interrupted".into();
         prog.estimated_remaining_ms = None;
+        prog.estimated_total_upper_ms = None;
         prog.note = Some(format!(
             "A execução anterior foi interrompida; {} dwell(s) já aprendidos permanecem salvos.",
             prog.learned_points
@@ -5180,6 +5182,94 @@ fn f2_clock_within_cmax_floor(target_mhz: u32, cmax_mhz: u32) -> bool {
 }
 
 #[cfg(windows)]
+const F2_ESTIMATE_MAX_PROFILE_PAIRS: usize = 3;
+
+#[cfg(windows)]
+fn f2_frontier_bounds(targets: &[u32], cmax_mhz: u32) -> Option<(u32, u32)> {
+    let mut floor = None;
+    let mut count = 0u32;
+    for &target in targets {
+        if target <= cmax_mhz && f2_clock_within_cmax_floor(target, cmax_mhz) {
+            floor = Some(target);
+            count = count.saturating_add(1);
+        }
+    }
+    floor.map(|floor_mhz| (floor_mhz, count))
+}
+
+#[cfg(windows)]
+fn f2_target_upper_estimate_ms(
+    candidate_count: usize,
+    policy: F2ForgeModePolicy,
+) -> u64 {
+    let discovery_ms = policy.discovery_dwell_ms.saturating_add(PROBE_OVERHEAD_MS);
+    let qualification_ms = u64::try_from(policy.qualification_passes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(
+            policy
+                .qualification_dwell_ms
+                .saturating_add(PROBE_OVERHEAD_MS),
+        );
+    let final_gate_ms = u64::try_from(policy.final_gate_passes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(
+            policy
+                .final_gate_dwell_ms
+                .saturating_add(PROBE_OVERHEAD_MS),
+        );
+    u64::try_from(candidate_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(
+            discovery_ms
+                .saturating_add(qualification_ms)
+                .saturating_add(final_gate_ms),
+        )
+}
+
+#[cfg(windows)]
+fn f2_calibration_upper_estimate_ms(
+    missing_count: usize,
+    policy: F2ForgeModePolicy,
+) -> u64 {
+    u64::try_from(missing_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(
+            u64::try_from(crate::gpu_undervolt::POWER_P99_MAX_ATTEMPTS)
+                .unwrap_or(u64::MAX),
+        )
+        .saturating_mul(
+            policy
+                .discovery_dwell_ms
+                .saturating_add(PROBE_OVERHEAD_MS),
+        )
+}
+
+#[cfg(windows)]
+fn f2_apply_upper_estimate_ms(pair_count: usize, policy: F2ForgeModePolicy) -> u64 {
+    if f2_required_qualification_passes(policy) == 0 {
+        return 0;
+    }
+    u64::try_from(pair_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(
+            u64::try_from(f2_required_qualification_passes(policy))
+                .unwrap_or(u64::MAX),
+        )
+        .saturating_mul(F2_APPLY_QUALIFICATION_DWELL_MS.saturating_add(PROBE_OVERHEAD_MS))
+}
+
+#[cfg(windows)]
+fn f2_publish_upper_estimate(
+    prog: &mut PowerSweepProgress,
+    started: &std::time::Instant,
+    remaining_upper_ms: u64,
+) {
+    prog.elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    prog.estimated_total_upper_ms =
+        Some(prog.elapsed_ms.saturating_add(remaining_upper_ms));
+}
+
+#[cfg(windows)]
 const F2_FRONTIER_PREDICTION_CONTRADICTION_MV: u32 = 25;
 
 #[cfg(windows)]
@@ -5333,6 +5423,7 @@ fn measure_multiclock_undervolt_forge(
     };
     use nidavellir_gpu_nvapi as gpu;
 
+    let started = Instant::now();
     info!("F2 undervolt forge starting (anchored min-stable-voltage per clock) — mode {}", mode.label());
     let previous = progress.lock().map(|g| g.clone()).unwrap_or_default();
     let mut prog = idle();
@@ -5505,11 +5596,26 @@ fn measure_multiclock_undervolt_forge(
         return;
     }
     prog.stock_clock_mhz = seed.stock_sustained_mhz;
-    let started = Instant::now();
     let estimated_targets: Vec<u32> = targets
         .iter()
         .copied()
         .take_while(|target| f2_clock_within_cmax_floor(*target, targets[0]))
+        .collect();
+    let target_upper_work_ms: HashMap<u32, u64> = targets
+        .iter()
+        .map(|&target| {
+            let descent = crate::gpu_undervolt::plan_anchored_undervolt_descent(
+                &f2_inputs.sane_base_curve,
+                target,
+                None,
+                &f2_inputs.limits,
+                usize::MAX,
+            );
+            (
+                target,
+                f2_target_upper_estimate_ms(descent.candidates.len(), mode_policy),
+            )
+        })
         .collect();
     let mut estimated_steps_by_target: HashMap<u32, usize> = estimated_targets
         .iter()
@@ -5543,18 +5649,28 @@ fn measure_multiclock_undervolt_forge(
             .saturating_add(
                 u64::try_from(discovery_steps)
                     .unwrap_or(u64::MAX)
-                    .saturating_mul(mode_policy.discovery_dwell_ms.saturating_add(5_000)),
+                    .saturating_mul(
+                        mode_policy
+                            .discovery_dwell_ms
+                            .saturating_add(PROBE_OVERHEAD_MS),
+                    ),
             )
             .saturating_add(
                 u64::try_from(qualification_steps)
                     .unwrap_or(u64::MAX)
-                    .saturating_mul(mode_policy.qualification_dwell_ms.saturating_add(5_000)),
+                    .saturating_mul(
+                        mode_policy
+                            .qualification_dwell_ms
+                            .saturating_add(PROBE_OVERHEAD_MS),
+                    ),
             )
     });
     let planned_average_step_ms = if prog.total_steps_estimate > 0 {
         estimated_work_ms / u64::from(prog.total_steps_estimate)
     } else {
-        mode_policy.discovery_dwell_ms.saturating_add(5_000)
+        mode_policy
+            .discovery_dwell_ms
+            .saturating_add(PROBE_OVERHEAD_MS)
     };
     prog.estimated_remaining_ms = Some(estimated_work_ms);
     prog.log.push(format!(
@@ -5790,6 +5906,36 @@ fn measure_multiclock_undervolt_forge(
                 "Cmax descoberto: {target} MHz sustentado. Continuando por todos os bins reais até 90%."
             ));
         }
+        if let Some(max) = cmax {
+            if let Some((floor_mhz, clock_count)) = f2_frontier_bounds(&targets, max) {
+                prog.cmax_clock_mhz = Some(max);
+                prog.frontier_floor_clock_mhz = Some(floor_mhz);
+                prog.frontier_clock_count = Some(clock_count);
+                let remaining_frontier_upper_ms = targets
+                    .iter()
+                    .skip(i + 1)
+                    .take_while(|next| f2_clock_within_cmax_floor(**next, max))
+                    .fold(0u64, |total, next| {
+                        total.saturating_add(
+                            target_upper_work_ms.get(next).copied().unwrap_or(0),
+                        )
+                    });
+                let calibration_upper_ms = f2_calibration_upper_estimate_ms(
+                    usize::try_from(clock_count).unwrap_or(usize::MAX),
+                    mode_policy,
+                );
+                let apply_upper_ms =
+                    f2_apply_upper_estimate_ms(F2_ESTIMATE_MAX_PROFILE_PAIRS, mode_policy);
+                f2_publish_upper_estimate(
+                    &mut prog,
+                    &started,
+                    remaining_frontier_upper_ms
+                        .saturating_add(calibration_upper_ms)
+                        .saturating_add(apply_upper_ms),
+                );
+                set(progress, prog.clone());
+            }
+        }
         if summary.sustainable {
             if let Some(boundary_mv) = summary.last_good_mv {
                 recent_boundaries.push((target, boundary_mv));
@@ -5815,6 +5961,9 @@ fn measure_multiclock_undervolt_forge(
         let initial_observations = obs_store.load_all();
         let missing_power =
             missing_f2_apply_power_backfills(&pts, &initial_observations, &gpu_key);
+        let missing_power_count = missing_power.len();
+        let reserved_apply_upper_ms =
+            f2_apply_upper_estimate_ms(F2_ESTIMATE_MAX_PROFILE_PAIRS, mode_policy);
         let mut backfill_ok = true;
         if !missing_power.is_empty() {
             prog.phase = "calibrate".into();
@@ -5825,9 +5974,19 @@ fn measure_multiclock_undervolt_forge(
                 "Calibração p99: {} bin(s) exato(s) de Apply sem medição v4; preenchendo somente essas lacunas com PowerRender.",
                 missing_power.len()
             ));
+            let calibration_upper_ms =
+                f2_calibration_upper_estimate_ms(missing_power_count, mode_policy);
+            prog.estimated_remaining_ms = Some(
+                calibration_upper_ms.saturating_add(reserved_apply_upper_ms),
+            );
+            f2_publish_upper_estimate(
+                &mut prog,
+                &started,
+                calibration_upper_ms.saturating_add(reserved_apply_upper_ms),
+            );
             set(progress, prog.clone());
         }
-        for missing in missing_power {
+        for (missing_index, missing) in missing_power.into_iter().enumerate() {
             if stop.load(Ordering::SeqCst) {
                 backfill_ok = false;
                 prog.log.push(
@@ -5835,9 +5994,13 @@ fn measure_multiclock_undervolt_forge(
                 );
                 break;
             }
+            let future_missing_count = missing_power_count.saturating_sub(missing_index + 1);
+            let mut calibration_attempts_completed = 0usize;
             let mut on_calibration_progress =
                 |event: crate::gpu_undervolt::F2ClockDiscoveryProgress| {
                     if event.outcome.is_some() {
+                        calibration_attempts_completed =
+                            calibration_attempts_completed.saturating_add(1);
                         prog.completed_steps = prog.completed_steps.saturating_add(1);
                         prog.learned_points = prog.learned_points.saturating_add(1);
                         prog.total_steps_estimate =
@@ -5846,8 +6009,23 @@ fn measure_multiclock_undervolt_forge(
                     prog.current_clock_mhz = Some(event.target_mhz);
                     prog.current_voltage_mv = event.anchor_mv;
                     prog.last_outcome = event.outcome.clone();
-                    prog.elapsed_ms =
-                        started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                    let current_attempts_remaining =
+                        crate::gpu_undervolt::POWER_P99_MAX_ATTEMPTS
+                            .saturating_sub(calibration_attempts_completed);
+                    let remaining_attempts = future_missing_count
+                        .saturating_mul(crate::gpu_undervolt::POWER_P99_MAX_ATTEMPTS)
+                        .saturating_add(current_attempts_remaining);
+                    let calibration_upper_ms = u64::try_from(remaining_attempts)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(
+                            mode_policy
+                                .discovery_dwell_ms
+                                .saturating_add(PROBE_OVERHEAD_MS),
+                        );
+                    let remaining_upper_ms =
+                        calibration_upper_ms.saturating_add(reserved_apply_upper_ms);
+                    prog.estimated_remaining_ms = Some(remaining_upper_ms);
+                    f2_publish_upper_estimate(&mut prog, &started, remaining_upper_ms);
                     prog.log.push(event.line);
                     set(progress, prog.clone());
                     if event.outcome.is_some() {
@@ -5886,6 +6064,13 @@ fn measure_multiclock_undervolt_forge(
                 );
                 break;
             }
+            let calibration_upper_ms =
+                f2_calibration_upper_estimate_ms(future_missing_count, mode_policy);
+            let remaining_upper_ms =
+                calibration_upper_ms.saturating_add(reserved_apply_upper_ms);
+            prog.estimated_remaining_ms = Some(remaining_upper_ms);
+            f2_publish_upper_estimate(&mut prog, &started, remaining_upper_ms);
+            set(progress, prog.clone());
         }
         prog.phase = "synthesize".into();
         set(progress, prog.clone());
@@ -5994,6 +6179,28 @@ fn measure_multiclock_undervolt_forge(
                 }
                 let mut changed = false;
                 let mut terminal = false;
+                let mut remaining_apply_pairs = selected
+                    .iter()
+                    .filter(|selected_point| {
+                        let Some(key) = f2_apply_key(selected_point) else {
+                            return true;
+                        };
+                        !classified.iter().any(|(point, _)| {
+                            f2_apply_key(point) == Some(key)
+                                && point.apply_qualified
+                                && point.apply_qualification_version
+                                    == Some(
+                                        nidavellir_core::f2_observation::
+                                            F2_QUALIFICATION_CONTRACT_VERSION,
+                                    )
+                        })
+                    })
+                    .count();
+                let apply_upper_ms =
+                    f2_apply_upper_estimate_ms(remaining_apply_pairs, mode_policy);
+                prog.estimated_remaining_ms = Some(apply_upper_ms);
+                f2_publish_upper_estimate(&mut prog, &started, apply_upper_ms);
+                set(progress, prog.clone());
                 for selected_point in selected {
                     let Some(key) = f2_apply_key(&selected_point) else {
                         terminal = true;
@@ -6022,10 +6229,16 @@ fn measure_multiclock_undervolt_forge(
                         "Qualificação Apply exato: {} MHz target @ {} mV VF — v7 High-FPS + Texture + Transitions, 5 min por padrão.",
                         key.0, key.1
                     ));
+                    let future_apply_pairs = remaining_apply_pairs.saturating_sub(1);
+                    let required_apply_passes =
+                        f2_required_qualification_passes(mode_policy);
+                    let mut completed_apply_dwells = 0usize;
                     set(progress, prog.clone());
                     let mut on_apply_qualification_progress =
                         |event: crate::gpu_undervolt::F2ClockDiscoveryProgress| {
                             if event.outcome.is_some() {
+                                completed_apply_dwells =
+                                    completed_apply_dwells.saturating_add(1);
                                 prog.completed_steps = prog.completed_steps.saturating_add(1);
                                 prog.learned_points = prog.learned_points.saturating_add(1);
                                 prog.total_steps_estimate =
@@ -6034,8 +6247,25 @@ fn measure_multiclock_undervolt_forge(
                             prog.current_clock_mhz = Some(event.target_mhz);
                             prog.current_voltage_mv = event.anchor_mv;
                             prog.last_outcome = event.outcome.clone();
-                            prog.elapsed_ms =
-                                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                            let remaining_apply_dwells = future_apply_pairs
+                                .saturating_mul(required_apply_passes)
+                                .saturating_add(
+                                    required_apply_passes
+                                        .saturating_sub(completed_apply_dwells),
+                                );
+                            let remaining_upper_ms =
+                                u64::try_from(remaining_apply_dwells)
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_mul(
+                                        F2_APPLY_QUALIFICATION_DWELL_MS
+                                            .saturating_add(PROBE_OVERHEAD_MS),
+                                    );
+                            prog.estimated_remaining_ms = Some(remaining_upper_ms);
+                            f2_publish_upper_estimate(
+                                &mut prog,
+                                &started,
+                                remaining_upper_ms,
+                            );
                             prog.log.push(event.line);
                             set(progress, prog.clone());
                             if event.outcome.is_some() {
@@ -6063,6 +6293,16 @@ fn measure_multiclock_undervolt_forge(
                         "Qualificação Apply exato {} MHz @ {} mV → {} ({} dwell(s)).",
                         key.0, key.1, summary.stop_reason, summary.executed_steps
                     ));
+                    remaining_apply_pairs = remaining_apply_pairs.saturating_sub(1);
+                    let remaining_upper_ms =
+                        f2_apply_upper_estimate_ms(remaining_apply_pairs, mode_policy);
+                    prog.estimated_remaining_ms = Some(remaining_upper_ms);
+                    f2_publish_upper_estimate(
+                        &mut prog,
+                        &started,
+                        remaining_upper_ms,
+                    );
+                    set(progress, prog.clone());
                     retain_boot_flag |= summary.retain_boot_flag;
                     if summary.qualified {
                         let observations = obs_store.load_all();
@@ -6266,6 +6506,7 @@ fn measure_multiclock_undervolt_forge(
     prog.frontier_complete = forge_complete && prog.godforge.is_some();
     prog.elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     prog.estimated_remaining_ms = None;
+    prog.estimated_total_upper_ms = Some(prog.elapsed_ms);
     prog.current_clock_mhz = None;
     prog.current_voltage_mv = None;
     prog.running = false;
@@ -6902,6 +7143,21 @@ mod tests {
         assert_eq!(pass.phase_metrics.len(), 8);
         assert_eq!(pass.phase_metrics[0].phase_pattern, "fsgl3-a");
 
+        let texture_pass = qualification_coverage_from_run(
+            StabilityResult::Stable,
+            &reports,
+            &samples,
+            Some(1800),
+            VfQualifierPattern::V7Texture,
+        );
+        assert_eq!(texture_pass.verdict, F2QualificationVerdict::Pass);
+        assert_eq!(texture_pass.strength, F2QualificationStrength::Fsgl4);
+        assert_eq!(
+            texture_pass.pattern,
+            Some(F2QualificationPattern::Texture)
+        );
+        assert_eq!(texture_pass.phases_completed, 8);
+
         let failed = qualification_coverage_from_run(
             StabilityResult::SilentError,
             &reports,
@@ -6944,6 +7200,29 @@ mod tests {
         assert_eq!(f2_stock_clock_ceiling(&stock_curve).unwrap(), 1950);
         assert!(f2_clock_within_cmax_floor(1755, 1950));
         assert!(!f2_clock_within_cmax_floor(1740, 1950));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_time_ceiling_uses_real_frontier_and_phase_costs() {
+        let targets = vec![
+            1950, 1935, 1920, 1905, 1890, 1875, 1860, 1845, 1830, 1815, 1800,
+            1785, 1770, 1755, 1740,
+        ];
+        assert_eq!(f2_frontier_bounds(&targets, 1935), Some((1755, 13)));
+
+        let standard = PowerSweepMode::Standard.f2_policy();
+        assert_eq!(f2_target_upper_estimate_ms(1, standard), 210_000);
+        assert_eq!(f2_calibration_upper_estimate_ms(1, standard), 45_000);
+        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 915_000);
+        assert_eq!(
+            f2_apply_upper_estimate_ms(F2_ESTIMATE_MAX_PROFILE_PAIRS, standard),
+            2_745_000
+        );
+
+        let fast = PowerSweepMode::Fast.f2_policy();
+        assert_eq!(f2_target_upper_estimate_ms(1, fast), 15_000);
+        assert_eq!(f2_apply_upper_estimate_ms(3, fast), 0);
     }
 
     #[cfg(windows)]
@@ -9617,6 +9896,10 @@ mod tests {
             "total_steps_estimate",
             "elapsed_ms",
             "estimated_remaining_ms",
+            "estimated_total_upper_ms",
+            "cmax_clock_mhz",
+            "frontier_floor_clock_mhz",
+            "frontier_clock_count",
             "learned_points",
             "last_outcome",
             "learning_saved",
@@ -9628,6 +9911,10 @@ mod tests {
         let restored: PowerSweepProgress = serde_json::from_value(value).expect("legacy decode");
         assert_eq!(restored.completed_steps, 0);
         assert_eq!(restored.total_steps_estimate, 0);
+        assert_eq!(restored.estimated_total_upper_ms, None);
+        assert_eq!(restored.cmax_clock_mhz, None);
+        assert_eq!(restored.frontier_floor_clock_mhz, None);
+        assert_eq!(restored.frontier_clock_count, None);
         assert!(!restored.learning_saved);
         assert!(!restored.frontier_complete);
         assert!(!restored.profiles_qualified);

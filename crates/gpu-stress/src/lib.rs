@@ -318,7 +318,7 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
     const V7_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 12] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
-        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
@@ -2523,6 +2523,16 @@ mod tests {
         let high_fps = vf_qualifier_plan(60_000, VfQualifierPattern::V7HighFps);
         let texture = vf_qualifier_plan(60_000, VfQualifierPattern::V7Texture);
         let transitions = vf_qualifier_plan(60_000, VfQualifierPattern::V7Transitions);
+        let required_phases = [
+            VfQualifierPhase::PowerOpening,
+            VfQualifierPhase::BoostEdge,
+            VfQualifierPhase::HeavySpike,
+            VfQualifierPhase::TextureRop,
+            VfQualifierPhase::ComputeBurst,
+            VfQualifierPhase::IdlePulse,
+            VfQualifierPhase::MixedGame,
+            VfQualifierPhase::PowerClosing,
+        ];
         for plan in [&high_fps, &texture, &transitions] {
             assert_eq!(
                 plan.iter().map(|segment| segment.duration_ms).sum::<u64>(),
@@ -2536,6 +2546,9 @@ mod tests {
                 plan.last().map(|segment| segment.phase),
                 Some(VfQualifierPhase::PowerClosing)
             );
+            for required in required_phases {
+                assert!(plan.iter().any(|segment| segment.phase == required));
+            }
         }
         let duration_for = |plan: &[VfQualifierSegment], workload| {
             plan.iter()

@@ -8,6 +8,24 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-03) — stage-aware Forge ETA and conservative total ceiling
+- `PowerSweepProgress` now carries additive/defaulted `estimated_total_upper_ms`,
+  `cmax_clock_mhz`, `frontier_floor_clock_mhz` and `frontier_clock_count`. Legacy/restored payloads
+  remain compatible and interrupted runs clear a stale upper estimate.
+- The run clock starts before preflight/golden capture. Before Cmax, the upper total stays absent and
+  the UI says `Refining`; once Cmax is confirmed the service publishes the exact inclusive
+  Cmax→90% real-clock domain and refreshes its conservative clean-run ceiling after each target.
+- The ceiling is phase-aware: every possible frontier candidate includes discovery plus current v7
+  qualification, p99 calibration reserves up to three attempts per missing Apply bin, and final
+  qualification reserves up to three unique Apply pairs at three five-minute patterns each.
+  Calibration and Apply progress then reduce their remaining work live; terminal state preserves the
+  measured elapsed total.
+- Forge Progress shows human-readable stage, live remaining time, current estimated total,
+  conservative maximum and elapsed time with tabular numerals. It never parses log copy for Cmax or
+  tuning policy and shows `Refining` for payloads without the new ceiling.
+- Validation was code-only: targeted core/service checks and tests plus the UI production build. No
+  Forge, VF write, Apply or hardware stress was run.
+
 ## Latest (2026-07-03) — automated qualification v7, strict p95 regime and responsive Forge
 - `F2_QUALIFICATION_CONTRACT_VERSION = 7`. Standard/Long and exact Apply now require three
   independent deterministic patterns: High-FPS, Texture and Transitions. Legacy FSGL1/2/3 positives

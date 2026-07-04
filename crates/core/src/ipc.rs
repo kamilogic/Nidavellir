@@ -237,6 +237,20 @@ pub struct PowerSweepProgress {
     pub elapsed_ms: u64,
     #[serde(default)]
     pub estimated_remaining_ms: Option<u64>,
+    /// Conservative estimated wall time from run start through completion. Unlike
+    /// `estimated_remaining_ms`, this is an absolute total duration and may tighten as Cmax,
+    /// frontier pruning, calibration gaps and final Apply pairs become known.
+    #[serde(default)]
+    pub estimated_total_upper_ms: Option<u64>,
+    /// First reset-clean sustainable real clock found by the current F2 run.
+    #[serde(default)]
+    pub cmax_clock_mhz: Option<u32>,
+    /// Lowest real clock included by the current run's inclusive 90%-of-Cmax domain.
+    #[serde(default)]
+    pub frontier_floor_clock_mhz: Option<u32>,
+    /// Number of real clocks in the inclusive Cmax-to-floor domain.
+    #[serde(default)]
+    pub frontier_clock_count: Option<u32>,
     #[serde(default)]
     pub learned_points: u32,
     #[serde(default)]
@@ -643,6 +657,10 @@ mod tests {
         let p = PowerSweepProgress {
             is_undervolt: true,
             profiles_qualified: true,
+            estimated_total_upper_ms: Some(7_200_000),
+            cmax_clock_mhz: Some(1935),
+            frontier_floor_clock_mhz: Some(1755),
+            frontier_clock_count: Some(13),
             ..Default::default()
         };
         let json = serde_json::to_string(&p).unwrap();
@@ -650,6 +668,10 @@ mod tests {
         assert!(back.is_undervolt);
         assert!(back.profiles_qualified);
         assert!(!back.power_bound_collapse);
+        assert_eq!(back.estimated_total_upper_ms, Some(7_200_000));
+        assert_eq!(back.cmax_clock_mhz, Some(1935));
+        assert_eq!(back.frontier_floor_clock_mhz, Some(1755));
+        assert_eq!(back.frontier_clock_count, Some(13));
     }
 
     #[test]
@@ -666,6 +688,10 @@ mod tests {
         assert!(!p.is_undervolt, "missing key must default to legacy F1 behavior");
         assert!(!p.profiles_qualified, "missing key must never unlock F2 Apply");
         assert!(!p.power_bound_collapse, "missing key must default to no structured collapse");
+        assert_eq!(p.estimated_total_upper_ms, None);
+        assert_eq!(p.cmax_clock_mhz, None);
+        assert_eq!(p.frontier_floor_clock_mhz, None);
+        assert_eq!(p.frontier_clock_count, None);
         assert_eq!(p.stock_clock_mhz, 1800);
     }
 }

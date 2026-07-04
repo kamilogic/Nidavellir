@@ -27,6 +27,21 @@
   });
   const completedSteps = $derived(Number(powerSweep?.completed_steps ?? 0));
   const totalSteps = $derived(Number(powerSweep?.total_steps_estimate ?? 0));
+  const elapsedMs = $derived(validDuration(powerSweep?.elapsed_ms));
+  const estimatedRemainingMs = $derived(validDuration(powerSweep?.estimated_remaining_ms));
+  const estimatedTotalMs = $derived.by(() => {
+    if (estimatedRemainingMs == null) return elapsedMs;
+    return (elapsedMs ?? 0) + estimatedRemainingMs;
+  });
+  const estimatedTotalUpperMs = $derived(validDuration(powerSweep?.estimated_total_upper_ms));
+  const estimateStage = $derived.by(() => stageEstimate(powerSweep?.phase, powerRunning));
+  const frontierPlan = $derived.by(() => {
+    const cmax = positiveNumber(powerSweep?.cmax_clock_mhz);
+    const floor = positiveNumber(powerSweep?.frontier_floor_clock_mhz);
+    const clockCount = positiveNumber(powerSweep?.frontier_clock_count);
+    if (cmax == null || floor == null) return null;
+    return `${fixed(cmax)} → ${fixed(floor)} MHz${clockCount == null ? "" : ` · ${fixed(clockCount)} physical clocks`}`;
+  });
   const progressPercent = $derived.by(() => {
     if (!totalSteps) return 0;
     return Math.min(100, Math.max(0, (completedSteps / totalSteps) * 100));
@@ -91,6 +106,76 @@
     return Number.isFinite(n) ? n.toFixed(digits) : "0";
   }
 
+  function validDuration(value) {
+    if (value == null || value === "") return null;
+    const ms = Number(value);
+    return Number.isFinite(ms) && ms >= 0 ? ms : null;
+  }
+
+  function positiveNumber(value) {
+    if (value == null || value === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : null;
+  }
+
+  function stageEstimate(currentPhase, running) {
+    if (!running && currentPhase === "finished") {
+      return {
+        label: "Forge complete",
+        detail: "The final elapsed time is preserved for this run.",
+      };
+    }
+    if (!running && currentPhase === "provisional") {
+      return {
+        label: "Provisional map complete",
+        detail: "Fast discovery finished without deployable qualification.",
+      };
+    }
+    if (!running) {
+      return {
+        label: "Waiting to start",
+        detail: "A live estimate appears when the Forge begins.",
+      };
+    }
+    switch (currentPhase) {
+      case "power":
+        return {
+          label: "Finding sustainable maximum",
+          detail: "Initial estimate; it tightens as Cmax and the physical frontier become known.",
+        };
+      case "descend":
+        return {
+          label: "Mapping physical frontier",
+          detail: "Recalculated from each completed clock, voltage bin and qualification dwell.",
+        };
+      case "calibrate":
+        return {
+          label: "Calibrating Apply power",
+          detail: "Filling only the exact Apply-bin measurements still missing.",
+        };
+      case "synthesize":
+        return {
+          label: "Selecting forged profiles",
+          detail: "The final Apply pairs are being deduplicated before qualification.",
+        };
+      case "apply-qualify":
+        return {
+          label: "Final Apply qualification",
+          detail: "The upper estimate tightens as each selected Apply pair completes.",
+        };
+      case "stopping":
+        return {
+          label: "Completing safe stop",
+          detail: "The current bounded batch and checked stock reset are finishing.",
+        };
+      default:
+        return {
+          label: "Refining live estimate",
+          detail: "The estimate updates as the active Forge stage reports progress.",
+        };
+    }
+  }
+
   function profilePower(point) {
     const p99 = Number(point?.power_p99_w);
     if (Number.isFinite(p99) && p99 > 0) return p99;
@@ -111,8 +196,8 @@
   }
 
   function duration(value) {
-    const ms = Number(value);
-    if (!Number.isFinite(ms) || ms < 0) return "Calculating…";
+    const ms = validDuration(value);
+    if (ms == null) return "Calculating…";
     const totalSeconds = Math.round(ms / 1000);
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
@@ -220,8 +305,7 @@
         <strong>{completedSteps} / {totalSteps || "—"} estimated dwells</strong>
       </div>
       <div class="sweep-timing">
-        <small>{fixed(progressPercent)}%</small>
-        <small>ETA {powerRunning ? duration(powerSweep?.estimated_remaining_ms) : "—"}</small>
+        <small>{fixed(progressPercent)}% estimated</small>
       </div>
     </div>
     <div
@@ -233,6 +317,41 @@
       aria-valuenow={Math.round(progressPercent)}
     >
       <span style={`width: ${progressPercent}%`}></span>
+    </div>
+    <div class="estimate-stage">
+      <div>
+        <span>Live estimate · {estimateStage.label}</span>
+        {#if frontierPlan}
+          <strong>{frontierPlan}</strong>
+        {/if}
+      </div>
+      <small>{estimateStage.detail}</small>
+    </div>
+    <div class="timing-grid" aria-live="polite">
+      <div class="timing-metric">
+        <span>Remaining</span>
+        <strong>{powerRunning && estimatedRemainingMs != null ? `≈ ${duration(estimatedRemainingMs)}` : "—"}</strong>
+        <small>Updates after each reported dwell.</small>
+      </div>
+      <div class="timing-metric">
+        <span>Estimated run total</span>
+        <strong>{hasRun && estimatedTotalMs != null ? `≈ ${duration(estimatedTotalMs)}` : "—"}</strong>
+        <small>Elapsed plus the current remaining estimate.</small>
+      </div>
+      <div class="timing-metric maximum" class:pending={estimatedTotalUpperMs == null}>
+        <span>Maximum estimated total</span>
+        <strong>{estimatedTotalUpperMs != null ? `Up to ${duration(estimatedTotalUpperMs)}` : powerRunning ? "Refining" : "—"}</strong>
+        <small>
+          {estimatedTotalUpperMs != null
+            ? "Includes the current conservative work ceiling."
+            : "Becomes available when the backend publishes the refined ceiling."}
+        </small>
+      </div>
+      <div class="timing-metric">
+        <span>Elapsed</span>
+        <strong>{hasRun && elapsedMs != null ? duration(elapsedMs) : "—"}</strong>
+        <small>Measured wall time for this Forge run.</small>
+      </div>
     </div>
     <div class="live-target">
       <span>
@@ -512,6 +631,84 @@
     box-shadow: 0 0 14px rgba(214, 168, 93, 0.26);
     transition: width 220ms ease-out;
   }
+  .estimate-stage {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    margin-top: 0.6rem;
+    padding: 0.58rem 0.65rem;
+    border-radius: 6px;
+    background: rgba(214, 168, 93, 0.055);
+    box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.12);
+  }
+  .estimate-stage span,
+  .timing-metric span {
+    display: block;
+    color: var(--nord-dim);
+    font-size: 0.66rem;
+    font-weight: 800;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+  .estimate-stage strong {
+    display: block;
+    margin-top: 0.16rem;
+    color: var(--forge-gold);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .estimate-stage small {
+    max-width: 28rem;
+    color: var(--muted);
+    font-size: 0.72rem;
+    line-height: 1.35;
+    text-align: right;
+    text-wrap: pretty;
+  }
+  .timing-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.45rem;
+    margin-top: 0.5rem;
+  }
+  .timing-metric {
+    min-width: 0;
+    padding: 0.55rem 0.62rem;
+    border-radius: 6px;
+    background: rgba(5, 7, 11, 0.42);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.045);
+  }
+  .timing-metric strong {
+    display: block;
+    margin-top: 0.22rem;
+    color: var(--text);
+    font-size: 0.88rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .timing-metric small {
+    display: block;
+    margin-top: 0.18rem;
+    color: var(--muted);
+    font-size: 0.68rem;
+    line-height: 1.32;
+    text-wrap: pretty;
+  }
+  .timing-metric.maximum {
+    background: rgba(214, 168, 93, 0.075);
+    box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.16);
+  }
+  .timing-metric.maximum strong {
+    color: var(--forge-gold);
+  }
+  .timing-metric.maximum.pending {
+    background: rgba(5, 7, 11, 0.32);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.035);
+  }
+  .timing-metric.maximum.pending strong {
+    color: var(--nord-dim);
+  }
   .live-target {
     margin-top: 0.55rem;
     color: var(--muted);
@@ -652,13 +849,18 @@
     }
     .progress-grid,
     .pipeline-steps,
-    .result-grid {
+    .result-grid,
+    .timing-grid {
       grid-template-columns: 1fr;
     }
     .sweep-progress-head,
-    .live-target {
+    .live-target,
+    .estimate-stage {
       align-items: flex-start;
       flex-direction: column;
+    }
+    .estimate-stage small {
+      text-align: left;
     }
   }
 </style>

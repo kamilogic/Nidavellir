@@ -2,6 +2,23 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Forge ETA separates best remaining time from a conservative total ceiling (2026-07-03)
+- **Decision:** keep `estimated_remaining_ms` as the live best remaining estimate and publish
+  `estimated_total_upper_ms` as a separate absolute wall-time ceiling. The UI must not label the best
+  estimate as a deadline or recreate backend timing constants.
+- **Refinement:** before Cmax, publish no upper total because the inclusive 90% physical domain is not
+  trustworthy yet. Once the first sustainable Cmax is known, publish that exact domain and recompute
+  after each target, calibration gap and selected exact-Apply pair.
+- **Conservative work model:** a frontier candidate may consume PowerRender plus every current v7
+  boundary pattern; each missing exact Apply bin reserves up to three p99 attempts; Standard/Long
+  reserve up to three unique exact-Apply pairs with three five-minute patterns each.
+- **Compatibility:** all new progress fields are optional/defaulted. Legacy and interrupted payloads
+  show a refining estimate rather than a fabricated maximum. Terminal progress stores actual elapsed
+  time as the final upper total.
+- **Trade-off:** the ceiling can begin deliberately high and tighten sharply after Cmax/synthesis.
+  Retries or newly exposed p95 support may still raise it; it is a transparent operating estimate,
+  not a hard deadline.
+
 ## F2 profile identity follows sustained p5 electrical regime (2026-07-02)
 - **Decision**: tolerate one 15 MHz physical bin of target/p5 variance. Beyond that, p5 owns the
   electrical regime. The candidate must carry at least the maximum measured Apply anchor through the
