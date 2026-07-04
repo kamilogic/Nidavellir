@@ -2314,13 +2314,21 @@ fn classify_f2_stress_dwell(
         F2DwellOutcome::SilentError
     } else if !s.stable {
         F2DwellOutcome::Unstable
-    } else if matches!(
-        purpose,
-        F2StressPurpose::PowerDiscovery | F2StressPurpose::ApplyQualification(_, _)
-    ) && s.thermal_throttled
+    } else if purpose == F2StressPurpose::PowerDiscovery && s.thermal_throttled {
+        // Thermal slowdown corrupts the V↔W power calibration regardless of clock (a throttled
+        // sample draws less than the point's real steady-state power), so discovery evidence is
+        // inconclusive whenever the card thermally slowed.
+        F2DwellOutcome::Inconclusive
+    } else if matches!(purpose, F2StressPurpose::ApplyQualification(_, _))
+        && s.thermal_throttled
+        && s.p5_clock_mhz + F2_CLOCK_DROP_TOL_MHZ < target_mhz
     {
-        // Thermal slowdown invalidates power calibration and exact-Apply qualification without
-        // proving voltage instability.
+        // Exact-Apply qualification: a thermal-slowdown flag only invalidates the proof when the
+        // slowdown actually backed the card OFF the qualified point — i.e. the sustained clock (p5)
+        // sagged below target beyond tolerance. When the card HELD >= target despite the flag (e.g.
+        // a momentary memory-junction hotspot at a cool core temp), the hard VF point was still
+        // exercised, so the throttle is not disqualifying and the dwell falls through to the normal
+        // coverage/stability verdict. Power discovery keeps the stricter rule above.
         F2DwellOutcome::Inconclusive
     } else if purpose == F2StressPurpose::PowerDiscovery && s.power_p99_w.is_none() {
         // Discovery cannot make a power-bound decision or calibrate an applied bin without p99.
@@ -6233,6 +6241,80 @@ mod tests {
         thermal.power_p99_w = None;
         assert_eq!(
             classify_f2_stress_dwell(&thermal, 1800, F2StressPurpose::PowerDiscovery),
+            F2DwellOutcome::Inconclusive
+        );
+    }
+
+    #[test]
+    fn apply_qualification_thermal_slowdown_that_held_clock_is_not_inconclusive() {
+        // A thermal-slowdown flag during exact-Apply qualification is only disqualifying when the
+        // slowdown backed the card OFF the qualified point. If the card HELD >= target the hard VF
+        // point was exercised, so the dwell must validate — otherwise a card that momentarily hits a
+        // memory-junction hotspot at a cool core temp can never certify an Apply point it is in fact
+        // stable at (the exact failure that left a whole run with zero applicable profiles).
+        let base = crate::gpu_power_sweep::SingleDwell {
+            cancelled: false,
+            crashed: false,
+            silent_error: false,
+            stable: true,
+            avg_clock_mhz: 1953,
+            p5_clock_mhz: 1935,
+            p95_clock_mhz: 1965,
+            power_w: 199.0,
+            max_power_w: 200.0,
+            power_p99_w: Some(199.7),
+            power_capped_frac: 1.0,
+            max_temp_c: Some(69.0),
+            thermal_throttled: true,
+            volt_min_mv: Some(955),
+            volt_avg_mv: Some(956),
+            volt_max_mv: Some(957),
+            volt_sample_count: 300,
+            render_frames: Some(18_000),
+            render_fps: Some(60.0),
+            duration_ms: 300_000,
+            sample_count: 5_000,
+            qualification_coverage: None,
+            prehang_stall_detected: false,
+        };
+        // Held clock (p5 == target) despite the throttle flag → hard point exercised → validate.
+        assert_eq!(
+            classify_f2_stress_dwell(
+                &base,
+                1935,
+                F2StressPurpose::ApplyQualification(
+                    F2QualificationPattern::A,
+                    RenderGoldens {
+                        power: 1,
+                        boost: 2,
+                        texrop: 3,
+                    },
+                ),
+            ),
+            F2DwellOutcome::Stable
+        );
+        // Power discovery is unchanged: thermal slowdown corrupts the V↔W map even at held clock.
+        assert_eq!(
+            classify_f2_stress_dwell(&base, 1935, F2StressPurpose::PowerDiscovery),
+            F2DwellOutcome::Inconclusive
+        );
+        // A thermal slowdown that actually sagged the sustained clock below tolerance stays
+        // inconclusive for Apply qualification — the card was backed off the qualified point.
+        let mut dropped = base;
+        dropped.p5_clock_mhz = 1935 - F2_CLOCK_DROP_TOL_MHZ - 1;
+        assert_eq!(
+            classify_f2_stress_dwell(
+                &dropped,
+                1935,
+                F2StressPurpose::ApplyQualification(
+                    F2QualificationPattern::A,
+                    RenderGoldens {
+                        power: 1,
+                        boost: 2,
+                        texrop: 3,
+                    },
+                ),
+            ),
             F2DwellOutcome::Inconclusive
         );
     }

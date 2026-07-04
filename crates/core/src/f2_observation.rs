@@ -795,10 +795,33 @@ pub fn current_discovery_observation_at_anchor<'a>(
         })
 }
 
+/// Sustained-clock tolerance (MHz) mirroring the service classifier's `F2_CLOCK_DROP_TOL_MHZ`: an
+/// Apply-qualification dwell whose sustained (p5) clock stayed within this margin of target still
+/// exercised the hard VF point despite any thermal-slowdown flag. Kept in sync with
+/// `gpu_undervolt::F2_CLOCK_DROP_TOL_MHZ` (30).
+pub const F2_APPLY_CLOCK_HOLD_TOL_MHZ: u32 = 30;
+
+/// True when an Apply-qualification observation's power/clock telemetry is trustworthy. A
+/// thermal-slowdown flag only invalidates it when the slowdown actually backed the card OFF the
+/// qualified point — i.e. the sustained (p5) clock sagged below target beyond tolerance. When the
+/// card HELD >= target despite the flag (a momentary memory-junction hotspot at a cool core temp),
+/// the point ran at its real operating clock/power, so the reading stands. Fails closed when the
+/// sustained clock is unknown. Mirrors the held-clock rule in `classify_f2_stress_dwell`; power
+/// discovery/calibration keep the stricter unconditional `!thermal_throttled`.
+fn apply_qual_reading_trustworthy(o: &F2Observation, target_mhz: u32) -> bool {
+    if !o.thermal_throttled {
+        return true;
+    }
+    o.sustained_clock_mhz
+        .is_some_and(|held| held + F2_APPLY_CLOCK_HOLD_TOL_MHZ >= target_mhz)
+}
+
 /// Highest sustained p99 measured by a complete, reset-clean v7 three-pattern set at one exact Apply
-/// anchor in one run. Partial sets, failed/inconclusive passes, thermal throttling and old
-/// qualification contracts are excluded. The maximum across all approved patterns is returned so
-/// profile presentation cannot understate power already observed during its deployability soak.
+/// anchor in one run. Partial sets, failed/inconclusive passes, old qualification contracts, and
+/// thermal slowdowns that sagged the sustained clock are excluded; a thermal-slowdown flag that
+/// still HELD the target clock is trusted (see `apply_qual_reading_trustworthy`). The maximum across
+/// all approved patterns is returned so profile presentation cannot understate power already observed
+/// during its deployability soak (accepting a held-throttled reading can only raise it).
 fn apply_qualification_p99_at_anchor(
     obs: &[F2Observation],
     run_id: Option<&str>,
@@ -815,7 +838,7 @@ fn apply_qualification_p99_at_anchor(
             && is_current_apply_qualification_pass(o)
             && o.reset_to_stock_ok
             && o.boot_flag_cleared
-            && !o.thermal_throttled
+            && apply_qual_reading_trustworthy(o, target_mhz)
             && o.power_p99_w
                 .is_some_and(|power| power.is_finite() && power > 0.0)
     }) {
@@ -873,7 +896,7 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
             && is_current_apply_qualification_pass(o)
             && o.reset_to_stock_ok
             && o.boot_flag_cleared
-            && !o.thermal_throttled
+            && apply_qual_reading_trustworthy(o, target_mhz)
     }) {
         let clock = observation
             .sustained_upper_clock_mhz
@@ -1505,9 +1528,13 @@ mod tests {
         transitions.run_id = "apply-v7".into();
         transitions.power_p99_w = Some(173.125);
         transitions.sustained_upper_clock_mhz = Some(1890);
+        // Thermal slowdown that ALSO sagged the sustained clock below tolerance stays excluded
+        // (fail-closed). The held-clock case (throttle but clock >= target) is trusted now and is
+        // covered by `apply_qualification_held_thermal_reading_is_trusted_but_sag_is_excluded`.
         let mut throttled = texture.clone();
         throttled.power_p99_w = Some(180.0);
         throttled.thermal_throttled = true;
+        throttled.sustained_clock_mhz = Some(1830 - F2_APPLY_CLOCK_HOLD_TOL_MHZ - 1);
         let mut other_run_high_fps = high_fps.clone();
         other_run_high_fps.run_id = "other-run".into();
         other_run_high_fps.power_p99_w = Some(189.0);
@@ -1562,6 +1589,55 @@ mod tests {
             ),
             None,
             "one approved pattern alone cannot publish soak power"
+        );
+    }
+
+    #[test]
+    fn apply_qualification_held_thermal_reading_is_trusted_but_sag_is_excluded() {
+        // A complete v7 triad whose dwells thermal-throttled but HELD the target clock (sustained
+        // p5 >= target - tol) is now trusted: the exact-Apply point ran at its real operating
+        // clock/power despite a momentary hotspot, so p95/p99 publish rather than fail closed. This
+        // is the fix for a power-bound top point (e.g. 1935 @ 200 W cap) that hotspot-throttles on
+        // every 5-min soak and would otherwise leave a whole run with zero applicable profiles.
+        let held = |pattern: F2QualificationPattern, p99: f32| -> F2Observation {
+            let mut o = apply_qualification_pass(obs(1935, 956, F2ObsOutcome::Validated), pattern);
+            o.run_id = "held-thermal".into();
+            o.gpu_key = Some("RTX 4070".into());
+            o.thermal_throttled = true;
+            o.sustained_clock_mhz = Some(1935); // held at target despite the flag
+            o.sustained_upper_clock_mhz = Some(1965);
+            o.power_p99_w = Some(p99);
+            o
+        };
+        let held_set = [
+            held(F2QualificationPattern::HighFps, 199.0),
+            held(F2QualificationPattern::Texture, 199.7),
+            held(F2QualificationPattern::Transitions, 199.1),
+        ];
+        assert_eq!(
+            current_apply_qualification_p99_at_anchor(&held_set, "held-thermal", 1935, 956, "RTX 4070"),
+            Some(199.7),
+            "held-clock thermal readings publish (highest p99), never understating power"
+        );
+        assert_eq!(
+            current_apply_qualification_p95_clock_at_anchor(&held_set, "held-thermal", 1935, 956, "RTX 4070"),
+            Some(1965),
+            "held-clock thermal readings publish the sustained upper clock"
+        );
+
+        // Sag the sustained clock below tolerance on one pattern → that pattern is untrustworthy,
+        // the triad is incomplete, and both gates fail closed.
+        let mut sagged_set = held_set.clone();
+        sagged_set[1].sustained_clock_mhz = Some(1935 - F2_APPLY_CLOCK_HOLD_TOL_MHZ - 1);
+        assert_eq!(
+            current_apply_qualification_p99_at_anchor(&sagged_set, "held-thermal", 1935, 956, "RTX 4070"),
+            None,
+            "a thermal slowdown that sagged the clock still fails closed"
+        );
+        assert_eq!(
+            current_apply_qualification_p95_clock_at_anchor(&sagged_set, "held-thermal", 1935, 956, "RTX 4070"),
+            None,
+            "a thermal slowdown that sagged the clock still fails closed"
         );
     }
 

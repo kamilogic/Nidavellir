@@ -2,6 +2,37 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Thermal slowdown disqualifies an exact-Apply dwell only if it dropped the clock (2026-07-04)
+- **Problem**: a full F2 run finished with ZERO applicable profiles. The power-bound top point
+  (1935 MHz @ 956 mV, pinned at the 200 W cap) returned `ExactApplyInconclusive`: three HighFPS
+  dwells each set NVML `thermal_throttled` (a memory-junction hotspot at only ~67-69 C core) while the
+  card actually ran avg 1953-1957 MHz, p5 >= 1935, no silent error, coverage 8/8. The old guardrail
+  treated any thermal-slowdown flag during exact-Apply as fatal, discarding evidence where the card
+  demonstrably HELD the qualified point.
+- **Decision**: a thermal-slowdown flag invalidates exact-Apply *stability* evidence only when the
+  slowdown actually backed the card OFF the point — i.e. sustained clock (p5) sagged below target
+  beyond the existing 30 MHz `F2_CLOCK_DROP_TOL_MHZ`. When the card held >= target despite the flag,
+  the hard VF point was exercised, so the dwell/observation is trusted. Implemented in two layers that
+  must agree: the dwell classifier (`classify_f2_stress_dwell`, `ApplyQualification` arm) and the two
+  Apply-qualification publish gates (`apply_qualification_p99_at_anchor` /
+  `current_apply_qualification_p95_clock_at_anchor` via `apply_qual_reading_trustworthy`). Fails closed
+  when the sustained clock is unknown.
+- **PowerDiscovery stays strict**: power calibration (`PowerDiscovery` classifier arm,
+  `f2_power_measurement_usable`, `current_discovery_observation_at_anchor`) keeps the unconditional
+  `!thermal_throttled` rule — a throttled sample understates the V<->W map, a different and real
+  corruption. Only Apply-qualification stability is relaxed.
+- **Safety (audited SAFE, twice)**: publish aggregation is max-only, so admitting a held-throttled
+  reading can only RAISE published p99 wattage (never understate → profile never presented cooler than
+  reality) and RAISE p95, which makes regime reconciliation demand *more* voltage, not less. Triad
+  completeness, reset-clean and boot-flag gates are untouched. No new path lets an under-qualified
+  profile reach apply/persist.
+- **Compatibility**: no discovery contract, Safe Loop, reset-to-stock or IPC change. New core const
+  `F2_APPLY_CLOCK_HOLD_TOL_MHZ = 30` mirrors service `F2_CLOCK_DROP_TOL_MHZ = 30` (hand-synced, doc
+  cross-referenced). Regression-covered in `f2_observation.rs`; core 78/0, service 355/0.
+- **Status**: code + tests complete, NOT hardware-tested. A controlled rerun is expected to validate
+  HighFPS on the first dwell, advance HighFPS->Texture->Transitions, and publish 1935 @ 956 mV even
+  when the hotspot recurs.
+
 ## Forge ETA separates best remaining time from a conservative total ceiling (2026-07-03)
 - **Decision:** keep `estimated_remaining_ms` as the live best remaining estimate and publish
   `estimated_total_upper_ms` as a separate absolute wall-time ceiling. The UI must not label the best

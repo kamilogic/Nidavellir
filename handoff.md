@@ -9,6 +9,28 @@ valid physical VF bin and exposes both values. `finished` means current v7 profi
 **NEXT = supervised v7 hardware gate; Leva 2 remains blocked.**
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Latest backend checkpoint (2026-07-04) — held-clock thermal rule for exact Apply (code-complete, NOT HW-tested)
+- **Why**: a full run ended with ZERO profiles. The power-bound top point `1935 MHz @ 956 mV` (pinned
+  at the 200 W cap) failed exact-Apply as `ExactApplyInconclusive` — three HighFPS dwells tripped NVML
+  `thermal_throttled` from a memory-junction hotspot at only ~67-69 C core, while the card actually
+  HELD >= 1935 MHz with no silent error and full coverage. The guardrail rejected evidence where the
+  card never left the qualified point.
+- **Fix (two layers, must stay in sync)**: a thermal-slowdown flag disqualifies exact-Apply stability
+  only when p5 sagged below target beyond 30 MHz (`F2_CLOCK_DROP_TOL_MHZ`). (1) classifier
+  `classify_f2_stress_dwell` (`ApplyQualification` arm), (2) publish gates
+  `apply_qualification_p99_at_anchor` + `current_apply_qualification_p95_clock_at_anchor` via new
+  `apply_qual_reading_trustworthy` (`f2_observation.rs`). Fails closed on unknown clock.
+- **Kept strict**: PowerDiscovery power calibration (`f2_power_measurement_usable`,
+  `current_discovery_observation_at_anchor`) still rejects any throttle — a throttled sample understates
+  the V<->W map.
+- **Safety**: audited SAFE twice (`nidavellir-safety-auditor`). Publish aggregation is max-only, so a
+  held-throttled reading can only raise published wattage (never understate) and raise p95 (stricter
+  voltage reconciliation). Triad completeness / reset-clean / boot-flag untouched.
+- **Validation**: core 78/0, service 355/0. No VF write, Forge or Apply run automatically.
+- **NEXT**: user runs a controlled rerun to confirm 1935 @ 956 mV now advances
+  HighFPS->Texture->Transitions and publishes. Changes are in the working tree on `master`, NOT
+  committed — rebuild picks them up.
+
 ## Latest backend/frontend checkpoint (2026-07-03) — stage-aware Forge time model
 - **Structured plan:** progress now publishes Cmax, the inclusive 90%-floor real clock, real-clock
   count and a conservative absolute total ceiling. All fields are additive/defaulted.
