@@ -373,6 +373,76 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         // profiles/points instead of showing an unforged GPU.
         power_sweep: gpu_power_sweep::restore_handle(),
     }));
+    #[cfg(windows)]
+    console_shutdown::install(Arc::clone(&state));
     ipc_server::run_pipe_server(state)?;
     Ok(())
+}
+
+/// Console-mode Ctrl+C / window-close handling. Without this, the main thread sits blocked in
+/// `ConnectNamedPipe` and worker threads keep the GPU saturated, so process teardown stalls on
+/// driver DLL detach until all queued GPU work drains — Ctrl+C and "End task" appear dead for a
+/// long time. The handler signals every motor's cooperative stop (the same path the IPC Stop
+/// request uses: the dwell cancels within a band/frame, resets to stock and clears the boot
+/// flag), waits a bounded grace for the workers to land, then exits. If the grace expires the
+/// process exits anyway — an armed boot flag is exactly what the Safe Loop startup recovery is
+/// designed to handle.
+#[cfg(windows)]
+mod console_shutdown {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+    use crate::AppState;
+
+    static STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
+    static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+    /// Upper bound before giving up on the cooperative landing. A cancelled dwell typically
+    /// finishes its band, resets to stock and clears the boot flag within a few seconds.
+    const GRACE_POLLS: u32 = 120; // × 250 ms = 30 s
+
+    pub fn install(state: Arc<Mutex<AppState>>) {
+        let _ = STATE.set(state);
+        unsafe {
+            if SetConsoleCtrlHandler(Some(ctrl_handler), true).is_err() {
+                tracing::warn!("console shutdown handler could not be installed");
+            }
+        }
+    }
+
+    unsafe extern "system" fn ctrl_handler(_event: u32) -> BOOL {
+        // A second Ctrl+C while already landing = exit immediately.
+        if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+            std::process::exit(1);
+        }
+        tracing::info!(
+            "shutdown signal — stopping motors, restoring GPU to stock (Ctrl+C again to force)"
+        );
+        if let Some(state) = STATE.get() {
+            if let Ok(s) = state.lock() {
+                s.power_sweep.stop();
+                s.real_sweep.stop();
+                s.mem_sweep.stop();
+                s.forge_all.stop();
+                s.benchmark.stop();
+            }
+            for poll in 0..GRACE_POLLS {
+                let busy = state
+                    .lock()
+                    .map(|s| s.power_sweep.progress().running)
+                    .unwrap_or(false);
+                if !busy {
+                    break;
+                }
+                if poll % 8 == 0 {
+                    tracing::info!("shutdown: waiting for the current dwell to land safely…");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+        tracing::info!("shutdown complete");
+        std::process::exit(0);
+    }
 }

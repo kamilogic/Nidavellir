@@ -11,6 +11,16 @@ qualified. **NEXT = supervised v8 hardware gate; Leva 2 remains blocked.** Direc
 `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Backend fix (2026-07-06, post-commit) — console shutdown handler (in working tree, NOT committed)
+- Console mode had no Ctrl+C/close handler: the main thread blocks in `ConnectNamedPipe` and
+  worker threads keep the GPU saturated, so teardown stalled on driver DLL detach (Ctrl+C and
+  "End task" looked dead for a long time). New `console_shutdown` module in `main.rs`:
+  `SetConsoleCtrlHandler` signals every motor's cooperative stop (same path as IPC Stop → dwell
+  cancels within a band, resets to stock, clears boot flag), waits a bounded 30 s grace polling
+  the forge's `running`, then exits; second Ctrl+C forces immediate exit. Grace expiry exits
+  anyway — an armed boot flag is the Safe Loop recovery's designed input. Added
+  `Win32_System_Console` feature. Tests 357/0.
+
 ## Latest backend checkpoint (2026-07-06, late) — v12: regime LIFT + exact-Apply 4-pattern fix (code-complete, NOT HW-tested)
 - **Run finding 1 (bug)**: exact-Apply ran only 3 patterns (`gate_anchored_candidate_fsgl3` was
   called with a hardcoded `final_gate_passes = 3`) while the p95/p99 publish gates require the
