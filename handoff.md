@@ -11,7 +11,7 @@ qualified. **NEXT = supervised v8 hardware gate; Leva 2 remains blocked.** Direc
 `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Backend fix (2026-07-06, post-commit) — console shutdown handler (in working tree, NOT committed)
+## Backend fix (2026-07-06, post-commit) — console shutdown handler (committed 6551997)
 - Console mode had no Ctrl+C/close handler: the main thread blocks in `ConnectNamedPipe` and
   worker threads keep the GPU saturated, so teardown stalled on driver DLL detach (Ctrl+C and
   "End task" looked dead for a long time). New `console_shutdown` module in `main.rs`:
