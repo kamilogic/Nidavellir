@@ -32,6 +32,10 @@ pub enum StabilityResult {
     SilentError,
     /// Hard fault (driver TDR / crash / WHEA). Caught by the Safe Loop on reboot.
     Crash,
+    /// Behaviourally unstable without a wrong result or crash: a pre-hang stall (a render band
+    /// ran toward the TDR watchdog) or a sustained throughput collapse versus the stock
+    /// reference. The point is bad; the driver was never allowed to reset.
+    Unstable,
 }
 
 impl StabilityResult {

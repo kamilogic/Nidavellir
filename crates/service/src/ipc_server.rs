@@ -31,7 +31,7 @@ fn serve_one_client(state: Arc<Mutex<AppState>>) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::io::{BufRead, BufReader};
-        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED};
         use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
         use windows::Win32::System::Pipes::{
             ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
@@ -60,7 +60,18 @@ fn serve_one_client(state: Arc<Mutex<AppState>>) -> Result<(), String> {
         }
 
         unsafe {
-            ConnectNamedPipe(handle, None).map_err(|e| format!("ConnectNamedPipe failed: {e}"))?;
+            if let Err(e) = ConnectNamedPipe(handle, None) {
+                // ERROR_PIPE_CONNECTED (0x80070217): the client connected between
+                // CreateNamedPipeW and ConnectNamedPipe — a documented SUCCESS case; the pipe is
+                // usable. Treating it as fatal abandoned the instance WITHOUT closing the handle,
+                // leaving the connected UI client waiting forever on a pipe nobody serves (the
+                // frozen-UI symptom). Any other connect error must close the handle before
+                // returning, or the instance leaks the same way.
+                if e.code() != ERROR_PIPE_CONNECTED.to_hresult() {
+                    let _ = CloseHandle(handle);
+                    return Err(format!("ConnectNamedPipe failed: {e}"));
+                }
+            }
         }
 
         let mut reader = BufReader::new(PipeReader { handle });

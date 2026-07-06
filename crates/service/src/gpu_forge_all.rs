@@ -226,7 +226,7 @@ fn run_forge_all(progress: Arc<Mutex<ForgeAllProgress>>, stop: Arc<AtomicBool>, 
                 }
                 break;
             }
-            StabilityResult::SilentError => break,
+            StabilityResult::SilentError | StabilityResult::Unstable => break,
         }
     }
     let _ = gpu::set_core_offset_mhz(0);

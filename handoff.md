@@ -1,15 +1,157 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-07-03: the F2 live Forge keeps homogeneous PowerRender
-discovery/p99 calibration, but deployability now requires qualification contract v7: High-FPS,
-Texture and Transitions at the boundary and exact Apply. P5 remains the performance floor; p95 owns
-the electrical support regime with zero bin tolerance. Stop is cooperative inside GPU loops and the
-UI avoids overlapping polling. Apply still requests 12 mV above the learned boundary, snaps to a
-valid physical VF bin and exposes both values. `finished` means current v7 profiles are qualified.
-**NEXT = supervised v7 hardware gate; Leva 2 remains blocked.**
+How to pick this up cold. State as of 2026-07-04: the F2 live Forge keeps homogeneous PowerRender
+discovery/p99 calibration, but deployability now requires qualification contract v8: High-FPS,
+Texture and Transitions — each including the new FrameCadence phase (game-frame-scale droop
+transients, own stock golden) — at the boundary and exact Apply. P5 remains the performance floor;
+p95 owns the electrical support regime with zero bin tolerance. Stop is cooperative inside GPU loops
+and the UI avoids overlapping polling. Apply still requests 12 mV above the learned boundary, snaps
+to a valid physical VF bin and exposes both values. `finished` means current v8 profiles are
+qualified. **NEXT = supervised v8 hardware gate; Leva 2 remains blocked.** Direction roadmap:
+`docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## Latest backend checkpoint (2026-07-04) — held-clock thermal rule for exact Apply (code-complete, NOT HW-tested)
+## Latest backend checkpoint (2026-07-06, late) — v12: regime LIFT + exact-Apply 4-pattern fix (code-complete, NOT HW-tested)
+- **Run finding 1 (bug)**: exact-Apply ran only 3 patterns (`gate_anchored_candidate_fsgl3` was
+  called with a hardcoded `final_gate_passes = 3`) while the p95/p99 publish gates require the
+  complete 4-pattern set — 1875@925 passed 15 min of soak and was refused as "sem p95 sustentado
+  mensurável". Fixed: the call now passes `REQUIRED_QUALIFICATION_PATTERNS.len()`.
+- **Run finding 2 (design)**: the strict p95 reconciliation excluded 11/13 candidates again — but
+  the log showed the excluded-with-reason voltages were exactly right: lifting 1800's Apply to the
+  1830-regime requirement gives 875 mV = the user's hand-validated daily driver. **v12 replaces
+  exclude with LIFT**: `apply_f2_margin_policy` now (a) records `base_apply_mv` (boundary+margin,
+  new additive `PowerSweepPoint` field), (b) lifts `vf_table_voltage_mv` to the sustained regime's
+  required voltage computed FROM BASE APPLIES — lifted values never feed requirements, so lifts
+  cannot cascade (the lifted extra on target S covers S's own overshoot, which a lower target's
+  hardware never reaches). `f2_regime_support` also reads `base_apply_mv` (fallback to
+  `vf_table_voltage_mv` for legacy), so the strict reconciliation stays as a fail-closed net that
+  lifted points satisfy by construction. Top-of-frontier points with NO measured regime above are
+  still excluded (future: direct regime confirmation dwell). Lift runs BEFORE the p99 backfill, so
+  lifted pairs get their own calibrated power like any pair.
+- **Expected next run**: lifted Apply ladder (e.g. 1800→875, 1830→893, mid/top pairs at the
+  sustained-regime voltages), 3 profiles synthesized, exact-Apply 4×5 min per selected pair.
+  1935-at-cap remains excluded by target-residency Inconclusive (power-bound; known, conservative).
+  1875 boundary 912 was a non-monotonic outlier vs 1890@906 — watch it; isotonic outlier handling
+  is a possible follow-up.
+- **Validation**: workspace 488/0 (new lift + no-cascade unit test). No hardware touched. Safety
+  audit still pending for v11 A2/A3/C1 + this v12 gate change before commit.
+
+## Backend checkpoint (2026-07-06) — v11 qualification engine hardening (code-complete, NOT HW-tested)
+- **Why**: the v10 run traded graceful silent errors for straight TDRs (2 in one run, e.g.
+  1920@906 boot-flag crash) and froze Discord voice at each burst — replacing the L2-resident
+  TextureRop with the memory-latency version removed the wrong-pixel detector AND made frames
+  giant non-preemptible draws.
+- **B1**: TextureRop reverted to the v9 L2-resident form (the proven graceful detector).
+- **B2/A1**: the scattered VRAM sampling moved to a NEW `TextureStream` workload/phase (code 11,
+  own golden `RenderGoldens.stream`), rendered in 16 scissor BANDS with one submit each — the
+  driver can preempt between bands (desktop/audio responsive) and each band is timed.
+- **A2 (two layers)**: (1) a band exceeding `STREAM_PREHANG_BAND_MS = 500` fails the dwell as the
+  new `StabilityResult::Unstable` BEFORE the ~2 s driver watchdog (partial frames are never
+  checksummed); (2) the existing `prehang_stall_detected` NVML-starvation signal (recorded since
+  v6, log-only) is now a failing verdict in `classify_f2_stress_dwell` for qualification dwells.
+- **A3**: golden capture now also returns avg frame time; `RenderGoldens.stream_frame_reference_ms`
+  is the stock reference — sustained stream frame time beyond 2× reference fails the bin as
+  Unstable (marginal silicon slows before it hangs). `capture_one_golden` returns
+  `(checksum, avg_frame_ms)`.
+- **B3**: severity ladder — hang-prone detectors (VramPressure, TextureStream) run LAST in
+  V8Texture/V8Memory; graceful detectors kill bad bins cheaply first (unit-tested ordering).
+- **C1**: crash-proximity margin in core synthesis: `frontier_entry_for_target` refuses a boundary
+  closer than `F2_CRASH_PROXIMITY_MIN_MV = 12` (~2 physical bins) above the target's highest
+  crash/TDR anchor (`crash_floor_for_target`, pure + tested) — a TDR at V taints V+1 even if it
+  passed, per the observed reality that the silent-error threshold above a crash went undetected.
+- **Contract v11**; `StabilityResult::Unstable` added (legacy F1 matches map it as non-crash
+  failure). Validation: workspace 487/0; clippy clean on new code. No hardware touched.
+- **Safety note**: A2/A3/C1 change verdict/gate semantics — run `nidavellir-safety-auditor`
+  before merge/commit.
+- **HW gate (manual)**: rerun Standard. Expect: TextureRop silent errors return as the primary
+  killer (graceful, early); Discord/desktop responsive during TextureStream; log shows Unstable
+  verdicts (pre-hang/degradation) instead of TDRs; any TDR that still happens must push the
+  boundary ≥2 bins above it in synthesis. Regression table gate unchanged (1815@856 & 1860@875
+  must be rejected; 1800 boundary near the user's known ~875).
+
+## Backend checkpoint (2026-07-05, late) — 1.7 texture-stream + 1.8 upward recovery, contract v10 (code-complete, NOT HW-tested)
+- **Why**: the 2026-07-05 HW run + user ground truth (1800@875 stable daily; 1800@868 and 1830@875
+  UNSTABLE in game) showed v9 still ~4-5 bins optimistic (approved 1815@843, 1860@875) — and 1800
+  was discarded whole because the warm-start entered below the real boundary. Ground-truth table
+  lives in `docs/qualification-v8-plan.md` ONLY as a validation gate — never hardcoded.
+- **1.7 (gpu-stress)**: TextureRop (the empirically sensitive detector — every v9 failure fired in
+  `texture-rop`) now samples a large VRAM-resident source: fixed 8192² RGBA8 (256 MB, size fixed —
+  NOT runtime-probed — so golden capture and qualifier can never diverge on size), GPU-filled via
+  hash shader (`TEXTURE_STREAM_FILL_SHADER`), and the tap chain start is SCATTERED per pixel
+  (sin-hash of frag coords) so neighbouring fragments hit far-apart texels → bilinear taps pay DRAM
+  latency: TMU + memory controller together, the game texturing path. Same source in
+  `capture_one_golden`. `F2_QUALIFICATION_CONTRACT_VERSION = 10` (v9 positives are the proven false
+  negatives; they cannot unlock Apply).
+- **1.8 (service)**: two fixes. (a) `warm_start_rejected` now requires a bin with the FULL required
+  pattern set passed — a single-pattern pass (High-FPS ok, Texture failed) no longer suppresses the
+  conservative fallback; `sustainable` uses the same full-set check. (b) New bounded upward
+  recovery in the outer ladder: a `QualificationRejected` end (NOT ClockDrop) re-runs the clock one
+  physical bin above the last attempted start, up to `F2_START_RECOVERY_MAX_CLIMBS = 4` (generic
+  search parameter). Pure helper `f2_next_bin_above` + test.
+- Earlier same day: IPC freeze fixed (`ERROR_PIPE_CONNECTED` treated as success; handle closed on
+  connect error) — `ipc_server.rs`.
+- **Validation**: workspace 486/0; clippy clean on new code. No hardware touched.
+- **HW gate (manual)**: clear forge state → Forge Standard → the run must now (a) REJECT 1815@856
+  and 1860@875-class points (expect `texture-rop` failures at higher voltages than v9), (b) land
+  the 1800 MHz boundary near the user's known ~875 (climb log lines "recuperação para cima" prove
+  1.8 fired), (c) TextureRop frame times will be longer (memory-latency bound) — watch for TDR
+  margin; per-frame work is bounded but untested on HW.
+
+## Backend checkpoint (2026-07-05) — Phase 1 complete: v8 workloads full set, contract v9 (code-complete, NOT HW-tested)
+- **Why**: v8 with FrameCadence alone still passed points the user knows crash in-game. Completed
+  the full Phase 1 workload set from `docs/qualification-v8-plan.md`.
+- **New workloads** (`gpu-stress`): `VramPressure` — up to 8×256 MB VRAM-resident tables (OOM-guarded
+  via error scopes, degrades gracefully), cache-defeating gathers cycling tables per dispatch,
+  known-answer verified (any mismatch = silent error). `GeometryDepth` — 49 152 procedural triangles
+  × 8 instances under a depth test (unique per-triangle depth ⇒ deterministic image), loads vertex
+  fetch/raster/depth-ROP; golden-verified (`RenderGoldens.geometry`, 5 goldens captured now).
+- **Patterns renamed V7→V8** (labels `v8-*`) and extended: HighFps/Transitions +GeometryDepth,
+  Texture +VramPressure, and NEW `V8Memory` pattern (VRAM-dominant, all 11 phases). Qualification
+  set is now **4 patterns** (HighFps/Texture/Transitions/Memory): boundary 4×60 s, exact-Apply
+  4×5 min (upper estimates updated: target 275 s, apply pair 1 220 s).
+- **Core**: `F2QualificationPattern::Memory`; canonical `REQUIRED_QUALIFICATION_PATTERNS: [_; 4]` —
+  all completeness gates (p99/p95 at anchor, frontier qualification count) now index into it, so
+  extending the array tightens every gate automatically. `F2_QUALIFICATION_CONTRACT_VERSION = 9`.
+  Item 1.5: pure `qualification_failure_histogram()` aggregates failed dwells by
+  (clock, mV, pattern, failure_phase) — data source for future pattern weighting/adaptive margin;
+  log/UI wiring deliberately deferred.
+- **Item 1.6 verified, no change needed**: golden-mode MixedGame decomposes into
+  BoostEdge/TextureRop/PowerRender (each golden-checked); ComputeBurst is known-answer.
+- **Validation**: workspace 485/0 tests; clippy baseline only (0 warnings in new code). No hardware
+  touched.
+- **HW next (manual)**: clear forge state → Forge Standard → confirm 5 golden captures + 4 patterns
+  run (look for `vram-pressure`/`geometry-depth` phases in JSONL) → re-test the known-unstable
+  points that v8-cadence-only still passed; they must now be rejected (likely in `vram-pressure` or
+  `frame-cadence` phases). VramPressure on cards < 4 GB and the geometry golden determinism across
+  driver versions are the untested risks.
+
+## Backend checkpoint (2026-07-04) — qualification v8: FrameCadence phase (code-complete, NOT HW-tested)
+- **Why**: v7-passing points still crash/TDR in real games. Root-cause analysis (see
+  `docs/qualification-v8-plan.md`, item 1.1): the v7 patterns never exercise VRM droop-release
+  transients at game frame cadence — idle pulses fire every 750 ms while games oscillate load every
+  6–16 ms, which is where undervolt Vmin actually fails.
+- **What**: new `VfWorkload::FrameCadence` + `VfQualifierPhase::FrameCadence` (code 8, label
+  `frame-cadence`) in `gpu-stress`: one heavy RENDER_SHADER frame at 1 instance (~10-20 ms of work =
+  a game frame) → poll(Wait) → sleep gap cycling 2/4/6/8 ms, repeating. Each frame is a heavy burst;
+  the gap sweep crosses different VRM response periods. Golden-verified with its OWN stock checksum
+  (`RenderGoldens.cadence` — the 1-instance image differs from the 8-instance power golden);
+  `capture_fsgl3_render_goldens` now captures four goldens.
+- **Patterns**: FrameCadence segments inserted into all three plans — HighFps ×2, Texture ×1,
+  Transitions ×3. Coverage denominator is now pattern-specific via new pure
+  `qualifier_expected_phases()` (legacy FSGL = 8 phases, v7 plans = 9); the old fixed
+  `EXPECTED_PHASES = 8` + `[false; 8]` would have panicked on phase code 8. A v7-pattern run that
+  skips FrameCadence is Inconclusive.
+- **Contract**: `F2_QUALIFICATION_CONTRACT_VERSION = 8` — pre-cadence positives cannot unlock Apply;
+  negatives stay conservative. Discovery contract (v4 PowerRender) untouched.
+- **Validation**: `cargo check --workspace` clean; `cargo test --workspace` 484/0 (core 78, gpu-stress
+  40, service 355); clippy shows only the pre-existing baseline. No VF write, Forge, Apply or GPU
+  stress was run.
+- **HW next (manual, user-run)**: clear persisted forge state → run Forge Standard → confirm the four
+  golden captures succeed and the three patterns execute FrameCadence phases (look for
+  `frame-cadence` in phase metrics/JSONL), then re-test the known game-crashing point: v8 should
+  reject it at the voltage v7 accepted.
+
+## Backend checkpoint (2026-07-04) — held-clock thermal rule for exact Apply (code-complete, NOT HW-tested)
 - **Why**: a full run ended with ZERO profiles. The power-bound top point `1935 MHz @ 956 mV` (pinned
   at the 200 W cap) failed exact-Apply as `ExactApplyInconclusive` — three HighFPS dwells tripped NVML
   `thermal_throttled` from a memory-junction hotspot at only ~67-69 C core, while the card actually

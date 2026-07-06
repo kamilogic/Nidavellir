@@ -296,7 +296,7 @@ fn run_real_sweep(
                         break;
                     }
                 }
-                StabilityResult::SilentError => {
+                StabilityResult::SilentError | StabilityResult::Unstable => {
                     // Gentle cliff — record it and back off with margin.
                     min_unstable_real =
                         Some(min_unstable_real.map_or(peak, |u| u.min(peak)));

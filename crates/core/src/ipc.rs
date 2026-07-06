@@ -116,6 +116,11 @@ pub struct PowerSweepPoint {
     /// Effective upward application margin after snapping to a real VF-table bin.
     #[serde(default)]
     pub apply_margin_mv: Option<u32>,
+    /// Apply bin BEFORE any regime lift (boundary + standard margin). Regime requirements are
+    /// computed from this pre-lift value so lifting one point can never cascade requirements
+    /// through the frontier. `None` on legacy points (falls back to `vf_table_voltage_mv`).
+    #[serde(default)]
+    pub base_apply_mv: Option<u32>,
 
     // ── Richer dwell stats (all additive/optional; `None` on legacy points) ──
     /// Lowest sustained clock (MHz) over the dwell — a clock that dips well below

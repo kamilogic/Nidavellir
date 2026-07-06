@@ -25,6 +25,20 @@ const TABLE_INIT: u32 = 2246822519;
 // weights if known unstable bins survive; use a verify ring if per-frame work causes TDR pressure.
 const DROOP_BURST: u64 = 6;
 const DROOP_GAP_MS: u64 = 4;
+// FrameCadence idle gaps between single heavy frames, cycled per frame. Sweeping the gap
+// varies the load-release→re-load period so the droop transient crosses different VRM
+// response frequencies instead of settling into one rhythm.
+const FRAME_CADENCE_GAPS_MS: [u64; 4] = [2, 4, 6, 8];
+// TextureStream banding: each frame renders in this many scissor bands, ONE SUBMIT EACH, so the
+// driver can preempt between bands (desktop/audio stay responsive during the heaviest detector)
+// and a stalling band is caught long before the ~2 s driver TDR watchdog.
+const STREAM_BANDS: u32 = 16;
+// A single band exceeding this wall time is a pre-hang: stop submitting and fail the dwell as
+// Unstable instead of letting the driver watchdog reset the device.
+const STREAM_PREHANG_BAND_MS: u64 = 500;
+// Sustained frame time beyond reference × this factor (stock, captured with the golden) marks a
+// bin as marginal: silicon slows down (internal retries) before it hangs.
+const STREAM_DEGRADATION_FACTOR: u64 = 2;
 const GOLDEN_MIN_FRAMES: u64 = 4;
 
 #[repr(C)]
@@ -71,6 +85,17 @@ pub struct RenderGoldens {
     pub power: u32,
     pub boost: u32,
     pub texrop: u32,
+    /// Golden for the FrameCadence workload (1-instance PowerRender frame — a different image
+    /// than the 8-instance `power` golden, so it needs its own stock checksum).
+    pub cadence: u32,
+    /// Golden for the GeometryDepth workload (instanced procedural triangles under depth test).
+    pub geometry: u32,
+    /// Golden for the TextureStream workload (scattered sampling of the large VRAM source).
+    pub stream: u32,
+    /// Stock average TextureStream frame time (ms), captured with the golden. The qualifier
+    /// rejects a bin whose sustained frame time degrades far beyond this reference — marginal
+    /// silicon slows down (internal retries) before it hangs.
+    pub stream_frame_reference_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,9 +119,24 @@ pub enum VfQualifierPhase {
     IdlePulse,
     MixedGame,
     PowerClosing,
+    /// Game-frame-scale heavy burst / short idle gap cycling — targets VRM droop-release
+    /// transients at real frame cadence (~5-25 ms period) that second-scale segments miss.
+    FrameCadence,
+    /// Multi-gigabyte VRAM-resident gather load — memory controller + DRAM on the shared rail,
+    /// the streaming path games exercise that cache-resident render targets never touch.
+    VramPressure,
+    /// Instanced procedural triangles under a depth test — vertex fetch, raster and depth-ROP
+    /// units the fullscreen-triangle workloads never exercise.
+    GeometryDepth,
+    /// Hang-prone heavy memory detector: per-pixel scattered sampling of the large VRAM source,
+    /// rendered in preemptible scissor bands. Runs LAST in patterns (severity ladder).
+    TextureStream,
 }
 
 impl VfQualifierPhase {
+    /// Number of phase variants (codes are `0..COUNT`). Coverage bitmaps must use this size.
+    pub const COUNT: usize = 12;
+
     pub const NONE_CODE: u8 = u8::MAX;
 
     pub fn label(self) -> &'static str {
@@ -109,6 +149,10 @@ impl VfQualifierPhase {
             VfQualifierPhase::IdlePulse => "idle-pulse",
             VfQualifierPhase::MixedGame => "mixed-game",
             VfQualifierPhase::PowerClosing => "power-closing",
+            VfQualifierPhase::FrameCadence => "frame-cadence",
+            VfQualifierPhase::VramPressure => "vram-pressure",
+            VfQualifierPhase::GeometryDepth => "geometry-depth",
+            VfQualifierPhase::TextureStream => "texture-stream",
         }
     }
 
@@ -126,6 +170,10 @@ impl VfQualifierPhase {
             5 => Some(Self::IdlePulse),
             6 => Some(Self::MixedGame),
             7 => Some(Self::PowerClosing),
+            8 => Some(Self::FrameCadence),
+            9 => Some(Self::VramPressure),
+            10 => Some(Self::GeometryDepth),
+            11 => Some(Self::TextureStream),
             _ => None,
         }
     }
@@ -140,9 +188,10 @@ pub enum VfQualifierPattern {
     Fsgl2B,
     Fsgl3A,
     Fsgl3B,
-    V7HighFps,
-    V7Texture,
-    V7Transitions,
+    V8HighFps,
+    V8Texture,
+    V8Transitions,
+    V8Memory,
 }
 
 impl VfQualifierPattern {
@@ -153,9 +202,10 @@ impl VfQualifierPattern {
             Self::Fsgl2B => "fsgl2-b",
             Self::Fsgl3A => "fsgl3-a",
             Self::Fsgl3B => "fsgl3-b",
-            Self::V7HighFps => "v7-high-fps",
-            Self::V7Texture => "v7-texture",
-            Self::V7Transitions => "v7-transitions",
+            Self::V8HighFps => "v8-high-fps",
+            Self::V8Texture => "v8-texture",
+            Self::V8Transitions => "v8-transitions",
+            Self::V8Memory => "v8-memory",
         }
     }
 }
@@ -169,6 +219,10 @@ pub enum VfWorkload {
     ComputeBurst,
     IdlePulse,
     MixedGame,
+    FrameCadence,
+    VramPressure,
+    GeometryDepth,
+    TextureStream,
 }
 
 fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u32> {
@@ -178,7 +232,11 @@ fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u
         }
         VfWorkload::BoostEdge => Some(goldens.boost),
         VfWorkload::TextureRop => Some(goldens.texrop),
-        VfWorkload::ComputeBurst | VfWorkload::MixedGame => None,
+        VfWorkload::FrameCadence => Some(goldens.cadence),
+        VfWorkload::GeometryDepth => Some(goldens.geometry),
+        VfWorkload::TextureStream => Some(goldens.stream),
+        // VramPressure is compute-path: its gather sum is a known answer, self-verified.
+        VfWorkload::ComputeBurst | VfWorkload::MixedGame | VfWorkload::VramPressure => None,
     }
 }
 
@@ -298,11 +356,12 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 4),
     ];
-    const V7_HIGH_FPS: [(VfQualifierPhase, VfWorkload, u64); 15] = [
+    const V8_HIGH_FPS: [(VfQualifierPhase, VfWorkload, u64); 18] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 12),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 4),
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 12),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
         (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 12),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 3),
@@ -312,10 +371,15 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 4),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
+        (VfQualifierPhase::GeometryDepth, VfWorkload::GeometryDepth, 6),
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 6),
     ];
-    const V7_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 12] = [
+    // Severity ladder: graceful silent-error detectors (L2 TextureRop, cadence) run FIRST; the
+    // hang-prone memory detectors (VramPressure, TextureStream) run LAST — a bad bin usually
+    // dies cheaply by wrong-pixel checksum long before anything TDR-prone executes.
+    const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 15] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
@@ -323,29 +387,57 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 3),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
         (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 5),
         (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
+        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 8),
+        (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 8),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 7),
     ];
-    const V7_TRANSITIONS: [(VfQualifierPhase, VfWorkload, u64); 16] = [
+    const V8_TRANSITIONS: [(VfQualifierPhase, VfWorkload, u64); 20] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 5),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
+        (VfQualifierPhase::GeometryDepth, VfWorkload::GeometryDepth, 6),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
         (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 5),
         (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 6),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 5),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 4),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 8),
+    ];
+    // Memory-dominant pattern: sustained multi-GB VRAM traffic interleaved with cadence, texture
+    // and geometry pressure — the streaming/memory-controller co-load real games apply to the
+    // shared voltage rail. BoostEdge is retained so the phase-contrast diagnostic stays defined.
+    const V8_MEMORY: [(VfQualifierPhase, VfWorkload, u64); 16] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 6),
+        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 12),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 6),
+        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 12),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 8),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 3),
+        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 12),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
+        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 10),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 6),
+        (VfQualifierPhase::GeometryDepth, VfWorkload::GeometryDepth, 6),
+        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 10),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 4),
+        (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 8),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 6),
     ];
 
     let template: &[(VfQualifierPhase, VfWorkload, u64)] = match pattern {
@@ -354,9 +446,10 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         VfQualifierPattern::Fsgl2B => &FSGL2_B,
         VfQualifierPattern::Fsgl3A => &FSGL3_A,
         VfQualifierPattern::Fsgl3B => &FSGL3_B,
-        VfQualifierPattern::V7HighFps => &V7_HIGH_FPS,
-        VfQualifierPattern::V7Texture => &V7_TEXTURE,
-        VfQualifierPattern::V7Transitions => &V7_TRANSITIONS,
+        VfQualifierPattern::V8HighFps => &V8_HIGH_FPS,
+        VfQualifierPattern::V8Texture => &V8_TEXTURE,
+        VfQualifierPattern::V8Transitions => &V8_TRANSITIONS,
+        VfQualifierPattern::V8Memory => &V8_MEMORY,
     };
     let total_weight = template.iter().map(|(_, _, weight)| *weight).sum::<u64>();
     let mut assigned = 0u64;
@@ -373,6 +466,16 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
             VfQualifierSegment { phase, workload, duration_ms }
         })
         .collect()
+}
+
+/// Distinct phases a pattern's plan exercises — the qualification-coverage denominator.
+/// Legacy FSGL patterns cover 8 phases; the v7 patterns add FrameCadence (9).
+pub fn qualifier_expected_phases(pattern: VfQualifierPattern) -> u32 {
+    let mut seen = [false; VfQualifierPhase::COUNT];
+    for segment in vf_qualifier_plan(1_000, pattern) {
+        seen[segment.phase.code() as usize] = true;
+    }
+    seen.iter().filter(|present| **present).count() as u32
 }
 
 const ALU_SHADER: &str = r#"
@@ -638,6 +741,42 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+// TextureRop samples a LARGE VRAM-resident source (not the 1024² ≈ L2-resident one) with the tap
+// chain SCATTERED per pixel, so neighbouring fragments hit far-apart texels and bilinear taps pay
+// DRAM latency — TMU + memory controller together on the shared rail, the game texturing path.
+// The dimension is FIXED (not probed at runtime): golden capture and qualifier run in separate
+// GpuCtx instances, and any runtime size fallback could diverge between them and turn a benign
+// allocation difference into a false SilentError. 8192² RGBA8 = 256 MB, far beyond any L2.
+const TEXTURE_STREAM_DIM: u32 = 8192;
+
+// Fills the large source texture on the GPU (uploading 256 MB from the CPU is not acceptable):
+// one fullscreen triangle whose fragment shader hashes the pixel coordinate — deterministic
+// content, same everywhere it is created.
+const TEXTURE_STREAM_FILL_SHADER: &str = r#"
+struct VOut { @builtin(position) pos: vec4<f32> };
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var o: VOut;
+    o.pos = vec4<f32>(p[vi], 0.0, 1.0);
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    let x = u32(in.pos.x);
+    let y = u32(in.pos.y);
+    var h = (y * 8192u + x) * 2654435761u;
+    h = h ^ (h >> 16u);
+    h = h * 2246822519u;
+    return vec4<f32>(
+        f32(h & 0xffu) / 255.0,
+        f32((h >> 8u) & 0xffu) / 255.0,
+        f32((h >> 16u) & 0xffu) / 255.0,
+        1.0,
+    );
+}
+"#;
+
 // Texture/ROP-biased path: dependent texture sampling and alpha blending dominate while the ALU
 // chain stays deliberately lighter than PowerRender.
 const TEXTURE_ROP_SHADER: &str = r#"
@@ -665,6 +804,96 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     }
     let v = fract((t.x + t.y + t.z) * 0.0031);
     return vec4<f32>(v, fract(v * 7.0), fract(v * 11.0), 0.55);
+}
+"#;
+
+// TextureStream: the HANG-PRONE heavy memory detector, split out of TextureRop (which stays the
+// L2-resident graceful silent-error detector — replacing it in v10 traded wrong-pixel failures
+// for driver hangs/TDR on hardware). Samples the large VRAM-resident source with the tap chain
+// start SCATTERED per pixel: neighbouring fragments hit far-apart texels, every bilinear tap
+// pays DRAM latency — TMU + memory controller together under droop. Runs LAST in patterns
+// (severity ladder) and is rendered in scissor BANDS with one submit each, so the driver can
+// preempt between bands (desktop stays responsive) and a stalling band is caught well before
+// the ~2 s TDR watchdog.
+const TEXTURE_STREAM_SHADER: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) seed: f32 };
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var o: VOut;
+    o.pos = vec4<f32>(p[vi], 0.0, 1.0);
+    o.uv = (p[vi] + vec2<f32>(1.0, 1.0)) * 0.5;
+    o.seed = f32(ii) * 0.113;
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    var uv = vec2<f32>(
+        fract(sin(dot(in.pos.xy, vec2<f32>(127.1, 311.7)) + in.seed) * 43758.5453),
+        fract(sin(dot(in.pos.xy, vec2<f32>(269.5, 183.3)) - in.seed) * 43758.5453),
+    );
+    var t = vec4<f32>(0.0);
+    for (var k = 0; k < 24; k = k + 1) {
+        uv = fract(uv * vec2<f32>(1.013, 0.991) + vec2<f32>(0.017, 0.029) + t.xy * 0.0001);
+        t = t + textureSampleLevel(tex, samp, uv, 0.0);
+        t = t + textureSampleLevel(tex, samp, fract(uv.yx * 1.7 + vec2<f32>(0.31, 0.17)), 0.0);
+    }
+    let v = fract((t.x + t.y + t.z) * 0.0037);
+    return vec4<f32>(v, fract(v * 7.0), fract(v * 13.0), 1.0);
+}
+"#;
+
+// Geometry/raster/depth path: many small procedurally-placed triangles (no vertex buffer — position
+// hashed from vertex/instance index) rendered under a depth test. Loads vertex fetch/transform,
+// triangle setup, raster and depth-ROP — units every fullscreen-triangle workload skips. Each
+// triangle gets a UNIQUE depth (hashed, no ties) so the depth test resolves deterministically
+// regardless of rasterization order and the frame checksum is stable on a healthy GPU.
+const GEOMETRY_DEPTH_TRIS: u32 = 49_152;
+const GEOMETRY_DEPTH_INSTANCES: u32 = 8;
+const GEOMETRY_DEPTH_SHADER: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) seed: f32 };
+fn hash(x: u32) -> u32 {
+    var h = x * 2654435761u;
+    h = h ^ (h >> 16u);
+    h = h * 2246822519u;
+    return h ^ (h >> 13u);
+}
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+    let tri = vi / 3u;
+    let corner = vi % 3u;
+    let id = tri * 8u + ii;
+    let h0 = hash(id);
+    let h1 = hash(id ^ 0x9e3779b9u);
+    // Center in clip space, small triangle, unique depth per (tri, instance).
+    let cx = (f32(h0 & 0xffffu) / 32768.0) - 1.0;
+    let cy = (f32(h0 >> 16u) / 32768.0) - 1.0;
+    let size = 0.006 + f32(h1 & 0xffu) / 8192.0;
+    var off = vec2<f32>(0.0, size);
+    if (corner == 1u) { off = vec2<f32>(-size, -size); }
+    if (corner == 2u) { off = vec2<f32>(size, -size); }
+    let z = (f32(id) + 0.5) / f32(49152u * 8u);
+    var o: VOut;
+    o.pos = vec4<f32>(cx + off.x, cy + off.y, z, 1.0);
+    o.uv = vec2<f32>(cx, cy) * 0.5 + vec2<f32>(0.5, 0.5);
+    o.seed = f32(h1 & 0x3ffu);
+    return o;
+}
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    var a = in.seed * 0.013 + in.uv.x;
+    var b = in.seed * 0.007 + in.uv.y;
+    for (var k = 0; k < 8; k = k + 1) {
+        a = fma(a, 1.003, b * 0.011);
+        b = fma(b, 0.997, a * 0.009);
+    }
+    let t = textureSampleLevel(tex, samp, fract(in.uv * 3.0 + vec2<f32>(a, b) * 0.001), 0.0);
+    let v = fract(abs(a + b + t.x + t.y) * 0.043);
+    return vec4<f32>(v, fract(v * 5.0), fract(v * 9.0), 1.0);
 }
 "#;
 
@@ -1174,6 +1403,172 @@ impl GpuCtx {
         }
     }
 
+    /// Multi-gigabyte VRAM-pressure qualifier load: several ~256 MB VRAM-resident tables are
+    /// gathered with cache-defeating strides, cycling across tables per dispatch so the DRAM
+    /// footprint far exceeds any cache — the memory-controller/DRAM co-load on the shared core
+    /// rail that render targets (L2-resident) never produce. Known-answer verified: the gather
+    /// sum is idempotent per dispatch and identical for every table, so ANY mismatch is a silent
+    /// error. Table allocation is OOM-guarded (error scope) and degrades to fewer tables — the
+    /// first table always allocates (256 MB fits any supported GPU alongside the working set).
+    pub fn run_vram_pressure_with_cancel(
+        &self,
+        target_ms: u64,
+        cancel: Option<&AtomicBool>,
+    ) -> StageReport {
+        const LANES: u32 = 262_144;
+        const GATHERS: u32 = 128;
+        /// Upper bound on tables (~2 GB at 256 MB each) — sized to pressure the memory
+        /// controller without risking overcommit on 4 GB cards.
+        const MAX_TABLES: usize = 8;
+        let start = std::time::Instant::now();
+        let table_bytes = (256u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
+        let table_len = (table_bytes / 4) as u32;
+
+        let mut tables: Vec<wgpu::Buffer> = Vec::new();
+        for _ in 0..MAX_TABLES {
+            // OOM-guarded: a failed allocation pops as an error (not a device loss) and we keep
+            // the tables already resident.
+            self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let table = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vram-pressure-table"),
+                size: (table_len as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            if pollster::block_on(self.device.pop_error_scope()).is_some() {
+                break;
+            }
+            tables.push(table);
+        }
+        if tables.is_empty() {
+            // Allocation failed outright — inconclusive hardware state, not proof of stability.
+            return StageReport {
+                name: "VramPressure".into(),
+                result: StabilityResult::Crash,
+                mismatches: 0,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+
+        // Fill every table with the same deterministic pattern (on-GPU; matches FILL_SHADER).
+        let fill_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vram-pressure-fill-params"),
+            contents: bytemuck::bytes_of(&Quad { a: table_len, b: 0, c: 0, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let fill_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("vram-pressure-fill"),
+            source: wgpu::ShaderSource::Wgsl(FILL_SHADER.into()),
+        });
+        let fill_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vram-pressure-fill"),
+            layout: None,
+            module: &fill_mod,
+            entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        for table in &tables {
+            let fill_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vram-pressure-fill"),
+                layout: &fill_pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: table.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: fill_params.as_entire_binding() },
+                ],
+            });
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&fill_pipe);
+                cp.set_bind_group(0, &fill_bind, &[]);
+                cp.dispatch_workgroups(table_len.div_ceil(64).min(65535), 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            self.device.poll(wgpu::Maintain::Wait);
+        }
+
+        let data = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vram-pressure-data"),
+            size: (LANES as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vram-pressure-params"),
+            contents: bytemuck::bytes_of(&Quad { a: GATHERS, b: LANES, c: table_len, d: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("vram-pressure"),
+            source: wgpu::ShaderSource::Wgsl(MEM_SHADER.into()),
+        });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vram-pressure"),
+            layout: None,
+            module: &module,
+            entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let binds: Vec<wgpu::BindGroup> = tables
+            .iter()
+            .map(|table| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("vram-pressure"),
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: data.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: table.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                    ],
+                })
+            })
+            .collect();
+
+        let groups = LANES.div_ceil(64);
+        let mut k: u64 = 0;
+        while (start.elapsed().as_millis() as u64) < target_ms
+            && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+        {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipeline);
+                cp.set_bind_group(0, &binds[(k % binds.len() as u64) as usize], &[]);
+                cp.dispatch_workgroups(groups, 1, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            k += 1;
+            if k % 8 == 0 {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
+            if self.crashed.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Same known answer as run_memory — every table holds the identical pattern, so the
+        // expected gather sum is independent of which table each dispatch hit.
+        let expected: Vec<u32> = (0..LANES)
+            .map(|i| {
+                let mut acc = 0u32;
+                for kk in 0..GATHERS {
+                    let idx = (i.wrapping_mul(HASH1).wrapping_add(kk.wrapping_mul(TABLE_INIT)))
+                        % table_len;
+                    acc = acc.wrapping_add(idx.wrapping_mul(TABLE_INIT));
+                }
+                acc
+            })
+            .collect();
+        let (mismatches, mapped_ok) = self.readback_compare(&data, (LANES as u64) * 4, &expected);
+        StageReport {
+            name: "VramPressure".into(),
+            result: self.verdict(mismatches, mapped_ok),
+            mismatches,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
     /// VRAM integrity check (roadmap §12 Phase 1): allocate a large VRAM buffer,
     /// write/verify deterministic patterns (address-in-cell, all-1/0,
     /// checkerboard, walking-bit), counting mismatches on the GPU. Run at stock
@@ -1600,6 +1995,7 @@ impl GpuCtx {
             false,
             None,
             None,
+            None,
         )
     }
 
@@ -1615,15 +2011,18 @@ impl GpuCtx {
             false,
             false,
             None,
+            None,
             Some(cancel),
         )
     }
 
+    /// Returns `(checksum, avg_frame_ms)` — the frame-time reference feeds the TextureStream
+    /// degradation gate.
     pub fn capture_one_golden(
         &self,
         profile: VfWorkload,
         sample_ms: u64,
-    ) -> Result<u32, String> {
+    ) -> Result<(u32, u32), String> {
         const DIM: u32 = 1536;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("golden-render-target"),
@@ -1667,18 +2066,48 @@ impl GpuCtx {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // Must match the qualifier exactly: TextureStream goldens sample the same large source.
+        let src_view = if profile == VfWorkload::TextureStream {
+            self.create_texture_stream_source_view()
+        } else {
+            src_view
+        };
 
         let (shader_source, instances, blend) = match profile {
             VfWorkload::PowerRender => (RENDER_SHADER, 8, wgpu::BlendState::REPLACE),
             VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
             VfWorkload::TextureRop => (TEXTURE_ROP_SHADER, 4, wgpu::BlendState::ALPHA_BLENDING),
+            // Must match the FrameCadence qualifier config exactly (same shader, 1 instance).
+            VfWorkload::FrameCadence => (RENDER_SHADER, 1, wgpu::BlendState::REPLACE),
+            VfWorkload::GeometryDepth => {
+                (GEOMETRY_DEPTH_SHADER, GEOMETRY_DEPTH_INSTANCES, wgpu::BlendState::REPLACE)
+            }
+            VfWorkload::TextureStream => (TEXTURE_STREAM_SHADER, 2, wgpu::BlendState::REPLACE),
             VfWorkload::HeavySpike
             | VfWorkload::IdlePulse
             | VfWorkload::ComputeBurst
-            | VfWorkload::MixedGame => {
+            | VfWorkload::MixedGame
+            | VfWorkload::VramPressure => {
                 return Err(format!("unsupported golden render profile: {profile:?}"));
             }
         };
+        // Must match the GeometryDepth qualifier config exactly (same depth state + draw range).
+        let geometry_depth = profile == VfWorkload::GeometryDepth;
+        let vertex_count: u32 = if geometry_depth { GEOMETRY_DEPTH_TRIS * 3 } else { 3 };
+        let depth_view = geometry_depth.then(|| {
+            self.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("golden-render-depth"),
+                    size: wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        });
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("golden-render"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
@@ -1687,7 +2116,13 @@ impl GpuCtx {
             label: Some("golden-render"), layout: None,
             vertex: wgpu::VertexState { module: &shader, entry_point: "vs", buffers: &[], compilation_options: Default::default() },
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: geometry_depth.then(|| wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader, entry_point: "fs",
@@ -1761,13 +2196,22 @@ impl GpuCtx {
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                     })],
-                    depth_stencil_attachment: None,
+                    depth_stencil_attachment: depth_view.as_ref().map(|view| {
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }
+                    }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
                 rp.set_pipeline(&pipeline);
                 rp.set_bind_group(0, &tex_bind, &[]);
-                rp.draw(0..3, 0..instances);
+                rp.draw(0..vertex_count, 0..instances);
             }
             enc.copy_texture_to_buffer(
                 wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -1790,7 +2234,10 @@ impl GpuCtx {
             frames = frames.saturating_add(1);
             observe_golden_checksum(&mut golden, checksum, frames)?;
         }
-        finish_golden_capture(golden, frames)
+        let checksum = finish_golden_capture(golden, frames)?;
+        let avg_frame_ms =
+            u32::try_from((start.elapsed().as_millis() as u64) / frames.max(1)).unwrap_or(u32::MAX);
+        Ok((checksum, avg_frame_ms))
     }
 
     /// Failure-seeking F2 qualification loop. Discovery must keep calling
@@ -1907,6 +2354,23 @@ impl GpuCtx {
                             }],
                         }
                     }
+                    VfWorkload::VramPressure => {
+                        let stage = self.run_vram_pressure_with_cancel(duration_ms, cancel);
+                        RenderResult {
+                            result: stage.result,
+                            frames: 0,
+                            fps: 0.0,
+                            failure_phase: (stage.result != StabilityResult::Stable)
+                                .then_some(segment.phase),
+                            phase_reports: vec![VfPhaseReport {
+                                phase: segment.phase,
+                                result: stage.result,
+                                frames: 0,
+                                checksum_count: 1,
+                                elapsed_ms: stage.elapsed_ms,
+                            }],
+                        }
+                    }
                     other => self.run_render_profile(
                         duration_ms,
                         other,
@@ -1914,6 +2378,9 @@ impl GpuCtx {
                         matches!(other, VfWorkload::IdlePulse),
                         true,
                         goldens.and_then(|g| golden_for_workload(g, other)),
+                        (other == VfWorkload::TextureStream)
+                            .then(|| goldens.map(|g| g.stream_frame_reference_ms))
+                            .flatten(),
                         cancel,
                     ),
                 };
@@ -1944,6 +2411,77 @@ impl GpuCtx {
         }
     }
 
+    /// Create + deterministically fill the large VRAM-resident TextureRop source (see
+    /// [`TEXTURE_STREAM_DIM`]). Used by BOTH the qualifier and golden capture — content and size
+    /// must be identical in both or the golden would diverge for a healthy GPU.
+    fn create_texture_stream_source_view(&self) -> wgpu::TextureView {
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("texture-stream-src"),
+            size: wgpu::Extent3d {
+                width: TEXTURE_STREAM_DIM,
+                height: TEXTURE_STREAM_DIM,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("texture-stream-fill"),
+            source: wgpu::ShaderSource::Wgsl(TEXTURE_STREAM_FILL_SHADER.into()),
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("texture-stream-fill"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("texture-stream-fill"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rp.set_pipeline(&pipeline);
+            rp.draw(0..3, 0..1);
+        }
+        self.queue.submit(Some(enc.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        view
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_render_profile(
         &self,
@@ -1953,6 +2491,7 @@ impl GpuCtx {
         idle_pulses: bool,
         full_workload_duration: bool,
         golden: Option<u32>,
+        stream_frame_reference_ms: Option<u32>,
         cancel: Option<&AtomicBool>,
     ) -> RenderResult {
         let start = std::time::Instant::now();
@@ -2010,6 +2549,13 @@ impl GpuCtx {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // TextureStream samples the LARGE VRAM-resident source (cache-defeating; see
+        // TEXTURE_STREAM_DIM) instead of the small L2-resident one.
+        let src_view = if profile == VfWorkload::TextureStream {
+            self.create_texture_stream_source_view()
+        } else {
+            src_view
+        };
 
         let (shader_source, instances, blend) = match profile {
             VfWorkload::PowerRender | VfWorkload::HeavySpike | VfWorkload::IdlePulse => {
@@ -2017,8 +2563,35 @@ impl GpuCtx {
             }
             VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
             VfWorkload::TextureRop => (TEXTURE_ROP_SHADER, 4, wgpu::BlendState::ALPHA_BLENDING),
-            VfWorkload::ComputeBurst | VfWorkload::MixedGame => unreachable!("non-render workload"),
+            // One instance keeps a single frame at game-frame scale (~10-20 ms of heavy work)
+            // so the burst/idle cycle below runs at real frame cadence.
+            VfWorkload::FrameCadence => (RENDER_SHADER, 1, wgpu::BlendState::REPLACE),
+            VfWorkload::GeometryDepth => {
+                (GEOMETRY_DEPTH_SHADER, GEOMETRY_DEPTH_INSTANCES, wgpu::BlendState::REPLACE)
+            }
+            VfWorkload::TextureStream => (TEXTURE_STREAM_SHADER, 2, wgpu::BlendState::REPLACE),
+            VfWorkload::ComputeBurst | VfWorkload::MixedGame | VfWorkload::VramPressure => {
+                unreachable!("non-render workload")
+            }
         };
+        // GeometryDepth draws many small procedural triangles under a depth test; everything else
+        // draws overdraw fullscreen triangles with no depth attachment.
+        let geometry_depth = profile == VfWorkload::GeometryDepth;
+        let vertex_count: u32 = if geometry_depth { GEOMETRY_DEPTH_TRIS * 3 } else { 3 };
+        let depth_view = geometry_depth.then(|| {
+            self.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("render-depth"),
+                    size: wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        });
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render"), source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
@@ -2026,7 +2599,13 @@ impl GpuCtx {
             label: Some("render"), layout: None,
             vertex: wgpu::VertexState { module: &shader, entry_point: "vs", buffers: &[], compilation_options: Default::default() },
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: geometry_depth.then(|| wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader, entry_point: "fs",
@@ -2133,11 +2712,22 @@ impl GpuCtx {
             if full_workload_duration { std::time::Instant::now() } else { start };
         let mut last_idle = workload_start;
         let golden_mode = golden.is_some();
+        // FrameCadence paces itself per frame (sync + gap after every submit below), so the
+        // coarser droop-burst / idle-pulse pacing must not also fire.
+        let frame_cadence = profile == VfWorkload::FrameCadence;
+        // TextureStream renders in scissor bands, one submit each (preemptible + pre-hang
+        // detectable). A stalled band or sustained frame-time collapse fails the dwell as
+        // Unstable BEFORE the driver TDR watchdog can fire.
+        let stream_banded = profile == VfWorkload::TextureStream;
+        let mut stalled = false;
+        let mut stream_frame_ms_total: u64 = 0;
 
         while (workload_start.elapsed().as_millis() as u64) < target_ms
             && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
         {
-            if golden_mode && frames > 0 && frames.is_multiple_of(DROOP_BURST) {
+            if frame_cadence {
+                // paced after submit
+            } else if golden_mode && frames > 0 && frames.is_multiple_of(DROOP_BURST) {
                 self.device.poll(wgpu::Maintain::Wait);
                 std::thread::sleep(std::time::Duration::from_millis(DROOP_GAP_MS));
             } else if !golden_mode && idle_pulses && last_idle.elapsed().as_millis() >= 750 {
@@ -2145,19 +2735,78 @@ impl GpuCtx {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 last_idle = std::time::Instant::now();
             }
+            if stream_banded {
+                let frame_start = std::time::Instant::now();
+                let band_h = DIM / STREAM_BANDS;
+                for band in 0..STREAM_BANDS {
+                    let band_start = std::time::Instant::now();
+                    let mut benc = self.device.create_command_encoder(&Default::default());
+                    {
+                        let mut rp = benc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("render-stream-band"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: if band == 0 {
+                                        wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                                    } else {
+                                        wgpu::LoadOp::Load
+                                    },
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                        rp.set_pipeline(&pipeline);
+                        rp.set_bind_group(0, &tex_bind, &[]);
+                        rp.set_scissor_rect(0, band * band_h, DIM, band_h);
+                        rp.draw(0..vertex_count, 0..instances);
+                    }
+                    self.queue.submit(Some(benc.finish()));
+                    self.device.poll(wgpu::Maintain::Wait);
+                    if (band_start.elapsed().as_millis() as u64) > STREAM_PREHANG_BAND_MS {
+                        stalled = true;
+                    }
+                    if stalled
+                        || self.crashed.load(Ordering::SeqCst)
+                        || cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+                    {
+                        break;
+                    }
+                }
+                stream_frame_ms_total =
+                    stream_frame_ms_total.saturating_add(frame_start.elapsed().as_millis() as u64);
+                if stalled || self.crashed.load(Ordering::SeqCst) {
+                    // Partial frame — never checksum it (a stall is not a wrong result).
+                    break;
+                }
+            }
             let mut enc = self.device.create_command_encoder(&Default::default());
-            {
+            if !stream_banded {
                 let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("render"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                     })],
-                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                    depth_stencil_attachment: depth_view.as_ref().map(|view| {
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }
+                    }),
+                    timestamp_writes: None, occlusion_query_set: None,
                 });
                 rp.set_pipeline(&pipeline);
                 rp.set_bind_group(0, &tex_bind, &[]);
-                rp.draw(0..3, 0..instances);
+                rp.draw(0..vertex_count, 0..instances);
             }
             if golden_mode {
                 enc.copy_texture_to_buffer(
@@ -2190,7 +2839,15 @@ impl GpuCtx {
             // load) polls every 8 submits for the same reason; render frames are far
             // heavier, so bound tighter (every 3). Keeps the GPU saturated (~199 W,
             // game power) while staying safely repeatable across a full sweep.
-            if frames % 3 == 0 {
+            if frame_cadence {
+                // Each frame IS the heavy burst: finish it, then idle a few ms like a
+                // present/vsync gap. The heavy→idle→heavy edge at frame period is the VRM
+                // droop-release transient that kills undervolts in real games.
+                self.device.poll(wgpu::Maintain::Wait);
+                let gap_ms = FRAME_CADENCE_GAPS_MS
+                    [(frames % FRAME_CADENCE_GAPS_MS.len() as u64) as usize];
+                std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+            } else if frames % 3 == 0 {
                 self.device.poll(wgpu::Maintain::Wait);
             }
 
@@ -2254,7 +2911,25 @@ impl GpuCtx {
             }
         }
 
-        let result = render_integrity_result(self.crashed.load(Ordering::SeqCst), diverged);
+        // Marginal-silicon gate: sustained stream frame time far beyond the stock reference means
+        // internal retries/slowdown — reject before it becomes a hang. Requires a few frames so a
+        // single scheduling hiccup cannot fail a healthy bin.
+        let degraded = stream_banded
+            && !stalled
+            && frames >= 4
+            && stream_frame_reference_ms.is_some_and(|reference| {
+                stream_frame_ms_total / frames
+                    > u64::from(reference.max(1)) * STREAM_DEGRADATION_FACTOR
+            });
+        let mut result = render_integrity_result(self.crashed.load(Ordering::SeqCst), diverged);
+        if result == StabilityResult::Stable
+            && (stalled || degraded)
+            && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+        {
+            // Not a wrong result (no divergence) and not a crash — the bin is behaviourally
+            // unstable: a band stalled toward the TDR watchdog or throughput collapsed.
+            result = StabilityResult::Unstable;
+        }
         let secs = start.elapsed().as_secs_f64().max(0.001);
         let phase_reports = phase
             .map(|phase| {
@@ -2519,10 +3194,11 @@ mod tests {
     }
 
     #[test]
-    fn v7_patterns_preserve_duration_and_bias_distinct_failure_modes() {
-        let high_fps = vf_qualifier_plan(60_000, VfQualifierPattern::V7HighFps);
-        let texture = vf_qualifier_plan(60_000, VfQualifierPattern::V7Texture);
-        let transitions = vf_qualifier_plan(60_000, VfQualifierPattern::V7Transitions);
+    fn v8_patterns_preserve_duration_and_bias_distinct_failure_modes() {
+        let high_fps = vf_qualifier_plan(60_000, VfQualifierPattern::V8HighFps);
+        let texture = vf_qualifier_plan(60_000, VfQualifierPattern::V8Texture);
+        let transitions = vf_qualifier_plan(60_000, VfQualifierPattern::V8Transitions);
+        let memory = vf_qualifier_plan(60_000, VfQualifierPattern::V8Memory);
         let required_phases = [
             VfQualifierPhase::PowerOpening,
             VfQualifierPhase::BoostEdge,
@@ -2532,8 +3208,9 @@ mod tests {
             VfQualifierPhase::IdlePulse,
             VfQualifierPhase::MixedGame,
             VfQualifierPhase::PowerClosing,
+            VfQualifierPhase::FrameCadence,
         ];
-        for plan in [&high_fps, &texture, &transitions] {
+        for plan in [&high_fps, &texture, &transitions, &memory] {
             assert_eq!(
                 plan.iter().map(|segment| segment.duration_ms).sum::<u64>(),
                 60_000
@@ -2550,6 +3227,14 @@ mod tests {
                 assert!(plan.iter().any(|segment| segment.phase == required));
             }
         }
+        // Memory is VRAM-dominant; the other three each carry exactly one unit-specific extra.
+        assert!(
+            duration_for_workload(&memory, VfWorkload::VramPressure) > 25_000,
+            "V8Memory must be VRAM-pressure dominant"
+        );
+        assert!(high_fps.iter().any(|s| s.workload == VfWorkload::GeometryDepth));
+        assert!(texture.iter().any(|s| s.workload == VfWorkload::VramPressure));
+        assert!(transitions.iter().any(|s| s.workload == VfWorkload::GeometryDepth));
         let duration_for = |plan: &[VfQualifierSegment], workload| {
             plan.iter()
                 .filter(|segment| segment.workload == workload)
@@ -2571,9 +3256,43 @@ mod tests {
                 .count()
                 >= 5
         );
-        assert_eq!(VfQualifierPattern::V7HighFps.label(), "v7-high-fps");
-        assert_eq!(VfQualifierPattern::V7Texture.label(), "v7-texture");
-        assert_eq!(VfQualifierPattern::V7Transitions.label(), "v7-transitions");
+        assert_eq!(VfQualifierPattern::V8HighFps.label(), "v8-high-fps");
+        assert_eq!(VfQualifierPattern::V8Texture.label(), "v8-texture");
+        assert_eq!(VfQualifierPattern::V8Transitions.label(), "v8-transitions");
+        assert_eq!(VfQualifierPattern::V8Memory.label(), "v8-memory");
+        // v11: Texture and Memory also carry the banded TextureStream phase (severity-last).
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8HighFps), 10);
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Texture), 11);
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Transitions), 10);
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Memory), 12);
+        // Severity ladder: hang-prone detectors sit AFTER the last graceful TextureRop segment.
+        for plan in [&texture, &memory] {
+            let last_texrop = plan
+                .iter()
+                .rposition(|s| s.workload == VfWorkload::TextureRop)
+                .unwrap();
+            let stream = plan
+                .iter()
+                .position(|s| s.workload == VfWorkload::TextureStream)
+                .unwrap();
+            assert!(stream > last_texrop, "TextureStream must run after graceful detectors");
+        }
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::Fsgl1), 8);
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::Fsgl3A), 8);
+        for phase in [
+            VfQualifierPhase::FrameCadence,
+            VfQualifierPhase::VramPressure,
+            VfQualifierPhase::GeometryDepth,
+        ] {
+            assert_eq!(VfQualifierPhase::from_code(phase.code()), Some(phase));
+        }
+    }
+
+    fn duration_for_workload(plan: &[VfQualifierSegment], workload: VfWorkload) -> u64 {
+        plan.iter()
+            .filter(|segment| segment.workload == workload)
+            .map(|segment| segment.duration_ms)
+            .sum()
     }
 
     #[test]

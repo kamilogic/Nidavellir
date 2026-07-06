@@ -124,14 +124,14 @@ const F2_ADAPTIVE_MAX_STRIDE_BINS: usize = 4;
 #[cfg(windows)]
 const F2_ADAPTIVE_MAX_VOLTAGE_DROP_MV: u32 = 25;
 
-/// Relative sustained-clock margin allowed between equivalent v7 qualification passes. A
+/// Relative sustained-clock margin allowed between equivalent v8 qualification passes. A
 /// candidate whose heavy-phase p5 falls farther than this below the median of prior stable
 /// candidates at the same target/pattern has reached the voltage-margin cliff even if it did not
 /// crash. This is policy, not a hardware limit.
 #[cfg(windows)]
 const MARGIN_DROP_TOL_MHZ: u32 = 30;
 
-/// Number of additional attempts after an inconclusive v7 qualification dwell. Coverage
+/// Number of additional attempts after an inconclusive v8 qualification dwell. Coverage
 /// ambiguity is not instability: retry the same physical point, then skip only this clock.
 #[cfg(windows)]
 const INCONCLUSIVE_RETRY_BUDGET: usize = 2;
@@ -2251,7 +2251,7 @@ pub fn confirmed_multi_report_lines(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum F2StressPurpose {
     PowerDiscovery,
-    V7Qualification(F2QualificationPattern, RenderGoldens),
+    V8Qualification(F2QualificationPattern, RenderGoldens),
     ApplyQualification(F2QualificationPattern, RenderGoldens),
 }
 
@@ -2264,23 +2264,27 @@ impl F2StressPurpose {
     fn qualifier_pattern(self) -> Option<VfQualifierPattern> {
         match self {
             F2StressPurpose::PowerDiscovery => None,
-            F2StressPurpose::V7Qualification(F2QualificationPattern::A, _) => {
+            F2StressPurpose::V8Qualification(F2QualificationPattern::A, _) => {
                 Some(VfQualifierPattern::Fsgl3A)
             }
-            F2StressPurpose::V7Qualification(F2QualificationPattern::B, _) => {
+            F2StressPurpose::V8Qualification(F2QualificationPattern::B, _) => {
                 Some(VfQualifierPattern::Fsgl3B)
             }
-            F2StressPurpose::V7Qualification(F2QualificationPattern::HighFps, _)
+            F2StressPurpose::V8Qualification(F2QualificationPattern::HighFps, _)
             | F2StressPurpose::ApplyQualification(F2QualificationPattern::HighFps, _) => {
-                Some(VfQualifierPattern::V7HighFps)
+                Some(VfQualifierPattern::V8HighFps)
             }
-            F2StressPurpose::V7Qualification(F2QualificationPattern::Texture, _)
+            F2StressPurpose::V8Qualification(F2QualificationPattern::Texture, _)
             | F2StressPurpose::ApplyQualification(F2QualificationPattern::Texture, _) => {
-                Some(VfQualifierPattern::V7Texture)
+                Some(VfQualifierPattern::V8Texture)
             }
-            F2StressPurpose::V7Qualification(F2QualificationPattern::Transitions, _)
+            F2StressPurpose::V8Qualification(F2QualificationPattern::Transitions, _)
             | F2StressPurpose::ApplyQualification(F2QualificationPattern::Transitions, _) => {
-                Some(VfQualifierPattern::V7Transitions)
+                Some(VfQualifierPattern::V8Transitions)
+            }
+            F2StressPurpose::V8Qualification(F2QualificationPattern::Memory, _)
+            | F2StressPurpose::ApplyQualification(F2QualificationPattern::Memory, _) => {
+                Some(VfQualifierPattern::V8Memory)
             }
             F2StressPurpose::ApplyQualification(F2QualificationPattern::A, _) => {
                 Some(VfQualifierPattern::Fsgl3A)
@@ -2293,7 +2297,7 @@ impl F2StressPurpose {
 
     fn render_goldens(self) -> Option<RenderGoldens> {
         match self {
-            F2StressPurpose::V7Qualification(_, goldens) => Some(goldens),
+            F2StressPurpose::V8Qualification(_, goldens) => Some(goldens),
             F2StressPurpose::ApplyQualification(_, goldens) => Some(goldens),
             F2StressPurpose::PowerDiscovery => None,
         }
@@ -2339,6 +2343,11 @@ fn classify_f2_stress_dwell(
             .is_some_and(|coverage| coverage.verdict == F2QualificationVerdict::Inconclusive)
     {
         F2DwellOutcome::Inconclusive
+    } else if purpose.is_qualification() && s.prehang_stall_detected {
+        // The sensor sampler starved mid-dwell (the pre-hang signature recorded since v6, now a
+        // verdict): the GPU stopped answering while under the qualifier. The bin is bad — fail
+        // it here instead of letting a deeper bin reach the driver TDR watchdog.
+        F2DwellOutcome::Unstable
     } else if purpose == F2StressPurpose::PowerDiscovery
         && s.p5_clock_mhz + F2_CLOCK_DROP_TOL_MHZ < target_mhz
     {
@@ -2476,7 +2485,7 @@ impl F2Ops for RealF2Ops<'_> {
                         .expect("qualification purpose has a pattern"),
                     purpose
                         .render_goldens()
-                        .expect("v7 qualification purpose has stock goldens"),
+                        .expect("v8 qualification purpose has stock goldens"),
                     self.cancel,
                 )
             }
@@ -3695,7 +3704,7 @@ pub(crate) struct F2ClockDiscoveryProgress {
 
 /// Result of filling one missing exact-Apply-bin PowerRender measurement after the qualified
 /// frontier is complete. This step never promotes stability; it only contributes current-contract
-/// power telemetry. The distinct exact-Apply v7 gate runs after synthesis.
+/// power telemetry. The distinct exact-Apply v8 gate runs after synthesis.
 #[cfg(windows)]
 pub(crate) struct F2PowerCalibrationSummary {
     pub confirmed: bool,
@@ -3706,7 +3715,7 @@ pub(crate) struct F2PowerCalibrationSummary {
     pub logs: Vec<String>,
 }
 
-/// Result of the long v7 three-pattern gate at the exact post-margin Apply pair selected for a profile.
+/// Result of the long v8 three-pattern gate at the exact post-margin Apply pair selected for a profile.
 /// A reset-clean rejection is local to this candidate and lets synthesis choose another point; hard
 /// device/reset/write failures still abort the Forge.
 #[cfg(windows)]
@@ -3815,6 +3824,7 @@ struct F2QualificationMarginHistory {
     high_fps: Vec<u32>,
     texture: Vec<u32>,
     transitions: Vec<u32>,
+    memory: Vec<u32>,
 }
 
 #[cfg(windows)]
@@ -3826,6 +3836,7 @@ impl F2QualificationMarginHistory {
             F2QualificationPattern::HighFps => &self.high_fps,
             F2QualificationPattern::Texture => &self.texture,
             F2QualificationPattern::Transitions => &self.transitions,
+            F2QualificationPattern::Memory => &self.memory,
         }
     }
 
@@ -3836,6 +3847,7 @@ impl F2QualificationMarginHistory {
             F2QualificationPattern::HighFps => self.high_fps.push(p5_mhz),
             F2QualificationPattern::Texture => self.texture.push(p5_mhz),
             F2QualificationPattern::Transitions => self.transitions.push(p5_mhz),
+            F2QualificationPattern::Memory => self.memory.push(p5_mhz),
         }
     }
 }
@@ -3929,7 +3941,7 @@ fn annotate_qualification_report(
     }
 }
 
-/// Run the v7 qualification (`qualification_passes` independent reset/reapply patterns) on ONE
+/// Run the v8 qualification (`qualification_passes` independent reset/reapply patterns) on ONE
 /// already-PowerRender-validated anchored candidate. Each pass uses the proven
 /// arm→write→verify→dwell→reset motor and is persisted immediately as Qualification evidence. Pure
 /// hardware sequencing — all policy (what to do with the result) stays in the caller.
@@ -3983,7 +3995,7 @@ fn qualify_anchored_candidate(
                 baseline_offset_mhz: 0,
                 prev_offset_override_mhz: None,
                 dwell_ms: attempt_dwell_ms,
-                stress_purpose: F2StressPurpose::V7Qualification(pattern, goldens),
+                stress_purpose: F2StressPurpose::V8Qualification(pattern, goldens),
                 cancel: Some(stop),
                 cur: None,
             };
@@ -4000,7 +4012,7 @@ fn qualify_anchored_candidate(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: None,
                 line: format!(
-                    "v7 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
+                    "v8 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
                     qualification_pattern_label(pattern),
                     pass_index,
                     patterns.len(),
@@ -4029,7 +4041,7 @@ fn qualify_anchored_candidate(
                         report.dwell = Some(F2DwellOutcome::ClockDrop);
                         report.validated = false;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV v7 {}: colapso de margem p5={current_p5} MHz (baseline {:?} MHz, tolerância {} MHz)",
+                            "{target_mhz} MHz @ {} mV v8 {}: colapso de margem p5={current_p5} MHz (baseline {:?} MHz, tolerância {} MHz)",
                             candidate.anchor.voltage_mv,
                             qualification_pattern_label(pattern),
                             median_u32(margin_history.values(pattern)),
@@ -4041,7 +4053,7 @@ fn qualify_anchored_candidate(
                 }
             }
             logs.push(format!(
-                "{target_mhz} MHz @ {} mV v7 {} {}/{}: {:?}",
+                "{target_mhz} MHz @ {} mV v8 {} {}/{}: {:?}",
                 candidate.anchor.voltage_mv,
                 qualification_pattern_label(pattern),
                 pass_index,
@@ -4069,7 +4081,7 @@ fn qualify_anchored_candidate(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: Some(format!("{:?}", report.outcome)),
                 line: format!(
-                    "{target_mhz} MHz @ {} mV · v7 {} {}/{} → {:?} · aprendizado salvo",
+                    "{target_mhz} MHz @ {} mV · v8 {} {}/{} → {:?} · aprendizado salvo",
                     candidate.anchor.voltage_mv,
                     qualification_pattern_label(pattern),
                     pass_index,
@@ -4093,7 +4105,7 @@ fn qualify_anchored_candidate(
                     if qualification_should_retry_inconclusive(inconclusive_retries) {
                         inconclusive_retries += 1;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV v7 {} inconclusivo; retentativa {}/{} com dwell ampliado",
+                            "{target_mhz} MHz @ {} mV v8 {} inconclusivo; retentativa {}/{} com dwell ampliado",
                             candidate.anchor.voltage_mv,
                             qualification_pattern_label(pattern),
                             inconclusive_retries,
@@ -4118,18 +4130,15 @@ fn qualification_pattern_label(pattern: F2QualificationPattern) -> &'static str 
         F2QualificationPattern::HighFps => "High-FPS",
         F2QualificationPattern::Texture => "Texture",
         F2QualificationPattern::Transitions => "Transitions",
+        F2QualificationPattern::Memory => "Memory",
     }
 }
 
 #[cfg(windows)]
 fn qualification_gate_patterns(final_gate_passes: usize) -> Vec<F2QualificationPattern> {
-    [
-        F2QualificationPattern::HighFps,
-        F2QualificationPattern::Texture,
-        F2QualificationPattern::Transitions,
-    ]
+    nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS
         .into_iter()
-        .take(final_gate_passes.min(3))
+        .take(final_gate_passes)
         .collect()
 }
 
@@ -4138,9 +4147,9 @@ fn qualification_next_higher_candidate_index(rejected_index: usize) -> Option<us
     rejected_index.checked_sub(1)
 }
 
-/// Run the optional final v7 boundary gate on ONE already-qualified candidate. This does not rediscover the
+/// Run the optional final v8 boundary gate on ONE already-qualified candidate. This does not rediscover the
 /// voltage ladder: a real failure rejects exactly this bin, and the caller moves one physical bin
-/// higher before trying the v7 set again.
+/// higher before trying the v8 set again.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn gate_anchored_candidate_fsgl3(
@@ -4168,7 +4177,7 @@ fn gate_anchored_candidate_fsgl3(
 
     let Some(goldens) = render_goldens else {
         return F2QualificationOutcome::Aborted {
-            stop_reason: "V7GoldenMissing".into(),
+            stop_reason: "V8GoldenMissing".into(),
             retain_boot_flag: false,
         };
     };
@@ -4193,14 +4202,14 @@ fn gate_anchored_candidate_fsgl3(
                 stress_purpose: if exact_apply {
                     F2StressPurpose::ApplyQualification(pattern, goldens)
                 } else {
-                    F2StressPurpose::V7Qualification(pattern, goldens)
+                    F2StressPurpose::V8Qualification(pattern, goldens)
                 },
                 cancel: Some(stop),
                 cur: None,
             };
             if let Err(e) = validation_ops.select(0) {
                 return F2QualificationOutcome::Aborted {
-                    stop_reason: format!("V7PrecheckFailed: {e}"),
+                    stop_reason: format!("V8PrecheckFailed: {e}"),
                     retain_boot_flag: false,
                 };
             }
@@ -4211,7 +4220,7 @@ fn gate_anchored_candidate_fsgl3(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: None,
                 line: format!(
-                    "v7 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
+                    "v8 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
                     qualification_pattern_label(pattern),
                     pass_index,
                     patterns.len(),
@@ -4228,7 +4237,7 @@ fn gate_anchored_candidate_fsgl3(
                 inconclusive_retries as u32,
             );
             logs.push(format!(
-                "{target_mhz} MHz @ {} mV v7 {} {}/{}: {:?}",
+                "{target_mhz} MHz @ {} mV v8 {} {}/{}: {:?}",
                 candidate.anchor.voltage_mv,
                 qualification_pattern_label(pattern),
                 pass_index,
@@ -4256,7 +4265,7 @@ fn gate_anchored_candidate_fsgl3(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: Some(format!("{:?}", report.outcome)),
                 line: format!(
-                    "{target_mhz} MHz @ {} mV · v7 {} {}/{} → {:?} · aprendizado salvo",
+                    "{target_mhz} MHz @ {} mV · v8 {} {}/{} → {:?} · aprendizado salvo",
                     candidate.anchor.voltage_mv,
                     qualification_pattern_label(pattern),
                     pass_index,
@@ -4273,7 +4282,7 @@ fn gate_anchored_candidate_fsgl3(
                             clean_passes_after_inconclusive,
                         ) {
                             logs.push(format!(
-                                "{target_mhz} MHz @ {} mV v7 {}: dívida inconclusiva preservada; exigindo mais um passe limpo consecutivo",
+                                "{target_mhz} MHz @ {} mV v8 {}: dívida inconclusiva preservada; exigindo mais um passe limpo consecutivo",
                                 candidate.anchor.voltage_mv,
                                 qualification_pattern_label(pattern)
                             ));
@@ -4288,7 +4297,7 @@ fn gate_anchored_candidate_fsgl3(
                 | F2Outcome::ApplyFailed(_)
                 | F2Outcome::VerifyFailed => {
                     return F2QualificationOutcome::Aborted {
-                        stop_reason: format!("V7Aborted: {:?}", report.outcome),
+                        stop_reason: format!("V8Aborted: {:?}", report.outcome),
                         retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
                     };
                 }
@@ -4302,7 +4311,7 @@ fn gate_anchored_candidate_fsgl3(
                         inconclusive_retries += 1;
                         clean_passes_after_inconclusive = 0;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV v7 {} inconclusivo; {}",
+                            "{target_mhz} MHz @ {} mV v8 {} inconclusivo; {}",
                             candidate.anchor.voltage_mv,
                             qualification_pattern_label(pattern),
                             if exact_apply {
@@ -4423,7 +4432,10 @@ pub(crate) fn run_confirmed_f2_apply_qualification(
         3,
         3,
         qualification_dwell_ms,
-        3,
+        // The exact-Apply gate must run the COMPLETE required pattern set: the p95/p99 publish
+        // gates demand every pattern, so a shorter list (this was a hardcoded 3) discards a fully
+        // passed soak as "no measurable sustained p95".
+        nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len(),
         render_goldens,
         true,
         stop,
@@ -4814,7 +4826,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         // A same-target v4 boundary may be far enough from stock that replanning directly at the
         // predicted start hits the +15 MHz progression guard. Reuse only the already-compatible
         // historical offset as the writer's cross-run baseline, while still executing fresh
-        // PowerRender + current v7 evidence at every selected bin.
+        // PowerRender + current v8 evidence at every selected bin.
         descent = unpruned_descent.clone();
         descent.start_mv = start_mv;
         if let Some(start_mv) = start_mv {
@@ -4988,7 +5000,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     }
 
     // Qualification evidence context, separate from the Discovery `ctx` used by PowerRender.
-    // The v7 three-pattern set is the default per-candidate qualifier during descent. The optional final gate is kept
+    // The v8 three-pattern set is the default per-candidate qualifier during descent. The optional final gate is kept
     // dormant for now and shares the same boundary shape.
     let mut qual_ctx = ctx.clone();
     qual_ctx.evidence_kind = nidavellir_core::f2_observation::F2EvidenceKind::Qualification;
@@ -5228,7 +5240,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                     near_cap,
                     qualification_passes,
                 ) {
-                    // Standard/Long: qualify THIS bin with all v7 patterns before going any
+                    // Standard/Long: qualify THIS bin with all v8 patterns before going any
                     // deeper. If it passes we descend one real bin lower (next iteration's PowerRender
                     // measures its power and gates the next qualification); if it fails we stop here with
                     // the last qualified bin as the boundary — the heavy qualifier never runs more than
@@ -5280,14 +5292,14 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                                     descent.candidates[safe_index].anchor.offset_mhz;
                                 if let Some(midpoint) = f2_recovery_midpoint(safe_index, i) {
                                     logs.push(format!(
-                                        "{target_mhz} MHz @ {anchor_mv} mV: v7 rejeitou após salto ({reason}); recuperando para cima em {} mV",
+                                        "{target_mhz} MHz @ {anchor_mv} mV: v8 rejeitou após salto ({reason}); recuperando para cima em {} mV",
                                         descent.candidates[midpoint].anchor.voltage_mv
                                     ));
                                     current_index = midpoint;
                                     continue;
                                 }
                             }
-                            // A reset-clean v7 rejection completes only this clock. Even when no
+                            // A reset-clean v8 rejection completes only this clock. Even when no
                             // shallower bin qualified, the outer ladder must continue to a lower
                             // target and discover the real Cmax instead of aborting the whole Forge.
                             completed = qualification_completed;
@@ -5313,7 +5325,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                                     descent.candidates[safe_index].anchor.offset_mhz;
                                 if let Some(midpoint) = f2_recovery_midpoint(safe_index, i) {
                                     logs.push(format!(
-                                        "{target_mhz} MHz @ {anchor_mv} mV: v7 inconclusivo após salto; recuperando para cima em {} mV",
+                                        "{target_mhz} MHz @ {anchor_mv} mV: v8 inconclusivo após salto; recuperando para cima em {} mV",
                                         descent.candidates[midpoint].anchor.voltage_mv
                                     ));
                                     current_index = midpoint;
@@ -5352,7 +5364,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                     && qualification_passes > 0
                 {
                     logs.push(format!(
-                        "{target_mhz} MHz @ {anchor_mv} mV: Validated ainda no cap (p99 {:?} W); v7 adiado e descida continua",
+                        "{target_mhz} MHz @ {anchor_mv} mV: Validated ainda no cap (p99 {:?} W); v8 adiado e descida continua",
                         report.power_p99_w
                     ));
                 }
@@ -5495,23 +5507,23 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 }
                 F2QualificationOutcome::Rejected(reason) => {
                     logs.push(format!(
-                        "{target_mhz} MHz @ {} mV boundary rejected by v7 ({reason})",
+                        "{target_mhz} MHz @ {} mV boundary rejected by v8 ({reason})",
                         candidate.anchor.voltage_mv
                     ));
                     gate_index = qualification_next_higher_candidate_index(idx);
                     if gate_index.is_none() {
                         completed = false;
-                        stop_reason = format!("V7RejectedNoHigherBin: {reason}");
+                        stop_reason = format!("V8RejectedNoHigherBin: {reason}");
                     }
                 }
                 F2QualificationOutcome::Inconclusive => {
                     completed = false;
-                    stop_reason = "V7Inconclusive".into();
+                    stop_reason = "V8Inconclusive".into();
                     break;
                 }
                 F2QualificationOutcome::Cancelled => {
                     completed = false;
-                    stop_reason = "CancelledDuringV7".into();
+                    stop_reason = "CancelledDuringV8".into();
                     break;
                 }
                 F2QualificationOutcome::Aborted {
@@ -5529,7 +5541,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         if let Some(idx) = last_qualified_index {
             let candidate = &descent.candidates[idx];
             logs.push(format!(
-                "{target_mhz} MHz @ {} mV BoundaryAccepted (v7 default)",
+                "{target_mhz} MHz @ {} mV BoundaryAccepted (v8 default)",
                 candidate.anchor.voltage_mv
             ));
         }
@@ -5590,13 +5602,38 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         .collect();
     let next_clock_start_mv =
         f2_optimized_next_clock_start(&planned_voltages, last_good_mv, conservative_start_mv);
-    let has_current_qualification_pass = scoped.iter().any(|observation| {
-        observation.run_id == run_id && is_current_qualification_pass(observation)
-    });
+    // A bin only counts as a warm-start success when the FULL required pattern set passed there.
+    // A single-pattern pass at a bin whose later pattern failed (e.g. High-FPS ok, Texture
+    // SilentError) previously counted as success and suppressed the conservative fallback —
+    // discarding the whole clock when the warm-start prediction overshot the real boundary.
+    let has_current_full_qualification = {
+        use nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS;
+        let mut by_anchor = std::collections::BTreeMap::<
+            u32,
+            [bool; REQUIRED_QUALIFICATION_PATTERNS.len()],
+        >::new();
+        for observation in scoped
+            .iter()
+            .filter(|o| o.run_id == run_id && is_current_qualification_pass(o))
+        {
+            let Some(index) = observation
+                .qualification_coverage
+                .as_ref()
+                .and_then(|coverage| coverage.pattern)
+                .and_then(|pattern| {
+                    REQUIRED_QUALIFICATION_PATTERNS.iter().position(|p| *p == pattern)
+                })
+            else {
+                continue;
+            };
+            by_anchor.entry(observation.anchor_mv).or_default()[index] = true;
+        }
+        by_anchor.values().any(|seen| seen.iter().all(|present| *present))
+    };
     let warm_start_rejected = start_mv.is_some()
         && (refresh_discovery_for_qualification || prior_good_mv.is_none())
         && (if qualification_passes > 0 {
-            !has_current_qualification_pass
+            !has_current_full_qualification
         } else {
             current_run_last_good_mv.is_none()
         })
@@ -5604,7 +5641,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         && !aborted;
     F2ClockDiscoverySummary {
         sustainable: last_good_mv.is_some()
-            && (qualification_passes == 0 || has_current_qualification_pass),
+            && (qualification_passes == 0 || has_current_full_qualification),
         last_good_mv,
         first_bad_mv,
         next_clock_start_mv,
@@ -6211,12 +6248,16 @@ mod tests {
             classify_f2_stress_dwell(
                 &stable_low_p5,
                 1800,
-                F2StressPurpose::V7Qualification(
+                F2StressPurpose::V8Qualification(
                     F2QualificationPattern::A,
                     RenderGoldens {
                         power: 1,
                         boost: 2,
                         texrop: 3,
+                        cadence: 4,
+                        geometry: 5,
+                        stream: 6,
+                        stream_frame_reference_ms: 20,
                     },
                 )
             ),
@@ -6288,6 +6329,10 @@ mod tests {
                         power: 1,
                         boost: 2,
                         texrop: 3,
+                        cadence: 4,
+                        geometry: 5,
+                        stream: 6,
+                        stream_frame_reference_ms: 20,
                     },
                 ),
             ),
@@ -6312,6 +6357,10 @@ mod tests {
                         power: 1,
                         boost: 2,
                         texrop: 3,
+                        cadence: 4,
+                        geometry: 5,
+                        stream: 6,
+                        stream_frame_reference_ms: 20,
                     },
                 ),
             ),
@@ -6346,9 +6395,10 @@ mod tests {
                         phase_pattern: match pattern {
                             F2QualificationPattern::A => "fsgl3-a",
                             F2QualificationPattern::B => "fsgl3-b",
-                            F2QualificationPattern::HighFps => "v7-high-fps",
-                            F2QualificationPattern::Texture => "v7-texture",
-                            F2QualificationPattern::Transitions => "v7-transitions",
+                            F2QualificationPattern::HighFps => "v8-high-fps",
+                            F2QualificationPattern::Texture => "v8-texture",
+                            F2QualificationPattern::Transitions => "v8-transitions",
+                            F2QualificationPattern::Memory => "v8-memory",
                         }
                         .to_string(),
                         duration_ms: 1_000,
@@ -6452,14 +6502,18 @@ mod tests {
             power: 11,
             boost: 22,
             texrop: 33,
+            cadence: 44,
+            geometry: 55,
+            stream: 66,
+            stream_frame_reference_ms: 20,
         };
-        let purpose = F2StressPurpose::V7Qualification(
+        let purpose = F2StressPurpose::V8Qualification(
             F2QualificationPattern::Transitions,
             goldens,
         );
         assert_eq!(
             purpose.qualifier_pattern(),
-            Some(VfQualifierPattern::V7Transitions)
+            Some(VfQualifierPattern::V8Transitions)
         );
         assert_eq!(purpose.render_goldens(), Some(goldens));
     }

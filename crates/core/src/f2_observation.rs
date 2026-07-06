@@ -32,7 +32,23 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 4;
 ///
 /// v7 requires the High-FPS, Texture and Transitions qualification set and reconciles the exact
 /// sustained-p95 electrical regime before a point may be applied.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 7;
+///
+/// v8 adds the FrameCadence phase (game-frame-scale heavy burst / short idle cycling with its own
+/// stock golden) to all three patterns — evidence qualified without it cannot unlock Apply.
+///
+/// v9 adds VRAM-pressure and geometry/depth phases plus the fourth Memory pattern; the complete
+/// qualification set is now HighFps + Texture + Transitions + Memory.
+///
+/// v10 rebuilds the texture path: TextureRop now samples a large VRAM-resident source with a
+/// per-pixel scattered tap chain (TMU + memory controller together, cache-defeating). v9
+/// positives were measured against an L2-resident source and proved optimistic on hardware —
+/// they cannot unlock Apply.
+///
+/// v11 hardens the engine: TextureRop reverts to the L2-resident graceful silent-error detector,
+/// the heavy memory sampling moves to the banded TextureStream phase (pre-hang watchdog +
+/// stock-referenced degradation gate), patterns are severity-ordered, and the pre-hang stall
+/// signal became a failing verdict.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 11;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -67,8 +83,8 @@ pub enum F2QualificationStrength {
     Fsgl4,
 }
 
-/// Deterministic workload pattern. A/B remain readable for legacy observations; v7 deployability
-/// requires HighFps + Texture + Transitions.
+/// Deterministic workload pattern. A/B remain readable for legacy observations; current (v9)
+/// deployability requires the complete [`REQUIRED_QUALIFICATION_PATTERNS`] set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum F2QualificationPattern {
@@ -77,6 +93,21 @@ pub enum F2QualificationPattern {
     HighFps,
     Texture,
     Transitions,
+    Memory,
+}
+
+/// The complete pattern set the current qualification contract requires at a boundary and at the
+/// exact Apply pair. Completeness checks index into this array — extending it automatically
+/// tightens every gate.
+pub const REQUIRED_QUALIFICATION_PATTERNS: [F2QualificationPattern; 4] = [
+    F2QualificationPattern::HighFps,
+    F2QualificationPattern::Texture,
+    F2QualificationPattern::Transitions,
+    F2QualificationPattern::Memory,
+];
+
+fn required_pattern_index(pattern: F2QualificationPattern) -> Option<usize> {
+    REQUIRED_QUALIFICATION_PATTERNS.iter().position(|required| *required == pattern)
 }
 
 /// Per-phase telemetry captured during a qualification dwell. Optional values remain absent when a
@@ -538,12 +569,7 @@ pub fn is_current_apply_qualification_pass(o: &F2Observation) -> bool {
 }
 
 fn is_v7_qualification_pattern(pattern: F2QualificationPattern) -> bool {
-    matches!(
-        pattern,
-        F2QualificationPattern::HighFps
-            | F2QualificationPattern::Texture
-            | F2QualificationPattern::Transitions
-    )
+    required_pattern_index(pattern).is_some()
 }
 
 /// Lowest-voltage stable point proven by the current, homogeneous discovery contract. Negative
@@ -635,11 +661,47 @@ pub fn validated_descent_baseline<'a>(
         .min_by_key(|o| o.anchor_mv)
 }
 
+/// Crash-proximity margin: a synthesized boundary must sit at least this far (≈ two physical VF
+/// bins on modern NVIDIA curves) above the highest crash/TDR anchor observed for the target. A
+/// crash means the silent-error threshold above it went undetected — the immediately adjacent bin
+/// cannot be trusted just because it happened to pass. Generic rule; never derived from any
+/// specific GPU's known points.
+pub const F2_CRASH_PROXIMITY_MIN_MV: u32 = 12;
+
+/// Highest crash/TDR/device-loss anchor recorded for a target, if any. Pure.
+pub fn crash_floor_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<u32> {
+    obs.iter()
+        .filter(|o| {
+            o.target_mhz == target_mhz
+                && (o.device_lost || matches!(o.outcome, F2ObsOutcome::DeviceLost))
+        })
+        .map(|o| o.anchor_mv)
+        .max()
+}
+
 /// Build one learned frontier entry for a target from its observations, or `None` if the target has no
 /// Validated observation. Chooses the LOWEST-voltage validated point (the deepest undervolt) and
-/// annotates it with first-bad / bracket / counts / aggregate confidence. Pure.
+/// annotates it with first-bad / bracket / counts / aggregate confidence, enforcing the
+/// crash-proximity margin ([`F2_CRASH_PROXIMITY_MIN_MV`]). Pure.
 pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<F2FrontierEntry> {
-    let best = last_discovery_good_for_target(obs, target_mhz)?;
+    let crash_floor = crash_floor_for_target(obs, target_mhz);
+    let best = obs
+        .iter()
+        .filter(|o| {
+            o.target_mhz == target_mhz
+                && o.outcome.is_validated()
+                && is_current_discovery_evidence(o)
+        })
+        .filter(|o| {
+            first_bad_for_target(obs, target_mhz)
+                .is_none_or(|bad| o.anchor_mv > bad.anchor_mv)
+        })
+        .filter(|o| {
+            crash_floor.is_none_or(|crash_mv| {
+                o.anchor_mv >= crash_mv.saturating_add(F2_CRASH_PROXIMITY_MIN_MV)
+            })
+        })
+        .min_by_key(|o| o.anchor_mv)?;
     let evidence_at_best: Vec<&F2Observation> = obs
         .iter()
         .filter(|o| {
@@ -649,11 +711,7 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
                 && (is_current_discovery_evidence(o) || is_current_qualification_pass(o))
         })
         .collect();
-    let qualification_count = [
-        F2QualificationPattern::HighFps,
-        F2QualificationPattern::Texture,
-        F2QualificationPattern::Transitions,
-    ]
+    let qualification_count = REQUIRED_QUALIFICATION_PATTERNS
     .into_iter()
     .filter(|pattern| {
         evidence_at_best.iter().any(|o| {
@@ -829,7 +887,10 @@ fn apply_qualification_p99_at_anchor(
     anchor_mv: u32,
     gpu_key: &str,
 ) -> Option<f32> {
-    let mut runs = std::collections::BTreeMap::<&str, (bool, bool, bool, f32)>::new();
+    let mut runs = std::collections::BTreeMap::<
+        &str,
+        ([bool; REQUIRED_QUALIFICATION_PATTERNS.len()], f32),
+    >::new();
     for observation in obs.iter().filter(|o| {
         run_id.is_none_or(|expected| o.run_id == expected)
             && o.target_mhz == target_mhz
@@ -844,23 +905,22 @@ fn apply_qualification_p99_at_anchor(
     }) {
         let entry = runs
             .entry(observation.run_id.as_str())
-            .or_insert((false, false, false, 0.0));
-        match observation
+            .or_insert(([false; REQUIRED_QUALIFICATION_PATTERNS.len()], 0.0));
+        let Some(index) = observation
             .qualification_coverage
             .as_ref()
             .and_then(|coverage| coverage.pattern)
-        {
-            Some(F2QualificationPattern::HighFps) => entry.0 = true,
-            Some(F2QualificationPattern::Texture) => entry.1 = true,
-            Some(F2QualificationPattern::Transitions) => entry.2 = true,
-            _ => continue,
-        }
+            .and_then(required_pattern_index)
+        else {
+            continue;
+        };
+        entry.0[index] = true;
         let power = observation.power_p99_w.unwrap_or(0.0);
-        entry.3 = entry.3.max(power);
+        entry.1 = entry.1.max(power);
     }
     runs.into_values()
-        .filter(|(high_fps, texture, transitions, _)| *high_fps && *texture && *transitions)
-        .map(|(_, _, _, power)| power)
+        .filter(|(seen, _)| seen.iter().all(|present| *present))
+        .map(|(_, power)| power)
         .max_by(f32::total_cmp)
 }
 
@@ -884,9 +944,7 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
     anchor_mv: u32,
     gpu_key: &str,
 ) -> Option<u32> {
-    let mut high_fps = false;
-    let mut texture = false;
-    let mut transitions = false;
+    let mut seen = [false; REQUIRED_QUALIFICATION_PATTERNS.len()];
     let mut highest = 0u32;
     for observation in obs.iter().filter(|o| {
         o.run_id == run_id
@@ -901,19 +959,18 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
         let clock = observation
             .sustained_upper_clock_mhz
             .filter(|clock| *clock > 0)?;
-        match observation
+        let Some(index) = observation
             .qualification_coverage
             .as_ref()
             .and_then(|coverage| coverage.pattern)
-        {
-            Some(F2QualificationPattern::HighFps) => high_fps = true,
-            Some(F2QualificationPattern::Texture) => texture = true,
-            Some(F2QualificationPattern::Transitions) => transitions = true,
-            _ => continue,
-        }
+            .and_then(required_pattern_index)
+        else {
+            continue;
+        };
+        seen[index] = true;
         highest = highest.max(clock);
     }
-    (high_fps && texture && transitions && highest > 0).then_some(highest)
+    (seen.iter().all(|present| *present) && highest > 0).then_some(highest)
 }
 
 /// Highest sustained p99 across every complete current-contract v7 run for one exact Apply pair.
@@ -925,6 +982,30 @@ pub fn highest_apply_qualification_p99_at_anchor(
     gpu_key: &str,
 ) -> Option<f32> {
     apply_qualification_p99_at_anchor(obs, None, target_mhz, anchor_mv, gpu_key)
+}
+
+/// Failure-phase telemetry: counts of qualification dwells that failed inside a named phase,
+/// keyed by `(target_mhz, anchor_mv, pattern, failure_phase)`. This is the data source for
+/// evidence-driven pattern weighting and adaptive apply margins — over time it shows WHICH
+/// stress phase actually predicts instability on this hardware. Pure; counts persisted
+/// evidence only.
+pub fn qualification_failure_histogram(
+    obs: &[F2Observation],
+) -> std::collections::BTreeMap<(u32, u32, String, String), u32> {
+    let mut histogram = std::collections::BTreeMap::new();
+    for observation in obs {
+        let Some(coverage) = observation.qualification_coverage.as_ref() else { continue };
+        // `failure_phase` is recorded only when a phase actually failed.
+        let Some(phase) = coverage.failure_phase.clone() else { continue };
+        let pattern = coverage
+            .pattern
+            .map(|pattern| format!("{pattern:?}"))
+            .unwrap_or_else(|| "legacy".to_string());
+        *histogram
+            .entry((observation.target_mhz, observation.anchor_mv, pattern, phase))
+            .or_insert(0u32) += 1;
+    }
+    histogram
 }
 
 /// Bridge a whole learned frontier to the `(PowerSweepPoint, confidence)` pairing the existing
@@ -1092,6 +1173,7 @@ mod tests {
                 F2QualificationPattern::HighFps => 1,
                 F2QualificationPattern::Texture => 2,
                 F2QualificationPattern::Transitions => 3,
+                F2QualificationPattern::Memory => 4,
             },
             verdict: F2QualificationVerdict::Pass,
             phases_completed: 8,
@@ -1528,6 +1610,12 @@ mod tests {
         transitions.run_id = "apply-v7".into();
         transitions.power_p99_w = Some(173.125);
         transitions.sustained_upper_clock_mhz = Some(1890);
+        let mut memory = apply_qualification_pass(
+            obs(1830, 862, F2ObsOutcome::Validated),
+            F2QualificationPattern::Memory,
+        );
+        memory.run_id = "apply-v7".into();
+        memory.power_p99_w = Some(172.9);
         // Thermal slowdown that ALSO sagged the sustained clock below tolerance stays excluded
         // (fail-closed). The held-clock case (throttle but clock >= target) is trusted now and is
         // covered by `apply_qualification_held_thermal_reading_is_trusted_but_sag_is_excluded`.
@@ -1544,15 +1632,20 @@ mod tests {
         let mut other_run_transitions = transitions.clone();
         other_run_transitions.run_id = "other-run".into();
         other_run_transitions.power_p99_w = Some(191.0);
+        let mut other_run_memory = memory.clone();
+        other_run_memory.run_id = "other-run".into();
+        other_run_memory.power_p99_w = Some(190.5);
 
         let observations = [
             high_fps.clone(),
             texture,
             transitions,
+            memory,
             throttled,
             other_run_high_fps,
             other_run_texture,
             other_run_transitions,
+            other_run_memory,
         ];
         assert_eq!(
             current_apply_qualification_p99_at_anchor(
@@ -1613,6 +1706,7 @@ mod tests {
             held(F2QualificationPattern::HighFps, 199.0),
             held(F2QualificationPattern::Texture, 199.7),
             held(F2QualificationPattern::Transitions, 199.1),
+            held(F2QualificationPattern::Memory, 199.3),
         ];
         assert_eq!(
             current_apply_qualification_p99_at_anchor(&held_set, "held-thermal", 1935, 956, "RTX 4070"),
@@ -1639,6 +1733,62 @@ mod tests {
             None,
             "a thermal slowdown that sagged the clock still fails closed"
         );
+    }
+
+    #[test]
+    fn frontier_boundary_respects_crash_proximity_margin() {
+        // Crash at V taints the adjacent bin: with a device-loss at 906 mV, a validated 912 mV
+        // (one bin up) cannot become the boundary; 918 mV (~two bins) can.
+        let mut crash = obs(1920, 906, F2ObsOutcome::DeviceLost);
+        crash.device_lost = true;
+        let near = obs(1920, 912, F2ObsOutcome::Validated);
+        let clear = obs(1920, 918, F2ObsOutcome::Validated);
+        assert_eq!(crash_floor_for_target(&[crash.clone()], 1920), Some(906));
+        let entry =
+            frontier_entry_for_target(&[crash.clone(), near.clone(), clear], 1920).unwrap();
+        assert_eq!(entry.best_anchor_mv, 918);
+        // Only the tainted bin available -> no boundary at all.
+        assert!(frontier_entry_for_target(&[crash, near], 1920).is_none());
+    }
+
+    #[test]
+    fn failure_histogram_counts_failed_phases_per_point_and_pattern() {
+        let mut fail_a = apply_qualification_pass(
+            obs(1935, 956, F2ObsOutcome::Unstable),
+            F2QualificationPattern::HighFps,
+        );
+        fail_a.qualification_coverage.as_mut().unwrap().failure_phase =
+            Some("frame-cadence".into());
+        let mut fail_b = fail_a.clone();
+        fail_b.qualification_coverage.as_mut().unwrap().failure_phase =
+            Some("frame-cadence".into());
+        let mut fail_other = apply_qualification_pass(
+            obs(1935, 950, F2ObsOutcome::Unstable),
+            F2QualificationPattern::Memory,
+        );
+        fail_other.qualification_coverage.as_mut().unwrap().failure_phase =
+            Some("vram-pressure".into());
+        // A clean pass (no failure_phase) contributes nothing.
+        let clean = apply_qualification_pass(
+            obs(1935, 962, F2ObsOutcome::Validated),
+            F2QualificationPattern::Texture,
+        );
+
+        let histogram =
+            qualification_failure_histogram(&[fail_a, fail_b, fail_other, clean]);
+        assert_eq!(
+            histogram
+                .get(&(1935, 956, "HighFps".into(), "frame-cadence".into()))
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            histogram
+                .get(&(1935, 950, "Memory".into(), "vram-pressure".into()))
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(histogram.len(), 2);
     }
 
     #[test]
