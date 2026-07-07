@@ -314,6 +314,11 @@ pub fn reset(_store: &SafeLoopStore) -> Result<(), String> {
 /// boot-flag is armed (last apply crashed) or Safe Mode is active.
 #[cfg(windows)]
 pub fn reapply_on_boot(store: &SafeLoopStore) {
+    // v13 (audit N1): the NVML clock ceiling is driver-resident and would survive a service
+    // restart WITHOUT a reboot. Release it unconditionally BEFORE the early-return guards so
+    // every service start begins from a known clock-lock state (idempotent; the success branch
+    // re-sets it via the apply below).
+    let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
     if store.is_boot_flag_armed() {
         warn!("GPU apply-on-boot: boot-flag armed (prior crash) — not re-applying");
         if let Err(e) = store.clear_boot_flag() {

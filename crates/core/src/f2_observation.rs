@@ -27,7 +27,12 @@ pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 /// v4 preserves mean, sustained-p99 and sampled-peak power separately, validates suspicious p99
 /// steps with reset-clean repeated dwells, and carries render/voltage telemetry so frontier
 /// decisions and exact apply-margin-bin calibration use confirmed sustained-power evidence.
-pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 4;
+///
+/// v5 (v13 plan): every discovery dwell runs under an absolute NVML max-clock ceiling at the
+/// focus target, so the measured point IS the labeled point (p95 == target; the pre-v5 thermal
+/// curve shift let every pair run +15/+30 MHz above its label). v4 clocks/powers describe
+/// shifted regimes and cannot seed the new frontier.
+pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// Current FailureSeekingGameLoop qualification contract.
 ///
 /// v7 requires the High-FPS, Texture and Transitions qualification set and reconciles the exact
@@ -48,7 +53,12 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 4;
 /// the heavy memory sampling moves to the banded TextureStream phase (pre-hang watchdog +
 /// stock-referenced degradation gate), patterns are severity-ordered, and the pre-hang stall
 /// signal became a failing verdict.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 11;
+///
+/// v12 (v13 plan): every qualification dwell runs under an absolute NVML max-clock ceiling at
+/// the focus target — the qualified point IS the point the hardware exercised (p95 == target).
+/// Pre-v12 positives were exercised +15/+30 MHz above their label by the thermal curve shift
+/// and cannot unlock Apply.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 12;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.

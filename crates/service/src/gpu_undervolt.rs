@@ -101,6 +101,13 @@ const F2_VERIFY_TOL_MHZ: u32 = 15;
 #[cfg(windows)]
 const F2_CLOCK_DROP_TOL_MHZ: u32 = 30;
 
+/// v13: every F2 dwell runs under an absolute NVML max-clock ceiling at the focus target, so the
+/// sustained p95 can never sit above target. One boost bin of slack absorbs clock-counter
+/// quantization; beyond it the ceiling did not hold (driver refusal / NVML failure) and the dwell
+/// evidence does not describe the labeled point.
+#[cfg(windows)]
+const F2_CLOCK_CEILING_TOL_MHZ: u32 = 15;
+
 /// An adjacent PowerRender p99 step larger than both limits is remeasured at the exact same bin.
 /// The absolute floor catches the observed whole-dwell underload, while the relative limit scales
 /// with other board-power classes.
@@ -2318,6 +2325,12 @@ fn classify_f2_stress_dwell(
         F2DwellOutcome::SilentError
     } else if !s.stable {
         F2DwellOutcome::Unstable
+    } else if s.p95_clock_mhz > target_mhz + F2_CLOCK_CEILING_TOL_MHZ {
+        // v13: the dwell ran under an absolute NVML max-clock ceiling at `target`, so a sustained
+        // p95 above target means the ceiling did not hold (driver refusal / silent NVML failure).
+        // The evidence describes a different (higher) point than the label — never Stable and never
+        // boundary knowledge. The GPU itself did nothing wrong, so this is Inconclusive, not Unstable.
+        F2DwellOutcome::Inconclusive
     } else if purpose == F2StressPurpose::PowerDiscovery && s.thermal_throttled {
         // Thermal slowdown corrupts the V↔W power calibration regardless of clock (a throttled
         // sample draws less than the point's real steady-state power), so discovery evidence is
@@ -2403,7 +2416,7 @@ impl F2Ops for RealF2Ops<'_> {
                     prev,
                     &self.limits,
                 )
-                .map(|_| ())
+                .map(|_| ())?
             }
             _ => nidavellir_gpu_nvapi::apply_bounded_positive_offset(
                 &self.curve,
@@ -2412,8 +2425,14 @@ impl F2Ops for RealF2Ops<'_> {
                 prev,
                 &self.limits,
             )
-            .map(|_| ()),
+            .map(|_| ())?,
         }
+        // v13: absolute clock ceiling at the focus target — the VF-curve plateau caps are offsets
+        // relative to a base curve the driver shifts with temperature, so only an NVML locked-clocks
+        // max makes the measured point BE the labeled point (p95 == target). Failure fails the apply
+        // closed: the step motor resets, and the shared reset releases the ceiling.
+        nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(self.target_mhz)
+            .map_err(|e| format!("v13 clock ceiling ({} MHz) failed after VF write: {e}", self.target_mhz))
     }
 
     fn verify(&mut self) -> PositiveOffsetVerification {
@@ -3662,7 +3681,18 @@ pub(crate) fn apply_anchored_undervolt(target_mhz: u32, anchor_mv: u32) -> Resul
         .collect();
     let verdict = crate::gpu_verify::verify_anchored_positive_offset(&plan, &observed, F2_VERIFY_TOL_MHZ);
     if verdict == AnchoredOffsetVerification::AnchoredRaiseVerified {
-        info!("F2 apply: anchored undervolt verified ({target_mhz} MHz @ {anchor_mv} mV bin)");
+        // v13: absolute clock ceiling at the applied target — the plateau caps alone shift with the
+        // driver's thermal curve compensation, so without the ceiling the delivered regime exceeds
+        // the validated point. Fail-closed: no ceiling ⇒ no apply (undo the verified curve too).
+        if let Err(e) = nidavellir_core::nvml_gpu::lock_core_clock_max_mhz(target_mhz) {
+            warn!("F2 apply: v13 clock ceiling failed ({e}) — resetting to stock (fail closed)");
+            let touched: Vec<usize> = plan.entries.iter().map(|e| e.index).collect();
+            return Err(reset_and_confirm(
+                &touched,
+                format!("F2 apply: v13 clock ceiling ({target_mhz} MHz) failed ({e})"),
+            ));
+        }
+        info!("F2 apply: anchored undervolt verified ({target_mhz} MHz @ {anchor_mv} mV bin) + clock ceiling {target_mhz} MHz");
         return Ok(());
     }
 
@@ -6298,9 +6328,10 @@ mod tests {
             crashed: false,
             silent_error: false,
             stable: true,
-            avg_clock_mhz: 1953,
+            // v13: dwells run under the absolute clock ceiling, so p95 never exceeds target.
+            avg_clock_mhz: 1935,
             p5_clock_mhz: 1935,
-            p95_clock_mhz: 1965,
+            p95_clock_mhz: 1935,
             power_w: 199.0,
             max_power_w: 200.0,
             power_p99_w: Some(199.7),

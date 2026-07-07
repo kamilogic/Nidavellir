@@ -2,6 +2,27 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## v13: absolute NVML max-clock ceiling for every F2 dwell AND Apply (2026-07-06)
+- **Problem**: the anchored plateau caps are per-point offsets relative to the base V/F curve, which
+  the driver shifts with temperature — the full 2026-07-06 run measured p5/p95 = label **+15/+30 MHz**
+  on every pair. The delivered regime was ambient-dependent, the calm profile "1770@856" effectively
+  ran ~1800@~856 when cool (operator ground truth: 1800@868 is game-unstable, 1800@875 is the
+  hand-validated point), and the operator's 1800@875 was displaced into an unselected regime rung by
+  the v12 relabeling.
+- **Decision**: set `nvml_gpu::lock_core_clock_max_mhz(target)` (min=210, max=target — the
+  `nvidia-smi -lgc` equivalent, absolute in MHz, immune to the thermal shift) after every verified
+  anchored VF write: in the dwell motor (`RealF2Ops::apply_positive_offset`) and in the one-shot
+  Apply (`apply_anchored_undervolt`). Fail-closed: ceiling failure fails the apply; every reset path
+  already releases the lock (`reset_to_stock`, `gpu_apply::reset`). Measured point == labeled point
+  == applied point. Classifier: sustained p95 > target + 15 ⇒ Inconclusive (ceiling didn't hold —
+  never Stable, never boundary knowledge). The v12 regime lift is REMOVED; the strict p95
+  reconciliation stays as a dormant fail-closed net. Contracts bumped: discovery 4→5,
+  qualification 11→12 (all shifted-regime evidence quarantined; full re-forge required).
+- **Distinct from the rejected pin**: the earlier "no NVML clock pin" decision rejected the RIGID
+  pin (min=max) / voltage lock, which removes power management and TDRs under a power cap. The
+  max-only ceiling keeps full downward elasticity and stays adopted.
+- Plan/gates: `docs/clock-lock-v13-plan.md`.
+
 ## Thermal slowdown disqualifies an exact-Apply dwell only if it dropped the clock (2026-07-04)
 - **Problem**: a full F2 run finished with ZERO applicable profiles. The power-bound top point
   (1935 MHz @ 956 mV, pinned at the 200 W cap) returned `ExactApplyInconclusive`: three HighFPS

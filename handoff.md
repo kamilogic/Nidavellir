@@ -7,9 +7,107 @@ transients, own stock golden) — at the boundary and exact Apply. P5 remains th
 p95 owns the electrical support regime with zero bin tolerance. Stop is cooperative inside GPU loops
 and the UI avoids overlapping polling. Apply still requests 12 mV above the learned boundary, snaps
 to a valid physical VF bin and exposes both values. `finished` means current v8 profiles are
-qualified. **NEXT = supervised v8 hardware gate; Leva 2 remains blocked.** Direction roadmap:
-`docs/qualification-v8-plan.md`.
+qualified. **The supervised v8/v12 hardware gate PASSED on 2026-07-06 (see HW-run checkpoint
+below), but root-cause analysis of the +15/+30 MHz regime overshoot set the next direction:
+v13 absolute clock ceiling — `docs/clock-lock-v13-plan.md`. Leva 2 remains blocked.**
+Earlier roadmap: `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## HW-run checkpoint (2026-07-06) — v12 supervised gate PASSED: 3 profiles published, zero TDR
+- **Run**: full F2 Standard forge, 05:20→09:03 (~3h43). 13 frontier points (1755–1935 MHz),
+  frontier stop correct (next bin 1740 < 90% of Cmax 1935). Forge finished clean; forge_state
+  saved with 13 points.
+- **v12 lift confirmed**: 11 bins lifted; 1800→**875 mV** (the user's hand-validated daily
+  driver) and 1830→**893 mV** — the exact values the v12 plan predicted. Regression gate holds:
+  1815 publishes at 887 (>856) and 1860 at 906 (>875).
+- **v12 4-pattern exact-Apply confirmed**: qualification ran High-FPS+Texture+Transitions+Memory
+  4×5 min. 1905@937 passed the soak but its own v8 set raised p95 to 1935 (needs 950) → refused
+  and resynthesized (designed loop worked); 1860@906 and 1770@856 then ExactApplyQualified.
+- **v11 confirmed**: every failure in the run was a graceful SilentError in `texture-rop`
+  (~12×); zero TDR, zero reboot, no Unstable/pre-hang verdicts needed. Held-clock thermal rule
+  correctly kept thermal_throttled dwells Stable at 66–72 °C while the clock held.
+- **Published**: Godforge 1860 MHz @ 906 mV (regime 1890, p99 185 W) · Brokkr's Best & Deep Calm
+  1770 MHz @ 856 mV (regime 1800, p99 169 W). 1935-at-cap excluded as expected.
+- **SUPERSEDED follow-up (lift ordering → v13)**: 1875@906 was EXCLUDED instead of lifted (the
+  p99-calibration dwell raised its regime AFTER the lift pass). Root-cause analysis with the
+  operator went deeper: the anchored plateau caps are offsets relative to the base curve, which
+  the driver shifts with temperature — EVERY pair in the run measured p5/p95 = label +15/+30 MHz,
+  so the delivered regime is ambient-dependent and the calm profile "1770@856" effectively runs
+  ~1800@~856 when cool (operator ground truth: 1800@868 is game-unstable; 1800@875 is the
+  validated point, and it was displaced into the unselected "1830 regime" rung). **Decision:
+  v13 = absolute NVML max-clock ceiling (`lock_core_clock_max_mhz`) during every F2 dwell AND at
+  Apply; remove the v12 lift; keep reconciliation as a dormant fail-closed net; contract bumps
+  discovery 4→5 / qualification 11→12; full re-forge. Plan: `docs/clock-lock-v13-plan.md`.**
+  NEXT = implement v13 phases A–C, safety audit, then the three supervised HW gates in the plan.
+
+## HW-run checkpoint (2026-07-07) — v13 supervised gate: MECHANISM VALIDATED, profiles pending real-use
+- **Run**: full F2 Standard re-forge, 01:31→05:41 (~4h10). 13 frontier points (1755–1935 MHz),
+  frontier stop correct (1740 < 90% of Cmax 1935). Finished clean; 13 points saved. Zero TDR/reboot.
+- **PRIMARY GATE PASSED**: every stable dwell measured **avg = p5 = p95 = target exactly** (1935/1935/1935
+  … 1770/1770/1770). The v12 +15/+30 MHz thermal-shift overshoot is GONE — the NVML max-clock ceiling
+  holds on driver 595.97. No dwell ever showed p95 > target (Inconclusive gate never needed); early
+  ClockDrops were the real power-bound Cmax search, correct.
+- **Lift removed cleanly**: zero "Regime lift" lines; Apply ladder is honest boundary + one-bin margin
+  (+12/+13 mV). No reconciliation exclusions/cascade.
+- **All failures graceful**: texture-rop SilentError only; 1935@925 ExactApplyRejected (SilentError) →
+  resynth to 1920@918 (designed loop). 1755 warm-start fallback fired correctly.
+- **Published**: Godforge 1920 MHz @ 918 mV (190 W) · Brokkr's 1905 @ 906 (186 W) · Deep Calm
+  1770 @ 825 (158 W). Perf profiles rose vs v12 (1860/1770) because honest boundaries freed real
+  headroom; no 1800 profile this run.
+- **OPEN — the one thing to validate (bigger than usual)**: honest voltages fell far below the
+  operator's Afterburner ground truth (true-1800 boundary 825 / Apply 837, vs the hand-validated
+  "1800@875 stable, 868 unstable"). Expected under the v13 thesis (the old "1800" secretly ran ~1830,
+  which needs more voltage), BUT hinges on whether Afterburner's fixed point is temperature-compensated
+  — unprovable from logs. **Do NOT assume 837 is safe.** Discriminating test = run the exact games/scenes
+  where 1800@868 failed before. Apply margin is now thin (one bin above first silent error); if real
+  games show instability, FIX = raise `APPLY_MARGIN_MV`, do NOT re-introduce the lift.
+- **Real-use validation (2026-07-07, in progress)**: **Brokkr's 1905@906 PASSED** 4 full Overwatch
+  matches + Guild Wars 2 events + BG3 act 3. WATCH: occasional light Discord "micro-hang" cuts —
+  unconfirmed whether GPU-related; could be a transient/pre-hang signature or unrelated. Operator
+  continues testing tomorrow (more Brokkr's + Godforge + Deep Calm). Not yet reproduced/attributed.
+- **v13 committed + pushed (2026-07-07)** at the operator's request — considered a success so far;
+  real-use validation continues before it is declared final.
+- **NEXT (operator, then backend)**: (1) finish real-use validation of all 3 profiles + the
+  discriminating 1800-fail-scene test + in-game ceiling-hold / idle-downclock / reboot(D1) checks;
+  (2) THEN a margin-tuning review for absolute safety — either +1 voltage bin at the same clock, or
+  −1 clock step at the same voltage bin (via `APPLY_MARGIN_MV`, NOT the lift); (3) confirm the
+  algorithm's profile selection is within expectations for Godforge/Brokkr's/Deep Calm
+  (1920@918 / 1905@906 / 1770@825); (4) ONLY AFTER profiles+algorithm are dialed in — begin
+  runtime-optimization work (shorten the ~4 h forge) while preserving discovery/qualification quality.
+
+## Latest backend checkpoint (2026-07-06, night) — v13 IMPLEMENTED: absolute clock ceiling (code-complete, NOT HW-tested)
+- Phases A–C of `docs/clock-lock-v13-plan.md` are in the working tree (NOT committed):
+  1. `RealF2Ops::apply_positive_offset` sets `lock_core_clock_max_mhz(target)` after a successful
+     VF write (both anchored and simple arms) — covers EVERY dwell (discovery, v8 qualification,
+     p99 calibration, exact-Apply). Lock failure ⇒ `ApplyFailed` ⇒ step motor resets (the shared
+     `gpu_power_sweep::reset_to_stock` already released the lock at :4113; `gpu_apply::reset` at
+     :260 likewise — no reset-path change was needed).
+  2. `apply_anchored_undervolt` sets the ceiling after `AnchoredRaiseVerified`; ceiling failure ⇒
+     reset_and_confirm + Err (no apply without ceiling). Covers user Apply + reapply-on-boot.
+  3. Classifier: new `F2_CLOCK_CEILING_TOL_MHZ = 15`; sustained p95 > target + 15 ⇒ Inconclusive
+     (ceiling didn't hold; evidence describes a different point — the GPU did nothing wrong).
+  4. Contracts: `F2_DISCOVERY_CONTRACT_VERSION` 4→5, `F2_QUALIFICATION_CONTRACT_VERSION` 11→12 —
+     ALL pre-v13 evidence (shifted +15/+30 regimes) quarantined; full re-forge required.
+  5. v12 regime lift REMOVED from `apply_f2_margin_policy` (returns no messages);
+     `f2_regime_support` reconciliation + exact-Apply resynthesis KEPT as dormant fail-closed nets.
+     Lift test replaced by `f2_margin_policy_v13_never_lifts_and_reconciliation_refuses_failed_ceiling`.
+- **Validation**: `cargo check --workspace` clean; tests 488/0 (one legacy fixture updated to
+  ceiling-held clocks); clippy baseline-only in touched files. No hardware touched.
+- **Safety audit (2026-07-06)**: `nidavellir-safety-auditor` → **GO with changes**. No blocking
+  issues: no residual-lock exit path, both apply sites fail-closed, classifier ordering correct,
+  contract quarantine holds. **N1 (medium) FIXED**: unconditional `reset_core_clock_lock()` at the
+  top of `reapply_on_boot` (gpu_apply.rs) — the driver-resident lock would otherwise survive a
+  service restart WITHOUT a reboot through the early-return guards (armed flag / Safe Mode / no
+  profile). **N2 (low, deferred)**: `f2_regime_support` uses strict `> target` while the
+  classifier tolerates +15 — only a benign false-REJECT in the 1-bin jitter band; align to
+  `F2_CLOCK_CEILING_TOL_MHZ` only if HW gate (b) shows p95 != target. **D1 (doc)**: the
+  "locks don't survive reboot" premise must be confirmed during gate (c): set lock → reboot →
+  `nvidia-smi -q -d CLOCK` shows stock boost before the service starts.
+- **NEXT**: the three supervised HW gates (plan §D3): (a) manual `nvidia-smi -lgc 210,1800`
+  sanity under load, (b) re-forge Standard with the primary gate "Brokkr's/Deep Calm publish
+  ≈1800@~875", (c) Apply + reboot gate (+ D1 check). Then commit.
+- Minor, log-only: duplicated consecutive `forge_state saved` lines during p99 calibration
+  retries (07:59:24, 08:00:10, 08:00:56) — harmless.
 
 ## Backend fix (2026-07-06, post-commit) — console shutdown handler (committed 6551997)
 - Console mode had no Ctrl+C/close handler: the main thread blocks in `ConnectNamedPipe` and
@@ -21,7 +119,7 @@ Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
   anyway — an armed boot flag is the Safe Loop recovery's designed input. Added
   `Win32_System_Console` feature. Tests 357/0.
 
-## Latest backend checkpoint (2026-07-06, late) — v12: regime LIFT + exact-Apply 4-pattern fix (code-complete, NOT HW-tested)
+## Latest backend checkpoint (2026-07-06, late) — v12: regime LIFT + exact-Apply 4-pattern fix (HW-VALIDATED by the 2026-07-06 run above)
 - **Run finding 1 (bug)**: exact-Apply ran only 3 patterns (`gate_anchored_candidate_fsgl3` was
   called with a hardcoded `final_gate_passes = 3`) while the p95/p99 publish gates require the
   complete 4-pattern set — 1875@925 passed 15 min of soak and was refused as "sem p95 sustentado

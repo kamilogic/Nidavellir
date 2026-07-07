@@ -1432,51 +1432,12 @@ fn apply_f2_margin_policy(
         point.base_apply_mv = Some(apply_mv);
         point.apply_margin_mv = Some(apply_mv.saturating_sub(boundary_mv));
     }
-    // Regime lift: a point anchored at T delivers a sustained clock S above T (boost temperature
-    // compensation), so its real electrical regime is S at this voltage. Instead of EXCLUDING the
-    // candidate (the reconciliation cascade that repeatedly zeroed whole runs), LIFT its Apply bin
-    // to the voltage the sustained regime itself qualified at — pricing the overshoot honestly
-    // with evidence the descent already measured. Requirements come from the base applies
-    // captured above, so one lift can never cascade into another.
-    let mut lift_messages = Vec::new();
-    let lifts: Vec<(usize, u32)> = points
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (point, _))| {
-            let target_mhz = point.target_clock_mhz?;
-            let observed_p95 = point.p95_clock_mhz.filter(|clock| *clock > target_mhz)?;
-            let support_target = points
-                .iter()
-                .filter_map(|(candidate, _)| candidate.target_clock_mhz)
-                .filter(|candidate_target| *candidate_target >= observed_p95)
-                .min()?;
-            let required = points
-                .iter()
-                .filter_map(|(candidate, _)| {
-                    let candidate_target = candidate.target_clock_mhz?;
-                    let base = candidate.base_apply_mv?;
-                    (candidate_target >= target_mhz && candidate_target <= support_target)
-                        .then_some(base)
-                })
-                .max()?;
-            (required > point.vf_table_voltage_mv.unwrap_or(u32::MAX))
-                .then_some((index, required))
-        })
-        .collect();
-    for (index, required) in lifts {
-        let (point, _) = &mut points[index];
-        let target_mhz = point.target_clock_mhz.unwrap_or(point.clock_mhz);
-        let boundary = point.boundary_voltage_mv.unwrap_or(point.voltage_mv);
-        lift_messages.push(format!(
-            "Regime lift: {} MHz sustenta p95 {} MHz — Apply elevado {} mV → {required} mV (tensão qualificada do regime sustentado).",
-            target_mhz,
-            point.p95_clock_mhz.unwrap_or(target_mhz),
-            point.vf_table_voltage_mv.unwrap_or(boundary),
-        ));
-        point.vf_table_voltage_mv = Some(required);
-        point.apply_margin_mv = Some(required.saturating_sub(boundary));
-    }
-    lift_messages
+    // v13: the regime lift was removed. Every dwell now runs under an absolute NVML max-clock
+    // ceiling at its target, so the sustained regime IS the target by construction (p95 == target;
+    // an over-target p95 fails the dwell as Inconclusive). The strict p95 reconciliation
+    // (`f2_regime_support`) stays untouched as a dormant fail-closed net: it can only fire if a
+    // ceiling silently failed, and excluding such a candidate is correct.
+    Vec::new()
 }
 
 #[cfg(windows)]
@@ -6799,10 +6760,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn f2_regime_lift_raises_apply_to_sustained_regime_voltage_without_cascading() {
-        // Overshoot chain: 1650 sustains p95 1665 (regime = 1665's base apply); 1665 sustains
-        // p95 1680. Requirements come from BASE applies, so 1650 lifts to 1665's base — not to
-        // 1665's post-lift value (no cascade). 1680 has no overshoot and stays unlifted.
+    fn f2_margin_policy_v13_never_lifts_and_reconciliation_refuses_failed_ceiling() {
+        // v13: every dwell runs under an absolute NVML clock ceiling, so p95 == target by
+        // construction and the regime lift no longer exists. A p95 above target can only mean the
+        // ceiling silently failed — the dormant reconciliation net must then REFUSE the candidate
+        // (fail closed), never lift it.
         let curve = vec![
             (0, 875, 1600),
             (1, 881, 1610),
@@ -6820,30 +6782,24 @@ mod tests {
             ..Default::default()
         };
         let mut points = vec![
-            (mk(1650, 875, Some(1665)), 0.9),
-            (mk(1665, 881, Some(1680)), 0.9),
-            (mk(1680, 893, Some(1680)), 0.9),
+            (mk(1650, 875, Some(1650)), 0.9), // ceiling held (p95 == target)
+            (mk(1665, 881, Some(1680)), 0.9), // ceiling FAILED (p95 above target)
+            (mk(1680, 893, Some(1680)), 0.9), // ceiling held
         ];
         let messages = apply_f2_margin_policy(&mut points, &curve);
-        // Base applies: 1650 → 887, 1665 → 893, 1680 → 906.
+        assert!(messages.is_empty(), "v13 removed the regime lift");
+        // Applies stay at boundary + margin snapped to a real bin — no lift mutation.
+        assert_eq!(points[0].0.vf_table_voltage_mv, Some(887));
         assert_eq!(points[0].0.base_apply_mv, Some(887));
-        assert_eq!(points[1].0.base_apply_mv, Some(893));
-        assert_eq!(points[2].0.base_apply_mv, Some(906));
-        // Lifts: 1650 → 1665's base (893), NOT 1665's lifted 906; 1665 → 1680's base (906).
-        assert_eq!(points[0].0.vf_table_voltage_mv, Some(893));
-        assert_eq!(points[1].0.vf_table_voltage_mv, Some(906));
+        assert_eq!(points[1].0.vf_table_voltage_mv, Some(893));
         assert_eq!(points[2].0.vf_table_voltage_mv, Some(906));
-        assert_eq!(points[0].0.apply_margin_mv, Some(893 - 875));
-        assert_eq!(messages.len(), 2);
-        // After the lift, the strict regime reconciliation accepts every point (requirements are
-        // base-derived, so lifted points satisfy them and nothing cascades to exclusion).
-        for (point, _) in &points {
-            assert_eq!(
-                f2_regime_candidate_refusal(point, &points, false, 0, 0.0),
-                None,
-                "lifted point must satisfy its own regime requirement"
-            );
-        }
+        // Held-ceiling points pass the dormant net; the failed-ceiling point is refused.
+        assert_eq!(f2_regime_candidate_refusal(&points[0].0, &points, false, 0, 0.0), None);
+        assert_eq!(f2_regime_candidate_refusal(&points[2].0, &points, false, 0, 0.0), None);
+        assert!(
+            f2_regime_candidate_refusal(&points[1].0, &points, false, 0, 0.0).is_some(),
+            "p95 above target (failed ceiling) must be refused, not lifted"
+        );
     }
 
     #[cfg(windows)]
