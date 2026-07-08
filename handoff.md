@@ -13,6 +13,108 @@ v13 absolute clock ceiling — `docs/clock-lock-v13-plan.md`. Leva 2 remains blo
 Earlier roadmap: `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Backend checkpoint (2026-07-08) — v13.3 single-detector descent (code-complete, NOT HW-tested)
+- The 2026-07-08 run confirmed Texture is ALWAYS the binding detector, so the descent no longer runs
+  the full set per bin. New `const F2_DESCENT_DETECTOR_PASSES = 1`; Standard/Long
+  `qualification_passes = 1` → `qualify_anchored_candidate` runs ONLY the first pattern (Texture) per
+  bin to find the boundary. Cuts descent from 4 dwells/bin (1 p99 + 3 v8) to 2 (1 p99 + 1 Texture) —
+  roughly HALVES the descent again (est. ~2h → ~1h).
+- **Deployment guarantee UNCHANGED**: the exact-Apply gate (`run_confirmed_f2_apply_qualification`)
+  still runs the COMPLETE `REQUIRED_QUALIFICATION_PATTERNS` (3) on the applied point, independent of
+  `qualification_passes`; both publish gates (reconciliation loop's `apply_qualified` +
+  `f2_profiles_meet_qualification`'s `f2_profile_points_have_current_apply_qualification`) require it.
+  A Texture-only boundary that another pattern would fail above is caught at exact-Apply → the pair
+  is EXCLUDED and the loop re-synthesizes from the remaining eligible points (may pick a different
+  point, or block Apply if <3 form) — never publishes the unqualified point.
+- `required_confirmations` (boundary gate) now = 1, consistent with the 1-pattern descent.
+  `f2_apply_upper_estimate_ms` + the in-loop ETA decoupled to `REQUIRED_QUALIFICATION_PATTERNS.len()`
+  so the exact-Apply ETA stays correct (3). Validation: core 80/0, service 359/0, clippy clean.
+- **Safety audit (2026-07-08): GO**, no blocking issues — deployment gate verified intact 3× (exact-
+  Apply hardcodes `REQUIRED_QUALIFICATION_PATTERNS.len()` independent of `qualification_passes`; both
+  publish gates + the `--confirm` hardware-apply gate require `apply_qualified`+current version).
+  Applied the audit's cheap fixes: in-loop ETA under-count (concern #3) + a decoupling regression test
+  (concern #2, locks descent-passes ≠ exact-Apply-passes). **Standing caveat (concern #1)**: the
+  single-detector's conservatism RESTS on "Texture is always the binding detector" — HW-confirmed on
+  THIS rig only (3 runs). On a different card (e.g. VRAM-weaker where Memory could bind first) a
+  Texture-only boundary could ship with thinner margin (still 3-pattern-qualified, never unstable).
+  **Do not generalize to other GPUs without a fresh audit / spot-check of a non-Texture pattern at the
+  boundary.** If `REQUIRED_QUALIFICATION_PATTERNS[0]` ever changes, the descent silently follows it.
+- **READY for the supervised re-forge** — expect ~1h, Godforge off-cap ≈1905, every descent failure
+  `texture-rop`, 3 profiles published.
+
+## HW-run checkpoint (2026-07-08) — time crushed + single-detector CONFIRMED, but a stale-const bug published ZERO profiles (FIXED)
+- **Run**: 00:09→02:05 = **~1h56** (was ~4h10). High-FPS removal + Texture-first delivered the time cut.
+- **Single-detector premise CONFIRMED**: EVERY descent failure this run was `texture-rop` (SilentError);
+  Transitions/Memory never failed first. Safe to build the single-detector descent next.
+- **v13 ceiling re-confirmed**: p5=p95=target on every dwell. No TDR.
+- **BUG (regression, now FIXED): zero profiles.** `PowerSweepMode::Standard/Long` had a hardcoded
+  `qualification_passes: 4` (gpu_power_sweep.rs:268/275). After HighFps was dropped the required set is
+  3, so `qualify_anchored_candidate` ran 3 (take(4) saturates) but `required_confirmations =
+  final_gate_passes.max(qualification_passes) = 4`, so `f2_boundary_point_is_qualified` demanded
+  validation_count≥4 while the frontier could only reach 3 → `f2_regime_candidate_refusal` excluded ALL
+  13 with "its own frontier boundary lacks current v8 qualification" → "nenhum candidato permaneceu".
+  FIX: `qualification_passes` now ties to `REQUIRED_QUALIFICATION_PATTERNS.len()` (Standard+Long) so it
+  can never desync again. Time-estimate tests recomputed (3 passes: target 210s, apply pair 915s,
+  3-pair 2745s). Validation: core 80/0, service 359/0. Off-cap gate was NOT exercised (run died before
+  synthesis) — next run validates it end-to-end.
+- **Boundaries still ~optimistic vs golden**: 1800 boundary 825 → Apply 837 (golden 1800@875). The
+  single-detector didn't move boundaries (Texture was always the binding detector). Q3 silicon-margin
+  bump still pending — calibrate against the NEXT run's in-game results, don't guess now.
+- **Operator request (frontend/Codex)**: a "Export full log" button (richer than console prints). Note
+  in `docs/contracts/ui-backend.md` later; not backend work.
+
+## Backend checkpoint (2026-07-07, later) — v13.2 High-FPS removed + Texture-first (efficiency; code-complete, NOT HW-tested)
+- Q2 + time: across two full HW runs High-FPS was NEVER the binding detector (every boundary/Apply
+  rejection fired in `texture-rop`). `REQUIRED_QUALIFICATION_PATTERNS` is now **3**:
+  Texture (binding, graceful → runs FIRST so a failing bin fails after ONE dwell) + Transitions +
+  Memory (VRAM-dominant, hang-prone → LAST). HighFps enum variant + workload kept (repurposable),
+  just not required. `F2_QUALIFICATION_CONTRACT_VERSION` 12 → **13** (different pattern set →
+  pre-v13 evidence quarantined; re-forge regenerates anyway).
+- Time impact (est., confirm on re-forge): descent drops one 60 s dwell per PASSING bin (~25%) and a
+  failing boundary bin now fails after 1×60 s not 2; exact-Apply drops one 300 s dwell per pair
+  (−5 min × up to 3 pairs). Rough ~4h → ~3h. Array `.len()` auto-propagates to every completeness
+  gate, so no gate logic changed. Validation: core 80/0, service 359/0, clippy clean.
+- **Q1 DONE (better peak measurement)**: `is_off_cap_safe` now gates on
+  `max(max_power_w, power_p99_w)` — the boundary-bin discovery peak alone underestimated the applied
+  draw (measured at the LOWER boundary voltage); `power_p99_w` is the apply-bin calibrated p99 (the
+  same value scoring uses, at the APPLIED voltage). Taking the higher of the two + 6% headroom is the
+  conservative basis. This only ever RAISES the estimate → strictly MORE conservative than the
+  audited v13.1 gate (safety-positive, no re-audit needed; excludes ≥ as many points, never fewer).
+  Unknown power (both absent) still fails closed. Validation: service 359/0, clippy clean.
+- STILL PENDING: **bigger time lever** = descent runs ONLY the binding detector (Texture) per bin,
+  full 3-set only at exact-Apply (needs its own safety audit) — could roughly halve the run again.
+  True worst-case BURST workload only if the re-forge shows a published point still exceeds the gate
+  in-game (the apply-bin p99 basis should now catch the at-cap points).
+
+## Backend checkpoint (2026-07-07, later) — v13.1 off-cap power invariant (code-complete, NOT HW-tested)
+- Root cause of the Godforge 1920@918 TDR: an undervolt held AT the power cap is forced by the driver
+  to droop voltage below its Vmin → crash. `synthesize_forge_profiles_capped` (gpu_power_sweep.rs)
+  now excludes from ALL three profiles any point whose measured PEAK power (`max_power_w`, NOT p99)
+  reaches within `POWER_HEADROOM_FRAC = 6%` of the cap. Godforge = highest OFF-CAP clock. Uses the
+  already-measured peak + the live cap (`prog.power_limit_w`); on the run's data (1920 peak ~190 W,
+  ceiling 188 W @ 200 W cap) 1920@918 is excluded and 1905@906 (186 W) becomes Godforge — matches the
+  operator's expectation, no heavier workload needed for this case.
+- 2-arg `synthesize_forge_profiles` kept as a no-op-gate wrapper (cap unknown → fail-open) so every
+  test/bridge caller is unchanged; only the live F2 path calls `_capped` with the cap.
+- **If EVERY qualified point is at-cap, the gate fails CLOSED** (publishes no profiles → Apply stays
+  blocked) rather than ship a TDR-prone at-cap profile — honors the operator's hard off-cap invariant.
+  Zero/unknown peak with a known cap also fails closed (cannot prove headroom).
+- **Safety audit (2026-07-07): GO**, no blocking issues (pure additive exclusion — can only lower
+  Godforge / remove points, never more aggressive; no panic; reconciliation loop still terminates).
+  The audit's top concern (empty-pool fail-OPEN re-exposing at-cap) was FIXED to fail-closed above.
+  Documented residuals, low real-risk on the live path: (a) `to_power_sweep_point` falls
+  `max_watts`→`watts` (mean) if peak missing — live path always populates `max_watts`
+  (gpu_f2_sweep.rs:126 ← gpu_undervolt.rs:1708); (b) classifier-bridge preview (gpu_power_sweep.rs
+  ~2133) still uses the no-op wrapper so its Godforge preview may read the at-cap clock (read-only,
+  never applied); (c) 6% headroom is single-run-derived (tunable); (d) cap read once at forge start.
+- Validation: service 359/0 (+`f2_off_cap_gate_excludes_at_cap_godforge`,
+  `f2_off_cap_gate_fails_closed_when_all_at_cap`); clippy clean on new code.
+- Deliberately NOT in this change (future, if needed): worst-case power BURST + cap-slam resilience
+  dwell (only if the peak-vs-game gap ever exceeds the 6% headroom); silicon-margin bump to the golden
+  1800@875; thermal-saturation soak repurposing High-FPS; failure histogram wiring.
+- NEXT: `nidavellir-safety-auditor` on this diff, then supervised re-forge — gate: Godforge lands
+  OFF-CAP (≈1905, not 1920), log shows "off-cap gate excluded", no in-game TDR.
+
 ## HW-run checkpoint (2026-07-06) — v12 supervised gate PASSED: 3 profiles published, zero TDR
 - **Run**: full F2 Standard forge, 05:20→09:03 (~3h43). 13 frontier points (1755–1935 MHz),
   frontier stop correct (next bin 1740 < 90% of Cmax 1935). Forge finished clean; forge_state
@@ -65,6 +167,18 @@ Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
   matches + Guild Wars 2 events + BG3 act 3. WATCH: occasional light Discord "micro-hang" cuts —
   unconfirmed whether GPU-related; could be a transient/pre-hang signature or unrelated. Operator
   continues testing tomorrow (more Brokkr's + Godforge + Deep Calm). Not yet reproduced/attributed.
+- **CRITICAL HW finding (2026-07-07)**: **Godforge 1920@918 TDR'd (Render Device Lost) after ~20 min
+  looping the Overwatch benchmark.** It is the POWER-BOUND top point: measured ~195 W avg, touched
+  199 W / ~200 W peak; clock momentarily dropped to 1905 then re-stabilized at 1920 — oscillating at
+  the 200 W cap, and a transient there killed it. Root cause = soak fidelity insufficient at the
+  at-cap top: the 4×5 min exact-Apply (with stock resets between patterns) never reproduces continuous
+  20-min thermal saturation + cap-slamming transients. Profiles judged "acceptable but unstable — best
+  distribution so far."
+- **Calibration signal (operator ground truth)**: the whole frontier is ~1–2 physical bins optimistic
+  vs real-game reliability. Golden = 1800@875 stable. Operator expects roughly Deep Calm ~1755@837,
+  Brokkr's ~1875+@906, Godforge ~1905@918 (1905 = last OFF-CAP clock, near a sustained undervolted
+  boost — the ideal Godforge). 1770@825 is expected UNSTABLE. Direction under discussion (see below):
+  regime-aware margin + thermal-saturation soak + Godforge=highest-off-cap; NOT yet implemented.
 - **v13 committed + pushed (2026-07-07)** at the operator's request — considered a success so far;
   real-use validation continues before it is declared final.
 - **NEXT (operator, then backend)**: (1) finish real-use validation of all 3 profiles + the

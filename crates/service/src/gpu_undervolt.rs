@@ -6499,14 +6499,14 @@ mod tests {
         assert_eq!(
             qualification_gate_patterns(3),
             vec![
-                F2QualificationPattern::HighFps,
                 F2QualificationPattern::Texture,
                 F2QualificationPattern::Transitions,
+                F2QualificationPattern::Memory,
             ]
         );
         assert_eq!(
             qualification_gate_patterns(1),
-            vec![F2QualificationPattern::HighFps]
+            vec![F2QualificationPattern::Texture]
         );
         assert_eq!(qualification_next_higher_candidate_index(3), Some(2));
         assert_eq!(qualification_next_higher_candidate_index(0), None);

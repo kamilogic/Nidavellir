@@ -58,7 +58,13 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// the focus target — the qualified point IS the point the hardware exercised (p95 == target).
 /// Pre-v12 positives were exercised +15/+30 MHz above their label by the thermal curve shift
 /// and cannot unlock Apply.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 12;
+///
+/// v13 (efficiency): HighFps dropped from the required set. Across two full HW runs it was never
+/// the binding detector — every boundary and Apply rejection fired in Texture (texture-rop). The set
+/// is now Texture (binding, graceful — runs FIRST so a failing bin fails after one dwell) +
+/// Transitions + Memory (VRAM-dominant, hang-prone — runs LAST). Cuts one 60 s dwell per descent
+/// bin and one 300 s dwell per Apply pair. Pre-v13 evidence used a different pattern set → quarantined.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 13;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -109,8 +115,9 @@ pub enum F2QualificationPattern {
 /// The complete pattern set the current qualification contract requires at a boundary and at the
 /// exact Apply pair. Completeness checks index into this array — extending it automatically
 /// tightens every gate.
-pub const REQUIRED_QUALIFICATION_PATTERNS: [F2QualificationPattern; 4] = [
-    F2QualificationPattern::HighFps,
+/// v13: Texture FIRST (the empirically-binding graceful silent-error detector — a failing bin fails
+/// after one dwell), Memory LAST (VRAM-dominant, hang-prone). HighFps was removed (never binding).
+pub const REQUIRED_QUALIFICATION_PATTERNS: [F2QualificationPattern; 3] = [
     F2QualificationPattern::Texture,
     F2QualificationPattern::Transitions,
     F2QualificationPattern::Memory,
@@ -1164,7 +1171,7 @@ mod tests {
     }
 
     fn qualification_pass(o: F2Observation) -> F2Observation {
-        qualification_pass_with_pattern(o, F2QualificationPattern::HighFps)
+        qualification_pass_with_pattern(o, F2QualificationPattern::Texture)
     }
 
     fn qualification_pass_with_pattern(
@@ -1474,22 +1481,22 @@ mod tests {
     #[test]
     fn learned_frontier_counts_distinct_v7_patterns() {
         let discovery = obs(1800, 962, F2ObsOutcome::Validated);
-        let high_fps_1 =
-            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::HighFps);
-        let high_fps_2 =
-            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::HighFps);
-        let only_high_fps =
-            frontier_entry_for_target(&[discovery.clone(), high_fps_1, high_fps_2], 1800).unwrap();
-        assert_eq!(only_high_fps.validation_count, 1);
+        let texture_1 =
+            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::Texture);
+        let texture_2 =
+            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::Texture);
+        let only_one =
+            frontier_entry_for_target(&[discovery.clone(), texture_1, texture_2], 1800).unwrap();
+        assert_eq!(only_one.validation_count, 1);
 
-        let high_fps =
-            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::HighFps);
         let texture =
             qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::Texture);
         let transitions =
             qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::Transitions);
+        let memory =
+            qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::Memory);
         let complete =
-            frontier_entry_for_target(&[discovery, high_fps, texture, transitions], 1800).unwrap();
+            frontier_entry_for_target(&[discovery, texture, transitions, memory], 1800).unwrap();
         assert_eq!(complete.validation_count, 3);
     }
 
@@ -1498,7 +1505,7 @@ mod tests {
         let discovery = obs(1800, 881, F2ObsOutcome::Validated);
         let apply_pass = apply_qualification_pass(
             obs(1800, 893, F2ObsOutcome::Validated),
-            F2QualificationPattern::HighFps,
+            F2QualificationPattern::Transitions,
         );
         assert!(is_current_apply_qualification_pass(&apply_pass));
         assert!(!is_current_qualification_pass(&apply_pass));

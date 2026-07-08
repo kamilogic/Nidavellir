@@ -265,14 +265,14 @@ impl PowerSweepMode {
             PowerSweepMode::Standard => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
                 qualification_dwell_ms: 60_000,
-                qualification_passes: 4,
+                qualification_passes: F2_DESCENT_DETECTOR_PASSES,
                 final_gate_dwell_ms: 0,
                 final_gate_passes: 0,
             },
             PowerSweepMode::Long => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
                 qualification_dwell_ms: 60_000,
-                qualification_passes: 4,
+                qualification_passes: F2_DESCENT_DETECTOR_PASSES,
                 final_gate_dwell_ms: 0,
                 final_gate_passes: 0,
             },
@@ -289,6 +289,19 @@ struct F2ForgeModePolicy {
     final_gate_dwell_ms: u64,
     final_gate_passes: usize,
 }
+
+/// v13 single-detector descent: during the per-bin descent, run ONLY the binding detector — the
+/// FIRST pattern in `REQUIRED_QUALIFICATION_PATTERNS` (Texture, the empirically-most-sensitive graceful
+/// silent-error detector, confirmed across 3 HW runs to always fail first). This finds the boundary in
+/// one qualification dwell per bin instead of the full set, ~halving the descent (the bulk of the run).
+/// It ALSO sets the boundary-reconciliation confirmation count (`f2_required_qualification_passes`), so
+/// the two always agree. The DEPLOYMENT guarantee is UNCHANGED: the exact-Apply gate
+/// (`run_confirmed_f2_apply_qualification`) still runs the COMPLETE `REQUIRED_QUALIFICATION_PATTERNS`
+/// set on the applied point, and both publish gates (`f2_profile_points_have_current_apply_qualification`)
+/// require that full pass — a Texture-only boundary that another pattern would fail above is caught at
+/// exact-Apply, which excludes the pair and the loop re-synthesizes a higher bin.
+#[cfg(windows)]
+const F2_DESCENT_DETECTOR_PASSES: usize = 1;
 
 #[cfg(windows)]
 fn f2_required_qualification_passes(policy: F2ForgeModePolicy) -> usize {
@@ -2182,6 +2195,37 @@ fn is_power_bound_point(p: &PowerSweepPoint) -> bool {
     is_power_bound_frac(p.power_capped_frac)
 }
 
+/// v13.1 off-cap headroom: a published undervolt point's measured PEAK power must stay this fraction
+/// below the power cap. An undervolt that reaches the cap is forced by the driver to droop voltage to
+/// respect the power budget, and a droop below the point's Vmin crashes — this is what TDR'd Godforge
+/// 1920@918 in-game at ~200 W while its dwell read only ~190 W. The fraction covers that measured
+/// peak vs real-game gap PLUS the µs transients NVML polling cannot see.
+#[cfg(windows)]
+const POWER_HEADROOM_FRAC: f32 = 0.06;
+
+/// The maximum measured PEAK power a point may draw and still count as off-cap.
+#[cfg(windows)]
+fn off_cap_ceiling_w(power_limit_w: f32) -> f32 {
+    power_limit_w * (1.0 - POWER_HEADROOM_FRAC)
+}
+
+/// True iff a point's estimated draw keeps `POWER_HEADROOM_FRAC` below the cap. The estimate is the
+/// MAX of two measurements, because neither alone is a clean upper bound on the applied point's power:
+/// `max_power_w` is a true PEAK but measured at the lower BOUNDARY voltage (so it underestimates the
+/// applied draw), while `power_p99_w` is only a p99 but measured at the exact APPLY voltage (the same
+/// value scoring uses). Whichever is higher is the safe basis; the 6% headroom then covers the
+/// p99→peak and NVML-invisible µs-transient gap. `power_limit_w <= 0` (unknown cap: bridge / legacy /
+/// test) fails OPEN so the gate is a no-op. A point with NO usable power measurement cannot prove
+/// headroom, so it fails CLOSED when the cap is known. Pure + testable.
+#[cfg(windows)]
+fn is_off_cap_safe(p: &PowerSweepPoint, power_limit_w: f32) -> bool {
+    if power_limit_w <= 0.0 {
+        return true;
+    }
+    let estimated_w = p.max_power_w.max(p.power_p99_w.unwrap_or(0.0));
+    estimated_w.is_finite() && estimated_w > 0.0 && estimated_w <= off_cap_ceiling_w(power_limit_w)
+}
+
 /// The frontier points that carry real clock-frontier information (NOT power-bound). Pure.
 #[cfg(windows)]
 fn useful_frontier_points(frontier: &[(PowerSweepPoint, f64)]) -> Vec<(PowerSweepPoint, f64)> {
@@ -2324,8 +2368,21 @@ fn phase_b_start_below(descent: &FrontierDescent, phase_a_floor_mv: u32) -> Opti
     descent.bins_desc.iter().copied().filter(|&b| b < phase_a_floor_mv).max()
 }
 
+/// Back-compat 2-arg entry (cap unknown → the off-cap gate is a no-op). The live F2 forge calls
+/// [`synthesize_forge_profiles_capped`] with the measured power cap so at-cap points are excluded.
+#[cfg(windows)]
+#[allow(dead_code)]
+fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &ForgePolicy,
+) -> ForgeProfiles {
+    synthesize_forge_profiles_capped(frontier, policy, 0.0)
+}
+
 /// Synthesize the three forge profiles from a (multi-clock) power frontier — each entry
 /// a measured operating point plus its accumulated stability confidence (Wilson LB):
+/// Every published point must ALSO be off-cap (v13.1): its measured PEAK power must keep
+/// `POWER_HEADROOM_FRAC` below `power_limit_w` (the cap). An at-cap undervolt droops voltage below
+/// its Vmin under the power budget and crashes. `power_limit_w <= 0` skips the gate (bridge/test).
+///
 /// - **Godforge**  = highest SUSTAINED clock (performance); ties → lowest power.
 /// - **Brokkr's**  = best benefit/cost `R = %power_saved ÷ %clock_lost` vs Godforge,
 ///   among points that keep ≥ `policy.brokkrs_min_clock_frac` of Godforge's clock
@@ -2342,7 +2399,8 @@ fn phase_b_start_below(descent: &FrontierDescent, phase_a_floor_mv: u32) -> Opti
 /// feeds it is produced by F1b Phase 2.
 #[cfg(windows)]
 #[allow(dead_code)] // wired into the live sweep by F1b Phase 2 (multi-clock measurement)
-fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &ForgePolicy,
+fn synthesize_forge_profiles_capped(frontier: &[(PowerSweepPoint, f64)], policy: &ForgePolicy,
+    power_limit_w: f32,
 ) -> ForgeProfiles {
     use std::cmp::Ordering as Ord;
     let mut log = Vec::new();
@@ -2401,6 +2459,44 @@ fn synthesize_forge_profiles(frontier: &[(PowerSweepPoint, f64)], policy: &Forge
             power_bound_excluded, power_bound_collapse, log,
         };
     }
+
+    // ── Off-cap power invariant (v13.1) ──────────────────────────────────────────────────────────
+    // Exclude any point whose estimated draw (peak, or apply-bin p99 — whichever is higher) reaches
+    // within POWER_HEADROOM_FRAC of the cap: an undervolt held at the cap is forced to droop voltage
+    // below its Vmin and crashes (Godforge
+    // 1920@918 TDR'd in-game at the 200 W cap). Applies to ALL three profiles. If EVERY point is
+    // at-cap the gate fails CLOSED (publishes nothing → Apply blocked) — never ships a TDR-prone
+    // profile. No-op when the cap is unknown (`power_limit_w <= 0`).
+    let pool: Vec<(PowerSweepPoint, f64)> = if power_limit_w > 0.0 {
+        let off_cap: Vec<(PowerSweepPoint, f64)> =
+            pool.iter().copied().filter(|(p, _)| is_off_cap_safe(p, power_limit_w)).collect();
+        let excluded = pool.len() - off_cap.len();
+        if off_cap.is_empty() {
+            // Hard off-cap invariant: EVERY qualified point reaches the cap → no safe undervolt
+            // exists at any qualified clock. Fail CLOSED (publish nothing → Apply stays blocked)
+            // rather than ship a TDR-prone at-cap profile: an undervolt held at the cap is forced to
+            // droop voltage below its Vmin and crashes (the Godforge 1920@918 failure).
+            log.push(format!(
+                "FORGE: off-cap gate — ALL {} qualified point(s) reach within {:.0}% of the {:.0} W \
+                 cap; no off-cap profile can be published — Apply stays blocked (fail-closed)",
+                pool.len(), POWER_HEADROOM_FRAC * 100.0, power_limit_w
+            ));
+            return ForgeProfiles {
+                godforge: None, brokkrs: None, deep_calm: None,
+                power_bound_excluded, power_bound_collapse, log,
+            };
+        }
+        if excluded > 0 {
+            log.push(format!(
+                "FORGE: off-cap gate excluded {excluded} at-cap point(s) (peak > {:.0} W = {:.0}% \
+                 of {:.0} W cap) from all profiles",
+                off_cap_ceiling_w(power_limit_w), (1.0 - POWER_HEADROOM_FRAC) * 100.0, power_limit_w
+            ));
+        }
+        off_cap
+    } else {
+        pool
+    };
 
     // Sustained clock = p5 when available (dip-aware), else average (legacy fallback).
     let sustained = |p: &PowerSweepPoint| p.p5_clock_mhz.unwrap_or(p.clock_mhz);
@@ -5287,13 +5383,16 @@ fn f2_calibration_upper_estimate_ms(
 
 #[cfg(windows)]
 fn f2_apply_upper_estimate_ms(pair_count: usize, policy: F2ForgeModePolicy) -> u64 {
+    // Fast (no qualification) skips exact-Apply entirely. Otherwise every pair runs the COMPLETE
+    // pattern set at exact-Apply — REQUIRED_QUALIFICATION_PATTERNS.len(), NOT the single-detector
+    // descent count — so the ETA reflects the real deployment gate.
     if f2_required_qualification_passes(policy) == 0 {
         return 0;
     }
     u64::try_from(pair_count)
         .unwrap_or(u64::MAX)
         .saturating_mul(
-            u64::try_from(f2_required_qualification_passes(policy))
+            u64::try_from(nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len())
                 .unwrap_or(u64::MAX),
         )
         .saturating_mul(F2_APPLY_QUALIFICATION_DWELL_MS.saturating_add(PROBE_OVERHEAD_MS))
@@ -6249,7 +6348,7 @@ fn measure_multiclock_undervolt_forge(
                     break;
                 }
                 let profiles =
-                    synthesize_forge_profiles(&eligible, &ForgePolicy::balanced());
+                    synthesize_forge_profiles_capped(&eligible, &ForgePolicy::balanced(), prog.power_limit_w);
                 if !exact_apply_required {
                     final_profiles = Some(profiles);
                     break;
@@ -6319,12 +6418,14 @@ fn measure_multiclock_undervolt_forge(
                     prog.total_steps_estimate =
                         prog.total_steps_estimate.saturating_add(4);
                     prog.log.push(format!(
-                        "Qualificação Apply exato: {} MHz target @ {} mV VF — v8 High-FPS + Texture + Transitions + Memory, 5 min por padrão.",
+                        "Qualificação Apply exato: {} MHz target @ {} mV VF — v8 Texture + Transitions + Memory (conjunto completo), 5 min por padrão.",
                         key.0, key.1
                     ));
                     let future_apply_pairs = remaining_apply_pairs.saturating_sub(1);
+                    // Exact-Apply runs the COMPLETE required set per pair (NOT the single-detector
+                    // descent count), so the remaining-dwell ETA must count the full set.
                     let required_apply_passes =
-                        f2_required_qualification_passes(mode_policy);
+                        nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len();
                     let mut completed_apply_dwells = 0usize;
                     set(progress, prog.clone());
                     let mut on_apply_qualification_progress =
@@ -7019,7 +7120,7 @@ mod tests {
                 standard.final_gate_dwell_ms,
                 standard.final_gate_passes
             ),
-            (60_000, 4, 0, 0)
+            (60_000, F2_DESCENT_DETECTOR_PASSES, 0, 0)
         );
         assert_eq!(
             (
@@ -7028,7 +7129,7 @@ mod tests {
                 long.final_gate_dwell_ms,
                 long.final_gate_passes
             ),
-            (60_000, 4, 0, 0)
+            (60_000, F2_DESCENT_DETECTOR_PASSES, 0, 0)
         );
     }
 
@@ -7067,9 +7168,11 @@ mod tests {
             0.85
         ));
         profiles[0] = Some(qualified);
+        // v13 single-detector: the boundary confirmation count is 1 (Texture), so validation_count 0
+        // (no boundary qualification at all) still fails; 1 now suffices for that gate.
         profiles[0] = Some(PowerSweepPoint {
             confidence: Some(0.99),
-            validation_count: Some(1),
+            validation_count: Some(0),
             apply_qualified: true,
             apply_qualification_version: Some(
                 nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
@@ -7377,17 +7480,32 @@ mod tests {
         assert_eq!(f2_frontier_bounds(&targets, 1935), Some((1755, 13)));
 
         let standard = PowerSweepMode::Standard.f2_policy();
-        assert_eq!(f2_target_upper_estimate_ms(1, standard), 275_000);
+        // v13 single-detector: descent = 15s discovery + 1×65s (Texture only). Exact-Apply still
+        // runs the full 3-pattern set, so the apply estimate stays 3×305s per pair.
+        assert_eq!(f2_target_upper_estimate_ms(1, standard), 80_000);
         assert_eq!(f2_calibration_upper_estimate_ms(1, standard), 45_000);
-        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 1_220_000);
+        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 915_000);
         assert_eq!(
             f2_apply_upper_estimate_ms(F2_ESTIMATE_MAX_PROFILE_PAIRS, standard),
-            3_660_000
+            2_745_000
         );
 
         let fast = PowerSweepMode::Fast.f2_policy();
         assert_eq!(f2_target_upper_estimate_ms(1, fast), 15_000);
         assert_eq!(f2_apply_upper_estimate_ms(3, fast), 0);
+
+        // v13 decoupling regression: the descent runs a SINGLE detector, but exact-Apply must run
+        // the FULL required set. The apply ETA must key off REQUIRED_QUALIFICATION_PATTERNS.len(),
+        // NOT the (smaller) per-mode qualification_passes — the desync that once published 0 profiles.
+        assert_ne!(
+            standard.qualification_passes,
+            nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len()
+        );
+        assert_eq!(
+            f2_apply_upper_estimate_ms(1, standard),
+            nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() as u64
+                * (F2_APPLY_QUALIFICATION_DWELL_MS + PROBE_OVERHEAD_MS)
+        );
     }
 
     #[cfg(windows)]
@@ -7560,6 +7678,68 @@ mod tests {
             1920,
             "sustained-p99 R must beat the mean-power choice"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_off_cap_gate_excludes_at_cap_godforge() {
+        // v13.1: the top clock peaks within 6% of the cap → forced voltage droop below Vmin → TDR.
+        // Reproduces Godforge 1920@918 (peak ~190 W at the 200 W cap) vs the honest off-cap 1905.
+        let mk = |clk: u32, peak: f32, p99: f32, mv: u32| {
+            let mut p = fp(clk, p99 - 2.0);
+            p.max_power_w = peak;
+            p.power_p99_w = Some(p99);
+            p.boundary_voltage_mv = Some(mv);
+            p.p5_clock_mhz = Some(clk);
+            p
+        };
+        let frontier = vec![
+            (mk(1920, 190.0, 188.0, 918), 0.95), // peak 190 > ceiling 188 → excluded
+            (mk(1905, 186.0, 184.0, 906), 0.95), // peak 186 ≤ 188 → honest Godforge
+            (mk(1770, 157.0, 155.0, 825), 0.95),
+        ];
+        // Cap known → at-cap top excluded; Godforge drops to the highest off-cap clock.
+        let capped =
+            synthesize_forge_profiles_capped(&frontier, &ForgePolicy::balanced(), 200.0);
+        assert_eq!(capped.godforge.unwrap().clock_mhz, 1905, "at-cap top must be excluded");
+        assert!(capped.log.iter().any(|l| l.contains("off-cap gate excluded")));
+        // Cap unknown → gate is a no-op (legacy behaviour keeps the highest clock).
+        let uncapped = synthesize_forge_profiles(&frontier, &ForgePolicy::balanced());
+        assert_eq!(uncapped.godforge.unwrap().clock_mhz, 1920, "no cap → no off-cap gate");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_off_cap_gate_fails_closed_when_all_at_cap() {
+        // Every qualified point reaches the cap → no off-cap profile exists → publish nothing so
+        // Apply stays blocked (never ship a TDR-prone at-cap profile). Also covers zero/unknown peak:
+        // it cannot prove headroom, so it is excluded (fail-closed) rather than trusted.
+        let mk = |clk: u32, peak: f32, mv: u32| {
+            let mut p = fp(clk, peak - 2.0);
+            p.max_power_w = peak;
+            p.power_p99_w = Some(peak - 2.0);
+            p.boundary_voltage_mv = Some(mv);
+            p.p5_clock_mhz = Some(clk);
+            p
+        };
+        let frontier = vec![
+            (mk(1935, 200.0, 925), 0.95), // at cap
+            (mk(1920, 195.0, 918), 0.95), // peak 195 > ceiling 188
+            (mk(1905, 190.0, 906), 0.95), // peak 190 > ceiling 188
+        ];
+        let p = synthesize_forge_profiles_capped(&frontier, &ForgePolicy::balanced(), 200.0);
+        assert!(
+            p.godforge.is_none() && p.brokkrs.is_none() && p.deep_calm.is_none(),
+            "all-at-cap frontier must publish nothing (fail closed)"
+        );
+        assert!(p.log.iter().any(|l| l.contains("Apply stays blocked")));
+
+        // A point with NO usable power measurement cannot prove headroom → fail closed on a known cap.
+        let mut unknown = fp(1900, 0.0);
+        unknown.max_power_w = 0.0;
+        unknown.power_p99_w = None;
+        assert!(!is_off_cap_safe(&unknown, 200.0), "unknown power → fail closed");
+        assert!(is_off_cap_safe(&unknown, 0.0), "unknown cap → gate no-op (fail open)");
     }
 
     #[cfg(windows)]
