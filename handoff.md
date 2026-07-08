@@ -13,6 +13,28 @@ v13 absolute clock ceiling — `docs/clock-lock-v13-plan.md`. Leva 2 remains blo
 Earlier roadmap: `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## HW-run checkpoint (2026-07-08, afternoon) — single-detector RUNAWAY diagnosed + FIXED (v13.3a)
+- **Run**: single-detector build ran ~5 h (13:xx→18:21) descending through ~20 clocks (1935→1650,
+  "Clock 20/67") until the operator cancelled it. NEVER stopped at the 90% floor, re-descended ~25
+  bins per clock from a conservative top, published nothing.
+- **Root cause (bug in the single-detector commit)**: `run_confirmed_f2_clock_discovery`'s
+  `has_current_full_qualification` (gpu_undervolt.rs ~5639) required ALL of
+  `REQUIRED_QUALIFICATION_PATTERNS` (3) to have passed at one anchor DURING THE DESCENT — but the
+  single-detector descent only runs the first pattern (Texture). So it was ALWAYS false, which made
+  `sustainable = last_good_mv.is_some() && has_current_full_qualification` ALWAYS false → `cmax` (set
+  only on the first sustainable clock, gpu_power_sweep.rs:6092) never set → the 90% frontier-floor
+  stop (gpu_power_sweep.rs:5844, gated on `cmax.is_some()`) never fired → the descent walked all 67
+  physical bins. The same flag drove `warm_start_rejected` true every clock → full re-descent each
+  time (the ~25 dwells/clock, the 5 h).
+- **FIX**: `has_current_full_qualification` now requires only the FIRST `qualification_passes`
+  patterns (= what the descent actually runs; 1 under v13) to have passed, not all of REQUIRED. The
+  full 3-pattern deployment gate at exact-Apply is unchanged. Validation: service 359/0, clippy clean.
+- **Not yet re-run** — this fix restores: Cmax detected → 90% floor stops at ~1755 → ~1 h runtime →
+  profiles published. Follow-up idea (defense-in-depth, deferred): an ABSOLUTE clock floor so a
+  never-sustained top clock can't run away regardless of `cmax`.
+- Confirmed good in this run despite the runaway: v13 ceiling held (p5=p95=target everywhere), every
+  failure was `texture-rop` (+ one `compute-burst` at 1665/1650 near the bottom), zero TDR.
+
 ## Backend checkpoint (2026-07-08) — v13.3 single-detector descent (code-complete, NOT HW-tested)
 - The 2026-07-08 run confirmed Texture is ALWAYS the binding detector, so the descent no longer runs
   the full set per bin. New `const F2_DESCENT_DETECTOR_PASSES = 1`; Standard/Long

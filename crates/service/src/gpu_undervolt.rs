@@ -5632,12 +5632,17 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         .collect();
     let next_clock_start_mv =
         f2_optimized_next_clock_start(&planned_voltages, last_good_mv, conservative_start_mv);
-    // A bin only counts as a warm-start success when the FULL required pattern set passed there.
-    // A single-pattern pass at a bin whose later pattern failed (e.g. High-FPS ok, Texture
-    // SilentError) previously counted as success and suppressed the conservative fallback —
-    // discarding the whole clock when the warm-start prediction overshot the real boundary.
+    // A bin counts as a warm-start success (and makes the clock "sustainable") only when the
+    // patterns the DESCENT actually runs all passed there. The descent runs the first
+    // `qualification_passes` of REQUIRED_QUALIFICATION_PATTERNS — the single binding detector under
+    // v13 (Texture); the FULL required set runs only at exact-Apply, NEVER here. Using the full
+    // REQUIRED length here made every single-detector descent read as non-qualified → `sustainable`
+    // false on every clock → `cmax` never set → the 90% frontier floor never fired and the descent
+    // ran away through all physical bins (the ~5 h runaway). It still guards the original case (a
+    // bin where an earlier descent pattern passed but a later one failed does not count).
     let has_current_full_qualification = {
         use nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS;
+        let descent_passes = qualification_passes.min(REQUIRED_QUALIFICATION_PATTERNS.len());
         let mut by_anchor = std::collections::BTreeMap::<
             u32,
             [bool; REQUIRED_QUALIFICATION_PATTERNS.len()],
@@ -5658,7 +5663,10 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             };
             by_anchor.entry(observation.anchor_mv).or_default()[index] = true;
         }
-        by_anchor.values().any(|seen| seen.iter().all(|present| *present))
+        descent_passes > 0
+            && by_anchor
+                .values()
+                .any(|seen| seen.iter().take(descent_passes).all(|present| *present))
     };
     let warm_start_rejected = start_mv.is_some()
         && (refresh_discovery_for_qualification || prior_good_mv.is_none())
