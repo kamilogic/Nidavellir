@@ -72,7 +72,7 @@ Keep language professional and clear.
 
 ### Claude Code
 
-Backend and algorithm owner.
+Full-stack owner — backend, algorithms, AND frontend.
 
 Responsibilities:
 
@@ -83,30 +83,8 @@ Responsibilities:
 * IPC implementation
 * Rust backend
 * Hardware interaction
+* The Tauri UI: frontend, design system, UX, product copy, forge theme
 
-Do not modify frontend architecture or UI design.
-
-If frontend changes are required, create a request in:
-
-docs/contracts/ui-backend.md
-
----
-
-### Codex
-
-Frontend and UI/UX owner.
-
-Responsibilities:
-
-* Svelte frontend
-* Design system
-* UX
-* Information architecture
-* Product copy
-* Forge theme consistency
-
-Do not modify backend algorithms or hardware logic.
-
-If backend changes are required, create a request in:
-
-docs/contracts/ui-backend.md
+The former Claude/Codex backend/frontend split was an experiment and has been
+retired: implement frontend changes directly when a task needs them. Keep
+`docs/contracts/ui-backend.md` current as IPC-surface documentation.

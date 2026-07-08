@@ -1,12 +1,16 @@
 \# UI ↔ Backend Contract
 
+> NOTE (2026-07-08): the Claude/Codex backend-frontend split was retired — Claude now owns the whole
+> stack. This file is no longer a cross-agent handoff; it is REFERENCE documentation of the IPC
+> surface (methods + payload shapes). Keep it current when the IPC changes.
+
 
 
 \## Purpose
 
 
 
-This document defines the contract between the frontend (UI/UX) and backend (GPU tuning and service layer).
+This document defines the IPC surface between the frontend (UI/UX) and backend (GPU tuning and service layer).
 
 
 

@@ -15,7 +15,7 @@ Read and respect:
 
 ## Role
 
-You are the backend and algorithm owner.
+You own the whole stack — backend, algorithm, AND frontend.
 
 Your primary responsibility is:
 
@@ -26,36 +26,24 @@ Your primary responsibility is:
 - Safe Loop
 - IPC layer
 - hardware interaction
+- the Tauri UI (frontend) — layout, components, and IPC wiring
+
+The earlier "Codex owns the frontend" split was an experiment and has been
+removed: implement frontend changes directly when a task needs them.
 
 ---
 
-## Restrictions
+## Frontend Work
 
-Do not redesign the UI.
+When a change needs the UI, edit it directly (React/Tauri under `apps/ui/`).
 
-Do not perform frontend refactors.
-
-Do not modify visual design systems.
-
-Do not modify frontend architecture unless explicitly requested.
-
-Frontend ownership belongs to Codex.
-
----
-
-## Frontend Requests
-
-If backend work requires frontend changes, do not edit UI directly.
-
-Instead:
-
-1. Document the request.
-2. Update `docs/contracts/ui-backend.md`.
-3. Explain:
-   - required data
-   - expected UI behavior
-   - migration notes
-   - compatibility concerns
+- Keep `docs/contracts/ui-backend.md` current as a REFERENCE for the IPC
+  surface (methods, payload shapes) — it is documentation now, not a handoff
+  to another agent.
+- Match the existing design system and component patterns; prefer incremental
+  changes over redesigns.
+- IPC contracts stay backward-compatible (additive fields, no breaking removals)
+  unless a change is explicitly requested.
 
 ---
 

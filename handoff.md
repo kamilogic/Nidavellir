@@ -13,6 +13,20 @@ v13 absolute clock ceiling — `docs/clock-lock-v13-plan.md`. Leva 2 remains blo
 Earlier roadmap: `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## Ownership + tooling change (2026-07-08) — Claude owns full stack; rich forge-log export added
+- **Ownership**: the Claude/Codex backend/frontend split was RETIRED (operator: it was an experiment).
+  Claude now owns the whole stack incl. the Tauri/Svelte UI under `apps/ui/`. Updated CLAUDE.md,
+  AGENTS.md, and the `docs/contracts/ui-backend.md` header (now REFERENCE docs for the IPC surface,
+  not a cross-agent handoff). Edit the UI directly; keep IPC additive/backward-compatible.
+- **Rich forge-log export** (new feature): `IpcRequest::ExportForgeLog` → `ResponseData::ForgeLogExport`
+  ({path, raw_observations_path, bytes, observation_count, note}). `gpu_power_sweep::export_forge_log`
+  (read-only, cross-platform) reads the F2 observation store + live `PowerSweepProgress` and writes a
+  timestamped `nidavellir-forge-log-<ts>.txt` under the data dir: run metadata, contract versions,
+  published profiles, Cmax/floor, the full progress log, and EVERY dwell (target@anchor, outcome,
+  avg/p5/p95, avg/p99/peak W, temp, pattern/verdict/failure-phase, flags). UI: "Export forge log"
+  diagnostic-card button in Forge.svelte (Terminal icon) → shows the saved path. No hardware touched.
+- Validation: core 80/0, service 359/0, clippy clean, `npm run build` clean (3823 modules).
+
 ## HW-run checkpoint (2026-07-08, afternoon) — single-detector RUNAWAY diagnosed + FIXED (v13.3a)
 - **Run**: single-detector build ran ~5 h (13:xx→18:21) descending through ~20 clocks (1935→1650,
   "Clock 20/67") until the operator cancelled it. NEVER stopped at the 90% floor, re-descended ~25

@@ -441,6 +441,13 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             let prog = guard.power_sweep.progress();
             apply_forge_profile(&guard.safe_store, &prog, prog.deep_calm, "Deep Calm")
         }
+        IpcRequest::ExportForgeLog => {
+            let prog = guard.power_sweep.progress();
+            match crate::gpu_power_sweep::export_forge_log(&prog) {
+                Ok(export) => IpcResponse::success(ResponseData::ForgeLogExport(export)),
+                Err(e) => IpcResponse::failure(format!("Export de log falhou: {e}")),
+            }
+        }
     }
 }
 

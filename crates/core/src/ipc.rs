@@ -56,6 +56,26 @@ pub enum IpcRequest {
     ApplyPowerGodforge,
     ApplyPowerBrokkrs,
     ApplyPowerDeepCalm,
+    /// Write a rich, human-readable log of the latest/current F2 forge run — run metadata, contract
+    /// versions, the published profiles, the frontier summary, the live progress log, and every
+    /// recorded dwell (clock/voltage/power/temp/outcome/pattern) — to a timestamped file under the
+    /// data dir. Read-only: gathers persisted observations + the live progress; touches no hardware.
+    ExportForgeLog,
+}
+
+/// Result of [`IpcRequest::ExportForgeLog`]: where the rich log was written and how much it covered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeLogExport {
+    /// Absolute path of the written human-readable log file.
+    pub path: String,
+    /// Absolute path of the raw append-only observation JSONL (machine-readable companion).
+    pub raw_observations_path: String,
+    /// Size of the written log file in bytes.
+    pub bytes: u64,
+    /// Number of dwell observations included.
+    pub observation_count: usize,
+    /// One-line human summary (for a toast / status line).
+    pub note: String,
 }
 
 /// Telemetry confidence for a dwell metric, from how many valid samples backed it.
@@ -571,6 +591,7 @@ pub enum ResponseData {
     ForgeAll(ForgeAllProgress),
     Benchmark(BenchmarkProgress),
     PowerSweep(PowerSweepProgress),
+    ForgeLogExport(ForgeLogExport),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

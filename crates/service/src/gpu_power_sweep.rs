@@ -556,6 +556,122 @@ fn save_forge_state(gpu_key: &str, prog: &PowerSweepProgress) {
     }
 }
 
+/// Write a rich, human-readable log of the current/last F2 forge run to a timestamped file under the
+/// data dir: run metadata, contract versions, published profiles, frontier summary, the live progress
+/// log, and EVERY recorded dwell (clock/voltage/power/temp/outcome/pattern). Read-only — reads the
+/// persisted observation store + the live progress; touches no hardware. Cross-platform (pure fs).
+pub fn export_forge_log(
+    prog: &PowerSweepProgress,
+) -> Result<nidavellir_core::ipc::ForgeLogExport, String> {
+    use nidavellir_core::f2_observation::{
+        F2ObservationStore, F2_DISCOVERY_CONTRACT_VERSION, F2_QUALIFICATION_CONTRACT_VERSION,
+    };
+    let data_dir = nidavellir_core::safe_loop::default_data_dir();
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
+    let generated = nidavellir_core::f2_observation::now_rfc3339();
+    let observations = F2ObservationStore::system().load_all();
+
+    let fmt_profile = |label: &str, p: &Option<PowerSweepPoint>| -> String {
+        match p {
+            Some(pt) => {
+                let clock = pt.target_clock_mhz.unwrap_or(pt.clock_mhz);
+                let mv = pt.vf_table_voltage_mv.or(pt.boundary_voltage_mv).unwrap_or(pt.voltage_mv);
+                let watts = pt.power_p99_w.unwrap_or(pt.power_w);
+                format!(
+                    "  {label:<14} {clock} MHz @ {mv} mV · p99 {watts:.0} W · p5 {:?} · p95 {:?}\n",
+                    pt.p5_clock_mhz, pt.p95_clock_mhz
+                )
+            }
+            None => format!("  {label:<14} (none)\n"),
+        }
+    };
+
+    let mut out = String::new();
+    out.push_str("===============================================================\n");
+    out.push_str(" NIDAVELLIR - F2 FORGE RUN LOG\n");
+    out.push_str("===============================================================\n");
+    out.push_str(&format!("generated    : {generated}\n"));
+    out.push_str(&format!(
+        "contracts    : discovery v{F2_DISCOVERY_CONTRACT_VERSION} - qualification v{F2_QUALIFICATION_CONTRACT_VERSION}\n"
+    ));
+    out.push_str(&format!("mode         : {}\n", prog.mode.as_deref().unwrap_or("-")));
+    out.push_str(&format!("phase        : {}\n", prog.phase));
+    out.push_str(&format!("profiles_ok  : {}\n", prog.profiles_qualified));
+    out.push_str(&format!("power cap    : {:.0} W\n", prog.power_limit_w));
+    out.push_str(&format!(
+        "Cmax / floor : {:?} MHz / {:?} MHz ({} frontier clocks)\n",
+        prog.cmax_clock_mhz,
+        prog.frontier_floor_clock_mhz,
+        prog.frontier_clock_count.map(|c| c.to_string()).unwrap_or_else(|| "-".into())
+    ));
+    out.push_str(&format!("elapsed      : {:.1} min\n", prog.elapsed_ms as f64 / 60_000.0));
+    if let Some(note) = &prog.note {
+        out.push_str(&format!("note         : {note}\n"));
+    }
+    out.push_str("\n-- Published profiles ------------------------------------------\n");
+    out.push_str(&fmt_profile("Godforge", &prog.godforge));
+    out.push_str(&fmt_profile("Brokkr's Best", &prog.brokkrs));
+    out.push_str(&fmt_profile("Deep Calm", &prog.deep_calm));
+
+    out.push_str("\n-- Live progress log -------------------------------------------\n");
+    for line in &prog.log {
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out.push_str(&format!(
+        "\n-- Recorded dwells ({} observations) ---------------------------\n",
+        observations.len()
+    ));
+    out.push_str(
+        "timestamp | kind | target@anchor | outcome | avg/p5/p95 MHz | avg/p99/peak W | temp | pattern/verdict/fail | flags\n",
+    );
+    let s = |v: Option<u32>| v.map(|x| x.to_string()).unwrap_or_else(|| "-".into());
+    for o in &observations {
+        let cov = o.qualification_coverage.as_ref();
+        let pattern = cov.and_then(|c| c.pattern).map(|p| format!("{p:?}")).unwrap_or_else(|| "-".into());
+        let verdict = cov.map(|c| format!("{:?}", c.verdict)).unwrap_or_else(|| "-".into());
+        let fail = cov.and_then(|c| c.failure_phase.clone()).unwrap_or_default();
+        let mut flags = Vec::new();
+        if o.silent_error { flags.push("silent"); }
+        if o.thermal_throttled { flags.push("throttle"); }
+        if o.device_lost { flags.push("device_lost"); }
+        if o.tdr_or_crash { flags.push("tdr"); }
+        if o.blacklisted { flags.push("blacklisted"); }
+        out.push_str(&format!(
+            "{} | {:?} | {}@{} | {:?} | {}/{}/{} | {}/{}/{} | {} | {}/{}/{} | {}\n",
+            o.timestamp, o.evidence_kind, o.target_mhz, o.anchor_mv, o.outcome,
+            s(o.avg_clock_mhz), s(o.sustained_clock_mhz), s(o.sustained_upper_clock_mhz),
+            o.watts.map(|w| w.to_string()).unwrap_or_else(|| "-".into()),
+            o.power_p99_w.map(|w| format!("{w:.0}")).unwrap_or_else(|| "-".into()),
+            s(o.max_watts),
+            o.max_temp_c.map(|t| format!("{t:.0}C")).unwrap_or_else(|| "-".into()),
+            pattern, verdict, fail, flags.join(","),
+        ));
+    }
+
+    let stamp: String = generated
+        .chars()
+        .map(|c| if c == ':' || c == '.' { '-' } else { c })
+        .collect();
+    let path = data_dir.join(format!("nidavellir-forge-log-{stamp}.txt"));
+    std::fs::write(&path, &out).map_err(|e| format!("write log: {e}"))?;
+    let bytes = out.len() as u64;
+    let raw = data_dir.join(nidavellir_core::f2_observation::F2_OBSERVATIONS_FILE);
+
+    Ok(nidavellir_core::ipc::ForgeLogExport {
+        path: path.display().to_string(),
+        raw_observations_path: raw.display().to_string(),
+        bytes,
+        observation_count: observations.len(),
+        note: format!(
+            "Log salvo: {} dwell(s), {:.0} KB",
+            observations.len(),
+            bytes as f64 / 1024.0
+        ),
+    })
+}
+
 /// Load the persisted forge result for `gpu_key`, or `None` to start idle.
 /// Logs each outcome (loaded / missing / GPU mismatch / failure) per spec.
 #[cfg(windows)]

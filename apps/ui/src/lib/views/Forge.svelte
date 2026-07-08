@@ -24,6 +24,8 @@
   let applied = $state(null);
   let verification = $state(null);
   let verifying = $state(false);
+  let exporting = $state(false);
+  let exportMsg = $state("");
   let benchmark = $state(null);
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
@@ -326,6 +328,25 @@
     }
   }
 
+  async function exportLog() {
+    exporting = true;
+    exportMsg = "";
+    try {
+      const r = await serviceCall("ExportForgeLog");
+      if (r?.data?.type === "ForgeLogExport") {
+        exportMsg = `${r.data.note} → ${r.data.path}`;
+        error = null;
+      } else {
+        exportMsg = r?.error ? String(r.error) : "Falha ao exportar log.";
+      }
+    } catch (e) {
+      error = String(e);
+      exportMsg = String(e);
+    } finally {
+      exporting = false;
+    }
+  }
+
   function closeMemPreflight() {
     memPreflight = false;
   }
@@ -466,6 +487,26 @@
           onStartBench={startBench}
           onStopBench={stopBench}
         />
+
+        <section class="diagnostic-card">
+          <div>
+            <h4 class="section-head">
+              <Terminal size={14} strokeWidth={1.85} />
+              <span>Export forge log</span>
+            </h4>
+            <p class="sub">Writes a rich, human-readable log of the last run — profiles, frontier, live log, and every recorded dwell — to a file under the data dir. Read-only; captures no hardware action.</p>
+          </div>
+          <button class="btn" onclick={exportLog} disabled={exporting}>
+            <Terminal size={15} strokeWidth={1.9} />
+            <span>{exporting ? "Exporting..." : "Export forge log"}</span>
+          </button>
+          {#if exportMsg}
+            <p class="point accent">
+              <CircleCheck size={14} strokeWidth={1.9} />
+              <span>{exportMsg}</span>
+            </p>
+          {/if}
+        </section>
 
         <section class="diagnostic-card">
           <div>
