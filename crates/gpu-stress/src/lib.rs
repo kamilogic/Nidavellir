@@ -40,6 +40,15 @@ const STREAM_PREHANG_BAND_MS: u64 = 500;
 // bin as marginal: silicon slows down (internal retries) before it hangs.
 const STREAM_DEGRADATION_FACTOR: u64 = 2;
 const GOLDEN_MIN_FRAMES: u64 = 4;
+// v15 boost-entry shock: TRUE idle gaps long enough for the driver to leave the high P-state
+// (downclock hysteresis is seconds; 10-30 s is comfortably beyond), then an instant heavy slam.
+// This is the game/benchmark-launch transition — idle P-state → full boost VF ramp + VRM load
+// step — that continuous workloads never enter, and where the in-game TDR cascade (repeated ~2 s
+// BusReset hangs, Event ID 153) was observed. The slam's wall time is the precursor detector: a
+// stock heavy frame takes ~10-20 ms, so a post-idle burst beyond this threshold is a pre-hang —
+// fail Unstable long BEFORE the ~2 s driver watchdog can fire (never reproduce the cascade itself).
+const BOOST_ENTRY_GAPS_MS: [u64; 3] = [10_000, 20_000, 30_000];
+const BOOST_ENTRY_STALL_MS: u64 = 500;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -131,11 +140,14 @@ pub enum VfQualifierPhase {
     /// Hang-prone heavy memory detector: per-pixel scattered sampling of the large VRAM source,
     /// rendered in preemptible scissor bands. Runs LAST in patterns (severity ladder).
     TextureStream,
+    /// v15 boost-entry shock: true-idle (seconds, GPU leaves the high P-state) → instant heavy
+    /// slam, cycling. Targets the launch-transition failure the continuous phases never enter.
+    BoostEntry,
 }
 
 impl VfQualifierPhase {
     /// Number of phase variants (codes are `0..COUNT`). Coverage bitmaps must use this size.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 
     pub const NONE_CODE: u8 = u8::MAX;
 
@@ -153,6 +165,7 @@ impl VfQualifierPhase {
             VfQualifierPhase::VramPressure => "vram-pressure",
             VfQualifierPhase::GeometryDepth => "geometry-depth",
             VfQualifierPhase::TextureStream => "texture-stream",
+            VfQualifierPhase::BoostEntry => "boost-entry",
         }
     }
 
@@ -174,6 +187,7 @@ impl VfQualifierPhase {
             9 => Some(Self::VramPressure),
             10 => Some(Self::GeometryDepth),
             11 => Some(Self::TextureStream),
+            12 => Some(Self::BoostEntry),
             _ => None,
         }
     }
@@ -196,6 +210,11 @@ pub enum VfQualifierPattern {
     /// the graceful TextureRop silent-error detector) that scales to fill a single ~15-min dwell.
     /// Run ONLY at the exact Apply pair, after the required 3-pattern set.
     Endurance,
+    /// v15 candidate-only transition shock: true-idle → heavy-slam cycles (BoostEntry) with the
+    /// graceful TextureRop detector between rounds. Targets the game/benchmark-LAUNCH transition
+    /// (P-state exit + VF ramp + VRM load step) behind the observed in-game BusReset TDR cascade.
+    /// Run ONLY at the exact Apply pair, before the Endurance soak (fail cheap first).
+    TransitionShock,
 }
 
 impl VfQualifierPattern {
@@ -211,6 +230,7 @@ impl VfQualifierPattern {
             Self::V8Transitions => "v8-transitions",
             Self::V8Memory => "v8-memory",
             Self::Endurance => "endurance",
+            Self::TransitionShock => "transition-shock",
         }
     }
 }
@@ -228,11 +248,17 @@ pub enum VfWorkload {
     VramPressure,
     GeometryDepth,
     TextureStream,
+    /// v15: true-idle (10-30 s, GPU leaves the high P-state) → instant heavy golden-checked slam.
+    BoostEntry,
 }
 
 fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u32> {
     match workload {
-        VfWorkload::PowerRender | VfWorkload::HeavySpike | VfWorkload::IdlePulse => {
+        // BoostEntry slams the same 8-instance heavy frame as PowerRender → same golden image.
+        VfWorkload::PowerRender
+        | VfWorkload::HeavySpike
+        | VfWorkload::IdlePulse
+        | VfWorkload::BoostEntry => {
             Some(goldens.power)
         }
         VfWorkload::BoostEdge => Some(goldens.boost),
@@ -487,6 +513,19 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         // Cool-down close.
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 3),
     ];
+    // v15 candidate-only transition shock: idle→slam cycles reproduce the game/benchmark-LAUNCH
+    // transition (the driver leaves the high P-state during each 10-30 s true-idle gap, then the
+    // slam forces the boost-entry VF ramp + VRM load step). The graceful golden-checked TextureRop
+    // between rounds catches slam-induced silent corruption; the slam wall-time stall check inside
+    // BoostEntry catches the pre-hang precursor (the ~2 s BusReset cascade class) before the
+    // driver watchdog. Runs BEFORE the Endurance soak: ~8 min, fail cheap first.
+    const TRANSITION_SHOCK: [(VfQualifierPhase, VfWorkload, u64); 5] = [
+        (VfQualifierPhase::BoostEntry, VfWorkload::BoostEntry, 12),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 4),
+        (VfQualifierPhase::BoostEntry, VfWorkload::BoostEntry, 12),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 4),
+        (VfQualifierPhase::BoostEntry, VfWorkload::BoostEntry, 12),
+    ];
 
     let template: &[(VfQualifierPhase, VfWorkload, u64)] = match pattern {
         VfQualifierPattern::Fsgl1 => &FSGL1,
@@ -499,6 +538,7 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         VfQualifierPattern::V8Transitions => &V8_TRANSITIONS,
         VfQualifierPattern::V8Memory => &V8_MEMORY,
         VfQualifierPattern::Endurance => &ENDURANCE,
+        VfQualifierPattern::TransitionShock => &TRANSITION_SHOCK,
     };
     let total_weight = template.iter().map(|(_, _, weight)| *weight).sum::<u64>();
     let mut assigned = 0u64;
@@ -2123,7 +2163,10 @@ impl GpuCtx {
         };
 
         let (shader_source, instances, blend) = match profile {
-            VfWorkload::PowerRender => (RENDER_SHADER, 8, wgpu::BlendState::REPLACE),
+            // BoostEntry slams the same 8-instance frame — shares PowerRender's golden.
+            VfWorkload::PowerRender | VfWorkload::BoostEntry => {
+                (RENDER_SHADER, 8, wgpu::BlendState::REPLACE)
+            }
             VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
             VfWorkload::TextureRop => (TEXTURE_ROP_SHADER, 4, wgpu::BlendState::ALPHA_BLENDING),
             // Must match the FrameCadence qualifier config exactly (same shader, 1 instance).
@@ -2607,7 +2650,10 @@ impl GpuCtx {
         };
 
         let (shader_source, instances, blend) = match profile {
-            VfWorkload::PowerRender | VfWorkload::HeavySpike | VfWorkload::IdlePulse => {
+            VfWorkload::PowerRender
+            | VfWorkload::HeavySpike
+            | VfWorkload::IdlePulse
+            | VfWorkload::BoostEntry => {
                 (RENDER_SHADER, 8, wgpu::BlendState::REPLACE)
             }
             VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
@@ -2764,6 +2810,8 @@ impl GpuCtx {
         // FrameCadence paces itself per frame (sync + gap after every submit below), so the
         // coarser droop-burst / idle-pulse pacing must not also fire.
         let frame_cadence = profile == VfWorkload::FrameCadence;
+        // BoostEntry paces itself too: heavy slam (timed) → true-idle seconds → slam again.
+        let boost_entry = profile == VfWorkload::BoostEntry;
         // TextureStream renders in scissor bands, one submit each (preemptible + pre-hang
         // detectable). A stalled band or sustained frame-time collapse fails the dwell as
         // Unstable BEFORE the driver TDR watchdog can fire.
@@ -2784,6 +2832,8 @@ impl GpuCtx {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 last_idle = std::time::Instant::now();
             }
+            // BoostEntry: time the whole slam (encode + submit + GPU) from here; read below.
+            let burst_start = std::time::Instant::now();
             if stream_banded {
                 let frame_start = std::time::Instant::now();
                 let band_h = DIM / STREAM_BANDS;
@@ -2888,7 +2938,28 @@ impl GpuCtx {
             // load) polls every 8 submits for the same reason; render frames are far
             // heavier, so bound tighter (every 3). Keeps the GPU saturated (~199 W,
             // game power) while staying safely repeatable across a full sweep.
-            if frame_cadence {
+            if boost_entry {
+                // v15: finish the slam frame and TIME it. A post-idle slam that stalls toward the
+                // ~2 s driver watchdog is the pre-hang precursor of the in-game BusReset TDR
+                // cascade — fail Unstable here, never let the cascade start.
+                self.device.poll(wgpu::Maintain::Wait);
+                if (burst_start.elapsed().as_millis() as u64) > BOOST_ENTRY_STALL_MS {
+                    stalled = true;
+                    break;
+                }
+                // TRUE idle, seconds — long enough for the driver to leave the high P-state, so
+                // the NEXT slam re-enters through the full boost VF ramp (the launch transition).
+                // Sliced so cooperative Stop and crash detection stay responsive throughout.
+                let gap_ms = BOOST_ENTRY_GAPS_MS
+                    [(frames % BOOST_ENTRY_GAPS_MS.len() as u64) as usize];
+                let idle_start = std::time::Instant::now();
+                while (idle_start.elapsed().as_millis() as u64) < gap_ms
+                    && !self.crashed.load(Ordering::SeqCst)
+                    && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            } else if frame_cadence {
                 // Each frame IS the heavy burst: finish it, then idle a few ms like a
                 // present/vsync gap. The heavy→idle→heavy edge at frame period is the VRM
                 // droop-release transient that kills undervolts in real games.
@@ -3382,6 +3453,32 @@ mod tests {
         // PowerOpening, HeavySpike, TextureRop, IdlePulse, FrameCadence, MixedGame, PowerClosing = 7.
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::Endurance), 7);
         assert_eq!(VfQualifierPattern::Endurance.label(), "endurance");
+    }
+
+    #[test]
+    fn transition_shock_pattern_cycles_idle_slam_with_graceful_detector() {
+        // Fills the whole requested ~8-min dwell; weights scale exactly.
+        let plan = vf_qualifier_plan(480_000, VfQualifierPattern::TransitionShock);
+        assert_eq!(
+            plan.iter().map(|segment| segment.duration_ms).sum::<u64>(),
+            480_000
+        );
+        // Idle→slam cycles dominate (the launch transition under test); the graceful
+        // golden-checked TextureRop between rounds catches slam-induced silent corruption.
+        assert!(
+            duration_for_workload(&plan, VfWorkload::BoostEntry)
+                > duration_for_workload(&plan, VfWorkload::TextureRop)
+        );
+        assert!(duration_for_workload(&plan, VfWorkload::TextureRop) > 0);
+        // Coverage denominator auto-derived: BoostEntry + TextureRop = 2 distinct phases; the new
+        // phase code (12) must fit the coverage bitmap (COUNT) without panicking.
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::TransitionShock), 2);
+        assert!((VfQualifierPhase::BoostEntry.code() as usize) < VfQualifierPhase::COUNT);
+        assert_eq!(
+            VfQualifierPhase::from_code(VfQualifierPhase::BoostEntry.code()),
+            Some(VfQualifierPhase::BoostEntry)
+        );
+        assert_eq!(VfQualifierPattern::TransitionShock.label(), "transition-shock");
     }
 
     #[test]

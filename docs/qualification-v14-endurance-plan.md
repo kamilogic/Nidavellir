@@ -1,8 +1,63 @@
 # Qualification v14 — Candidate-only endurance gate + directed fallback
 
-Status: STAGE 1 IMPLEMENTED + REINFORCED to worst-realistic + validated (cargo check/test/clippy
-green; NOT HW-tested, NOT committed). STAGE 2 (directed fallback) NOT started — mechanism fully
-specced below. Safety audit pending (whole v14 diff). 2026-07-09.
+Status: STAGE 1 (worst-realistic endurance) SHIPPED in `0629a9f` and HW-VALIDATED by the
+2026-07-10 18:26 run — the endurance soak REJECTED 1890@900 (SilentError texture-rop mid-soak, a
+point the old 3-pattern gate had just passed) and the loop resynthesized to 1875@893; 3 profiles
+published, all endurance-passed. STAGE 2 (directed fallback) NOT started — specced below.
+
+## v15 (2026-07-10) — TransitionShock gate (IMPLEMENTED, validated, NOT HW-tested, NOT committed)
+Motivation: the operator's in-game TDR on a forge-passing point (1860@875) presented as 4-7
+`nvlddmkm` Event ID 153 "BusReset TDR" hangs ~2-3 s apart until a hard wedge — the LAUNCH-transition
+failure class (idle P-state exit → boost VF ramp + VRM load step), which NO continuous workload
+enters (IdlePulse sleeps only 100 ms every 750 ms — the GPU never leaves the high P-state; every
+dwell also runs pre-warmed at 63-71 °C).
+- gpu-stress: `VfWorkload::BoostEntry` + `VfQualifierPhase::BoostEntry` (code 12, COUNT 13):
+  heavy 8-instance golden-checked slam (shares PowerRender's golden) → TRUE idle 10/20/30 s
+  (`BOOST_ENTRY_GAPS_MS`, sliced 250 ms so Stop/crash stay responsive) → next slam re-enters
+  through the full boost ramp. The slam wall time is the PRE-HANG detector
+  (`BOOST_ENTRY_STALL_MS = 500`): a post-idle slam stalling toward the ~2 s driver watchdog sets
+  `stalled` → dwell fails `Unstable` — catches the cascade's precursor without reproducing it.
+  `VfQualifierPattern::TransitionShock` = BoostEntry-dominant with graceful TextureRop between
+  rounds (2 phases).
+- service: `F2QualificationPattern::TransitionShock` (code 6, NOT in REQUIRED, no contract bump);
+  exact-Apply gate now runs BOTH candidate-only passes in order — TransitionShock
+  (`F2_TRANSITION_SHOCK_DWELL_MS = 480_000`, ~8 min, fail cheap first) THEN Endurance (20 min).
+- core: `point_has_current_endurance_qualification` now requires BOTH patterns run-scoped
+  (shock-only or endurance-only evidence cannot publish; resume hole stays closed).
+- Validation: core 81/0, gpu-stress 11/0, service 360/0; clippy baseline exact (8/19/1).
+- HW gate for the next supervised run: expect `v8 TransitionShock ... shock idle→slam (8 min)`
+  lines before each endurance soak; a launch-fragile candidate must fail there as `Unstable`
+  (pre-hang) or SilentError — NOT as an in-game BusReset cascade later. Dwell avg/p5 clocks will
+  read LOW during shock phases (deliberate idle) — that is expected, not a regression.
+
+## Remaining v15 work (approved, NOT implemented)
+1. **Runtime TDR sentinel** (service): watch System event log for `nvlddmkm` ID 153 while a
+   profile is applied; on FIRST event → reset to stock + Safe Loop blacklist of the applied point
+   + UI notification. Breaks the 5-strike cascade at hang #1; turns every real TDR into recorded
+   evidence. Design note: poll every ~15-30 s; act only when Nidavellir state is applied.
+2. **On-demand profile torture test** (IPC + UI): run TransitionShock+Endurance against the
+   APPLIED profile on operator demand — covers the genuinely COLD card (~30 °C first-boot state
+   the forge can never reach mid-run). New IpcRequest + Forge UI button.
+3. ~~ETA cosmetics~~ DONE (2026-07-10, same session): single-source
+   `F2_APPLY_PAIR_DWELL_LADDER_MS` (3×5 min + 8 + 20, + overhead/dwell) now feeds the upper
+   estimate, the in-loop remaining countdown, the steps counter and the log line — ETA and gate
+   read the SAME const and cannot desync. 1 pair = 2 605 s; 3 pairs = 7 815 s (~2h10).
+
+## Publish-contract audit for v15 (2026-07-10) — one real bug found and FIXED
+Full trace of the publish path with shock/endurance evidence present:
+- **BUG (fixed)**: `classify_f2_stress_dwell`'s held-clock thermal rule (throttle flag + p5 sag ⇒
+  Inconclusive) would misclassify EVERY TransitionShock dwell whenever NVML flagged a throttle
+  (routine at ~70 °C — 3 dwells carried `throttle` in the 18:26 run), because a shock dwell is
+  ~60% true-idle so p5 is an idle clock BY DESIGN. Result would have been: full run → candidate
+  refused at the very end. FIX: TransitionShock is exempt from the p5-sag disqualifier (its own
+  detectors — slam-stall ⇒ Unstable, golden ⇒ SilentError — carry the verdict). Regression test in
+  `apply_qualification_thermal_slowdown_that_held_clock_is_not_inconclusive`.
+- Verified SAFE (no change needed): p95/p99 publish helpers iterate ONLY
+  `REQUIRED_QUALIFICATION_PATTERNS` via `required_pattern_index` (shock/endurance observations are
+  skipped, never fatal — endurance already HW-proven by the 18:26 publish); `SingleDwell.stable`
+  comes purely from the gpu-stress `StabilityResult` (no p5 heuristic); the p95-ceiling check
+  can't false-fire (idle lowers p95, never raises); publish requires BOTH gates run-scoped
+  (core test); no contract-version bump needed (additive tightening at Apply only).
 
 Stage 1 deviation from the sketch below: the endurance pass is folded INTO
 `gate_anchored_candidate_fsgl3` (gpu_undervolt.rs), gated on `exact_apply`, right after the 3-pattern

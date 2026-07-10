@@ -1340,6 +1340,11 @@ fn f2_pattern_from_stress(
             Some(F2QualificationPattern::Endurance),
             "endurance",
         ),
+        VfQualifierPattern::TransitionShock => (
+            F2QualificationStrength::Fsgl4,
+            Some(F2QualificationPattern::TransitionShock),
+            "transition-shock",
+        ),
     }
 }
 
@@ -5502,21 +5507,41 @@ fn f2_calibration_upper_estimate_ms(
         )
 }
 
+/// Per-pair exact-Apply dwell durations IN EXECUTION ORDER: the required 5-min patterns first,
+/// then the v15 TransitionShock (~8 min), then the v14 Endurance soak (~20 min). The single source
+/// for every exact-Apply ETA (upper estimate + the in-loop remaining countdown), so the displayed
+/// time can never desync from what the gate actually runs.
+#[cfg(windows)]
+const F2_APPLY_PAIR_DWELL_LADDER_MS: [u64;
+    nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() + 2] = [
+    F2_APPLY_QUALIFICATION_DWELL_MS,
+    F2_APPLY_QUALIFICATION_DWELL_MS,
+    F2_APPLY_QUALIFICATION_DWELL_MS,
+    crate::gpu_undervolt::F2_TRANSITION_SHOCK_DWELL_MS,
+    crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS,
+];
+
+/// Total wall-clock upper bound for ONE exact-Apply pair (every dwell + per-dwell overhead).
+#[cfg(windows)]
+fn f2_apply_pair_upper_ms() -> u64 {
+    F2_APPLY_PAIR_DWELL_LADDER_MS
+        .iter()
+        .fold(0u64, |total, dwell| {
+            total.saturating_add(dwell.saturating_add(PROBE_OVERHEAD_MS))
+        })
+}
+
 #[cfg(windows)]
 fn f2_apply_upper_estimate_ms(pair_count: usize, policy: F2ForgeModePolicy) -> u64 {
     // Fast (no qualification) skips exact-Apply entirely. Otherwise every pair runs the COMPLETE
-    // pattern set at exact-Apply — REQUIRED_QUALIFICATION_PATTERNS.len(), NOT the single-detector
-    // descent count — so the ETA reflects the real deployment gate.
+    // gate ladder — the 3 required patterns + TransitionShock + Endurance — so the ETA reflects
+    // the real deployment gate, not just the 5-min patterns.
     if f2_required_qualification_passes(policy) == 0 {
         return 0;
     }
     u64::try_from(pair_count)
         .unwrap_or(u64::MAX)
-        .saturating_mul(
-            u64::try_from(nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len())
-                .unwrap_or(u64::MAX),
-        )
-        .saturating_mul(F2_APPLY_QUALIFICATION_DWELL_MS.saturating_add(PROBE_OVERHEAD_MS))
+        .saturating_mul(f2_apply_pair_upper_ms())
 }
 
 #[cfg(windows)]
@@ -6548,17 +6573,16 @@ fn measure_multiclock_undervolt_forge(
                     }
 
                     prog.phase = "apply-qualify".into();
-                    prog.total_steps_estimate =
-                        prog.total_steps_estimate.saturating_add(4);
+                    prog.total_steps_estimate = prog.total_steps_estimate.saturating_add(
+                        u32::try_from(F2_APPLY_PAIR_DWELL_LADDER_MS.len()).unwrap_or(u32::MAX),
+                    );
                     prog.log.push(format!(
-                        "Qualificação Apply exato: {} MHz target @ {} mV VF — v8 Texture + Transitions + Memory (conjunto completo), 5 min por padrão.",
-                        key.0, key.1
+                        "Qualificação Apply exato: {} MHz target @ {} mV VF — v8 Texture + Transitions + Memory (5 min cada) + TransitionShock ({} min) + Endurance ({} min).",
+                        key.0, key.1,
+                        crate::gpu_undervolt::F2_TRANSITION_SHOCK_DWELL_MS / 60_000,
+                        crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS / 60_000
                     ));
                     let future_apply_pairs = remaining_apply_pairs.saturating_sub(1);
-                    // Exact-Apply runs the COMPLETE required set per pair (NOT the single-detector
-                    // descent count), so the remaining-dwell ETA must count the full set.
-                    let required_apply_passes =
-                        nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len();
                     let mut completed_apply_dwells = 0usize;
                     set(progress, prog.clone());
                     let mut on_apply_qualification_progress =
@@ -6574,19 +6598,21 @@ fn measure_multiclock_undervolt_forge(
                             prog.current_clock_mhz = Some(event.target_mhz);
                             prog.current_voltage_mv = event.anchor_mv;
                             prog.last_outcome = event.outcome.clone();
-                            let remaining_apply_dwells = future_apply_pairs
-                                .saturating_mul(required_apply_passes)
-                                .saturating_add(
-                                    required_apply_passes
-                                        .saturating_sub(completed_apply_dwells),
-                                );
-                            let remaining_upper_ms =
-                                u64::try_from(remaining_apply_dwells)
-                                    .unwrap_or(u64::MAX)
-                                    .saturating_mul(
-                                        F2_APPLY_QUALIFICATION_DWELL_MS
-                                            .saturating_add(PROBE_OVERHEAD_MS),
-                                    );
+                            // Precise remaining time: the ladder is heterogeneous (5/5/5/8/20 min),
+                            // so count the CURRENT pair's remaining dwells by position and future
+                            // pairs by the full per-pair total — never a flat per-dwell average.
+                            let current_pair_remaining_ms = F2_APPLY_PAIR_DWELL_LADDER_MS
+                                .iter()
+                                .skip(completed_apply_dwells)
+                                .fold(0u64, |total, dwell| {
+                                    total.saturating_add(
+                                        dwell.saturating_add(PROBE_OVERHEAD_MS),
+                                    )
+                                });
+                            let remaining_upper_ms = u64::try_from(future_apply_pairs)
+                                .unwrap_or(u64::MAX)
+                                .saturating_mul(f2_apply_pair_upper_ms())
+                                .saturating_add(current_pair_remaining_ms);
                             prog.estimated_remaining_ms = Some(remaining_upper_ms);
                             f2_publish_upper_estimate(
                                 &mut prog,
@@ -7176,6 +7202,7 @@ mod tests {
                     F2QualificationPattern::Transitions => 3,
                     F2QualificationPattern::Memory => 4,
                     F2QualificationPattern::Endurance => 5,
+                    F2QualificationPattern::TransitionShock => 6,
                 },
                 verdict: F2QualificationVerdict::Pass,
                 phases_completed: 8,
@@ -7614,14 +7641,14 @@ mod tests {
         assert_eq!(f2_frontier_bounds(&targets, 1935), Some((1755, 13)));
 
         let standard = PowerSweepMode::Standard.f2_policy();
-        // v13 single-detector: descent = 15s discovery + 1×65s (Texture only). Exact-Apply still
-        // runs the full 3-pattern set, so the apply estimate stays 3×305s per pair.
+        // v13 single-detector: descent = 15s discovery + 1×65s (Texture only). Exact-Apply runs
+        // the full gate ladder per pair: 3×305s patterns + 485s TransitionShock + 1205s Endurance.
         assert_eq!(f2_target_upper_estimate_ms(1, standard), 80_000);
         assert_eq!(f2_calibration_upper_estimate_ms(1, standard), 45_000);
-        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 915_000);
+        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 2_605_000);
         assert_eq!(
             f2_apply_upper_estimate_ms(F2_ESTIMATE_MAX_PROFILE_PAIRS, standard),
-            2_745_000
+            7_815_000
         );
 
         let fast = PowerSweepMode::Fast.f2_policy();
@@ -7629,16 +7656,25 @@ mod tests {
         assert_eq!(f2_apply_upper_estimate_ms(3, fast), 0);
 
         // v13 decoupling regression: the descent runs a SINGLE detector, but exact-Apply must run
-        // the FULL required set. The apply ETA must key off REQUIRED_QUALIFICATION_PATTERNS.len(),
-        // NOT the (smaller) per-mode qualification_passes — the desync that once published 0 profiles.
+        // the FULL required set. The apply ETA must key off the complete gate ladder (which embeds
+        // REQUIRED_QUALIFICATION_PATTERNS.len()), NOT the (smaller) per-mode qualification_passes —
+        // the desync that once published 0 profiles.
         assert_ne!(
             standard.qualification_passes,
             nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len()
+        );
+        // v15: the ladder = 3 required patterns + TransitionShock + Endurance, each + overhead —
+        // the ETA and the gate can never desync because both read the SAME ladder const.
+        assert_eq!(
+            F2_APPLY_PAIR_DWELL_LADDER_MS.len(),
+            nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() + 2
         );
         assert_eq!(
             f2_apply_upper_estimate_ms(1, standard),
             nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() as u64
                 * (F2_APPLY_QUALIFICATION_DWELL_MS + PROBE_OVERHEAD_MS)
+                + (crate::gpu_undervolt::F2_TRANSITION_SHOCK_DWELL_MS + PROBE_OVERHEAD_MS)
+                + (crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS + PROBE_OVERHEAD_MS)
         );
     }
 

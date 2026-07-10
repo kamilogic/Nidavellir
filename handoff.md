@@ -13,7 +13,34 @@ v13 absolute clock ceiling — `docs/clock-lock-v13-plan.md`. Leva 2 remains blo
 Earlier roadmap: `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## START-HERE (2026-07-09) — blacklist-abort FIXED + published; v14 endurance gate Stage 1 DONE (uncommitted)
+## START-HERE (2026-07-10) — endurance gate HW-PROVEN; v15 TransitionShock gate implemented (uncommitted)
+State: `0629a9f` (blacklist-boundary fix + v14 worst-realistic endurance) is committed+pushed and
+**HW-validated by the 2026-07-10 18:26 run**: the 20-min endurance soak REJECTED Godforge candidate
+1890@900 (SilentError texture-rop mid-soak — a point the old gate had just passed 3×5 min) and the
+loop resynthesized to 1875@893; published Godforge 1875@893 183W · Brokkr's 1860@875 177W · Deep
+Calm 1755@818 158W, all endurance-passed, run 187.9 min.
+
+**Open problem it did NOT close**: the operator's real TDR on 1860@875 (Event Viewer: 7×
+`nvlddmkm` ID 153 "BusReset TDR", ~2-3 s apart, 09/07 04:43-04:45 local, until hard wedge) is the
+LAUNCH-transition class — idle P-state exit → boost VF ramp — which NO continuous dwell enters
+(IdlePulse = 100 ms naps; every dwell pre-warmed 63-71 °C). Operator believes it is NOT temperature;
+mechanism targeted is the transition itself.
+
+**NEW in the working tree (validated, NOT committed, NOT HW-tested): v15 TransitionShock gate** —
+see `docs/qualification-v14-endurance-plan.md` §v15 for full detail. Summary: gpu-stress
+`BoostEntry` workload (golden-checked heavy slam → TRUE idle 10/20/30 s → slam; slam wall-time
+> 500 ms ⇒ `stalled` ⇒ Unstable = pre-hang precursor caught below the 2 s watchdog);
+`TransitionShock` pattern (~8 min) now runs BEFORE the 20-min endurance at exact-Apply;
+publish gate requires BOTH (run-scoped). No contract bump. Tests: core 81/0, gpu-stress 11/0,
+service 360/0; clippy baseline exact.
+
+**NEXT (approved by operator, in order)**: (1) runtime TDR sentinel (nvlddmkm-153 watcher →
+first event = reset-to-stock + blacklist + UI notice — breaks the 5-strike cascade); (2) on-demand
+profile torture test (IPC+UI; covers the genuinely COLD card the forge can't reach); (3) Stage 2
+preserve-identity fallback (specced in the plan doc); safety-audit the accumulated diff before the
+next supervised re-forge.
+
+## OLDER START-HERE (2026-07-09) — blacklist-abort FIXED + published; v14 endurance gate Stage 1 DONE (uncommitted)
 Nothing below is committed. Two things landed this session (validated: cargo check/test/clippy green;
 NO hardware run; NO safety audit yet):
 

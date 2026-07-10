@@ -154,7 +154,14 @@ const F2_STANDARD_DWELL_MS: u64 = 15_000;
 /// mirrors the continuous Overwatch loop that TDR'd Godforge 1920@918; long enough to reach the
 /// thermal saturation the reset-between 5-min patterns never reach.
 #[cfg(windows)]
-const F2_ENDURANCE_QUALIFICATION_DWELL_MS: u64 = 1_200_000;
+pub(crate) const F2_ENDURANCE_QUALIFICATION_DWELL_MS: u64 = 1_200_000;
+
+/// v15 candidate-only transition shock (~8 min): true-idle → heavy-slam cycles at the exact Apply
+/// point, reproducing the game/benchmark-LAUNCH transition behind the observed in-game BusReset TDR
+/// cascade. Runs BEFORE the Endurance soak — a launch-fragile point fails in ~8 min instead of
+/// wasting the 20-min soak.
+#[cfg(windows)]
+pub(crate) const F2_TRANSITION_SHOCK_DWELL_MS: u64 = 480_000;
 
 /// Residual offset (kHz) at or below which a post-reset readback counts as "cleared". F2 must NEVER
 /// leave a positive offset applied; a larger residual makes the confirmed path treat the reset as
@@ -2307,11 +2314,15 @@ impl F2StressPurpose {
             F2StressPurpose::ApplyQualification(F2QualificationPattern::B, _) => {
                 Some(VfQualifierPattern::Fsgl3B)
             }
-            // v14 endurance soak is exact-Apply only; the V8Qualification arm never fires in
-            // practice but is mapped so the match stays exhaustive.
+            // v14/v15 candidate-only gates are exact-Apply only; the V8Qualification arms never
+            // fire in practice but are mapped so the match stays exhaustive.
             F2StressPurpose::V8Qualification(F2QualificationPattern::Endurance, _)
             | F2StressPurpose::ApplyQualification(F2QualificationPattern::Endurance, _) => {
                 Some(VfQualifierPattern::Endurance)
+            }
+            F2StressPurpose::V8Qualification(F2QualificationPattern::TransitionShock, _)
+            | F2StressPurpose::ApplyQualification(F2QualificationPattern::TransitionShock, _) => {
+                Some(VfQualifierPattern::TransitionShock)
             }
         }
     }
@@ -2350,8 +2361,18 @@ fn classify_f2_stress_dwell(
         // sample draws less than the point's real steady-state power), so discovery evidence is
         // inconclusive whenever the card thermally slowed.
         F2DwellOutcome::Inconclusive
-    } else if matches!(purpose, F2StressPurpose::ApplyQualification(_, _))
-        && s.thermal_throttled
+    } else if matches!(
+        purpose,
+        // v15: TransitionShock is EXEMPT from the p5-sag thermal disqualifier — its dwell is
+        // deliberately ~60% true-idle (10-30 s gaps), so p5 is an idle clock BY DESIGN and says
+        // nothing about whether the card backed off the qualified point. Any NVML throttle flag
+        // (routine at ~70 °C during exact-Apply) would otherwise misclassify EVERY shock dwell as
+        // Inconclusive and refuse the candidate at the end of a full run. The shock carries its
+        // own detectors instead: the post-idle slam wall-time stall (Unstable) + golden checksum
+        // (SilentError). All continuous patterns keep the held-clock rule below unchanged.
+        F2StressPurpose::ApplyQualification(pattern, _)
+            if pattern != F2QualificationPattern::TransitionShock
+    ) && s.thermal_throttled
         && s.p5_clock_mhz + F2_CLOCK_DROP_TOL_MHZ < target_mhz
     {
         // Exact-Apply qualification: a thermal-slowdown flag only invalidates the proof when the
@@ -3881,8 +3902,8 @@ impl F2QualificationMarginHistory {
             F2QualificationPattern::Texture => &self.texture,
             F2QualificationPattern::Transitions => &self.transitions,
             F2QualificationPattern::Memory => &self.memory,
-            // ponytail: endurance never feeds the descent margin history (exact-Apply only).
-            F2QualificationPattern::Endurance => &[],
+            // ponytail: the candidate-only gates never feed the descent margin history.
+            F2QualificationPattern::Endurance | F2QualificationPattern::TransitionShock => &[],
         }
     }
 
@@ -3894,8 +3915,8 @@ impl F2QualificationMarginHistory {
             F2QualificationPattern::Texture => self.texture.push(p5_mhz),
             F2QualificationPattern::Transitions => self.transitions.push(p5_mhz),
             F2QualificationPattern::Memory => self.memory.push(p5_mhz),
-            // ponytail: endurance never feeds the descent margin history (exact-Apply only).
-            F2QualificationPattern::Endurance => {}
+            // ponytail: the candidate-only gates never feed the descent margin history.
+            F2QualificationPattern::Endurance | F2QualificationPattern::TransitionShock => {}
         }
     }
 }
@@ -4180,6 +4201,7 @@ fn qualification_pattern_label(pattern: F2QualificationPattern) -> &'static str 
         F2QualificationPattern::Transitions => "Transitions",
         F2QualificationPattern::Memory => "Memory",
         F2QualificationPattern::Endurance => "Endurance",
+        F2QualificationPattern::TransitionShock => "TransitionShock",
     }
 }
 
@@ -4377,107 +4399,124 @@ fn gate_anchored_candidate_fsgl3(
             }
         }
     }
-    // v14 candidate-only ENDURANCE gate: one CONTINUOUS ~15-min mixed soak (MixedGame + FrameCadence
-    // + the graceful Texture detector) at the EXACT Apply point. Runs ONLY at exact-Apply — the
-    // frontier descent (exact_apply=false) never pays it. A single dwell is continuous by
-    // construction (no mid-soak reset), so it reaches the thermal saturation + sustained mixed load
-    // the reset-between 5-min patterns never do. Non-Validated ⇒ the exact point is rejected (fail
-    // closed). Same arm→apply→verify→dwell→reset motor + NVML clock ceiling + cooperative Stop.
+    // v14/v15 candidate-only STRESS gates at the EXACT Apply point, run ONLY at exact-Apply — the
+    // frontier descent (exact_apply=false) never pays them. IN ORDER (fail cheap first):
+    //   1. TransitionShock (~8 min): true-idle → heavy-slam cycles reproducing the game/benchmark
+    //      LAUNCH transition (P-state exit + boost VF ramp + VRM load step) behind the observed
+    //      in-game BusReset TDR cascade; the slam wall-time check fails Unstable at the pre-hang
+    //      precursor, long before the ~2 s driver watchdog.
+    //   2. Endurance (~20 min): one CONTINUOUS worst-realistic soak (sustained max-power +
+    //      cap-slam + droop + mixed), no mid-soak reset, so thermal saturation truly accumulates.
+    // Non-Validated ⇒ the exact point is rejected (fail closed). Each pass keeps the same
+    // arm→apply→verify→dwell→reset motor + NVML clock ceiling + cooperative Stop.
     if exact_apply {
-        if stop.load(Ordering::SeqCst) {
-            return F2QualificationOutcome::Cancelled;
-        }
-        let mut endurance_ops = RealF2MultiOps {
-            store,
-            curve: sane.to_vec(),
-            candidates: vec![candidate.clone()],
-            limits: *limits,
-            target_mhz,
-            baseline_offset_mhz: 0,
-            prev_offset_override_mhz: None,
-            dwell_ms: F2_ENDURANCE_QUALIFICATION_DWELL_MS,
-            stress_purpose: F2StressPurpose::ApplyQualification(
+        for (pattern, dwell_ms, kind) in [
+            (
+                F2QualificationPattern::TransitionShock,
+                F2_TRANSITION_SHOCK_DWELL_MS,
+                "shock idle→slam",
+            ),
+            (
                 F2QualificationPattern::Endurance,
-                goldens,
+                F2_ENDURANCE_QUALIFICATION_DWELL_MS,
+                "soak contínuo",
             ),
-            cancel: Some(stop),
-            cur: None,
-        };
-        if let Err(e) = endurance_ops.select(0) {
-            return F2QualificationOutcome::Aborted {
-                stop_reason: format!("EndurancePrecheckFailed: {e}"),
-                retain_boot_flag: false,
+        ] {
+            let label = qualification_pattern_label(pattern);
+            if stop.load(Ordering::SeqCst) {
+                return F2QualificationOutcome::Cancelled;
+            }
+            let mut gate_ops = RealF2MultiOps {
+                store,
+                curve: sane.to_vec(),
+                candidates: vec![candidate.clone()],
+                limits: *limits,
+                target_mhz,
+                baseline_offset_mhz: 0,
+                prev_offset_override_mhz: None,
+                dwell_ms,
+                stress_purpose: F2StressPurpose::ApplyQualification(pattern, goldens),
+                cancel: Some(stop),
+                cur: None,
             };
-        }
-        on_progress(F2ClockDiscoveryProgress {
-            target_mhz,
-            planned_steps: candidate_count,
-            unpruned_steps,
-            anchor_mv: Some(candidate.anchor.voltage_mv),
-            outcome: None,
-            line: format!(
-                "v8 Endurance: {target_mhz} MHz @ {} mV — soak contínuo ({} min)…",
-                candidate.anchor.voltage_mv,
-                F2_ENDURANCE_QUALIFICATION_DWELL_MS / 60_000
-            ),
-        });
-        let mut report = run_confirmed_f2_step(&mut endurance_ops);
-        annotate_qualification_report(
-            &mut report,
-            F2QualificationStrength::Fsgl4,
-            Some(F2QualificationPattern::Endurance),
-            1,
-            0,
-        );
-        logs.push(format!(
-            "{target_mhz} MHz @ {} mV v8 Endurance (soak {} min): {:?}",
-            candidate.anchor.voltage_mv,
-            F2_ENDURANCE_QUALIFICATION_DWELL_MS / 60_000,
-            report.outcome
-        ));
-        qual_ctx.timestamp = now_rfc3339();
-        let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
-            qual_ctx,
-            target_mhz,
-            candidate,
-            &report,
-        );
-        if let Err(e) = obs_store.append(&observation) {
-            return F2QualificationOutcome::Aborted {
-                stop_reason: format!("ObservationPersistFailed: {e}"),
-                retain_boot_flag: false,
-            };
-        }
-        *executed_steps = executed_steps.saturating_add(1);
-        on_progress(F2ClockDiscoveryProgress {
-            target_mhz,
-            planned_steps: candidate_count,
-            unpruned_steps,
-            anchor_mv: Some(candidate.anchor.voltage_mv),
-            outcome: Some(format!("{:?}", report.outcome)),
-            line: format!(
-                "{target_mhz} MHz @ {} mV · v8 Endurance → {:?} · aprendizado salvo",
-                candidate.anchor.voltage_mv, report.outcome
-            ),
-        });
-        if stop.load(Ordering::SeqCst) {
-            return F2QualificationOutcome::Cancelled;
-        }
-        match &report.outcome {
-            F2Outcome::Validated => {}
-            F2Outcome::DeviceLost
-            | F2Outcome::ResetFailed
-            | F2Outcome::ArmFailed(_)
-            | F2Outcome::ApplyFailed(_)
-            | F2Outcome::VerifyFailed => {
+            if let Err(e) = gate_ops.select(0) {
                 return F2QualificationOutcome::Aborted {
-                    stop_reason: format!("EnduranceAborted: {:?}", report.outcome),
-                    retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
+                    stop_reason: format!("{label}PrecheckFailed: {e}"),
+                    retain_boot_flag: false,
                 };
             }
-            F2Outcome::Inconclusive => return F2QualificationOutcome::Inconclusive,
-            other => {
-                return F2QualificationOutcome::Rejected(format!("endurance {other:?}"))
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(candidate.anchor.voltage_mv),
+                outcome: None,
+                line: format!(
+                    "v8 {label}: {target_mhz} MHz @ {} mV — {kind} ({} min)…",
+                    candidate.anchor.voltage_mv,
+                    dwell_ms / 60_000
+                ),
+            });
+            let mut report = run_confirmed_f2_step(&mut gate_ops);
+            annotate_qualification_report(
+                &mut report,
+                F2QualificationStrength::Fsgl4,
+                Some(pattern),
+                1,
+                0,
+            );
+            logs.push(format!(
+                "{target_mhz} MHz @ {} mV v8 {label} ({kind} {} min): {:?}",
+                candidate.anchor.voltage_mv,
+                dwell_ms / 60_000,
+                report.outcome
+            ));
+            qual_ctx.timestamp = now_rfc3339();
+            let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+                qual_ctx,
+                target_mhz,
+                candidate,
+                &report,
+            );
+            if let Err(e) = obs_store.append(&observation) {
+                return F2QualificationOutcome::Aborted {
+                    stop_reason: format!("ObservationPersistFailed: {e}"),
+                    retain_boot_flag: false,
+                };
+            }
+            *executed_steps = executed_steps.saturating_add(1);
+            on_progress(F2ClockDiscoveryProgress {
+                target_mhz,
+                planned_steps: candidate_count,
+                unpruned_steps,
+                anchor_mv: Some(candidate.anchor.voltage_mv),
+                outcome: Some(format!("{:?}", report.outcome)),
+                line: format!(
+                    "{target_mhz} MHz @ {} mV · v8 {label} → {:?} · aprendizado salvo",
+                    candidate.anchor.voltage_mv, report.outcome
+                ),
+            });
+            if stop.load(Ordering::SeqCst) {
+                return F2QualificationOutcome::Cancelled;
+            }
+            match &report.outcome {
+                F2Outcome::Validated => {}
+                F2Outcome::DeviceLost
+                | F2Outcome::ResetFailed
+                | F2Outcome::ArmFailed(_)
+                | F2Outcome::ApplyFailed(_)
+                | F2Outcome::VerifyFailed => {
+                    return F2QualificationOutcome::Aborted {
+                        stop_reason: format!("{label}Aborted: {:?}", report.outcome),
+                        retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
+                    };
+                }
+                F2Outcome::Inconclusive => return F2QualificationOutcome::Inconclusive,
+                other => {
+                    return F2QualificationOutcome::Rejected(format!(
+                        "{label} {other:?}"
+                    ))
+                }
             }
         }
     }
@@ -6549,6 +6588,30 @@ mod tests {
             ),
             F2DwellOutcome::Inconclusive
         );
+        // v15 regression: TransitionShock dwells are ~60% TRUE idle by design, so p5 is an idle
+        // clock and the p5-sag thermal rule must NOT apply — a routine throttle flag would
+        // otherwise misclassify every shock dwell as Inconclusive and refuse the candidate at the
+        // END of a full run. The shock carries its own detectors (slam-stall → Unstable, golden →
+        // SilentError); a clean shock dwell with a throttle flag and idle-low p5 must validate.
+        assert_eq!(
+            classify_f2_stress_dwell(
+                &dropped,
+                1935,
+                F2StressPurpose::ApplyQualification(
+                    F2QualificationPattern::TransitionShock,
+                    RenderGoldens {
+                        power: 1,
+                        boost: 2,
+                        texrop: 3,
+                        cadence: 4,
+                        geometry: 5,
+                        stream: 6,
+                        stream_frame_reference_ms: 20,
+                    },
+                ),
+            ),
+            F2DwellOutcome::Stable
+        );
     }
 
     fn qualification_coverage_with_phase_p5(
@@ -6583,6 +6646,7 @@ mod tests {
                             F2QualificationPattern::Transitions => "v8-transitions",
                             F2QualificationPattern::Memory => "v8-memory",
                             F2QualificationPattern::Endurance => "endurance",
+                            F2QualificationPattern::TransitionShock => "transition-shock",
                         }
                         .to_string(),
                         duration_ms: 1_000,
