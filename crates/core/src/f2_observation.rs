@@ -110,6 +110,12 @@ pub enum F2QualificationPattern {
     Texture,
     Transitions,
     Memory,
+    /// v14 candidate-only endurance soak: one CONTINUOUS ~15-min mixed dwell run ONLY at the exact
+    /// Apply pair (never in the frontier descent). Deliberately kept OUT of
+    /// [`REQUIRED_QUALIFICATION_PATTERNS`] so it tightens Apply without altering the descent /
+    /// completeness gates or forcing a contract-version bump; publishing is gated on run_id-scoped
+    /// endurance evidence instead ([`point_has_current_endurance_qualification`]).
+    Endurance,
 }
 
 /// The complete pattern set the current qualification contract requires at a boundary and at the
@@ -990,6 +996,37 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
     (seen.iter().all(|present| *present) && highest > 0).then_some(highest)
 }
 
+/// True when the CURRENT run's continuous Endurance soak validated cleanly at this exact
+/// `(target_mhz, apply_mv)` pair on this GPU. The endurance gate (v14) only TIGHTENS Apply — it is
+/// not part of [`REQUIRED_QUALIFICATION_PATTERNS`] and never touches the frontier descent — so it
+/// carries no contract-version bump; the publish gate is run_id-scoped evidence instead. Requires an
+/// [`F2EvidenceKind::ApplyQualification`] Validated observation whose coverage pattern is
+/// [`F2QualificationPattern::Endurance`] with a `Pass` verdict, reset-clean and boot-flag-cleared.
+/// Fail closed: legacy or absent endurance evidence reads `false` and can never publish.
+pub fn point_has_current_endurance_qualification(
+    obs: &[F2Observation],
+    run_id: &str,
+    target_mhz: u32,
+    apply_mv: u32,
+    gpu_key: &str,
+) -> bool {
+    obs.iter().any(|o| {
+        o.run_id == run_id
+            && o.target_mhz == target_mhz
+            && o.anchor_mv == apply_mv
+            && o.gpu_key.as_deref() == Some(gpu_key)
+            && o.evidence_kind == F2EvidenceKind::ApplyQualification
+            && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
+            && o.outcome.is_validated()
+            && o.reset_to_stock_ok
+            && o.boot_flag_cleared
+            && o.qualification_coverage.as_ref().is_some_and(|coverage| {
+                coverage.pattern == Some(F2QualificationPattern::Endurance)
+                    && coverage.verdict == F2QualificationVerdict::Pass
+            })
+    })
+}
+
 /// Highest sustained p99 across every complete current-contract v7 run for one exact Apply pair.
 /// This restores the conservative published wattage when a qualified Forge snapshot is reloaded.
 pub fn highest_apply_qualification_p99_at_anchor(
@@ -1191,6 +1228,7 @@ mod tests {
                 F2QualificationPattern::Texture => 2,
                 F2QualificationPattern::Transitions => 3,
                 F2QualificationPattern::Memory => 4,
+                F2QualificationPattern::Endurance => 5,
             },
             verdict: F2QualificationVerdict::Pass,
             phases_completed: 8,
@@ -1750,6 +1788,31 @@ mod tests {
             None,
             "a thermal slowdown that sagged the clock still fails closed"
         );
+    }
+
+    #[test]
+    fn endurance_gate_is_run_scoped_and_fails_closed() {
+        let endurance = |run: &str, outcome: F2ObsOutcome| -> F2Observation {
+            let mut o = apply_qualification_pass(obs(1935, 956, outcome), F2QualificationPattern::Endurance);
+            o.run_id = run.into();
+            o.gpu_key = Some("RTX 4070".into());
+            o
+        };
+        // A clean endurance soak in THIS run at the exact pair publishes.
+        let this_run = [endurance("R1", F2ObsOutcome::Validated)];
+        assert!(point_has_current_endurance_qualification(&this_run, "R1", 1935, 956, "RTX 4070"));
+        // Run-scoped: the same evidence never publishes a different run.
+        assert!(!point_has_current_endurance_qualification(&this_run, "R2", 1935, 956, "RTX 4070"));
+        // Fail closed: a complete 3-pattern Apply set WITHOUT any endurance obs is not publishable.
+        let mut no_endurance =
+            apply_qualification_pass(obs(1935, 956, F2ObsOutcome::Validated), F2QualificationPattern::Texture);
+        no_endurance.run_id = "R1".into();
+        no_endurance.gpu_key = Some("RTX 4070".into());
+        assert!(!point_has_current_endurance_qualification(&[no_endurance], "R1", 1935, 956, "RTX 4070"));
+        // A non-validated endurance dwell (silent error mid-soak) rejects the point.
+        let mut failed = endurance("R1", F2ObsOutcome::SilentError);
+        failed.silent_error = true;
+        assert!(!point_has_current_endurance_qualification(&[failed], "R1", 1935, 956, "RTX 4070"));
     }
 
     #[test]

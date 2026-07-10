@@ -148,6 +148,14 @@ const INCONCLUSIVE_RETRY_BUDGET: usize = 2;
 #[cfg(windows)]
 const F2_STANDARD_DWELL_MS: u64 = 15_000;
 
+/// v14 candidate-only endurance soak: ONE continuous WORST-REALISTIC dwell (~20 min) run only at the
+/// exact Apply point for the 3 profile candidates — deliberately harsher than a real game (sustained
+/// max-power + cap-slam + droop transients) so a PASS means real games are safe with margin. ~20 min
+/// mirrors the continuous Overwatch loop that TDR'd Godforge 1920@918; long enough to reach the
+/// thermal saturation the reset-between 5-min patterns never reach.
+#[cfg(windows)]
+const F2_ENDURANCE_QUALIFICATION_DWELL_MS: u64 = 1_200_000;
+
 /// Residual offset (kHz) at or below which a post-reset readback counts as "cleared". F2 must NEVER
 /// leave a positive offset applied; a larger residual makes the confirmed path treat the reset as
 /// failed and RETAIN the boot flag (fail closed).
@@ -2299,6 +2307,12 @@ impl F2StressPurpose {
             F2StressPurpose::ApplyQualification(F2QualificationPattern::B, _) => {
                 Some(VfQualifierPattern::Fsgl3B)
             }
+            // v14 endurance soak is exact-Apply only; the V8Qualification arm never fires in
+            // practice but is mapped so the match stays exhaustive.
+            F2StressPurpose::V8Qualification(F2QualificationPattern::Endurance, _)
+            | F2StressPurpose::ApplyQualification(F2QualificationPattern::Endurance, _) => {
+                Some(VfQualifierPattern::Endurance)
+            }
         }
     }
 
@@ -3867,6 +3881,8 @@ impl F2QualificationMarginHistory {
             F2QualificationPattern::Texture => &self.texture,
             F2QualificationPattern::Transitions => &self.transitions,
             F2QualificationPattern::Memory => &self.memory,
+            // ponytail: endurance never feeds the descent margin history (exact-Apply only).
+            F2QualificationPattern::Endurance => &[],
         }
     }
 
@@ -3878,6 +3894,8 @@ impl F2QualificationMarginHistory {
             F2QualificationPattern::Texture => self.texture.push(p5_mhz),
             F2QualificationPattern::Transitions => self.transitions.push(p5_mhz),
             F2QualificationPattern::Memory => self.memory.push(p5_mhz),
+            // ponytail: endurance never feeds the descent margin history (exact-Apply only).
+            F2QualificationPattern::Endurance => {}
         }
     }
 }
@@ -4161,6 +4179,7 @@ fn qualification_pattern_label(pattern: F2QualificationPattern) -> &'static str 
         F2QualificationPattern::Texture => "Texture",
         F2QualificationPattern::Transitions => "Transitions",
         F2QualificationPattern::Memory => "Memory",
+        F2QualificationPattern::Endurance => "Endurance",
     }
 }
 
@@ -4355,6 +4374,110 @@ fn gate_anchored_candidate_fsgl3(
                     return F2QualificationOutcome::Inconclusive;
                 }
                 other => return F2QualificationOutcome::Rejected(format!("{other:?}")),
+            }
+        }
+    }
+    // v14 candidate-only ENDURANCE gate: one CONTINUOUS ~15-min mixed soak (MixedGame + FrameCadence
+    // + the graceful Texture detector) at the EXACT Apply point. Runs ONLY at exact-Apply — the
+    // frontier descent (exact_apply=false) never pays it. A single dwell is continuous by
+    // construction (no mid-soak reset), so it reaches the thermal saturation + sustained mixed load
+    // the reset-between 5-min patterns never do. Non-Validated ⇒ the exact point is rejected (fail
+    // closed). Same arm→apply→verify→dwell→reset motor + NVML clock ceiling + cooperative Stop.
+    if exact_apply {
+        if stop.load(Ordering::SeqCst) {
+            return F2QualificationOutcome::Cancelled;
+        }
+        let mut endurance_ops = RealF2MultiOps {
+            store,
+            curve: sane.to_vec(),
+            candidates: vec![candidate.clone()],
+            limits: *limits,
+            target_mhz,
+            baseline_offset_mhz: 0,
+            prev_offset_override_mhz: None,
+            dwell_ms: F2_ENDURANCE_QUALIFICATION_DWELL_MS,
+            stress_purpose: F2StressPurpose::ApplyQualification(
+                F2QualificationPattern::Endurance,
+                goldens,
+            ),
+            cancel: Some(stop),
+            cur: None,
+        };
+        if let Err(e) = endurance_ops.select(0) {
+            return F2QualificationOutcome::Aborted {
+                stop_reason: format!("EndurancePrecheckFailed: {e}"),
+                retain_boot_flag: false,
+            };
+        }
+        on_progress(F2ClockDiscoveryProgress {
+            target_mhz,
+            planned_steps: candidate_count,
+            unpruned_steps,
+            anchor_mv: Some(candidate.anchor.voltage_mv),
+            outcome: None,
+            line: format!(
+                "v8 Endurance: {target_mhz} MHz @ {} mV — soak contínuo ({} min)…",
+                candidate.anchor.voltage_mv,
+                F2_ENDURANCE_QUALIFICATION_DWELL_MS / 60_000
+            ),
+        });
+        let mut report = run_confirmed_f2_step(&mut endurance_ops);
+        annotate_qualification_report(
+            &mut report,
+            F2QualificationStrength::Fsgl4,
+            Some(F2QualificationPattern::Endurance),
+            1,
+            0,
+        );
+        logs.push(format!(
+            "{target_mhz} MHz @ {} mV v8 Endurance (soak {} min): {:?}",
+            candidate.anchor.voltage_mv,
+            F2_ENDURANCE_QUALIFICATION_DWELL_MS / 60_000,
+            report.outcome
+        ));
+        qual_ctx.timestamp = now_rfc3339();
+        let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+            qual_ctx,
+            target_mhz,
+            candidate,
+            &report,
+        );
+        if let Err(e) = obs_store.append(&observation) {
+            return F2QualificationOutcome::Aborted {
+                stop_reason: format!("ObservationPersistFailed: {e}"),
+                retain_boot_flag: false,
+            };
+        }
+        *executed_steps = executed_steps.saturating_add(1);
+        on_progress(F2ClockDiscoveryProgress {
+            target_mhz,
+            planned_steps: candidate_count,
+            unpruned_steps,
+            anchor_mv: Some(candidate.anchor.voltage_mv),
+            outcome: Some(format!("{:?}", report.outcome)),
+            line: format!(
+                "{target_mhz} MHz @ {} mV · v8 Endurance → {:?} · aprendizado salvo",
+                candidate.anchor.voltage_mv, report.outcome
+            ),
+        });
+        if stop.load(Ordering::SeqCst) {
+            return F2QualificationOutcome::Cancelled;
+        }
+        match &report.outcome {
+            F2Outcome::Validated => {}
+            F2Outcome::DeviceLost
+            | F2Outcome::ResetFailed
+            | F2Outcome::ArmFailed(_)
+            | F2Outcome::ApplyFailed(_)
+            | F2Outcome::VerifyFailed => {
+                return F2QualificationOutcome::Aborted {
+                    stop_reason: format!("EnduranceAborted: {:?}", report.outcome),
+                    retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
+                };
+            }
+            F2Outcome::Inconclusive => return F2QualificationOutcome::Inconclusive,
+            other => {
+                return F2QualificationOutcome::Rejected(format!("endurance {other:?}"))
             }
         }
     }
@@ -5063,6 +5186,27 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             break;
         }
         ops.prev_offset_override_mhz = Some(reference_offset_mhz);
+        // A blacklisted NEXT candidate during the frontier DESCENT is BOUNDARY knowledge ("a prior
+        // run's crash/TDR proved this (clock, vf_bin) unsafe — don't undervolt this low here"), NOT a
+        // live safety emergency. Treat it like reaching the physical floor: stop THIS clock at the last
+        // validated bin and let the frontier continue, rather than aborting the whole forge and
+        // publishing nothing. The Safe Loop blacklist is DURABLE, so this is exactly how a run resumed
+        // after a TDR re-enters — the accumulated blacklist must CAP the descent, never kill it. The
+        // genuine live safety refusals (Safe Mode active / boot flag already armed) still hard-abort via
+        // `select` below; those are current-state emergencies, not boundary knowledge.
+        if candidate_blacklisted(
+            &ops.store.load_record(),
+            ops.target_mhz,
+            &descent.candidates[i].anchor,
+        ) {
+            completed = true;
+            stop_reason = "BlacklistedBoundary".into();
+            logs.push(format!(
+                "{target_mhz} MHz @ {} mV: próximo candidato na blacklist do Safe Loop (falha/TDR de execução anterior) — fronteira de segurança; parando acima sem novo dwell.",
+                descent.candidates[i].anchor.voltage_mv
+            ));
+            break;
+        }
         if let Err(e) = ops.select(i) {
             aborted = true;
             stop_reason = format!("SafetyPrecheckFailed: {e}");
@@ -6438,6 +6582,7 @@ mod tests {
                             F2QualificationPattern::Texture => "v8-texture",
                             F2QualificationPattern::Transitions => "v8-transitions",
                             F2QualificationPattern::Memory => "v8-memory",
+                            F2QualificationPattern::Endurance => "endurance",
                         }
                         .to_string(),
                         duration_ms: 1_000,
@@ -6851,6 +6996,32 @@ mod tests {
         // Clean state → safe.
         let v4 = undervolt_preflight(&SafeLoopRecord::default(), false, &pts);
         assert!(v4.safe && v4.reasons.is_empty());
+    }
+
+    // A durable Safe Loop blacklist (e.g. left by a prior run's crash/TDR, surviving a program
+    // reopen/resume) that catches the NEXT lower-voltage descent candidate must be recognized by
+    // `candidate_blacklisted`. The live descent (`run_confirmed_f2_clock_discovery`) keys its
+    // "stop at this boundary and let the frontier continue" branch on exactly this predicate — a
+    // blacklisted next candidate ⇒ BlacklistedBoundary (completed), NOT SafetyPrecheckFailed
+    // (aborted). Regression guard for the whole-frontier-abort bug (2026-07-08 20:51 run).
+    #[test]
+    fn blacklisted_next_descent_candidate_is_a_boundary_trigger() {
+        let plan = |mv: u32| PositiveOffsetPlan {
+            index: 0,
+            voltage_mv: mv,
+            base_mhz: 1740,
+            offset_mhz: 30,
+            prev_offset_mhz: 0,
+            step_delta_mhz: 30,
+            effective_mhz: 1770,
+        };
+        // A prior run's SilentError/TDR blacklisted the 812 mV region at 1770 MHz.
+        let mut rec = SafeLoopRecord::default();
+        rec.blacklist.push(BlacklistRegion::around(pt(1770, 812), 0));
+        // The next descent candidate (812 mV) is caught → descent stops ABOVE it (boundary).
+        assert!(candidate_blacklisted(&rec, 1770, &plan(812)));
+        // The last validated bin (818 mV) stays clean → it remains this clock's boundary.
+        assert!(!candidate_blacklisted(&rec, 1770, &plan(818)));
     }
 
     // ── confirmed F2 single-step: usage, preflight, fail-closed state machine (mock; no HW) ────

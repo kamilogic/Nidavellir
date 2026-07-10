@@ -192,6 +192,10 @@ pub enum VfQualifierPattern {
     V8Texture,
     V8Transitions,
     V8Memory,
+    /// v14 candidate-only endurance soak: one CONTINUOUS mixed dwell (MixedGame + FrameCadence +
+    /// the graceful TextureRop silent-error detector) that scales to fill a single ~15-min dwell.
+    /// Run ONLY at the exact Apply pair, after the required 3-pattern set.
+    Endurance,
 }
 
 impl VfQualifierPattern {
@@ -206,6 +210,7 @@ impl VfQualifierPattern {
             Self::V8Texture => "v8-texture",
             Self::V8Transitions => "v8-transitions",
             Self::V8Memory => "v8-memory",
+            Self::Endurance => "endurance",
         }
     }
 }
@@ -439,6 +444,49 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 8),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 6),
     ];
+    // v14 candidate-only endurance soak — WORST-REALISTIC (harsher than a real game, on purpose, so a
+    // PASS means real games are safe with margin — but NOT a synthetic power-virus that would reject
+    // game-stable points). ONE continuous dwell, never resets mid-run, so thermal saturation truly
+    // accumulates. Four ingredients, each targeting a real undervolt failure mode:
+    //   1. SUSTAINED max-power (HeavySpike held) → junction/VRM/current saturation a game's average
+    //      load never reaches.
+    //   2. CAP-SLAM (HeavySpike burst ↔ IdlePulse release, repeated) → oscillates the VRM; under the
+    //      v13 clock ceiling the driver drops VOLTAGE at the cap, not clock — the exact transient that
+    //      TDR'd Godforge 1920@918 after 20 min of Overwatch.
+    //   3. FrameCadence → fine frame-scale droop transients (VRM response-period sweep).
+    //   4. MixedGame → game-realistic varied load for coverage.
+    // The graceful golden-checked TextureRop is interleaved after every heavy block so a stress-induced
+    // silent error is caught by checksum promptly (ideally before a hard TDR). HeavySpike/IdlePulse/
+    // PowerRender are all golden-checked too. No new shader. CALIBRATION KNOBS (tune on real HW):
+    // HeavySpike amplitude + the burst/idle weight ratio below + FrameCadence's internal gap sweep.
+    const ENDURANCE: [(VfQualifierPhase, VfWorkload, u64); 20] = [
+        // Warm-up ramp into load.
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 3),
+        // Sustained max-power saturation block (the reset-between 5-min patterns never reach this heat).
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 14),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        // Cap-slam #1: heavy burst ↔ idle release, oscillating the VRM at high (already-hot) state.
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        // Fine droop transients + game-realistic mixed load.
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 10),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        // Second saturation + cap-slam pass — heat is at its peak now, the worst point for a marginal Vmin.
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 12),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        // Cool-down close.
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 3),
+    ];
 
     let template: &[(VfQualifierPhase, VfWorkload, u64)] = match pattern {
         VfQualifierPattern::Fsgl1 => &FSGL1,
@@ -450,6 +498,7 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         VfQualifierPattern::V8Texture => &V8_TEXTURE,
         VfQualifierPattern::V8Transitions => &V8_TRANSITIONS,
         VfQualifierPattern::V8Memory => &V8_MEMORY,
+        VfQualifierPattern::Endurance => &ENDURANCE,
     };
     let total_weight = template.iter().map(|(_, _, weight)| *weight).sum::<u64>();
     let mut assigned = 0u64;
@@ -3293,6 +3342,46 @@ mod tests {
             .filter(|segment| segment.workload == workload)
             .map(|segment| segment.duration_ms)
             .sum()
+    }
+
+    #[test]
+    fn endurance_pattern_is_worst_realistic_soak_with_correct_coverage() {
+        // One continuous ~20-min dwell; weights must scale to fill the whole requested duration.
+        let plan = vf_qualifier_plan(1_200_000, VfQualifierPattern::Endurance);
+        assert_eq!(
+            plan.iter().map(|segment| segment.duration_ms).sum::<u64>(),
+            1_200_000
+        );
+        // Worst-realistic ingredients: sustained max-power (HeavySpike) + cap-slam (HeavySpike ↔
+        // IdlePulse) + fine droop transients (FrameCadence) + game realism (MixedGame), with the
+        // graceful golden-checked TextureRop interleaved to catch a stress-induced silent error.
+        for workload in [
+            VfWorkload::HeavySpike,
+            VfWorkload::IdlePulse,
+            VfWorkload::FrameCadence,
+            VfWorkload::MixedGame,
+            VfWorkload::TextureRop,
+        ] {
+            assert!(
+                plan.iter().any(|segment| segment.workload == workload),
+                "endurance must exercise {workload:?}"
+            );
+        }
+        // Sustained max-power dominates — this is a worst-case soak, harsher than a game's average
+        // load (which MixedGame represents), not a single-detector burst.
+        assert!(
+            duration_for_workload(&plan, VfWorkload::HeavySpike)
+                > duration_for_workload(&plan, VfWorkload::MixedGame)
+        );
+        // Cap-slam requires BOTH the heavy burst and the idle release to be present.
+        assert!(
+            duration_for_workload(&plan, VfWorkload::HeavySpike) > 0
+                && duration_for_workload(&plan, VfWorkload::IdlePulse) > 0
+        );
+        // Phase-coverage denominator is exact and never panics (auto-derived from the plan):
+        // PowerOpening, HeavySpike, TextureRop, IdlePulse, FrameCadence, MixedGame, PowerClosing = 7.
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::Endurance), 7);
+        assert_eq!(VfQualifierPattern::Endurance.label(), "endurance");
     }
 
     #[test]

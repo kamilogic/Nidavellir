@@ -1335,6 +1335,11 @@ fn f2_pattern_from_stress(
             Some(F2QualificationPattern::Memory),
             "v8-memory",
         ),
+        VfQualifierPattern::Endurance => (
+            F2QualificationStrength::Fsgl4,
+            Some(F2QualificationPattern::Endurance),
+            "endurance",
+        ),
     }
 }
 
@@ -6525,7 +6530,19 @@ fn measure_multiclock_undervolt_forge(
                                     nidavellir_core::f2_observation::
                                         F2_QUALIFICATION_CONTRACT_VERSION,
                                 )
-                    });
+                    })
+                    // v14: "already qualified" must include THIS run's continuous endurance soak at
+                    // the exact pair. Endurance evidence is run-scoped, so a point whose apply-
+                    // qualification was restored from a prior run (same contract version) is NOT
+                    // considered done — it re-runs the gate (which now includes the endurance soak)
+                    // instead of publishing unproven. Fail closed.
+                        && nidavellir_core::f2_observation::point_has_current_endurance_qualification(
+                            &obs_store.load_all(),
+                            &run_id,
+                            key.0,
+                            key.1,
+                            &gpu_key,
+                        );
                     if already_qualified {
                         continue;
                     }
@@ -7158,6 +7175,7 @@ mod tests {
                     F2QualificationPattern::Texture => 2,
                     F2QualificationPattern::Transitions => 3,
                     F2QualificationPattern::Memory => 4,
+                    F2QualificationPattern::Endurance => 5,
                 },
                 verdict: F2QualificationVerdict::Pass,
                 phases_completed: 8,

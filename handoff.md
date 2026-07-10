@@ -13,6 +13,88 @@ v13 absolute clock ceiling — `docs/clock-lock-v13-plan.md`. Leva 2 remains blo
 Earlier roadmap: `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## START-HERE (2026-07-09) — blacklist-abort FIXED + published; v14 endurance gate Stage 1 DONE (uncommitted)
+Nothing below is committed. Two things landed this session (validated: cargo check/test/clippy green;
+NO hardware run; NO safety audit yet):
+
+1. **Blacklist-abort FIXED** (the bug the old START-HERE below describes). In the live descent
+   (`run_confirmed_f2_clock_discovery`, gpu_undervolt.rs ~5066) a blacklisted NEXT candidate now sets
+   `completed`/`BlacklistedBoundary` and continues the frontier instead of `aborted`/SafetyPrecheckFailed.
+   Genuine Safe Mode / boot-flag refusals in `select` stay hard aborts. Regression test
+   `blacklisted_next_descent_candidate_is_a_boundary_trigger`. **The 2026-07-09 03:47 run CONFIRMED it**:
+   full 14-clock frontier, 3 profiles published (Godforge 1905@906 187W · Brokkr's 1860@875 176W ·
+   Deep Calm 1755@818 159W), no abort, no TDR.
+
+2. **v14 candidate-only endurance gate — Stage 1 DONE + reinforced** (`docs/qualification-v14-endurance-plan.md`).
+   Operator ground truth: the published boundaries are game-honest but the forge gate is systematically
+   softer than real games (repeatable ±1-bin texture-rop wall, not noise). Fix = spend realism ONLY on
+   the 3 candidates. Stage 1 adds a continuous **~20-min WORST-REALISTIC** soak run at exact-Apply only,
+   inside `gate_anchored_candidate_fsgl3` gated on `exact_apply` (`F2QualificationPattern::Endurance`,
+   gpu-stress `Endurance` pattern). Composition: sustained max-power (HeavySpike) + cap-slam
+   (HeavySpike↔IdlePulse — the 1920@918-class VRM-droop transient) + FrameCadence droop + MixedGame
+   realism, with graceful golden-checked TextureRop interleaved. Harsher than a game on purpose, NOT a
+   power-virus. Non-Validated ⇒ ExactApply rejected. Publish is run-scoped via
+   `point_has_current_endurance_qualification` (reconcile loop's `already_qualified` also requires it →
+   no resume hole). No contract bump. `F2_ENDURANCE_QUALIFICATION_DWELL_MS = 1_200_000`. Calibration
+   knobs (tune on HW): HeavySpike amplitude, burst/idle ratio, FrameCadence gap.
+   - **NEXT: Stage 2 (directed "preserve-identity" fallback), NOT started — mechanism fully specced in
+     the plan doc.** On a GRACEFUL endurance-fail: perf (Godforge/Brokkr's) → raise to the next V-bin
+     same clock (`f2_next_bin_above`), calibrate p99 + re-run the gate, then MUTATE that clock's
+     `classified` point and resynth — synthesis's own off-cap gate keeps it (still off-cap) or drops the
+     clock (now at-cap), so no duplicate off-cap logic. Calm (Deep Calm) → existing exclude→resynth
+     already steps down. Bounded (`F2_ENDURANCE_FALLBACK_MAX_RAISES` ≈1–2; each raise ≈25 min).
+     Hard aborts (DeviceLost) never fall back. **No safety gap without Stage 2** — the reinforced gate
+     already makes the existing exclude→resynth converge to a worst-realistic-passing point; Stage 2
+     only biases perf profiles to keep their clock. Then safety-audit the whole v14 diff → re-forge.
+
+## START-HERE for the next session (2026-07-08, night) — runaway FIXED; NEW blacklist-abort bug to fix
+Read this first. The v13 stack (clock ceiling + off-cap + single-detector + Q1) is committed & pushed
+(HEAD `2662d04`). Two runs failed to publish, each a distinct, now-understood bug:
+1. The **single-detector runaway** (all 67 bins, ~5 h) is FIXED (commit `a2a3ec5`).
+2. The latest run (log `nidavellir-forge-log-2026-07-08T20-51-39...txt`) PROVED the runaway fix works —
+   Cmax=1950 detected, floor 1755, **stopped at the 90% floor, ~36 min**, single-detector premise held
+   (EVERY failure `texture-rop`), boundaries clean. BUT it aborted 1 clock short and published nothing.
+
+### The bug to fix (blacklist aborts the frontier)
+At clock 13/14 (1770 MHz) the descent found 818 mV Validated, then the next lower candidate (812 mV)
+matched a **blacklisted intent** and `RealF2MultiOps::select` (gpu_undervolt.rs ~2643-2650) returned
+`Err("candidate 1 intent is blacklisted")` → stop_reason `SafetyPrecheckFailed` → the forge loop treats
+it as an unsafe/failed end (gpu_power_sweep.rs ~6085-6090) → **whole frontier ends "parcial", no
+synthesis, no profiles.** The blacklist is DURABLE across runs (Safe Loop record) and reset-clean
+texture-rop SilentErrors ARE blacklisted (every SilentError dwell carries the `blacklisted` flag). Here
+the poisoning came from a PRIOR run's `1785@812` SilentError blacklisting a region that caught 1770's
+next bin. So blacklist entries accumulate and eventually abort a later run one bin at a time.
+
+- **Immediate operator workaround (no code)**: click **Reset all / "forget everything"**
+  (`ResetGpuTuningFull`) — it wipes the blacklist — THEN run Standard. Within a single fresh run the
+  descent reuses boundaries and should not re-poison itself, so it should complete + publish.
+- **Durable fix (next session)**: a blacklisted NEXT-candidate during the frontier DESCENT is BOUNDARY
+  knowledge ("don't go lower here"), NOT a safety emergency — treat it as a clean boundary (stop this
+  clock at the last-good bin, continue the frontier), never abort the whole forge. Keep the genuine
+  safety prechecks (Safe Mode active / boot flag armed in `select`) as hard aborts; only the
+  "blacklisted intent" branch should degrade to a boundary. Cleanest: pre-filter blacklisted bins out
+  of the descent candidate list so it simply stops above them. Consider also narrowing the blacklist so
+  a SilentError at a HIGHER clock's voltage cannot poison the SAME voltage at a LOWER clock (lower clocks
+  are stable at lower voltage), or not blacklisting reset-clean forge-descent SilentErrors at all (the
+  descent already stops at the first fail). Add a regression test. Then re-forge → should publish.
+
+### Clean boundary data from the 20:51 run (honest v13 boundaries; for Q3 calibration)
+min-stable / first-fail mV per clock (Texture single-detector): 1950 931/925 · 1935 925/918 ·
+1920 900/893 · 1905 900/893 · 1890 893/887 · 1875 881/875 · 1860 862/856 · 1845 856/850 · 1830 850/843 ·
+1815 837/831 · 1800 825/818 · 1785 818/812 · 1770 818/(aborted). Apply = boundary +12 mV (~1 bin), e.g.
+1800→~837 — still BELOW the operator's golden 1800@875, so **Q3 (silicon-margin bump to the golden)
+remains the real deployability gap.** p99 at boundary ≈ 1800@825 160 W, 1860@862 172 W, 1905@900 183 W.
+
+### Roadmap after the blacklist fix
+1. Fix blacklist-abort (above) → re-forge → confirm 3 profiles publish (~1 h).
+2. **Q3** — silicon-margin bump calibrated to the golden 1800@875 (frontier is ~1 bin optimistic;
+   raise `APPLY_MARGIN_MV`, currently 12). Off-cap invariant + Godforge=off-cap already in.
+3. **Q4** — golden-point regression gate (forge must reject 1800@868, accept 1800@875) + wire the
+   failure histogram. Then real-use in-game validation (the 20-min Overwatch loop that TDR'd 1920@918).
+The export-log button works well — ask the operator to attach the rich log each run.
+
+
+
 ## Ownership + tooling change (2026-07-08) — Claude owns full stack; rich forge-log export added
 - **Ownership**: the Claude/Codex backend/frontend split was RETIRED (operator: it was an experiment).
   Claude now owns the whole stack incl. the Tauri/Svelte UI under `apps/ui/`. Updated CLAUDE.md,
