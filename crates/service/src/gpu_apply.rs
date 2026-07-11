@@ -57,6 +57,13 @@ fn clear_applied() {
     let _ = std::fs::remove_file(applied_path());
 }
 
+/// v17 sentinel: the fallback ladder is exhausted (or re-apply failed) — clear the persisted
+/// profile so boot comes up stock instead of re-applying a point that failed in real use.
+#[cfg(windows)]
+pub(crate) fn sentinel_clear_applied() {
+    clear_applied();
+}
+
 /// Remove all persisted *learning* files for a full "forget everything" reset: the F2 observation
 /// frontier and the legacy single-clock knowledge. Best-effort — a missing file is success. Returns
 /// human-readable errors for files that existed but could not be removed (empty ⇒ all clear).

@@ -12,6 +12,7 @@ mod ipc_server;
 mod safe_loop_runtime;
 mod sensor_gather;
 mod service_impl;
+mod tdr_sentinel;
 
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
@@ -357,6 +358,10 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     // Re-apply the persisted GPU profile (volatile offsets) unless a prior
     // crash/Safe Mode says not to.
     gpu_apply::reapply_on_boot(&safe_store);
+    // v17 runtime TDR sentinel: watch nvlddmkm-153 while a profile is applied; on the FIRST
+    // in-game TDR break the hang cascade (stock → blacklist → auto-fallback +3 bins, same clock).
+    #[cfg(windows)]
+    tdr_sentinel::spawn(safe_store.clone());
 
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {

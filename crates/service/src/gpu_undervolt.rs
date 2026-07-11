@@ -182,7 +182,7 @@ const F2_SANE_MHZ_MIN: u32 = 500;
 const F2_SANE_MHZ_MAX: u32 = 3500;
 
 #[cfg(windows)]
-fn is_f2_sane_point(voltage_mv: u32, freq_mhz: u32) -> bool {
+pub(crate) fn is_f2_sane_point(voltage_mv: u32, freq_mhz: u32) -> bool {
     (F2_SANE_MV_MIN..=F2_SANE_MV_MAX).contains(&voltage_mv)
         && (F2_SANE_MHZ_MIN..=F2_SANE_MHZ_MAX).contains(&freq_mhz)
 }

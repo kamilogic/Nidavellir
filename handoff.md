@@ -23,6 +23,26 @@ contract 13→14**.
   `VramPressure` segments at peak heat). Exact-Apply/pair: Texture 5 + Shock 8 + Endurance 20 ≈
   33 min (was 43) → ~30 min/run saved, coverage STRONGER (composite > isolated).
 - ETA ladder converted to a runtime helper (`f2_apply_pair_dwell_ladder_ms`) that tracks REQUIRED.
+- **v17 Stage A — runtime TDR sentinel (2026-07-11, uncommitted, NOT HW-tested)**: new
+  `tdr_sentinel.rs`. Polls `wevtutil` for nvlddmkm-153 every 15 s (sub-ms CPU, ZERO GPU). On the
+  FIRST in-game TDR with an F2 profile applied (boot flag NOT armed — forge dwells own their own
+  recovery; DeviceLost retains the flag): stock reset → durable blacklist of the failed
+  (clock,vf_bin) → auto-fallback +3 bins SAME clock (`sentinel_decide`, pure+tested) → re-apply +
+  persist (`sentinel_rewrite_applied`; boot restores the SAFER point). 2nd event same session →
+  stock + profile cleared (ladder exhausted). Events appended to `sentinel_log.jsonl`. Baseline =
+  newest historical event at start (never re-handles old logs). Tests 362/0. Stage B pending: GPU
+  canary (silent-error layer, under-load only) + UI toast + safety audit of the whole v17.
+  HW-validated the same day: the 2026-07-11 run confirmed v16/v16.1/off-cap in HW (composite
+  endurance REJECTED 1905@906 mid-soak; off-cap raise lines fired 3×; Godforge 1890@900 published).
+  **Stage B ALSO DONE + AUDITED (2026-07-11)**: GPU canary layer — ~5 ms known-answer ALU every
+  30 s, ONLY with profile applied + util ≥30% (idle never woken); non-Stable ⇒ +2-bin fallback
+  (shared 1-bump/session budget with the TDR layer). Safety audit (nidavellir-safety-auditor):
+  **GO WITH CHANGES — the CRITICAL was FIXED same session** (sentinel bump now routes through
+  `gpu_apply::apply_and_persist_undervolt` → boot flag armed + 8 s survival window around the
+  autonomous write; prior label/mem-offset captured BEFORE reset). Non-blocking residuals to
+  fast-follow: (#2) coarse forge-active interlock beyond the boot flag; (#3) floor event dedup by
+  service-start time if the baseline query fails; (#4) unlocked save_record last-writer race;
+  (#5) cascade residue during cooldown can burn the 2nd strike. UI toast still pending.
 - **v16.1 ALSO DONE (2026-07-10)**: `CompositeGameLoad` workload/phase (code 13, COUNT 14) — each
   frame renders the heavy texture frame AND, in the same submit, gathers over a near-full
   VRAM-resident pool (48×256 MB OOM-guarded) → compute+texture+memory-controller on the shared rail

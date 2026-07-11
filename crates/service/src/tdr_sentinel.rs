@@ -1,0 +1,330 @@
+//! v17 runtime TDR sentinel — Stage A (Event Log layer).
+//!
+//! Watches the Windows System event log for `nvlddmkm` Event ID 153 ("BusReset TDR") while a
+//! Nidavellir undervolt profile is applied, and breaks the observed 5-strike hang cascade at the
+//! FIRST event: reset to stock → blacklist the failed intent (durable Safe Loop knowledge the next
+//! forge consumes as a boundary) → auto-fallback the profile +3 physical voltage bins at the SAME
+//! clock (preserve identity) and re-apply. A SECOND event in the same service session stops the
+//! ladder: stay stock, clear the applied profile (boot never re-applies the failed point) — if two
+//! bumps didn't fix it, the problem is not one bin.
+//!
+//! Cost: one filtered `wevtutil` query every ~15 s (sub-millisecond CPU, ZERO GPU — never touches
+//! the card during gameplay). The GPU canary (silent-error layer) is Stage B.
+//!
+//! Safety guards: acts ONLY when (a) an F2 undervolt profile is applied, (b) the Safe Loop boot
+//! flag is NOT armed (during forge dwells the flag is armed — and a dwell DeviceLost RETAINS it —
+//! so forge-owned TDRs are never double-handled), (c) the event is NEWER than service start /
+//! the last handled event (historical log entries never trigger on boot).
+
+#![cfg(windows)]
+
+use tracing::{info, warn};
+use nidavellir_core::safe_loop::{BlacklistRegion, SafeLoopStore, TuningPoint, DEFAULT_BLACKLIST_RADIUS};
+
+const SENTINEL_POLL_MS: u64 = 15_000;
+/// Post-action settle time (driver just recovered + we rewrote the curve).
+const SENTINEL_COOLDOWN_MS: u64 = 60_000;
+/// TDR is the gravest failure class → +3 physical bins at the same clock.
+const SENTINEL_TDR_BUMP_BINS: usize = 3;
+/// A canary-detected silent error is boundary-class → +2 bins at the same clock.
+const SENTINEL_SILENT_BUMP_BINS: usize = 2;
+/// Canary cadence + kernel budget: ~5 ms of known-answer ALU every 30 s (<0.02% GPU), and ONLY
+/// while the GPU is under real load (silent errors at elastic idle voltages are meaningless and
+/// the kernel must never keep an idle card awake).
+const SENTINEL_CANARY_POLL_MS: u64 = 30_000;
+const SENTINEL_CANARY_KERNEL_MS: u64 = 5;
+const SENTINEL_CANARY_MIN_UTIL_PCT: f64 = 30.0;
+/// One automatic bump per service session; the second event goes to stock and stays there.
+const SENTINEL_MAX_BUMPS_PER_SESSION: u32 = 1;
+
+/// What the sentinel decided for a detected TDR. Pure decision — testable without hardware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SentinelAction {
+    /// No undervolt applied (stock/F1) — record and move on.
+    Ignore,
+    /// Forge owns the GPU right now (boot flag armed) — never double-handle a dwell TDR.
+    ForgeOwns,
+    /// First failure: bump to this anchor (same clock) and re-apply.
+    Bump { target_mhz: u32, new_anchor_mv: u32 },
+    /// Ladder exhausted (or no higher bin exists): stay stock, clear the applied profile.
+    Stock { target_mhz: u32, failed_anchor_mv: u32 },
+}
+
+/// Pure fallback-ladder decision. `bins_above` are the physical VF bins strictly above the failed
+/// anchor, ascending (from the live sane curve).
+pub(crate) fn sentinel_decide(
+    applied: Option<(u32, u32)>,
+    boot_flag_armed: bool,
+    bumps_this_session: u32,
+    bins_above: &[u32],
+    bump_bins: usize,
+) -> SentinelAction {
+    let Some((target_mhz, anchor_mv)) = applied else {
+        return SentinelAction::Ignore;
+    };
+    if boot_flag_armed {
+        return SentinelAction::ForgeOwns;
+    }
+    if bumps_this_session >= SENTINEL_MAX_BUMPS_PER_SESSION {
+        return SentinelAction::Stock { target_mhz, failed_anchor_mv: anchor_mv };
+    }
+    // +N bins, or the highest available if the curve runs out before that (never less than +1).
+    match bins_above.get(bump_bins.saturating_sub(1)).or(bins_above.last()) {
+        Some(&new_anchor_mv) => SentinelAction::Bump { target_mhz, new_anchor_mv },
+        None => SentinelAction::Stock { target_mhz, failed_anchor_mv: anchor_mv },
+    }
+}
+
+/// Extract `SystemTime='…'` from `wevtutil /f:xml` output (locale-proof, no regex).
+pub(crate) fn parse_event_system_time(xml: &str) -> Option<String> {
+    let start = xml.find("SystemTime='")? + "SystemTime='".len();
+    let end = xml[start..].find('\'')? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// Newest nvlddmkm-153 event timestamp, if any.
+fn query_latest_tdr_event() -> Option<String> {
+    let out = std::process::Command::new("wevtutil")
+        .args([
+            "qe",
+            "System",
+            "/q:*[System[Provider[@Name='nvlddmkm'] and (EventID=153)]]",
+            "/c:1",
+            "/rd:true",
+            "/f:xml",
+        ])
+        .output()
+        .ok()?;
+    parse_event_system_time(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Physical VF bins strictly above `anchor_mv` on the live sane base curve, ascending.
+fn bins_above_anchor(anchor_mv: u32) -> Vec<u32> {
+    use nidavellir_gpu_nvapi as gpu;
+    let mut bins: Vec<u32> = gpu::read_vf_base_curve_modern()
+        .into_iter()
+        .filter(|&(_, mv, f)| crate::gpu_undervolt::is_f2_sane_point(mv, f))
+        .map(|(_, mv, _)| mv)
+        .filter(|&mv| mv > anchor_mv)
+        .collect();
+    bins.sort_unstable();
+    bins.dedup();
+    bins
+}
+
+fn append_sentinel_log(entry: &str) {
+    let path = nidavellir_core::safe_loop::default_data_dir().join("sentinel_log.jsonl");
+    let line = format!(
+        "{{\"ts\":\"{}\",{entry}}}\n",
+        nidavellir_core::f2_observation::now_rfc3339()
+    );
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
+/// Handle one confirmed failure (TDR event or canary silent error). Returns true on a bump.
+fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usize, kind: &str) -> bool {
+    let applied = crate::gpu_apply::load_applied()
+        .and_then(|p| p.undervolt.map(|u| (u.target_mhz, u.anchor_mv)));
+    let action = sentinel_decide(
+        applied,
+        store.is_boot_flag_armed(),
+        bumps_this_session,
+        &applied.map(|(_, mv)| bins_above_anchor(mv)).unwrap_or_default(),
+        bump_bins,
+    );
+    match action {
+        SentinelAction::Ignore => {
+            info!("sentinel: nvlddmkm-153 TDR with no undervolt applied — recorded, no action");
+            append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"ignore\""));
+            false
+        }
+        SentinelAction::ForgeOwns => {
+            info!("sentinel: TDR while the Safe Loop boot flag is armed — forge owns recovery");
+            append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"forge-owns\""));
+            false
+        }
+        SentinelAction::Bump { target_mhz, new_anchor_mv } => {
+            let (_, failed_mv) = applied.expect("Bump implies applied");
+            warn!(
+                "sentinel: in-game TDR at {target_mhz} MHz @ {failed_mv} mV — resetting to stock, \
+                 blacklisting, auto-fallback to {new_anchor_mv} mV (+{SENTINEL_TDR_BUMP_BINS} bins)"
+            );
+            // Capture label/mem-offset BEFORE reset() — it deletes gpu_applied.json (audit #1).
+            let prior = crate::gpu_apply::load_applied();
+            let prior_label = prior.as_ref().map(|p| p.label.clone()).unwrap_or_default();
+            let prior_mem = prior.as_ref().and_then(|p| p.mem_offset_mhz);
+            // 1. Deterministic stock (the driver already bus-reset; make our state match).
+            if let Err(e) = crate::gpu_apply::reset(store) {
+                warn!("sentinel: stock reset failed ({e}) — staying stock, no re-apply");
+                crate::gpu_apply::sentinel_clear_applied();
+                append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"stock\",\"reason\":\"reset-failed\""));
+                return false;
+            }
+            // 2. Durable blacklist: the failed (clock, vf_bin) intent — the next forge descent
+            //    stops ABOVE it (BlacklistedBoundary), so real-world failures refine the frontier.
+            let mut rec = store.load_record();
+            let intent = TuningPoint::from_axes([
+                ("gpu_freq_mhz", target_mhz as i64),
+                ("gpu_vf_bin_mv", failed_mv as i64),
+            ]);
+            rec.blacklist.push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
+            if let Err(e) = store.save_record(&rec) {
+                warn!("sentinel: blacklist persist failed: {e}");
+            }
+            // 3. Preserve-identity fallback: same clock, higher bin — through the FULL guarded
+            //    apply path (audit #1: arms the Safe Loop boot flag around the autonomous write +
+            //    8 s survival window, so a bumped point that cold-hangs is NOT re-applied on boot;
+            //    also re-applies the prior mem offset and persists the composed label).
+            match crate::gpu_apply::apply_and_persist_undervolt(
+                format!("{} (sentinela +{bump_bins} bins)", prior_label.trim_end()),
+                target_mhz,
+                new_anchor_mv,
+                prior_mem,
+                store,
+            ) {
+                Ok(()) => {
+                    append_sentinel_log(&format!(
+                        "\"event\":\"{kind}\",\"action\":\"bump\",\"target_mhz\":{target_mhz},\
+                         \"failed_mv\":{failed_mv},\"new_mv\":{new_anchor_mv}"
+                    ));
+                    true
+                }
+                Err(e) => {
+                    warn!("sentinel: fallback re-apply failed ({e}) — staying stock");
+                    crate::gpu_apply::sentinel_clear_applied();
+                    append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"stock\",\"reason\":\"reapply-failed\""));
+                    false
+                }
+            }
+        }
+        SentinelAction::Stock { target_mhz, failed_anchor_mv } => {
+            warn!(
+                "sentinel: TDR at {target_mhz} MHz @ {failed_anchor_mv} mV after a previous bump \
+                 this session — staying at stock (ladder exhausted); profile cleared"
+            );
+            let _ = crate::gpu_apply::reset(store);
+            let mut rec = store.load_record();
+            let intent = TuningPoint::from_axes([
+                ("gpu_freq_mhz", target_mhz as i64),
+                ("gpu_vf_bin_mv", failed_anchor_mv as i64),
+            ]);
+            rec.blacklist.push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
+            let _ = store.save_record(&rec);
+            crate::gpu_apply::sentinel_clear_applied();
+            append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"stock\",\"reason\":\"ladder-exhausted\""));
+            false
+        }
+    }
+}
+
+/// Spawn the sentinel thread. Baseline = the newest historical event at start (never re-handled).
+pub fn spawn(store: SafeLoopStore) {
+    // Shared bump budget across BOTH layers: one automatic bump per service session, total.
+    let bumps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    // Layer 1 — Event Log (TDR/BusReset; authoritative, zero GPU).
+    {
+        let store = store.clone();
+        let bumps = std::sync::Arc::clone(&bumps);
+        std::thread::spawn(move || {
+            let mut last_handled = query_latest_tdr_event();
+            info!("sentinel: watching nvlddmkm-153 (baseline {last_handled:?})");
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(SENTINEL_POLL_MS));
+                let Some(newest) = query_latest_tdr_event() else { continue };
+                if last_handled.as_deref() == Some(newest.as_str()) {
+                    continue;
+                }
+                last_handled = Some(newest);
+                let n = bumps.load(std::sync::atomic::Ordering::SeqCst);
+                if handle_failure(&store, n, SENTINEL_TDR_BUMP_BINS, "tdr") {
+                    bumps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(SENTINEL_COOLDOWN_MS));
+            }
+        });
+    }
+
+    // Layer 2 — GPU canary (silent errors): ~5 ms of known-answer ALU every 30 s, ONLY while an
+    // undervolt is applied AND the GPU is under real load (>30% util — an idle card is never woken,
+    // and elastic idle voltages make idle silent-errors meaningless). A non-Stable canary at the
+    // applied point means the silicon is corrupting under the game RIGHT NOW → boundary-class
+    // fallback (+2 bins). Context created lazily per check and dropped (no persistent GPU state).
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(SENTINEL_CANARY_POLL_MS));
+        let applied = crate::gpu_apply::load_applied().and_then(|p| p.undervolt);
+        if applied.is_none() || store.is_boot_flag_armed() {
+            continue;
+        }
+        let under_load = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()
+            .first()
+            .and_then(|g| g.utilization_pct)
+            .is_some_and(|u| u >= SENTINEL_CANARY_MIN_UTIL_PCT);
+        if !under_load {
+            continue;
+        }
+        let Ok(ctx) = nidavellir_gpu_stress::GpuCtx::new() else { continue };
+        let report = ctx.run_alu("sentinel-canary", 65_536, 64, SENTINEL_CANARY_KERNEL_MS);
+        if report.result != nidavellir_core::gpu_sweep::StabilityResult::Stable {
+            warn!("sentinel: canary detected {:?} at the applied point", report.result);
+            let n = bumps.load(std::sync::atomic::Ordering::SeqCst);
+            if handle_failure(&store, n, SENTINEL_SILENT_BUMP_BINS, "silent-canary") {
+                bumps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(SENTINEL_COOLDOWN_MS));
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sentinel_ladder_bumps_three_bins_then_goes_stock() {
+        let bins = [850, 856, 862, 868];
+        // First failure at 1815@843 → +3 bins = 862, same clock (preserve identity).
+        assert_eq!(
+            sentinel_decide(Some((1815, 843)), false, 0, &bins, SENTINEL_TDR_BUMP_BINS),
+            SentinelAction::Bump { target_mhz: 1815, new_anchor_mv: 862 }
+        );
+        // Second failure in the same session → ladder exhausted → stock.
+        assert_eq!(
+            sentinel_decide(Some((1815, 862)), false, 1, &[868], SENTINEL_TDR_BUMP_BINS),
+            SentinelAction::Stock { target_mhz: 1815, failed_anchor_mv: 862 }
+        );
+        // Curve runs out before +3 → highest available bin, never a lower one.
+        assert_eq!(
+            sentinel_decide(Some((1815, 843)), false, 0, &[850], SENTINEL_TDR_BUMP_BINS),
+            SentinelAction::Bump { target_mhz: 1815, new_anchor_mv: 850 }
+        );
+        // No higher bin at all → stock.
+        assert_eq!(
+            sentinel_decide(Some((1815, 843)), false, 0, &[], SENTINEL_TDR_BUMP_BINS),
+            SentinelAction::Stock { target_mhz: 1815, failed_anchor_mv: 843 }
+        );
+        // Forge owns the GPU (boot flag armed) → never double-handle a dwell TDR.
+        assert_eq!(sentinel_decide(Some((1815, 843)), true, 0, &bins, SENTINEL_TDR_BUMP_BINS), SentinelAction::ForgeOwns);
+        // Canary silent error is boundary-class → +2 bins (850→856 from 843).
+        assert_eq!(
+            sentinel_decide(Some((1815, 843)), false, 0, &bins, SENTINEL_SILENT_BUMP_BINS),
+            SentinelAction::Bump { target_mhz: 1815, new_anchor_mv: 856 }
+        );
+        // Stock / F1 applied → nothing to do.
+        assert_eq!(sentinel_decide(None, false, 0, &bins, SENTINEL_TDR_BUMP_BINS), SentinelAction::Ignore);
+    }
+
+    #[test]
+    fn parses_wevtutil_xml_system_time() {
+        let xml = "<Event><System><TimeCreated SystemTime='2026-07-09T07:43:40.123456700Z'/></System></Event>";
+        assert_eq!(
+            parse_event_system_time(xml).as_deref(),
+            Some("2026-07-09T07:43:40.123456700Z")
+        );
+        assert_eq!(parse_event_system_time("no events"), None);
+    }
+}
