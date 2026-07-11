@@ -1038,6 +1038,39 @@ pub fn point_has_current_endurance_qualification(
         })
 }
 
+/// WORST-CASE measured power (max of p99 and peak) across ALL of the CURRENT run's validated
+/// ApplyQualification dwells at one exact Apply pair — INCLUDING the v14 Endurance soak and the
+/// v15 TransitionShock, which are the honest worst-load measurements. The off-cap invariant must
+/// consume this, not just the calm PowerRender basis: a cool-ambient run measures PowerRender
+/// 10-15 W below a warm day at the same point, letting an at-cap-under-game-load clock slip past
+/// the headroom ceiling (the 2026-07-10 run published the known-TDR 1920@918 exactly this way —
+/// PowerRender 174 W, Endurance peak 189 W). Strictly conservative: only ever RAISES the basis.
+pub fn worst_current_apply_qualification_power_at_anchor(
+    obs: &[F2Observation],
+    run_id: &str,
+    target_mhz: u32,
+    apply_mv: u32,
+    gpu_key: &str,
+) -> Option<f32> {
+    obs.iter()
+        .filter(|o| {
+            o.run_id == run_id
+                && o.target_mhz == target_mhz
+                && o.anchor_mv == apply_mv
+                && o.gpu_key.as_deref() == Some(gpu_key)
+                && o.evidence_kind == F2EvidenceKind::ApplyQualification
+                && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
+                && o.outcome.is_validated()
+        })
+        .flat_map(|o| {
+            o.power_p99_w
+                .into_iter()
+                .chain(o.max_watts.map(|peak| peak as f32))
+        })
+        .filter(|power| power.is_finite() && *power > 0.0)
+        .max_by(f32::total_cmp)
+}
+
 /// Highest sustained p99 across every complete current-contract v7 run for one exact Apply pair.
 /// This restores the conservative published wattage when a qualified Forge snapshot is reloaded.
 pub fn highest_apply_qualification_p99_at_anchor(
@@ -1837,6 +1870,37 @@ mod tests {
         let with_failed_endurance =
             [pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated), failed];
         assert!(!point_has_current_endurance_qualification(&with_failed_endurance, "R1", 1935, 956, "RTX 4070"));
+    }
+
+    #[test]
+    fn worst_apply_power_includes_endurance_and_is_run_scoped() {
+        let mut calm = apply_qualification_pass(
+            obs(1920, 918, F2ObsOutcome::Validated),
+            F2QualificationPattern::Texture,
+        );
+        calm.run_id = "R1".into();
+        calm.gpu_key = Some("RTX 4070".into());
+        calm.power_p99_w = Some(174.0);
+        calm.max_watts = Some(175);
+        // The endurance soak measured the honest worst load — its PEAK must win the basis.
+        let mut soak = apply_qualification_pass(
+            obs(1920, 918, F2ObsOutcome::Validated),
+            F2QualificationPattern::Endurance,
+        );
+        soak.run_id = "R1".into();
+        soak.gpu_key = Some("RTX 4070".into());
+        soak.power_p99_w = Some(188.0);
+        soak.max_watts = Some(189);
+        let set = [calm, soak];
+        assert_eq!(
+            worst_current_apply_qualification_power_at_anchor(&set, "R1", 1920, 918, "RTX 4070"),
+            Some(189.0)
+        );
+        // Run-scoped: another run's evidence never feeds this run's off-cap basis.
+        assert_eq!(
+            worst_current_apply_qualification_power_at_anchor(&set, "R2", 1920, 918, "RTX 4070"),
+            None
+        );
     }
 
     #[test]

@@ -6677,10 +6677,35 @@ fn measure_multiclock_undervolt_forge(
                             changed = true;
                             break;
                         };
+                        // Off-cap worst-case basis: the Endurance/TransitionShock dwells are the
+                        // honest worst-load power measurements, and the off-cap invariant must see
+                        // them. A cool-ambient run measures PowerRender 10-15 W below a warm day at
+                        // the same point — the 2026-07-10 run published the known-TDR 1920@918 that
+                        // way (PowerRender 174 W vs Endurance peak 189 W). Raising the point's peak
+                        // basis here means the NEXT resynthesis pass re-runs the existing off-cap
+                        // gate against the worst measured draw and excludes an at-cap point from all
+                        // profiles. Strictly conservative: only ever raises, never relaxes.
+                        let worst_apply_power = nidavellir_core::f2_observation::
+                            worst_current_apply_qualification_power_at_anchor(
+                                &observations,
+                                &run_id,
+                                key.0,
+                                key.1,
+                                &gpu_key,
+                            );
                         for (point, _) in &mut classified {
                             if f2_apply_key(point) == Some(key) {
                                 point.p95_clock_mhz =
                                     Some(point.p95_clock_mhz.unwrap_or(0).max(apply_p95));
+                                if let Some(worst) = worst_apply_power {
+                                    if worst > point.max_power_w {
+                                        prog.log.push(format!(
+                                            "FORGE: pior potência medida no conjunto de Apply (incl. Endurance/TransitionShock) elevou a base off-cap de {} MHz @ {} mV: {:.0} → {:.0} W.",
+                                            key.0, key.1, point.max_power_w, worst
+                                        ));
+                                        point.max_power_w = worst;
+                                    }
+                                }
                                 point.apply_qualified = true;
                                 point.apply_qualification_version = Some(
                                     nidavellir_core::f2_observation::

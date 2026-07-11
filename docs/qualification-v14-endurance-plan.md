@@ -30,6 +30,39 @@ dwell also runs pre-warmed at 63-71 °C).
   (pre-hang) or SilentError — NOT as an in-game BusReset cascade later. Dwell avg/p5 clocks will
   read LOW during shock phases (deliberate idle) — that is expected, not a regression.
 
+## Off-cap worst-case fix (2026-07-10, IMPLEMENTED after the 23:44 run) — approved "fix 1"
+The 23:44 run published the KNOWN-TDR 1920@918 as Brokkr's + at-cap 1935@937 as Godforge: a cool
+evening measured PowerRender 10-15 W below the previous day at identical anchors (1935@925: 176 vs
+191 W), so the synthesis off-cap gate (fed only by discovery/calibration PowerRender) excluded
+nothing — while the Endurance soak measured 1935@937 at p99/peak 200/200 W (AT cap) and 1920@918
+peak 189 W (> 188 ceiling). FIX: new core helper
+`worst_current_apply_qualification_power_at_anchor` (max p99/peak over ALL current-run validated
+ApplyQualification dwells incl. Endurance/TransitionShock) raises the point's `max_power_w` when a
+pair qualifies; the existing resynthesis + off-cap gate then re-evaluates against the honest worst
+draw and excludes at-cap points from all profiles. Strictly conservative (only raises). Expected
+next run: Godforge lands ≈1905 (last clock whose WORST measured draw clears 188 W). Tests: core
+82/0, service 360/0. OPERATOR NOTE: do NOT game on the 23:44 run's Godforge/Brokkr's;
+Deep Calm 1755@825 is safe.
+
+## v16 spec — composite game-load gate (operator-approved direction, NOT implemented)
+Data across all 5 logged runs: EVERY first-failure was `texture-rop` (~40×) except 2× `mixed-game`
+and 1× `compute-burst`; the standalone Transitions and Memory 5-min passes NEVER rejected any
+candidate at exact-Apply — 10 min/pair of redundant coverage. Operator direction: fold them into
+ONE denser composite ("carga real de jogo": ~80% VRAM resident + texture hops + transitions
+simultaneously) and cut the per-pair pattern block.
+Proposed shape (needs contract bump 13→14 since REQUIRED changes; full re-forge anyway):
+- `REQUIRED_QUALIFICATION_PATTERNS = [Texture]` (len 1 — the empirically binding detector; the
+  descent per-bin 60 s Texture is unchanged; exact-Apply runs it 1×5 min).
+- ENDURANCE becomes the composite: add an ~80%-VRAM-resident allocation (NVML-total-scaled,
+  OOM-guarded like VramPressure) held THROUGHOUT the soak while the existing segments (sustained
+  max-power, cap-slam, FrameCadence, MixedGame, TextureRop) run against it — VRAM pressure under
+  worst load, which the isolated 5-min Memory pass never was. Transitions edges already covered by
+  cap-slam + FrameCadence + shock.
+- Pair cost: 5 (Texture) + 8 (shock) + 20 (composite endurance) ≈ 33 min +overhead, vs 43 today —
+  saves ~30 min/run — while STRENGTHENING coverage (composite > isolated).
+- Risks to audit: 80% VRAM alloc on smaller cards (OOM guard mandatory), golden determinism with
+  concurrent VRAM residency, contract quarantine.
+
 ## Remaining v15 work (approved, NOT implemented)
 1. **Runtime TDR sentinel** (service): watch System event log for `nvlddmkm` ID 153 while a
    profile is applied; on FIRST event → reset to stock + Safe Loop blacklist of the applied point
