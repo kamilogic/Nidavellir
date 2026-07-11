@@ -373,6 +373,14 @@ impl PowerSweepHandle {
     pub fn start(&self, store: SafeLoopStore) -> bool {
         self.start_with_mode(store, PowerSweepMode::Standard)
     }
+}
+
+/// v17: true while a live forge worker owns the GPU. Read by the TDR sentinel so an autonomous
+/// fallback can never race a forge run (audit #2 — the boot flag alone has inter-step windows).
+pub(crate) static FORGE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+impl PowerSweepHandle {
     /// Start the live multi-clock forge in a specific button `mode` (Fast / Standard / Long). All
     /// modes run the same complete physical frontier and fail-closed motor; only dwell duration and
     /// independent validation count vary.
@@ -381,6 +389,10 @@ impl PowerSweepHandle {
             return false;
         }
         self.stop.store(false, Ordering::SeqCst);
+        // v17 audit #2: coarse run-wide interlock — the TDR sentinel must never reset/blacklist/
+        // re-apply while a forge run owns the GPU (the per-step boot flag has clear inter-step
+        // windows a forge-induced TDR event can land in).
+        FORGE_ACTIVE.store(true, Ordering::SeqCst);
         let progress = Arc::clone(&self.progress);
         let stop = Arc::clone(&self.stop);
         let running = Arc::clone(&self.running);
@@ -414,6 +426,7 @@ impl PowerSweepHandle {
                 }
             }
             running.store(false, Ordering::SeqCst);
+            FORGE_ACTIVE.store(false, Ordering::SeqCst);
         });
         true
     }

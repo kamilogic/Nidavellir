@@ -232,19 +232,42 @@ pub fn spawn(store: SafeLoopStore) {
         let bumps = std::sync::Arc::clone(&bumps);
         std::thread::spawn(move || {
             let mut last_handled = query_latest_tdr_event();
-            info!("sentinel: watching nvlddmkm-153 (baseline {last_handled:?})");
+            // Audit #3: absolute time floor — even if the baseline query failed (Event Log not
+            // ready at boot), a HISTORICAL event can never trigger an action. Both timestamp
+            // formats share the "YYYY-MM-DDTHH:MM:SS" prefix, so a 19-char lexicographic compare
+            // is a valid ordering at second granularity.
+            let service_start = nidavellir_core::f2_observation::now_rfc3339();
+            let start_floor: String = service_start.chars().take(19).collect();
+            info!("sentinel: watching nvlddmkm-153 (baseline {last_handled:?}, floor {start_floor})");
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(SENTINEL_POLL_MS));
                 let Some(newest) = query_latest_tdr_event() else { continue };
                 if last_handled.as_deref() == Some(newest.as_str()) {
                     continue;
                 }
+                let is_historical = newest.len() >= 19 && newest[..19] < start_floor[..];
                 last_handled = Some(newest);
+                if is_historical {
+                    continue;
+                }
+                // Audit #2: never act while a forge run owns the GPU (the per-step boot flag has
+                // inter-step windows a forge-induced 153 can land in).
+                if crate::gpu_power_sweep::FORGE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                    info!("sentinel: TDR event during an active forge run — forge owns recovery");
+                    append_sentinel_log("\"event\":\"tdr\",\"action\":\"forge-active-skip\"");
+                    continue;
+                }
                 let n = bumps.load(std::sync::atomic::Ordering::SeqCst);
                 if handle_failure(&store, n, SENTINEL_TDR_BUMP_BINS, "tdr") {
                     bumps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(SENTINEL_COOLDOWN_MS));
+                // Audit #5: absorb the SAME episode's cascade residue (multiple 153s logged while
+                // we were handling + cooling down) so it can never burn the 2nd strike — only a
+                // genuinely NEW failure after this point counts against the session budget.
+                if let Some(residual) = query_latest_tdr_event() {
+                    last_handled = Some(residual);
+                }
             }
         });
     }
@@ -257,7 +280,11 @@ pub fn spawn(store: SafeLoopStore) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(SENTINEL_CANARY_POLL_MS));
         let applied = crate::gpu_apply::load_applied().and_then(|p| p.undervolt);
-        if applied.is_none() || store.is_boot_flag_armed() {
+        if applied.is_none()
+            || store.is_boot_flag_armed()
+            // Audit #2: never spin a second GPU context or act while a forge run owns the card.
+            || crate::gpu_power_sweep::FORGE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+        {
             continue;
         }
         let under_load = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()

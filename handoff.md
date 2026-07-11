@@ -43,6 +43,16 @@ contract 13→14**.
   fast-follow: (#2) coarse forge-active interlock beyond the boot flag; (#3) floor event dedup by
   service-start time if the baseline query fails; (#4) unlocked save_record last-writer race;
   (#5) cascade residue during cooldown can burn the 2nd strike. UI toast still pending.
+  **Audit residuals #2/#3/#5 FIXED (same day, committed)**: `FORGE_ACTIVE` static in
+  gpu_power_sweep (set around the worker) checked by BOTH sentinel layers; 19-char lexicographic
+  service-start floor makes historical events inert even if the baseline query fails; post-cooldown
+  re-baseline absorbs same-episode cascade residue so it never burns the 2nd strike. Remaining:
+  (#4) unlocked save_record last-writer race (LOW-MED, accepted for now) + UI toast.
+  Operator ground truth update (2026-07-11): the 1860@875 TDR was NOT launch/cold — several matches
+  OK, then the OW lobby/practice high-load LOOP (250-400 fps light frames = sustained residency AT
+  the anchor bin + kHz VRM ripple) crashed in 5-10 min WARM. Missing stressor = sustained BoostEdge
+  ("lobby regime") segment in the composite Endurance — small future change; v15.1 launch-ramp
+  deprioritized accordingly. For now the sentinel covers the gap by design (operator decision).
 - **v16.1 ALSO DONE (2026-07-10)**: `CompositeGameLoad` workload/phase (code 13, COUNT 14) — each
   frame renders the heavy texture frame AND, in the same submit, gathers over a near-full
   VRAM-resident pool (48×256 MB OOM-guarded) → compute+texture+memory-controller on the shared rail
