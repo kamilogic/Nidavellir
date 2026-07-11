@@ -44,7 +44,28 @@ next run: Godforge lands ≈1905 (last clock whose WORST measured draw clears 18
 82/0, service 360/0. OPERATOR NOTE: do NOT game on the 23:44 run's Godforge/Brokkr's;
 Deep Calm 1755@825 is safe.
 
-## v16 spec — composite game-load gate (operator-approved direction, NOT implemented)
+## v16 composite gate — IMPLEMENTED (2026-07-10, contract 13→14; validated, NOT HW-tested)
+- core: `REQUIRED_QUALIFICATION_PATTERNS = [Texture]` (len 1); `F2_QUALIFICATION_CONTRACT_VERSION`
+  13→14 (pre-v14 evidence quarantined → full re-forge). `.len()`-driven gates auto-propagated.
+- gpu-stress: ENDURANCE is now COMPOSITE — two `VramPressure` segments interleaved into the
+  worst-realistic soak (after the cap-slam blocks, at peak heat), folding in the coverage the
+  standalone 5-min Memory pass gave, under sustained worst load. 8 distinct phases now.
+- Exact-Apply per pair: Texture 5 min + TransitionShock 8 min + composite Endurance 20 min ≈ 33 min
+  (+overhead), down from 43 (dropped Transitions+Memory 2×5 min). ETA ladder auto-tracks REQUIRED.
+- Tests updated for len-1 REQUIRED (core 82/0, service 360/0, gpu-stress 11/0); clippy baseline.
+- **v16.1 — IMPLEMENTED (2026-07-10)**: `VfWorkload/Phase::CompositeGameLoad` (phase code 13,
+  COUNT 14). Each frame does the heavy 8-instance render (texture hops, golden = power, image
+  unchanged) AND, in the SAME command submit, a cache-defeating scattered gather over a near-full
+  VRAM-resident pool → compute + texture + memory controller load the shared core rail SIMULTANEOUSLY
+  (highest combined draw in the soak). Pool = up to 48×256 MB OOM-guarded (fills whatever remains
+  after the render buffers; ~80%+ on a 12 GB card, degrades on smaller). Gather writes only to a
+  256-word sink (no correctness claim; the render golden is the detector). Replaced BOTH interleaved
+  VramPressure segments in ENDURANCE with CompositeGameLoad (weights 14 + 12). Tests: gpu-stress 11/0
+  (endurance test asserts CompositeGameLoad present, 8 phases), core 82/0, service 360/0; clippy
+  baseline. HW gate: watch for `composite-game-load` phases; VRAM ~full during the soak; render
+  golden still clean. Risk noted: 48-table alloc OOM-guard is the safety net on <8 GB cards.
+
+## Original v16 spec (superseded by the IMPLEMENTED section above)
 Data across all 5 logged runs: EVERY first-failure was `texture-rop` (~40×) except 2× `mixed-game`
 and 1× `compute-burst`; the standalone Transitions and Memory 5-min passes NEVER rejected any
 candidate at exact-Apply — 10 min/pair of redundant coverage. Operator direction: fold them into

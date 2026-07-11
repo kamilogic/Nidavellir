@@ -5511,20 +5511,25 @@ fn f2_calibration_upper_estimate_ms(
 /// then the v15 TransitionShock (~8 min), then the v14 Endurance soak (~20 min). The single source
 /// for every exact-Apply ETA (upper estimate + the in-loop remaining countdown), so the displayed
 /// time can never desync from what the gate actually runs.
+/// Per-pair exact-Apply dwell durations IN EXECUTION ORDER: the required 5-min pattern(s), then
+/// the v15 TransitionShock (~8 min), then the composite v16 Endurance soak (~20 min). Built from
+/// REQUIRED_QUALIFICATION_PATTERNS so it tracks the set automatically (v14: 1 pattern). Single
+/// source for every exact-Apply ETA — the displayed time can never desync from what the gate runs.
 #[cfg(windows)]
-const F2_APPLY_PAIR_DWELL_LADDER_MS: [u64;
-    nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() + 2] = [
-    F2_APPLY_QUALIFICATION_DWELL_MS,
-    F2_APPLY_QUALIFICATION_DWELL_MS,
-    F2_APPLY_QUALIFICATION_DWELL_MS,
-    crate::gpu_undervolt::F2_TRANSITION_SHOCK_DWELL_MS,
-    crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS,
-];
+fn f2_apply_pair_dwell_ladder_ms() -> Vec<u64> {
+    let mut ladder = vec![
+        F2_APPLY_QUALIFICATION_DWELL_MS;
+        nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len()
+    ];
+    ladder.push(crate::gpu_undervolt::F2_TRANSITION_SHOCK_DWELL_MS);
+    ladder.push(crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS);
+    ladder
+}
 
 /// Total wall-clock upper bound for ONE exact-Apply pair (every dwell + per-dwell overhead).
 #[cfg(windows)]
 fn f2_apply_pair_upper_ms() -> u64 {
-    F2_APPLY_PAIR_DWELL_LADDER_MS
+    f2_apply_pair_dwell_ladder_ms()
         .iter()
         .fold(0u64, |total, dwell| {
             total.saturating_add(dwell.saturating_add(PROBE_OVERHEAD_MS))
@@ -6574,7 +6579,7 @@ fn measure_multiclock_undervolt_forge(
 
                     prog.phase = "apply-qualify".into();
                     prog.total_steps_estimate = prog.total_steps_estimate.saturating_add(
-                        u32::try_from(F2_APPLY_PAIR_DWELL_LADDER_MS.len()).unwrap_or(u32::MAX),
+                        u32::try_from(f2_apply_pair_dwell_ladder_ms().len()).unwrap_or(u32::MAX),
                     );
                     prog.log.push(format!(
                         "Qualificação Apply exato: {} MHz target @ {} mV VF — v8 Texture + Transitions + Memory (5 min cada) + TransitionShock ({} min) + Endurance ({} min).",
@@ -6598,10 +6603,10 @@ fn measure_multiclock_undervolt_forge(
                             prog.current_clock_mhz = Some(event.target_mhz);
                             prog.current_voltage_mv = event.anchor_mv;
                             prog.last_outcome = event.outcome.clone();
-                            // Precise remaining time: the ladder is heterogeneous (5/5/5/8/20 min),
+                            // Precise remaining time: the ladder is heterogeneous (5/8/20 min),
                             // so count the CURRENT pair's remaining dwells by position and future
                             // pairs by the full per-pair total — never a flat per-dwell average.
-                            let current_pair_remaining_ms = F2_APPLY_PAIR_DWELL_LADDER_MS
+                            let current_pair_remaining_ms = f2_apply_pair_dwell_ladder_ms()
                                 .iter()
                                 .skip(completed_apply_dwells)
                                 .fold(0u64, |total, dwell| {
@@ -7258,8 +7263,10 @@ mod tests {
             "GPU-1"
         )
         .unwrap());
-        assert_eq!(published.power_p99_w, Some(204.0));
-        assert!((published.perf_per_watt - 1875.0 / 204.0).abs() < f64::EPSILON);
+        // v14: REQUIRED = [Texture] only, so the published soak p99 is Texture's (203.5), not the
+        // old 3-pattern max (Transitions 204.0). Transitions/Memory are now candidate-only composite.
+        assert_eq!(published.power_p99_w, Some(203.5));
+        assert!((published.perf_per_watt - 1875.0 / 203.5).abs() < f64::EPSILON);
 
         let mut missing_p99 = measured;
         missing_p99.power_p99_w = None;
@@ -7666,32 +7673,24 @@ mod tests {
         assert_eq!(f2_frontier_bounds(&targets, 1935), Some((1755, 13)));
 
         let standard = PowerSweepMode::Standard.f2_policy();
-        // v13 single-detector: descent = 15s discovery + 1×65s (Texture only). Exact-Apply runs
-        // the full gate ladder per pair: 3×305s patterns + 485s TransitionShock + 1205s Endurance.
+        // v14 single-detector: descent = 15s discovery + 1×65s (Texture only). Exact-Apply runs the
+        // gate ladder per pair: 1×305s Texture + 485s TransitionShock + 1205s composite Endurance.
         assert_eq!(f2_target_upper_estimate_ms(1, standard), 80_000);
         assert_eq!(f2_calibration_upper_estimate_ms(1, standard), 45_000);
-        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 2_605_000);
+        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 1_995_000);
         assert_eq!(
             f2_apply_upper_estimate_ms(F2_ESTIMATE_MAX_PROFILE_PAIRS, standard),
-            7_815_000
+            5_985_000
         );
 
         let fast = PowerSweepMode::Fast.f2_policy();
         assert_eq!(f2_target_upper_estimate_ms(1, fast), 15_000);
         assert_eq!(f2_apply_upper_estimate_ms(3, fast), 0);
 
-        // v13 decoupling regression: the descent runs a SINGLE detector, but exact-Apply must run
-        // the FULL required set. The apply ETA must key off the complete gate ladder (which embeds
-        // REQUIRED_QUALIFICATION_PATTERNS.len()), NOT the (smaller) per-mode qualification_passes —
-        // the desync that once published 0 profiles.
-        assert_ne!(
-            standard.qualification_passes,
-            nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len()
-        );
-        // v15: the ladder = 3 required patterns + TransitionShock + Endurance, each + overhead —
-        // the ETA and the gate can never desync because both read the SAME ladder const.
+        // The ETA and the gate can never desync: both read the SAME ladder helper (REQUIRED
+        // pattern(s) + TransitionShock + Endurance, each + overhead).
         assert_eq!(
-            F2_APPLY_PAIR_DWELL_LADDER_MS.len(),
+            f2_apply_pair_dwell_ladder_ms().len(),
             nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() + 2
         );
         assert_eq!(

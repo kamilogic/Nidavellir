@@ -13,7 +13,29 @@ v13 absolute clock ceiling — `docs/clock-lock-v13-plan.md`. Leva 2 remains blo
 Earlier roadmap: `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## START-HERE (2026-07-10) — endurance gate HW-PROVEN; v15 TransitionShock gate implemented (uncommitted)
+## START-HERE (2026-07-10 late) — v16 composite gate + contract v14 (uncommitted, NOT HW-tested)
+Committed+pushed: `d568a4c` (off-cap worst-case power fix). UNCOMMITTED on top: **v16 composite +
+contract 13→14**.
+- `REQUIRED_QUALIFICATION_PATTERNS = [Texture]` only (5 HW runs: Texture was the ONLY binding
+  detector; standalone Transitions/Memory 5-min passes never rejected a candidate). Contract
+  `F2_QUALIFICATION_CONTRACT_VERSION` 13→14 → pre-v14 evidence quarantined, FULL re-forge required.
+- Memory's VRAM coverage folded INTO the candidate-only composite Endurance soak (two interleaved
+  `VramPressure` segments at peak heat). Exact-Apply/pair: Texture 5 + Shock 8 + Endurance 20 ≈
+  33 min (was 43) → ~30 min/run saved, coverage STRONGER (composite > isolated).
+- ETA ladder converted to a runtime helper (`f2_apply_pair_dwell_ladder_ms`) that tracks REQUIRED.
+- **v16.1 ALSO DONE (2026-07-10)**: `CompositeGameLoad` workload/phase (code 13, COUNT 14) — each
+  frame renders the heavy texture frame AND, in the same submit, gathers over a near-full
+  VRAM-resident pool (48×256 MB OOM-guarded) → compute+texture+memory-controller on the shared rail
+  SIMULTANEOUSLY. Golden = power (unchanged; gather → sink only). Replaced ENDURANCE's two
+  VramPressure segments. This is the operator's "80% VRAM ao mesmo tempo que texture hops".
+- Validated: workspace clean, core 82/0, service 360/0, gpu-stress 11/0, clippy baseline. NOT HW-tested.
+- Operator: **Deep Calm 1755@825 currently APPLIED and validated in real use** (safe profile).
+- **NEXT**: re-forge (contract 14 forces it) validates v16 + v16.1 + off-cap fix in ONE run (expect
+  Godforge ≈1905, log "elevou a base off-cap", `composite-game-load` phases, VRAM ~full during soak).
+  Then: v15.1 (forced P-state drop in shock), runtime TDR sentinel, on-demand torture test — each with
+  a safety audit. Stage 2 (preserve-identity) lowest priority.
+
+## OLDER START-HERE (2026-07-10) — endurance gate HW-PROVEN; v15 TransitionShock gate implemented
 State: `0629a9f` (blacklist-boundary fix + v14 worst-realistic endurance) is committed+pushed and
 **HW-validated by the 2026-07-10 18:26 run**: the 20-min endurance soak REJECTED Godforge candidate
 1890@900 (SilentError texture-rop mid-soak — a point the old gate had just passed 3×5 min) and the

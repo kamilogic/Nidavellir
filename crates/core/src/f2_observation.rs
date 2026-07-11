@@ -64,7 +64,13 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// is now Texture (binding, graceful — runs FIRST so a failing bin fails after one dwell) +
 /// Transitions + Memory (VRAM-dominant, hang-prone — runs LAST). Cuts one 60 s dwell per descent
 /// bin and one 300 s dwell per Apply pair. Pre-v13 evidence used a different pattern set → quarantined.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 13;
+/// v14 (2026-07-10): across 5 HW runs, Texture (texture-rop) was the ONLY binding boundary/Apply
+/// detector; the standalone Transitions and Memory 5-min passes never rejected a candidate — 10 min
+/// of redundant per-pair coverage. REQUIRED is now Texture alone; the VRAM-controller path Memory
+/// covered is folded INTO the candidate-only Endurance soak as an interleaved VramPressure segment
+/// under sustained worst-case load (stronger than the isolated pass ever was). Different set →
+/// pre-v14 evidence quarantined; full re-forge required.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 14;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -129,11 +135,8 @@ pub enum F2QualificationPattern {
 /// tightens every gate.
 /// v13: Texture FIRST (the empirically-binding graceful silent-error detector — a failing bin fails
 /// after one dwell), Memory LAST (VRAM-dominant, hang-prone). HighFps was removed (never binding).
-pub const REQUIRED_QUALIFICATION_PATTERNS: [F2QualificationPattern; 3] = [
-    F2QualificationPattern::Texture,
-    F2QualificationPattern::Transitions,
-    F2QualificationPattern::Memory,
-];
+pub const REQUIRED_QUALIFICATION_PATTERNS: [F2QualificationPattern; 1] =
+    [F2QualificationPattern::Texture];
 
 fn required_pattern_index(pattern: F2QualificationPattern) -> Option<usize> {
     REQUIRED_QUALIFICATION_PATTERNS.iter().position(|required| *required == pattern)
@@ -1572,6 +1575,8 @@ mod tests {
             frontier_entry_for_target(&[discovery.clone(), texture_1, texture_2], 1800).unwrap();
         assert_eq!(only_one.validation_count, 1);
 
+        // v14: only Texture is REQUIRED. Non-required patterns (Transitions/Memory, now folded into
+        // the candidate-only composite Endurance) must NOT inflate the frontier validation count.
         let texture =
             qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::Texture);
         let transitions =
@@ -1580,7 +1585,7 @@ mod tests {
             qualification_pass_with_pattern(discovery.clone(), F2QualificationPattern::Memory);
         let complete =
             frontier_entry_for_target(&[discovery, texture, transitions, memory], 1800).unwrap();
-        assert_eq!(complete.validation_count, 3);
+        assert_eq!(complete.validation_count, 1);
     }
 
     #[test]
@@ -1588,7 +1593,7 @@ mod tests {
         let discovery = obs(1800, 881, F2ObsOutcome::Validated);
         let apply_pass = apply_qualification_pass(
             obs(1800, 893, F2ObsOutcome::Validated),
-            F2QualificationPattern::Transitions,
+            F2QualificationPattern::Texture,
         );
         assert!(is_current_apply_qualification_pass(&apply_pass));
         assert!(!is_current_qualification_pass(&apply_pass));
@@ -1703,6 +1708,9 @@ mod tests {
         );
         texture.run_id = "apply-v7".into();
         texture.power_p99_w = Some(172.587);
+        // v14: Texture is the sole REQUIRED pattern, so it carries the sustained p95 clock the
+        // publish gate reads (Transitions/Memory are folded into candidate-only Endurance).
+        texture.sustained_upper_clock_mhz = Some(1890);
         let mut transitions = apply_qualification_pass(
             obs(1830, 862, F2ObsOutcome::Validated),
             F2QualificationPattern::Transitions,
@@ -1755,7 +1763,7 @@ mod tests {
                 862,
                 "RTX 3060 Ti"
             ),
-            Some(173.125)
+            Some(172.587)
         );
         assert_eq!(
             current_apply_qualification_p95_clock_at_anchor(
@@ -1769,7 +1777,7 @@ mod tests {
         );
         assert_eq!(
             highest_apply_qualification_p99_at_anchor(&observations, 1830, 862, "RTX 3060 Ti"),
-            Some(191.0),
+            Some(190.0),
             "restored snapshots use the highest complete approved run"
         );
         assert_eq!(

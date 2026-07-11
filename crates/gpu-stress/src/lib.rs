@@ -143,11 +143,13 @@ pub enum VfQualifierPhase {
     /// v15 boost-entry shock: true-idle (seconds, GPU leaves the high P-state) → instant heavy
     /// slam, cycling. Targets the launch-transition failure the continuous phases never enter.
     BoostEntry,
+    /// v16.1 composite game load: heavy render + near-full VRAM-resident gather in the same submit.
+    CompositeGameLoad,
 }
 
 impl VfQualifierPhase {
     /// Number of phase variants (codes are `0..COUNT`). Coverage bitmaps must use this size.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 14;
 
     pub const NONE_CODE: u8 = u8::MAX;
 
@@ -166,6 +168,7 @@ impl VfQualifierPhase {
             VfQualifierPhase::GeometryDepth => "geometry-depth",
             VfQualifierPhase::TextureStream => "texture-stream",
             VfQualifierPhase::BoostEntry => "boost-entry",
+            VfQualifierPhase::CompositeGameLoad => "composite-game-load",
         }
     }
 
@@ -188,6 +191,7 @@ impl VfQualifierPhase {
             10 => Some(Self::GeometryDepth),
             11 => Some(Self::TextureStream),
             12 => Some(Self::BoostEntry),
+            13 => Some(Self::CompositeGameLoad),
             _ => None,
         }
     }
@@ -250,15 +254,21 @@ pub enum VfWorkload {
     TextureStream,
     /// v15: true-idle (10-30 s, GPU leaves the high P-state) → instant heavy golden-checked slam.
     BoostEntry,
+    /// v16.1: heavy 8-instance render (texture hops, golden-checked) with a near-full VRAM-resident
+    /// pool gathered IN THE SAME per-frame submit — composite real game load (compute + texture +
+    /// memory controller on the shared rail simultaneously), the highest combined draw the soak has.
+    CompositeGameLoad,
 }
 
 fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u32> {
     match workload {
-        // BoostEntry slams the same 8-instance heavy frame as PowerRender → same golden image.
+        // BoostEntry / CompositeGameLoad slam the same 8-instance heavy frame → same golden image
+        // (the VRAM gather writes to a separate sink, never the rendered texture).
         VfWorkload::PowerRender
         | VfWorkload::HeavySpike
         | VfWorkload::IdlePulse
-        | VfWorkload::BoostEntry => {
+        | VfWorkload::BoostEntry
+        | VfWorkload::CompositeGameLoad => {
             Some(goldens.power)
         }
         VfWorkload::BoostEdge => Some(goldens.boost),
@@ -485,7 +495,12 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
     // silent error is caught by checksum promptly (ideally before a hard TDR). HeavySpike/IdlePulse/
     // PowerRender are all golden-checked too. No new shader. CALIBRATION KNOBS (tune on real HW):
     // HeavySpike amplitude + the burst/idle weight ratio below + FrameCadence's internal gap sweep.
-    const ENDURANCE: [(VfQualifierPhase, VfWorkload, u64); 20] = [
+    // v16 COMPOSITE: VramPressure (large VRAM-resident scattered gathers — memory controller + DRAM
+    // on the shared core rail) is interleaved INTO the worst-realistic soak, under sustained heat and
+    // right after the cap-slam blocks. This folds in the coverage the standalone 5-min Memory pass
+    // gave (which never rejected a candidate as an isolated pass) but under continuous worst load —
+    // stronger, so the required Transitions/Memory patterns can be dropped (contract v14).
+    const ENDURANCE: [(VfQualifierPhase, VfWorkload, u64); 21] = [
         // Warm-up ramp into load.
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 3),
         // Sustained max-power saturation block (the reset-between 5-min patterns never reach this heat).
@@ -499,6 +514,9 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
+        // v16.1 composite: heavy render + near-full VRAM-resident gather SIMULTANEOUSLY (real game
+        // load: compute + texture + memory controller on the shared rail at once). Golden-checked.
+        (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 14),
         // Fine droop transients + game-realistic mixed load.
         (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
         (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 10),
@@ -508,7 +526,8 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
-        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
+        // Second composite pass at peak heat.
+        (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 12),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
         // Cool-down close.
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 3),
@@ -647,6 +666,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Fills the large table on the GPU so we don't upload hundreds of MB. Uses a
 // grid-stride loop so a bounded workgroup count covers a huge buffer (the X
 // dispatch dimension is capped at 65535).
+// v16.1 composite: cache-defeating scattered gather over a near-full VRAM-resident pool, run in the
+// SAME per-frame submit as the heavy render. Pure memory-controller/DRAM bandwidth pressure on the
+// shared core rail; the XOR into `sink` (never the render texture) only exists so the reads are not
+// dead-code-eliminated — no correctness claim on the pool (the render golden is the detector).
+const COMPOSITE_GATHER_SHADER: &str = r#"
+struct GP { table_len: u32, gathers: u32, seed: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> table: array<u32>;
+@group(0) @binding(1) var<storage, read_write> sink: array<atomic<u32>>;
+@group(0) @binding(2) var<uniform> p: GP;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    var acc = p.seed ^ gid.x;
+    var idx = (gid.x * 2654435761u) % p.table_len;
+    for (var k = 0u; k < p.gathers; k = k + 1u) {
+        acc = acc ^ table[idx];
+        idx = (idx * 1664525u + 1013904223u) % p.table_len;
+    }
+    atomicXor(&sink[gid.x & 255u], acc);
+}
+"#;
+
 const FILL_SHADER: &str = r#"
 struct P { n: u32, p0: u32, p1: u32, p2: u32 };
 @group(0) @binding(0) var<storage, read_write> table: array<u32>;
@@ -2163,8 +2203,11 @@ impl GpuCtx {
         };
 
         let (shader_source, instances, blend) = match profile {
-            // BoostEntry slams the same 8-instance frame — shares PowerRender's golden.
-            VfWorkload::PowerRender | VfWorkload::BoostEntry => {
+            // BoostEntry / CompositeGameLoad slam the same 8-instance frame — share PowerRender's
+            // golden (the composite's VRAM gather writes only to its sink, never the render image).
+            VfWorkload::PowerRender
+            | VfWorkload::BoostEntry
+            | VfWorkload::CompositeGameLoad => {
                 (RENDER_SHADER, 8, wgpu::BlendState::REPLACE)
             }
             VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
@@ -2653,7 +2696,8 @@ impl GpuCtx {
             VfWorkload::PowerRender
             | VfWorkload::HeavySpike
             | VfWorkload::IdlePulse
-            | VfWorkload::BoostEntry => {
+            | VfWorkload::BoostEntry
+            | VfWorkload::CompositeGameLoad => {
                 (RENDER_SHADER, 8, wgpu::BlendState::REPLACE)
             }
             VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
@@ -2819,6 +2863,83 @@ impl GpuCtx {
         let mut stalled = false;
         let mut stream_frame_ms_total: u64 = 0;
 
+        // v16.1 composite: allocate a near-full VRAM-resident pool (OOM-guarded — fills whatever
+        // remains after the render's own buffers, degrading on smaller cards) + a scattered-gather
+        // pipeline. Each frame issues a gather over one pool table in the SAME submit as the heavy
+        // render, so texture hops and DRAM/controller pressure load the shared core rail together.
+        const COMPOSITE_MAX_TABLES: usize = 48; // up to ~12 GB attempted; OOM-guard keeps what fits
+        const COMPOSITE_LANES: u32 = 262_144;
+        const COMPOSITE_GATHERS: u32 = 96;
+        let composite_table_len = {
+            let bytes = (256u64 * 1024 * 1024).min(self.max_buffer_bytes).max(64 * 1024 * 1024);
+            (bytes / 4) as u32
+        };
+        let composite_pool: Vec<wgpu::Buffer> = if profile == VfWorkload::CompositeGameLoad {
+            let mut pool = Vec::new();
+            for _ in 0..COMPOSITE_MAX_TABLES {
+                self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                let table = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("composite-vram-table"),
+                    size: (composite_table_len as u64) * 4,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                if pollster::block_on(self.device.pop_error_scope()).is_some() {
+                    break;
+                }
+                pool.push(table);
+            }
+            pool
+        } else {
+            Vec::new()
+        };
+        let composite_gather = (!composite_pool.is_empty()).then(|| {
+            let sink = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("composite-sink"),
+                size: 256 * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("composite-gather-params"),
+                contents: bytemuck::bytes_of(&Quad {
+                    a: composite_table_len,
+                    b: COMPOSITE_GATHERS,
+                    c: 0x9e37_79b9,
+                    d: 0,
+                }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("composite-gather"),
+                source: wgpu::ShaderSource::Wgsl(COMPOSITE_GATHER_SHADER.into()),
+            });
+            let pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("composite-gather"),
+                layout: None,
+                module: &module,
+                entry_point: "main",
+                compilation_options: Default::default(),
+            });
+            // wgpu keeps bound resources alive via the bind group, so the local sink/params handles
+            // may drop; the pool tables are held by `composite_pool` for the whole workload.
+            let binds: Vec<wgpu::BindGroup> = composite_pool
+                .iter()
+                .map(|table| {
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("composite-gather"),
+                        layout: &pipe.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: table.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: sink.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                        ],
+                    })
+                })
+                .collect();
+            (pipe, binds)
+        });
+
         while (workload_start.elapsed().as_millis() as u64) < target_ms
             && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
         {
@@ -2927,6 +3048,16 @@ impl GpuCtx {
                     cp.dispatch_workgroups(1, 1, 1);
                 }
                 checksum_count = checksum_count.saturating_add(1);
+            }
+            // v16.1: the VRAM-resident gather rides in the SAME submit as the render frame — the
+            // heavy texture render and the DRAM/memory-controller pressure hit the shared core rail
+            // together (highest combined draw in the soak).
+            if let Some((gather_pipe, gather_binds)) = &composite_gather {
+                let bind = &gather_binds[(frames as usize) % gather_binds.len()];
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(gather_pipe);
+                cp.set_bind_group(0, bind, &[]);
+                cp.dispatch_workgroups(COMPOSITE_LANES / 64, 1, 1);
             }
             self.queue.submit(Some(enc.finish()));
             frames += 1;
@@ -3432,6 +3563,9 @@ mod tests {
             VfWorkload::FrameCadence,
             VfWorkload::MixedGame,
             VfWorkload::TextureRop,
+            // v16.1 composite: heavy render + near-full VRAM-resident gather SIMULTANEOUSLY
+            // (replaces the standalone Memory pass AND the sequential VramPressure segments).
+            VfWorkload::CompositeGameLoad,
         ] {
             assert!(
                 plan.iter().any(|segment| segment.workload == workload),
@@ -3449,9 +3583,9 @@ mod tests {
             duration_for_workload(&plan, VfWorkload::HeavySpike) > 0
                 && duration_for_workload(&plan, VfWorkload::IdlePulse) > 0
         );
-        // Phase-coverage denominator is exact and never panics (auto-derived from the plan):
-        // PowerOpening, HeavySpike, TextureRop, IdlePulse, FrameCadence, MixedGame, PowerClosing = 7.
-        assert_eq!(qualifier_expected_phases(VfQualifierPattern::Endurance), 7);
+        // Phase-coverage denominator is exact and never panics (auto-derived from the plan): +Composite
+        // = PowerOpening, HeavySpike, TextureRop, IdlePulse, CompositeGameLoad, FrameCadence, MixedGame, PowerClosing = 8.
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::Endurance), 8);
         assert_eq!(VfQualifierPattern::Endurance.label(), "endurance");
     }
 

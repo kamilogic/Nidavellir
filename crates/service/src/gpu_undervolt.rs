@@ -6712,14 +6712,12 @@ mod tests {
     }
 
     #[test]
-    fn qualification_gate_uses_all_v7_patterns_and_failure_moves_one_bin_up() {
+    fn qualification_gate_uses_required_patterns_and_failure_moves_one_bin_up() {
+        // v14: REQUIRED = [Texture] only (Transitions/Memory folded into the composite Endurance);
+        // take(n) saturates to the set, so any pass count yields just Texture.
         assert_eq!(
             qualification_gate_patterns(3),
-            vec![
-                F2QualificationPattern::Texture,
-                F2QualificationPattern::Transitions,
-                F2QualificationPattern::Memory,
-            ]
+            vec![F2QualificationPattern::Texture]
         );
         assert_eq!(
             qualification_gate_patterns(1),
