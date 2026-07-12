@@ -31,9 +31,17 @@ const SENTINEL_SILENT_BUMP_BINS: usize = 2;
 /// Canary cadence + kernel budget: ~5 ms of known-answer ALU every 30 s (<0.02% GPU), and ONLY
 /// while the GPU is under real load (silent errors at elastic idle voltages are meaningless and
 /// the kernel must never keep an idle card awake).
-const SENTINEL_CANARY_POLL_MS: u64 = 30_000;
-const SENTINEL_CANARY_KERNEL_MS: u64 = 5;
+const SENTINEL_CANARY_POLL_MS: u64 = 20_000;
+/// TextureRop self-check burst: long enough for ≥2 of the 250 ms checksum windows (reference +
+/// compare). ~700 ms of shared GPU load every 20 s ≈ 3.5% duty while gaming — the price of a
+/// canary that samples the BINDING failure path instead of being statistically blind.
+const SENTINEL_CANARY_KERNEL_MS: u64 = 700;
 const SENTINEL_CANARY_MIN_UTIL_PCT: f64 = 30.0;
+/// Stall watchdog: the canary normally returns in well under a second. If it has not come back by
+/// this deadline the GPU is ALREADY stalling — that IS the pre-hang precursor of the BusReset
+/// cascade. Act immediately (stock reset from this thread) instead of waiting for the driver's
+/// ~2 s TDR watchdog to start the cascade.
+const SENTINEL_CANARY_STALL_MS: u64 = 3_000;
 /// One automatic bump per service session; the second event goes to stock and stays there.
 const SENTINEL_MAX_BUMPS_PER_SESSION: u32 = 1;
 
@@ -325,11 +333,13 @@ pub fn spawn(store: SafeLoopStore) {
         });
     }
 
-    // Layer 2 — GPU canary (silent errors): ~5 ms of known-answer ALU every 30 s, ONLY while an
-    // undervolt is applied AND the GPU is under real load (>30% util — an idle card is never woken,
-    // and elastic idle voltages make idle silent-errors meaningless). A non-Stable canary at the
-    // applied point means the silicon is corrupting under the game RIGHT NOW → boundary-class
-    // fallback (+2 bins). Context created lazily per check and dropped (no persistent GPU state).
+    // Layer 2 — GPU canary (v17.2, ACTIVE): a ~700 ms TextureRop SELF-CHECK every 20 s, ONLY while
+    // an undervolt is applied AND the GPU is under real load (>30% util — an idle card is never
+    // woken). Two jobs: (1) silent-error detection on the BINDING path (texture-rop — where every
+    // forge failure fired; the old 5 ms ALU kernel was statistically blind: wrong unit, 0.017%
+    // duty); (2) STALL WATCHDOG — a canary that never returns is the pre-hang itself, and we reset
+    // to stock BEFORE the driver's 2 s TDR watchdog can start the cascade. Honest limit: a
+    // full bus wedge can still freeze even our reset call — boot reconciliation is the final net.
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(SENTINEL_CANARY_POLL_MS));
         let applied = crate::gpu_apply::load_applied().and_then(|p| p.undervolt);
@@ -347,12 +357,48 @@ pub fn spawn(store: SafeLoopStore) {
         if !under_load {
             continue;
         }
-        let Ok(ctx) = nidavellir_gpu_stress::GpuCtx::new() else { continue };
-        let report = ctx.run_alu("sentinel-canary", 65_536, 64, SENTINEL_CANARY_KERNEL_MS);
-        if report.result != nidavellir_core::gpu_sweep::StabilityResult::Stable {
-            warn!("sentinel: canary detected {:?} at the applied point", report.result);
+        // v17.2: the canary runs on ITS OWN thread with a stall watchdog. Normal return: a
+        // TextureRop self-check verdict (the BINDING detector — every forge boundary failure fired
+        // in texture-rop, never ALU). No return by the deadline: the GPU is already stalling — the
+        // pre-hang precursor of the BusReset cascade — and we act from HERE, before the driver's
+        // ~2 s watchdog starts the cascade the operator had to power-cycle out of.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let verdict = nidavellir_gpu_stress::GpuCtx::new().map(|ctx| {
+                ctx.run_canary_texture_selfcheck(SENTINEL_CANARY_KERNEL_MS).result
+            });
+            let _ = tx.send(verdict);
+        });
+        let outcome =
+            rx.recv_timeout(std::time::Duration::from_millis(SENTINEL_CANARY_STALL_MS));
+        let (failed, kind) = match outcome {
+            // Healthy canary — clean self-consistent render.
+            Ok(Ok(nidavellir_core::gpu_sweep::StabilityResult::Stable)) => (false, ""),
+            // Context creation failed (driver busy/hiccup) — inconclusive, never a fallback.
+            Ok(Err(_)) => (false, ""),
+            // Corruption or in-canary crash at the applied point.
+            Ok(Ok(verdict)) => {
+                warn!("sentinel: texture canary detected {verdict:?} at the applied point");
+                (true, "silent-canary")
+            }
+            // Stall: the canary never came back — the GPU is hanging RIGHT NOW.
+            Err(_) => {
+                warn!(
+                    "sentinel: canary STALLED >{SENTINEL_CANARY_STALL_MS} ms — pre-hang; acting \
+                     before the driver TDR cascade"
+                );
+                (true, "pre-hang-canary")
+            }
+        };
+        if failed {
             let n = bumps.load(std::sync::atomic::Ordering::SeqCst);
-            if handle_failure(&store, n, SENTINEL_SILENT_BUMP_BINS, "silent-canary") {
+            // Pre-hang is TDR-grade (+3 bins); corruption is boundary-grade (+2 bins).
+            let bins = if kind == "pre-hang-canary" {
+                SENTINEL_TDR_BUMP_BINS
+            } else {
+                SENTINEL_SILENT_BUMP_BINS
+            };
+            if handle_failure(&store, n, bins, kind) {
                 bumps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             std::thread::sleep(std::time::Duration::from_millis(SENTINEL_COOLDOWN_MS));

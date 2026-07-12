@@ -2115,6 +2115,25 @@ impl GpuCtx {
     /// test (raster + ROP + fragment units), so it catches instability that
     /// compute-only validation passes. Returns the verdict plus the rendered
     /// frame count / FPS — the benchmark uses the FPS as its performance metric.
+    /// v17.2 sentinel canary: a short TextureRop burst (the empirically BINDING silent-error
+    /// detector on this silicon — every forge boundary failure fired here, never in ALU) with
+    /// SELF-REFERENCING checksums: the first in-run checksum becomes the reference and later
+    /// frames must match it bit-for-bit. Needs no stock golden (works under an applied profile,
+    /// any driver): marginal silicon corrupts stochastically, so two identical renders diverge.
+    /// `target_ms` must exceed ~600 ms so at least two 250 ms checksum windows land.
+    pub fn run_canary_texture_selfcheck(&self, target_ms: u64) -> RenderResult {
+        self.run_render_profile(
+            target_ms,
+            VfWorkload::TextureRop,
+            None,
+            false,
+            true,
+            None,
+            None,
+            None,
+        )
+    }
+
     pub fn run_render_stress(&self, target_ms: u64) -> RenderResult {
         self.run_render_profile(
             target_ms,
