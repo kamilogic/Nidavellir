@@ -6758,6 +6758,21 @@ fn measure_multiclock_undervolt_forge(
                         changed = true;
                         continue;
                     }
+                    // A BLACKLISTED Apply pair is BOUNDARY knowledge, not a safety emergency —
+                    // same principle as the frontier BlacklistedBoundary fix. The sentinel's
+                    // real-world failures (e.g. 1905@906 damned by a field TDR) land here when the
+                    // margin policy picks that exact pair: exclude it and RESYNTHESIZE so the
+                    // forge converges on a point real use has not condemned, instead of ending the
+                    // whole run "parcial" with zero profiles (2026-07-12 18:32 run).
+                    if summary.aborted && summary.stop_reason.contains("blacklisted") {
+                        excluded_apply_pairs.insert(key);
+                        prog.log.push(format!(
+                            "FORGE: par de Apply {} MHz @ {} mV está na blacklist (falha real anterior) — excluído; ressintetizando acima dele.",
+                            key.0, key.1
+                        ));
+                        changed = true;
+                        break;
+                    }
                     if summary.aborted || summary.cancelled {
                         forge_aborted |= summary.aborted;
                         terminal = true;
