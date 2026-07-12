@@ -13,7 +13,53 @@ v13 absolute clock ceiling — `docs/clock-lock-v13-plan.md`. Leva 2 remains blo
 Earlier roadmap: `docs/qualification-v8-plan.md`.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## START-HERE (2026-07-10 late) — v16 composite gate + contract v14 (uncommitted, NOT HW-tested)
+## START-HERE (2026-07-12) — pipeline completo forja↔sentinela FECHADO; próximo = re-forge de validação
+Tudo commitado+pushado até `202689f`. Estado consolidado da sessão 2026-07-10→12 (a mais produtiva
+até hoje — ler ESTA seção basta para retomar):
+
+### O que está no repo e JÁ PROVADO EM CAMPO
+1. **v17 sentinela runtime (2 camadas, ATIVO)** — `tdr_sentinel.rs`:
+   - Camada 1: watch nvlddmkm-153 (wevtutil 15 s, zero GPU). Camada 2 (v17.2): canário TextureRop
+     auto-comparado ~700 ms/20 s sob carga (util≥30%) + **watchdog de stall 3 s = detector de
+     pre-hang** (age ANTES do watchdog de 2 s do driver).
+   - Escada preserve-identity: +2 bins (silent) / +3 bins (TDR/pre-hang), **3 strikes** (2 bumps →
+     stock + perfil limpo). Label do perfil conta a história (strike N/3); `sentinel_status.json`
+     carrega recomendação em PT (card na UI Forge lê via `GetSentinelStatus`, poll 10 s).
+   - Guards: FORGE_ACTIVE interlock, boot-flag, piso histórico, re-baseline pós-cooldown, dedup
+     cross-layer 90 s. **Boot reconciliation** (`startup_reconcile` antes do reapply): wedge duro →
+     reboot → blacklist + stock, nunca re-aplica o ponto que congelou o PC.
+   - **CAMPO (2026-07-12): 5+ recuperações limpas, zero botão de força.** Pre-hang pego pelo stall
+     do canário em todas. Pontos condenados pelo mundo real: 1815@843, 1815@862, 1890@900, 1890@918.
+   - Console: hard-exit via TerminateProcess (loader-lock deadlock no shutdown corrigido).
+2. **v16/v16.1/v16.2 gate composto (contrato qualification v14)**:
+   - REQUIRED=[Texture] só (descida 60 s/bin); exact-Apply = Texture 5 min + TransitionShock 8 min
+     (idle real 10-30 s → slam, detector de stall 500 ms) + **Endurance composto 20 min**: HeavySpike
+     sustentado + cap-slam + FrameCadence + MixedGame + **CompositeGameLoad** (render pesado + gather
+     em pool ~VRAM-cheia NO MESMO submit) + **v16.2 BoostEdge "regime lobby"** (2 segmentos, frames
+     leves a centenas de fps = residência no bin do anchor — o killer de campo comprovado; NÃO
+     testado em HW ainda). 9 fases; ETA na escada única.
+   - Off-cap worst-case: base de potência = max p99/pico de TODO o conjunto de Apply (incl.
+     Endurance/Shock) — noite fria não engana mais o teto de 188 W.
+3. **Ciclo de aprendizado FECHADO (fix `202689f`)**: blacklist de campo guia a fronteira
+   (BlacklistedBoundary) E o Apply — par de Apply blacklisted agora exclui+ressintetiza (o run
+   18:32 morreu "parcial" porque 1905@906, condenado pelo Endurance de 11/07, abortava o publish).
+   Cadeia esperada no próximo forge: 1905@906→skip, 1890@900→skip, ~1875@893 publica.
+
+### PRÓXIMO PASSO (o teste que fecha tudo)
+**Rebuild (service + UI) → re-forge Standard completo.** Esperado: fronteira ~40 min (reuso), gates
+com regime lobby, perfis publicados ABAIXO dos pontos condenados (Godforge ≤1875@893). Depois:
+operador roda o **lobby do Overwatch** (250-400 fps) — o torture test de produção. Se segurar,
+pipeline validado ponta a ponta; se cair, sentinela pega (+strike) e o forge seguinte aprende.
+
+### Fila restante (ordem de valor)
+1. **Torture test on-demand** (IPC+UI; provoca crash de propósito — exige auditoria própria).
+2. Residual auditoria #4 (race last-writer no save_record, LOW-MED).
+3. v15.1 rampa de P-state forçada no shock (despriorizado — lobby regime cobre o caso de campo).
+4. Stage 2 preserve-identity na forja (docs/qualification-v14-endurance-plan.md, specado).
+5. Ground truth do operador (régua honesta): 1815 estável ≥875? · 1890 instável até 918 · golden
+   antigo 1800@875 (régua pré-v13). Blacklist de campo é a fonte viva agora.
+
+## OLDER (2026-07-10 late) — v16 composite gate + contract v14
 Committed+pushed: `d568a4c` (off-cap worst-case power fix). UNCOMMITTED on top: **v16 composite +
 contract 13→14**.
 - `REQUIRED_QUALIFICATION_PATTERNS = [Texture]` only (5 HW runs: Texture was the ONLY binding
