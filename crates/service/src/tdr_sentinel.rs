@@ -196,8 +196,28 @@ fn append_sentinel_log(entry: &str) {
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
+/// Cross-LAYER episode dedup: the canary (stall) and the event-log watcher (the driver's 153 from
+/// the same episode, seconds later) must never both act — observed in the field as a doubled
+/// "ladder exhausted" 4 s apart. Any layer that ACTS stamps this; the other skips within the window.
+static LAST_ACTION_EPOCH_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const CROSS_LAYER_DEDUP_S: u64 = 90;
+
+fn epoch_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Handle one confirmed failure (TDR event or canary silent error). Returns true on a bump.
 fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usize, kind: &str) -> bool {
+    let last = LAST_ACTION_EPOCH_S.load(std::sync::atomic::Ordering::SeqCst);
+    let now = epoch_s();
+    if last != 0 && now.saturating_sub(last) < CROSS_LAYER_DEDUP_S {
+        info!("sentinel: {kind} within {CROSS_LAYER_DEDUP_S}s of the last action — same episode, skipping");
+        append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"same-episode-skip\""));
+        return false;
+    }
     let applied = crate::gpu_apply::load_applied()
         .and_then(|p| p.undervolt.map(|u| (u.target_mhz, u.anchor_mv)));
     let action = sentinel_decide(
@@ -219,6 +239,7 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
             false
         }
         SentinelAction::Bump { target_mhz, new_anchor_mv } => {
+            LAST_ACTION_EPOCH_S.store(epoch_s(), std::sync::atomic::Ordering::SeqCst);
             let (_, failed_mv) = applied.expect("Bump implies applied");
             warn!(
                 "sentinel: in-game TDR at {target_mhz} MHz @ {failed_mv} mV — resetting to stock, \
@@ -283,6 +304,7 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
             }
         }
         SentinelAction::Stock { target_mhz, failed_anchor_mv } => {
+            LAST_ACTION_EPOCH_S.store(epoch_s(), std::sync::atomic::Ordering::SeqCst);
             warn!(
                 "sentinel: TDR at {target_mhz} MHz @ {failed_anchor_mv} mV after a previous bump \
                  this session — staying at stock (ladder exhausted); profile cleared"
