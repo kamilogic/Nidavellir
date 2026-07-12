@@ -441,6 +441,13 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             let prog = guard.power_sweep.progress();
             apply_forge_profile(&guard.safe_store, &prog, prog.deep_calm, "Deep Calm")
         }
+        IpcRequest::GetSentinelStatus => {
+            let status = std::fs::read_to_string(
+                nidavellir_core::safe_loop::default_data_dir().join("sentinel_status.json"),
+            )
+            .ok();
+            IpcResponse::success(ResponseData::SentinelStatus { status })
+        }
         IpcRequest::ExportForgeLog => {
             let prog = guard.power_sweep.progress();
             match crate::gpu_power_sweep::export_forge_log(&prog) {

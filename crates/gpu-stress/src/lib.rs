@@ -500,7 +500,7 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
     // right after the cap-slam blocks. This folds in the coverage the standalone 5-min Memory pass
     // gave (which never rejected a candidate as an isolated pass) but under continuous worst load —
     // stronger, so the required Transitions/Memory patterns can be dropped (contract v14).
-    const ENDURANCE: [(VfQualifierPhase, VfWorkload, u64); 21] = [
+    const ENDURANCE: [(VfQualifierPhase, VfWorkload, u64); 23] = [
         // Warm-up ramp into load.
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 3),
         // Sustained max-power saturation block (the reset-between 5-min patterns never reach this heat).
@@ -517,6 +517,12 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         // v16.1 composite: heavy render + near-full VRAM-resident gather SIMULTANEOUSLY (real game
         // load: compute + texture + memory controller on the shared rail at once). Golden-checked.
         (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 14),
+        // v16.2 LOBBY REGIME (field-proven killer): sustained BoostEdge — hundreds of LIGHT frames
+        // per second riding the TOP of the boost curve, i.e. continuous residency AT the anchor bin
+        // + kHz-scale VRM ripple. This is the OW-lobby/high-FPS regime that killed 1815@843/862 and
+        // 1890@900/918 in real use while every heavy pattern passed: heavy loads sit power-bound
+        // BELOW the anchor; only light frames pin the anchor itself. Golden-checked (goldens.boost).
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 12),
         // Fine droop transients + game-realistic mixed load.
         (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
         (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 10),
@@ -528,6 +534,8 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
         // Second composite pass at peak heat.
         (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 12),
+        // Second lobby pass at peak heat — anchor-bin residency when the silicon is at its worst.
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 10),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
         // Cool-down close.
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 3),
@@ -3585,6 +3593,8 @@ mod tests {
             // v16.1 composite: heavy render + near-full VRAM-resident gather SIMULTANEOUSLY
             // (replaces the standalone Memory pass AND the sequential VramPressure segments).
             VfWorkload::CompositeGameLoad,
+            // v16.2 lobby regime: sustained light-frame anchor-bin residency (the field killer).
+            VfWorkload::BoostEdge,
         ] {
             assert!(
                 plan.iter().any(|segment| segment.workload == workload),
@@ -3602,9 +3612,10 @@ mod tests {
             duration_for_workload(&plan, VfWorkload::HeavySpike) > 0
                 && duration_for_workload(&plan, VfWorkload::IdlePulse) > 0
         );
-        // Phase-coverage denominator is exact and never panics (auto-derived from the plan): +Composite
-        // = PowerOpening, HeavySpike, TextureRop, IdlePulse, CompositeGameLoad, FrameCadence, MixedGame, PowerClosing = 8.
-        assert_eq!(qualifier_expected_phases(VfQualifierPattern::Endurance), 8);
+        // Phase-coverage denominator is exact and never panics (auto-derived from the plan):
+        // PowerOpening, HeavySpike, TextureRop, IdlePulse, CompositeGameLoad, BoostEdge,
+        // FrameCadence, MixedGame, PowerClosing = 9.
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::Endurance), 9);
         assert_eq!(VfQualifierPattern::Endurance.label(), "endurance");
     }
 

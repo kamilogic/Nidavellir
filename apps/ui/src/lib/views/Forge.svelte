@@ -26,6 +26,8 @@
   let verifying = $state(false);
   let exporting = $state(false);
   let exportMsg = $state("");
+  // v17 sentinel: last automatic action + recommendation (sentinel_status.json via IPC).
+  let sentinel = $state(null);
   let benchmark = $state(null);
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
@@ -368,11 +370,27 @@
     return "Curve verification: Unavailable";
   });
 
+  async function refreshSentinel() {
+    try {
+      const r = await serviceCall("GetSentinelStatus");
+      if (r?.data?.type === "SentinelStatus" && r.data.status) {
+        sentinel = JSON.parse(r.data.status);
+      }
+    } catch {
+      /* sentinel status is best-effort UI info */
+    }
+  }
+
   $effect(() => {
     loadHardware();
     refresh();
+    refreshSentinel();
     timer = setInterval(refresh, 500);
-    return () => clearInterval(timer);
+    const sentinelTimer = setInterval(refreshSentinel, 10_000);
+    return () => {
+      clearInterval(timer);
+      clearInterval(sentinelTimer);
+    };
   });
 </script>
 
@@ -448,6 +466,24 @@
     </section>
 
     <ForgeKnowledge summary {powerSweep} {validation} />
+  {/if}
+
+  {#if sentinel}
+    <div class="sentinel-card" class:stock={sentinel.action === "stock"}>
+      <TriangleAlert size={17} strokeWidth={1.85} />
+      <div class="sentinel-body">
+        <strong>
+          Sentinela ·
+          {#if sentinel.action === "bump"}
+            instabilidade em {sentinel.target_mhz} MHz — rebaixado {sentinel.failed_mv}→{sentinel.new_mv} mV (strike {sentinel.strike}/3)
+          {:else}
+            {sentinel.target_mhz} MHz @ {sentinel.failed_mv} mV removido — GPU em stock (3 falhas)
+          {/if}
+        </strong>
+        <small>{sentinel.recommendation}</small>
+        <small class="sentinel-ts">{sentinel.ts}</small>
+      </div>
+    </div>
   {/if}
 
   <details class="advanced-diagnostics">
@@ -1076,5 +1112,28 @@
     .btn {
       width: fit-content;
     }
+  }
+  .sentinel-card {
+    display: flex;
+    gap: 0.65rem;
+    align-items: flex-start;
+    padding: 0.75rem 0.9rem;
+    border-radius: 10px;
+    border: 1px solid color-mix(in srgb, orange 45%, transparent);
+    background: color-mix(in srgb, orange 10%, transparent);
+    margin-top: 0.75rem;
+  }
+  .sentinel-card.stock {
+    border-color: color-mix(in srgb, crimson 45%, transparent);
+    background: color-mix(in srgb, crimson 10%, transparent);
+  }
+  .sentinel-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .sentinel-ts {
+    opacity: 0.6;
+    font-size: 0.72rem;
   }
 </style>

@@ -61,6 +61,8 @@ pub enum IpcRequest {
     /// recorded dwell (clock/voltage/power/temp/outcome/pattern) — to a timestamped file under the
     /// data dir. Read-only: gathers persisted observations + the live progress; touches no hardware.
     ExportForgeLog,
+    /// v17: read the TDR sentinel's last action + recommendation (sentinel_status.json). Read-only.
+    GetSentinelStatus,
 }
 
 /// Result of [`IpcRequest::ExportForgeLog`]: where the rich log was written and how much it covered.
@@ -592,6 +594,9 @@ pub enum ResponseData {
     Benchmark(BenchmarkProgress),
     PowerSweep(PowerSweepProgress),
     ForgeLogExport(ForgeLogExport),
+    /// Raw JSON of the sentinel's last action (None = no sentinel event ever recorded).
+    /// Struct variant: the enum is internally tagged, which cannot carry a bare Option.
+    SentinelStatus { status: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
