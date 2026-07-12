@@ -112,6 +112,57 @@ fn bins_above_anchor(anchor_mv: u32) -> Vec<u32> {
     bins
 }
 
+fn baseline_path() -> std::path::PathBuf {
+    nidavellir_core::safe_loop::default_data_dir().join("sentinel_baseline.txt")
+}
+
+fn persist_baseline(ts: &str) {
+    let _ = std::fs::create_dir_all(nidavellir_core::safe_loop::default_data_dir());
+    let _ = std::fs::write(baseline_path(), ts);
+}
+
+/// BOOT RECONCILIATION — the hole a live sentinel cannot cover: a hard WEDGE freezes the whole
+/// machine (sentinel included), the operator power-cycles, and on the next boot the crash events
+/// are HISTORICAL (correctly inert for the live watcher) while `reapply_on_boot` would happily
+/// re-apply the exact profile that just froze the PC. Called BEFORE `reapply_on_boot`: if a
+/// nvlddmkm-153 newer than the last persisted baseline exists AND an undervolt profile is
+/// persisted, the crash happened on OUR watch → blacklist the point + clear the applied profile
+/// (boot comes up STOCK — a hard wedge is ladder-exhausted-grade, no auto-bump at cold boot).
+/// First run (no baseline file) only initializes the baseline. Returns true when it demoted.
+pub fn startup_reconcile(store: &SafeLoopStore) -> bool {
+    let newest = query_latest_tdr_event();
+    let baseline = std::fs::read_to_string(baseline_path()).ok();
+    let Some(newest) = newest else { return false };
+    let Some(baseline) = baseline else {
+        persist_baseline(&newest);
+        return false;
+    };
+    persist_baseline(&newest);
+    if newest.as_str() <= baseline.trim() {
+        return false;
+    }
+    let Some(applied) = crate::gpu_apply::load_applied().and_then(|p| p.undervolt) else {
+        return false;
+    };
+    warn!(
+        "sentinel: TDR/wedge at {} MHz @ {} mV happened while the service was down (event {newest}          > baseline) — blacklisting and clearing the profile; boot stays STOCK",
+        applied.target_mhz, applied.anchor_mv
+    );
+    let mut rec = store.load_record();
+    let intent = TuningPoint::from_axes([
+        ("gpu_freq_mhz", applied.target_mhz as i64),
+        ("gpu_vf_bin_mv", applied.anchor_mv as i64),
+    ]);
+    rec.blacklist.push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
+    let _ = store.save_record(&rec);
+    crate::gpu_apply::sentinel_clear_applied();
+    append_sentinel_log(&format!(
+        "\"event\":\"boot-reconcile\",\"action\":\"stock\",\"target_mhz\":{},\"failed_mv\":{}",
+        applied.target_mhz, applied.anchor_mv
+    ));
+    true
+}
+
 fn append_sentinel_log(entry: &str) {
     let path = nidavellir_core::safe_loop::default_data_dir().join("sentinel_log.jsonl");
     let line = format!(
@@ -246,6 +297,7 @@ pub fn spawn(store: SafeLoopStore) {
                     continue;
                 }
                 let is_historical = newest.len() >= 19 && newest[..19] < start_floor[..];
+                persist_baseline(&newest);
                 last_handled = Some(newest);
                 if is_historical {
                     continue;
@@ -266,6 +318,7 @@ pub fn spawn(store: SafeLoopStore) {
                 // we were handling + cooling down) so it can never burn the 2nd strike — only a
                 // genuinely NEW failure after this point counts against the session budget.
                 if let Some(residual) = query_latest_tdr_event() {
+                    persist_baseline(&residual);
                     last_handled = Some(residual);
                 }
             }

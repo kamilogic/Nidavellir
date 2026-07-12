@@ -357,6 +357,10 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     safe_loop_runtime::spawn_heartbeat(safe_store.clone());
     // Re-apply the persisted GPU profile (volatile offsets) unless a prior
     // crash/Safe Mode says not to.
+    // v17 boot reconciliation: a hard wedge freezes the live sentinel with the machine — detect a
+    // TDR that happened while we were down BEFORE re-applying the very profile that caused it.
+    #[cfg(windows)]
+    tdr_sentinel::startup_reconcile(&safe_store);
     gpu_apply::reapply_on_boot(&safe_store);
     // v17 runtime TDR sentinel: watch nvlddmkm-153 while a profile is applied; on the FIRST
     // in-game TDR break the hang cascade (stock → blacklist → auto-fallback +3 bins, same clock).
@@ -417,10 +421,20 @@ mod console_shutdown {
         }
     }
 
+    /// Exit WITHOUT running DLL_PROCESS_DETACH/atexit: the v17 sentinel keeps background threads
+    /// inside CreateProcess (wevtutil) / NVML / wgpu, and a normal `exit` deadlocks on the loader
+    /// lock during DLL detach — the "shutdown complete but the window never closes" hang.
+    /// TerminateProcess cannot take that lock; the GPU is already back at stock by this point.
+    fn hard_exit(code: u32) -> ! {
+        unsafe { windows::Win32::System::Threading::TerminateProcess(
+            windows::Win32::System::Threading::GetCurrentProcess(), code) }.ok();
+        std::process::abort();
+    }
+
     unsafe extern "system" fn ctrl_handler(_event: u32) -> BOOL {
         // A second Ctrl+C while already landing = exit immediately.
         if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
-            std::process::exit(1);
+            hard_exit(1);
         }
         tracing::info!(
             "shutdown signal — stopping motors, restoring GPU to stock (Ctrl+C again to force)"
@@ -448,6 +462,6 @@ mod console_shutdown {
             }
         }
         tracing::info!("shutdown complete");
-        std::process::exit(0);
+        hard_exit(0);
     }
 }
