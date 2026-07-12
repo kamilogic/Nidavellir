@@ -42,8 +42,11 @@ const SENTINEL_CANARY_MIN_UTIL_PCT: f64 = 30.0;
 /// cascade. Act immediately (stock reset from this thread) instead of waiting for the driver's
 /// ~2 s TDR watchdog to start the cascade.
 const SENTINEL_CANARY_STALL_MS: u64 = 3_000;
-/// One automatic bump per service session; the second event goes to stock and stays there.
-const SENTINEL_MAX_BUMPS_PER_SESSION: u32 = 1;
+/// Operator policy (2026-07-12, after the first successful field recovery): THREE strikes —
+/// two automatic bumps, the third failure resets to stock and clears the profile. On the field
+/// case (1815@843 → 862 exhausted at 2 strikes) the third bump would have landed 875 mV — the
+/// operator's hand-validated golden voltage.
+const SENTINEL_MAX_BUMPS_PER_SESSION: u32 = 2;
 
 /// What the sentinel decided for a detected TDR. Pure decision — testable without hardware.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +174,15 @@ pub fn startup_reconcile(store: &SafeLoopStore) -> bool {
     true
 }
 
+/// UI-facing status (overwritten each action): last sentinel event + operator recommendation.
+fn write_sentinel_status(json: &str) {
+    let _ = std::fs::create_dir_all(nidavellir_core::safe_loop::default_data_dir());
+    let _ = std::fs::write(
+        nidavellir_core::safe_loop::default_data_dir().join("sentinel_status.json"),
+        json,
+    );
+}
+
 fn append_sentinel_log(entry: &str) {
     let path = nidavellir_core::safe_loop::default_data_dir().join("sentinel_log.jsonl");
     let line = format!(
@@ -238,8 +250,14 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
             //    apply path (audit #1: arms the Safe Loop boot flag around the autonomous write +
             //    8 s survival window, so a bumped point that cold-hangs is NOT re-applied on boot;
             //    also re-applies the prior mem offset and persists the composed label).
+            // Compose from the BASE label (strip any previous sentinel suffix) so repeated
+            // strikes update the description instead of growing it.
+            let base_label = prior_label.split(" · sentinela").next().unwrap_or("").trim_end();
+            let strike = bumps_this_session + 1;
             match crate::gpu_apply::apply_and_persist_undervolt(
-                format!("{} (sentinela +{bump_bins} bins)", prior_label.trim_end()),
+                format!(
+                    "{base_label} · sentinela {kind}: {failed_mv}→{new_anchor_mv} mV (strike {strike}/3)"
+                ),
                 target_mhz,
                 new_anchor_mv,
                 prior_mem,
@@ -249,6 +267,10 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
                     append_sentinel_log(&format!(
                         "\"event\":\"{kind}\",\"action\":\"bump\",\"target_mhz\":{target_mhz},\
                          \"failed_mv\":{failed_mv},\"new_mv\":{new_anchor_mv}"
+                    ));
+                    write_sentinel_status(&format!(
+                        "{{\"ts\":\"{}\",\"event\":\"{kind}\",\"action\":\"bump\",\"strike\":{strike},\"target_mhz\":{target_mhz},\"failed_mv\":{failed_mv},\"new_mv\":{new_anchor_mv},\"recommendation\":\"Instabilidade detectada em jogo: o perfil foi rebaixado automaticamente para {new_anchor_mv} mV (strike {strike}/3). Se estabilizar, re-forje quando puder para requalificar; a falha ja esta na blacklist e o proximo Forge evita o ponto ruim sozinho.\"}}",
+                        nidavellir_core::f2_observation::now_rfc3339()
                     ));
                     true
                 }
@@ -275,6 +297,10 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
             let _ = store.save_record(&rec);
             crate::gpu_apply::sentinel_clear_applied();
             append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"stock\",\"reason\":\"ladder-exhausted\""));
+            write_sentinel_status(&format!(
+                "{{\"ts\":\"{}\",\"event\":\"{kind}\",\"action\":\"stock\",\"strike\":3,\"target_mhz\":{target_mhz},\"failed_mv\":{failed_anchor_mv},\"recommendation\":\"3 falhas na mesma sessao: GPU em STOCK e perfil removido por seguranca. Recomendado: aplicar Deep Calm (validado) e re-forjar — os pontos ruins ja estao na blacklist e o novo Forge parte acima deles.\"}}",
+                nidavellir_core::f2_observation::now_rfc3339()
+            ));
             false
         }
     }
@@ -418,10 +444,14 @@ mod tests {
             sentinel_decide(Some((1815, 843)), false, 0, &bins, SENTINEL_TDR_BUMP_BINS),
             SentinelAction::Bump { target_mhz: 1815, new_anchor_mv: 862 }
         );
-        // Second failure in the same session → ladder exhausted → stock.
+        // Second failure → still bumps (3-strike policy); THIRD failure → stock.
         assert_eq!(
-            sentinel_decide(Some((1815, 862)), false, 1, &[868], SENTINEL_TDR_BUMP_BINS),
-            SentinelAction::Stock { target_mhz: 1815, failed_anchor_mv: 862 }
+            sentinel_decide(Some((1815, 862)), false, 1, &[868, 875], SENTINEL_TDR_BUMP_BINS),
+            SentinelAction::Bump { target_mhz: 1815, new_anchor_mv: 875 }
+        );
+        assert_eq!(
+            sentinel_decide(Some((1815, 875)), false, 2, &[881], SENTINEL_TDR_BUMP_BINS),
+            SentinelAction::Stock { target_mhz: 1815, failed_anchor_mv: 875 }
         );
         // Curve runs out before +3 → highest available bin, never a lower one.
         assert_eq!(
