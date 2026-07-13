@@ -390,7 +390,7 @@
     --profile-accent-soft: rgba(156, 170, 189, 0.1);
     position: relative;
     overflow: hidden;
-    border: 1px solid var(--forge-line);
+    border: 1px solid transparent;
     border-radius: 8px;
     padding: 0.92rem 0.95rem;
     background:
@@ -414,16 +414,16 @@
     opacity: 0.72;
   }
   .profile-godforge {
-    --profile-accent: var(--forge-copper);
-    --profile-accent-soft: rgba(185, 117, 75, 0.11);
+    --profile-accent: var(--forge-gold);
+    --profile-accent-soft: rgba(227, 168, 59, 0.12);
   }
   .profile-brokkrs {
-    --profile-accent: var(--forge-gold);
-    --profile-accent-soft: rgba(214, 168, 93, 0.12);
+    --profile-accent: var(--forge-green);
+    --profile-accent-soft: rgba(51, 196, 129, 0.12);
   }
   .profile-deep_calm {
-    --profile-accent: var(--forge-blue);
-    --profile-accent-soft: rgba(126, 173, 190, 0.09);
+    --profile-accent: var(--forge-teal);
+    --profile-accent-soft: rgba(63, 208, 201, 0.1);
   }
   .profile.recommended {
     border-color: rgba(214, 168, 93, 0.44);

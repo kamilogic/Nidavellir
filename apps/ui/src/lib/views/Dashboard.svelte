@@ -170,8 +170,8 @@
 
 <style>
   .dash {
-    --surface: rgba(19, 31, 46, 0.82);
-    --border: var(--nord-border-card);
+    --surface: var(--forge-panel);
+    --border: transparent;
     --muted: var(--nord-mist);
     --text: var(--nord-silver);
     --green: var(--nord-aurora);
@@ -210,8 +210,8 @@
   .badge {
     font-size: 0.72rem;
     font-weight: 700;
-    background: rgba(10, 16, 28, 0.82);
-    border: 1px solid var(--nord-border);
+    background: var(--forge-panel-raised);
+    border: none;
     padding: 0.38rem 0.7rem;
     border-radius: 999px;
     color: var(--muted);

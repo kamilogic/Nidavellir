@@ -1,6 +1,5 @@
 <script>
-  import { Activity, CircleCheck, Gauge, Square, Terminal, Zap } from "@lucide/svelte";
-  import LogTerminal from "./LogTerminal.svelte";
+  import { Activity, CircleCheck, Gauge, Square, Zap } from "@lucide/svelte";
   import StatusBadge from "./StatusBadge.svelte";
 
   let {
@@ -45,10 +44,6 @@
   const progressPercent = $derived.by(() => {
     if (!totalSteps) return 0;
     return Math.min(100, Math.max(0, (completedSteps / totalSteps) * 100));
-  });
-  const technicalLog = $derived.by(() => {
-    const lines = powerSweep?.log ?? [];
-    return lines.length ? lines : ["No technical Forge events recorded yet."];
   });
   const latestMessage = $derived.by(() => {
     if (powerSweep?.note) return powerSweep.note;
@@ -455,21 +450,6 @@
       </div>
     </div>
   {/if}
-
-  <section class="progress-log" aria-label="Technical Power Sweep log">
-      <header>
-        <Terminal size={14} strokeWidth={1.85} />
-        <span>Technical Power Sweep log</span>
-        <small>{powerRunning ? "Live" : "Persistent history"}</small>
-      </header>
-      <LogTerminal
-        title="nidavellir / core vf forge"
-        status={powerSweep?.running ? powerSweep.phase : "idle"}
-        live={Boolean(powerSweep?.running)}
-        lines={technicalLog}
-        runningText={powerSweep?.running ? `${powerSweep.phase}...` : null}
-      />
-  </section>
 </div>
 
 <style>
@@ -584,15 +564,13 @@
     padding: 0.72rem 0.8rem;
   }
   .sweep-progress-head,
-  .live-target,
-  .progress-log header {
+  .live-target {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 0.75rem;
   }
-  .sweep-progress-head span,
-  .progress-log header span {
+  .sweep-progress-head span {
     display: block;
     color: var(--nord-dim);
     font-size: 0.7rem;
@@ -820,21 +798,6 @@
     font-size: 0.82rem;
     font-variant-numeric: tabular-nums;
     margin-top: 0.2rem;
-  }
-  .progress-log {
-    border-top: 1px solid var(--forge-line);
-    padding-top: 0.65rem;
-  }
-  .progress-log header {
-    justify-content: flex-start;
-    color: var(--muted);
-    margin-bottom: 0.55rem;
-  }
-  .progress-log header small {
-    margin-left: auto;
-    color: var(--nord-dim);
-    font-size: 0.68rem;
-    font-weight: 700;
   }
   @media (max-width: 760px) {
     .progress-head,

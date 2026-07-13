@@ -4,11 +4,11 @@
   import { t } from "../i18n.js";
   import VfChart from "../components/VfChart.svelte";
   import DiagnosticsPanel from "../components/forge/DiagnosticsPanel.svelte";
-  import ForgeKnowledge from "../components/forge/ForgeKnowledge.svelte";
   import ForgeProgress from "../components/forge/ForgeProgress.svelte";
   import GpuHeroStatus from "../components/forge/GpuHeroStatus.svelte";
+  import LogTerminal from "../components/forge/LogTerminal.svelte";
+  import MonitoringPanel from "../components/forge/MonitoringPanel.svelte";
   import ProfileCards from "../components/forge/ProfileCards.svelte";
-  import RecommendedAction from "../components/forge/RecommendedAction.svelte";
   import VfCurvePanel from "../components/forge/VfCurvePanel.svelte";
 
   let error = $state(null);
@@ -28,6 +28,10 @@
   let exportMsg = $state("");
   // v17 sentinel: last automatic action + recommendation (sentinel_status.json via IPC).
   let sentinel = $state(null);
+  // Live GPU telemetry (ReadSensors) + rolling sparkline buffers for the monitoring panel.
+  let sensors = $state(null);
+  let sparks = $state({ core: [], mem: [], temp: [], power: [], usage: [] });
+  const SPARK_CAP = 20;
   let benchmark = $state(null);
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
@@ -43,6 +47,7 @@
   const hasKnowledge = $derived(
     Boolean(powerSweep?.points?.length || validation?.result || verification?.status),
   );
+  const hasForgeRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
 
   // Keep diagnostics output pinned to its newest line.
   function autoscroll(node, _dep) {
@@ -381,15 +386,60 @@
     }
   }
 
+  function pushSpark(arr, value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return arr;
+    const next = [...arr, n];
+    return next.length > SPARK_CAP ? next.slice(next.length - SPARK_CAP) : next;
+  }
+
+  async function refreshSensors() {
+    try {
+      const r = await serviceCall("ReadSensors");
+      if (r?.data?.type !== "Sensors") return;
+      sensors = r.data;
+      const g = sensors.gpu?.[0];
+      if (!g) return;
+      sparks = {
+        core: pushSpark(sparks.core, g.core_clock_mhz),
+        mem: pushSpark(sparks.mem, g.memory_clock_mhz),
+        temp: pushSpark(sparks.temp, g.temperature_c),
+        power: pushSpark(sparks.power, g.power_w),
+        usage: pushSpark(sparks.usage, g.utilization_pct),
+      };
+    } catch {
+      /* telemetry is best-effort UI info */
+    }
+  }
+
+  const primarySensorGpu = $derived(sensors?.gpu?.[0] ?? null);
+  const logLines = $derived(powerSweep?.log ?? []);
+  const sentinelState = $derived.by(() => {
+    if (!sentinel) return "Monitorando";
+    if (sentinel.action === "bump") return "Ajuste automático";
+    if (sentinel.action === "stock") return "GPU em stock";
+    return "Ativo";
+  });
+  const sentinelSummary = $derived.by(() => {
+    if (!sentinel) return "Nenhum evento recente";
+    if (sentinel.action === "bump") {
+      return `${sentinel.target_mhz} MHz — rebaixado ${sentinel.failed_mv}→${sentinel.new_mv} mV (strike ${sentinel.strike}/3)`;
+    }
+    return `${sentinel.target_mhz} MHz @ ${sentinel.failed_mv} mV removido — GPU em stock (3 falhas)`;
+  });
+
   $effect(() => {
     loadHardware();
     refresh();
     refreshSentinel();
+    refreshSensors();
     timer = setInterval(refresh, 500);
     const sentinelTimer = setInterval(refreshSentinel, 10_000);
+    const sensorTimer = setInterval(refreshSensors, 2000);
     return () => {
       clearInterval(timer);
       clearInterval(sentinelTimer);
+      clearInterval(sensorTimer);
     };
   });
 </script>
@@ -407,20 +457,74 @@
     {hasProfiles}
     {hasKnowledge}
     {verification}
+    {forgeMode}
+    onStartPower={startPower}
+    onForgeModeChange={selectForgeMode}
     onReset={resetTuning}
     onFullReset={fullResetTuning}
+    onRecoverContinue={recoverAndStartPower}
   />
 
-  <ForgeProgress
-    {powerSweep}
-    {powerRunning}
-    {safeLoop}
-    onStopPower={stopPower}
-  />
+  <MonitoringPanel gpu={primarySensorGpu} {sparks} live={powerRunning} />
+
+  <div class="footer-row">
+    <details class="collapsed-bar log-bar">
+      <summary>
+        <span class="bar-lead">
+          <Terminal size={15} strokeWidth={1.85} />
+          <span class="bar-title">Log Técnico</span>
+        </span>
+        <span class="bar-sub">{logLines.length} {logLines.length === 1 ? "linha" : "linhas"}</span>
+        <span class="bar-toggle">
+          <span class="when-closed">Ver log ▾</span>
+          <span class="when-open">Recolher ▲</span>
+        </span>
+      </summary>
+      <div class="bar-body">
+        <LogTerminal
+          title="nidavellir / core vf forge"
+          status={powerSweep?.running ? powerSweep.phase : "idle"}
+          live={Boolean(powerSweep?.running)}
+          lines={logLines.length ? logLines : ["No technical Forge events recorded yet."]}
+          runningText={powerSweep?.running ? `${powerSweep.phase}...` : null}
+        />
+      </div>
+    </details>
+
+    <details class="collapsed-bar sent-bar" class:stock={sentinel?.action === "stock"}>
+      <summary>
+        <span class="bar-lead">
+          <span class={`sent-dot ${sentinel?.action ?? "idle"}`} aria-hidden="true"></span>
+          <span class="bar-title">Sentinela — {sentinelState}</span>
+        </span>
+        <span class="bar-sub">{sentinelSummary}</span>
+        <span class="bar-toggle">
+          <span class="when-closed">Detalhes ▾</span>
+          <span class="when-open">Recolher ▲</span>
+        </span>
+      </summary>
+      <div class="bar-body">
+        {#if sentinel}
+          <p class="sent-detail">{sentinelSummary}</p>
+          <p class="sent-reco">{sentinel.recommendation}</p>
+          <p class="sent-ts">{sentinel.ts}</p>
+        {:else}
+          <p class="sent-detail">O Sentinela monitora a estabilidade em segundo plano. Nenhum evento automático foi registrado ainda.</p>
+        {/if}
+      </div>
+    </details>
+  </div>
+
+  {#if hasForgeRun}
+    <ForgeProgress
+      {powerSweep}
+      {powerRunning}
+      {safeLoop}
+      onStopPower={stopPower}
+    />
+  {/if}
 
   {#if powerRunning}
-    <ForgeKnowledge summary compact {powerSweep} {validation} />
-
     <section class="home-section profile-section active-forging">
       <div>
         <span class="section-kicker">Profile Comparison</span>
@@ -436,20 +540,6 @@
       />
     </section>
   {:else}
-    <RecommendedAction
-      {applied}
-      {powerSweep}
-      {powerRunning}
-      {safeLoop}
-      {forgeMode}
-      onStartPower={startPower}
-      onForgeModeChange={selectForgeMode}
-      onStopPower={stopPower}
-      onReset={resetTuning}
-      onFullReset={fullResetTuning}
-      onRecoverContinue={recoverAndStartPower}
-    />
-
     <section class="home-section profile-section">
       <div>
         <span class="section-kicker">Profile Comparison</span>
@@ -464,26 +554,6 @@
         onApplyPower={applyPower}
       />
     </section>
-
-    <ForgeKnowledge summary {powerSweep} {validation} />
-  {/if}
-
-  {#if sentinel}
-    <div class="sentinel-card" class:stock={sentinel.action === "stock"}>
-      <TriangleAlert size={17} strokeWidth={1.85} />
-      <div class="sentinel-body">
-        <strong>
-          Sentinela ·
-          {#if sentinel.action === "bump"}
-            instabilidade em {sentinel.target_mhz} MHz — rebaixado {sentinel.failed_mv}→{sentinel.new_mv} mV (strike {sentinel.strike}/3)
-          {:else}
-            {sentinel.target_mhz} MHz @ {sentinel.failed_mv} mV removido — GPU em stock (3 falhas)
-          {/if}
-        </strong>
-        <small>{sentinel.recommendation}</small>
-        <small class="sentinel-ts">{sentinel.ts}</small>
-      </div>
-    </div>
   {/if}
 
   <details class="advanced-diagnostics">
@@ -695,7 +765,7 @@
 <style>
   .forge {
     --surface: var(--forge-panel);
-    --border: var(--forge-line);
+    --border: transparent;
     --muted: var(--nord-mist);
     --text: var(--nord-silver);
     --accent: var(--nord-aurora);
@@ -915,7 +985,7 @@
   }
   .overlay {
     --surface: var(--forge-panel);
-    --border: var(--forge-line);
+    --border: transparent;
     --muted: var(--nord-mist);
     --text: var(--nord-silver);
     --accent: var(--nord-aurora);
@@ -1113,27 +1183,107 @@
       width: fit-content;
     }
   }
-  .sentinel-card {
-    display: flex;
-    gap: 0.65rem;
-    align-items: flex-start;
-    padding: 0.75rem 0.9rem;
+  .footer-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+  .collapsed-bar {
+    min-width: 0;
+    background: var(--forge-panel);
+    border: 1px solid var(--forge-border-neutral);
     border-radius: 10px;
-    border: 1px solid color-mix(in srgb, orange 45%, transparent);
-    background: color-mix(in srgb, orange 10%, transparent);
-    margin-top: 0.75rem;
+    padding: 0.72rem 1rem;
   }
-  .sentinel-card.stock {
-    border-color: color-mix(in srgb, crimson 45%, transparent);
-    background: color-mix(in srgb, crimson 10%, transparent);
-  }
-  .sentinel-body {
+  .collapsed-bar > summary {
     display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
+    align-items: center;
+    gap: 0.6rem;
+    cursor: pointer;
+    list-style: none;
   }
-  .sentinel-ts {
-    opacity: 0.6;
+  .collapsed-bar > summary::-webkit-details-marker {
+    display: none;
+  }
+  .bar-lead {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
+    color: var(--forge-muted);
+    flex-shrink: 0;
+  }
+  .bar-title {
+    color: var(--forge-text);
+    font-size: 0.82rem;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .bar-sub {
+    flex: 1;
+    min-width: 0;
+    color: var(--forge-muted);
+    font-size: 0.74rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .bar-toggle {
+    flex-shrink: 0;
+    color: var(--forge-gold);
     font-size: 0.72rem;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .when-open {
+    display: none;
+  }
+  .collapsed-bar[open] .when-open {
+    display: inline;
+  }
+  .collapsed-bar[open] .when-closed {
+    display: none;
+  }
+  .bar-body {
+    margin-top: 0.7rem;
+  }
+  .log-bar[open] {
+    grid-column: 1 / -1;
+  }
+  .sent-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 999px;
+    background: var(--forge-green);
+    flex-shrink: 0;
+  }
+  .sent-dot.bump {
+    background: var(--forge-gold);
+  }
+  .sent-dot.stock {
+    background: var(--forge-red);
+  }
+  .sent-detail {
+    margin: 0;
+    color: var(--text);
+    font-size: 0.82rem;
+    line-height: 1.5;
+  }
+  .sent-reco {
+    margin: 0.35rem 0 0;
+    color: var(--muted);
+    font-size: 0.8rem;
+    line-height: 1.45;
+  }
+  .sent-ts {
+    margin: 0.3rem 0 0;
+    color: var(--nord-dim);
+    font-size: 0.72rem;
+    opacity: 0.75;
+  }
+  @media (max-width: 760px) {
+    .footer-row {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

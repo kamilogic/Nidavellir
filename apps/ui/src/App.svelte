@@ -69,27 +69,32 @@
 
 <style>
   :global(:root) {
-    --forge-void: #05070b;
-    --forge-night: #090d13;
+    --forge-void: #0b0f14;
+    --forge-night: #0b0f14;
     --forge-iron: #10161e;
-    --forge-panel: rgba(18, 24, 32, 0.94);
-    --forge-panel-raised: rgba(26, 34, 45, 0.94);
+    --forge-panel: #141b24;
+    --forge-panel-raised: #1b232e;
     --forge-graphite: #222c38;
     --forge-line: rgba(189, 166, 126, 0.18);
     --forge-line-strong: rgba(214, 168, 93, 0.34);
-    --forge-text: #e8edf4;
-    --forge-muted: #9aa7b7;
-    --forge-dim: #657386;
+    --forge-border-neutral: #2a3441;
+    --forge-text: #e8ecf1;
+    --forge-muted: #8a96a3;
+    --forge-dim: #5c6774;
     --forge-steel: #9caabd;
     --forge-blue: #7eadbe;
-    --forge-green: #9dbf91;
-    --forge-gold: #d6a85d;
+    --forge-green: #33c481;
+    --forge-green-bg: #1f4436;
+    --forge-gold: #e3a83b;
     --forge-copper: #b9754b;
-    --forge-red: #c56f73;
-    --forge-panel-bg: linear-gradient(180deg, rgba(24, 31, 40, 0.96), rgba(13, 18, 25, 0.94));
-    --forge-panel-edge: inset 0 1px 0 rgba(255, 255, 255, 0.045);
-    --forge-shadow-panel: 0 18px 45px rgba(0, 0, 0, 0.34), var(--forge-panel-edge);
-    --forge-shadow-active: 0 18px 42px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(214, 168, 93, 0.12);
+    --forge-red: #e2545a;
+    --forge-red-bg: #3a2226;
+    --forge-teal: #3fd0c9;
+    --forge-ink: #0b0f14;
+    --forge-panel-bg: var(--forge-panel);
+    --forge-panel-edge: inset 0 0 0 0 transparent;
+    --forge-shadow-panel: none;
+    --forge-shadow-active: 0 0 0 1px rgba(227, 168, 59, 0.3);
 
     --nord-void: var(--forge-void);
     --nord-night: var(--forge-night);
@@ -106,7 +111,7 @@
     --nord-mist: var(--forge-muted);
     --nord-dim: var(--forge-dim);
     --nord-aurora: var(--forge-green);
-    --nord-aurora-glow: rgba(157, 191, 145, 0.28);
+    --nord-aurora-glow: rgba(51, 196, 129, 0.22);
     --nord-ember: var(--forge-copper);
     --nord-ember-bright: var(--forge-gold);
     --nord-twilight: rgba(185, 117, 75, 0.08);
@@ -116,14 +121,9 @@
   :global(body) {
     margin: 0;
     min-height: 100vh;
-    font-family: Inter, "Segoe UI", system-ui, sans-serif;
+    font-family: "Source Sans Pro", Inter, "Segoe UI", system-ui, sans-serif;
     color: var(--nord-silver);
     background-color: var(--nord-void);
-    background-image:
-      radial-gradient(ellipse 120% 70% at 50% -30%, rgba(214, 168, 93, 0.09) 0%, rgba(214, 168, 93, 0.035) 34%, transparent 68%),
-      linear-gradient(180deg, rgba(255, 255, 255, 0.018) 0, transparent 14rem),
-      linear-gradient(145deg, var(--forge-void) 0%, var(--forge-night) 48%, #07090d 100%);
-    background-attachment: fixed;
   }
 
   :global(html) {
@@ -201,10 +201,10 @@
     justify-content: flex-end;
   }
   .lang {
-    background: rgba(10, 16, 28, 0.75);
+    background: var(--forge-panel-raised);
     color: var(--nord-mist);
-    border: 1px solid var(--nord-border);
-    border-radius: 8px;
+    border: none;
+    border-radius: 999px;
     padding: 0.45rem 0.6rem;
     font-size: 0.8rem;
     font-weight: 600;
@@ -212,37 +212,30 @@
   }
   nav {
     display: flex;
-    gap: 0.35rem;
-    padding: 0.3rem;
-    border-radius: 10px;
-    background: rgba(8, 11, 16, 0.76);
-    border: 1px solid var(--nord-border);
-    backdrop-filter: blur(10px);
+    gap: 0.4rem;
   }
 
   nav button {
-    background: transparent;
+    background: var(--forge-panel-raised);
     color: var(--nord-mist);
     border: none;
-    border-radius: 8px;
-    padding: 0.5rem 1rem;
+    border-radius: 999px;
+    padding: 0.5rem 1.05rem;
     cursor: pointer;
     font-weight: 600;
-    font-size: 0.85rem;
+    font-size: 0.8rem;
     letter-spacing: 0.02em;
+    text-transform: uppercase;
   }
 
   nav button:hover {
     color: var(--nord-silver);
-    background: rgba(214, 168, 93, 0.07);
   }
 
   nav button.active {
-    color: var(--forge-gold);
-    background: rgba(214, 168, 93, 0.1);
-    box-shadow:
-      inset 0 0 0 1px rgba(214, 168, 93, 0.22),
-      0 0 24px rgba(214, 168, 93, 0.08);
+    color: var(--forge-ink);
+    background: var(--forge-gold);
+    font-weight: 700;
   }
   @media (max-width: 760px) {
     main {

@@ -141,8 +141,8 @@
 
 <style>
   .safe {
-    --surface: rgba(19, 31, 46, 0.82);
-    --border: var(--nord-border-card);
+    --surface: var(--forge-panel);
+    --border: transparent;
     --muted: var(--nord-mist);
     --text: var(--nord-silver);
     display: flex;
@@ -176,14 +176,14 @@
     padding: 0.85rem 1rem;
     font-size: 0.88rem;
     line-height: 1.5;
-    background: rgba(191, 97, 106, 0.14);
-    border: 1px solid rgba(191, 97, 106, 0.4);
-    color: #f3b9bd;
+    background: var(--forge-red-bg);
+    border: 1px solid rgba(226, 84, 90, 0.5);
+    color: var(--forge-red);
   }
   .alert--warn {
-    background: rgba(232, 162, 58, 0.12);
-    border-color: rgba(232, 162, 58, 0.4);
-    color: var(--nord-ember-bright);
+    background: rgba(227, 168, 59, 0.12);
+    border-color: rgba(227, 168, 59, 0.4);
+    color: var(--forge-gold);
   }
   .grid {
     display: grid;

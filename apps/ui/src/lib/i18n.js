@@ -24,7 +24,7 @@ const dict = {
   en: {
     "app.tagline": "Where silicon is forged to its prime.",
     "nav.forge": "Forge",
-    "nav.sensors": "Diagnostics",
+    "nav.sensors": "Sentinel",
     "nav.safety": "Safety",
     "common.waiting": "Waiting for the service…",
 

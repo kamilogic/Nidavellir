@@ -104,11 +104,10 @@
   }
   .card {
     background: var(--forge-panel-bg);
-    border: 1px solid var(--forge-line);
-    border-radius: 10px;
+    border: none;
+    border-radius: 12px;
     padding: 1.35rem 1.45rem;
     margin-top: 1.5rem;
-    box-shadow: var(--forge-panel-edge);
   }
   .card p {
     color: var(--nord-mist);
@@ -121,16 +120,16 @@
     align-items: center;
     justify-content: center;
     min-height: 2.5rem;
-    background: rgba(214, 168, 93, 0.13);
-    color: var(--forge-gold);
-    border: 1px solid rgba(214, 168, 93, 0.42);
+    background: var(--forge-gold);
+    color: var(--forge-ink);
+    border: none;
     border-radius: 8px;
-    padding: 0.56rem 1rem;
+    padding: 0.56rem 1.1rem;
     font-weight: 700;
     cursor: pointer;
   }
   button:hover {
-    border-color: var(--forge-line-strong);
+    opacity: 0.92;
   }
   button:disabled {
     opacity: 0.6;
