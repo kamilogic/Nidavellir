@@ -1983,8 +1983,61 @@ fn f2_intent(target_mhz: u32, cand: &PositiveOffsetPlan) -> TuningPoint {
     ])
 }
 
-/// Conservative blacklist match: refuse if the 3-axis F2 intent OR the 2-axis (freq, vf_bin) point
-/// (matching build-frontier's region keys) falls in a blacklisted region.
+/// Field-learned monotonic voltage floor at `clock_mhz`, from the durable blacklist. Every
+/// condemned (gpu_freq_mhz, gpu_vf_bin_mv) center is evidence the silicon needs MORE than that
+/// voltage at that clock — and, by V/F monotonicity, at every HIGHER clock too. The floor is the
+/// running-max envelope over condemned points by clock, linearly interpolated between condemned
+/// clocks (required voltage is convex in clock, so the chord sits above the true boundary —
+/// conservative) and held flat beyond the highest one. `None` below the lowest condemned clock
+/// (no field evidence) or when the blacklist has no GPU V/F entries. Entirely data-driven —
+/// no GPU-specific constants; the same record that condemned 1815@862 in the field is what
+/// rejects a dominated 1845@863 here, for any card.
+fn field_vf_floor_mv(record: &SafeLoopRecord, clock_mhz: i64) -> Option<i64> {
+    let mut pts: Vec<(i64, i64)> = record
+        .blacklist
+        .iter()
+        .filter_map(|region| {
+            Some((
+                *region.center.axes.get("gpu_freq_mhz")?,
+                *region.center.axes.get("gpu_vf_bin_mv")?,
+            ))
+        })
+        .collect();
+    pts.sort_unstable();
+    // Running-max envelope: non-decreasing condemned voltage by clock (dominance).
+    let mut env: Vec<(i64, i64)> = Vec::new();
+    let mut worst = i64::MIN;
+    for (clock, mv) in pts {
+        worst = worst.max(mv);
+        match env.last_mut() {
+            Some(last) if last.0 == clock => last.1 = worst,
+            _ => env.push((clock, worst)),
+        }
+    }
+    if clock_mhz < env.first()?.0 {
+        return None;
+    }
+    let mut floor = env[0].1;
+    for pair in env.windows(2) {
+        let ((c0, v0), (c1, v1)) = (pair[0], pair[1]);
+        if clock_mhz >= c1 {
+            floor = v1;
+        } else if clock_mhz > c0 {
+            // Ceil interpolation — round toward the safe side.
+            floor = v0 + ((v1 - v0) * (clock_mhz - c0) + (c1 - c0) - 1) / (c1 - c0);
+            break;
+        } else {
+            break;
+        }
+    }
+    Some(floor)
+}
+
+/// Conservative field-evidence match: refuse if the 3-axis F2 intent OR the 2-axis (freq, vf_bin)
+/// point (matching build-frontier's region keys) falls in a blacklisted region, OR the candidate
+/// sits at/below the monotonic field voltage floor ([`field_vf_floor_mv`]) — a point dominated by
+/// a real prior failure (same or higher clock at same or lower voltage) is condemned by physics
+/// even when no exact blacklist entry matches it.
 fn candidate_blacklisted(record: &SafeLoopRecord, target_mhz: u32, cand: &PositiveOffsetPlan,
 ) -> bool {
     let f2 = f2_intent(target_mhz, cand);
@@ -1992,7 +2045,10 @@ fn candidate_blacklisted(record: &SafeLoopRecord, target_mhz: u32, cand: &Positi
         ("gpu_freq_mhz", target_mhz as i64),
         ("gpu_vf_bin_mv", cand.voltage_mv as i64),
     ]);
-    record.is_blacklisted(&f2) || record.is_blacklisted(&f1_like)
+    record.is_blacklisted(&f2)
+        || record.is_blacklisted(&f1_like)
+        || field_vf_floor_mv(record, target_mhz as i64)
+            .is_some_and(|floor| (cand.voltage_mv as i64) <= floor)
 }
 
 /// Pure confirmed-mode preflight. Returns `Some(reason)` to REFUSE (fail closed) before any
@@ -2058,7 +2114,10 @@ pub fn confirmed_f2_refusal(
         ));
     }
     if candidate_blacklisted(record, target_mhz, cand) {
-        return Some("the candidate intent is blacklisted".to_string());
+        return Some(
+            "the candidate intent is blacklisted or below the field-learned voltage floor"
+                .to_string(),
+        );
     }
     None
 }
@@ -2704,7 +2763,9 @@ impl F2MultiStepOps for RealF2MultiOps<'_> {
             );
         }
         if candidate_blacklisted(&rec, self.target_mhz, &plan.anchor) {
-            return Err(format!("candidate {i} intent is blacklisted"));
+            return Err(format!(
+                "candidate {i} intent is blacklisted or below the field-learned voltage floor"
+            ));
         }
         // Ordinary chained descent uses candidate i-1. Adaptive live discovery supplies the offset
         // of the last candidate that actually completed reset-clean, so skipped plan entries can
@@ -5241,7 +5302,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             completed = true;
             stop_reason = "BlacklistedBoundary".into();
             logs.push(format!(
-                "{target_mhz} MHz @ {} mV: próximo candidato na blacklist do Safe Loop (falha/TDR de execução anterior) — fronteira de segurança; parando acima sem novo dwell.",
+                "{target_mhz} MHz @ {} mV: próximo candidato na blacklist do Safe Loop ou abaixo do piso de tensão aprendido de falhas reais — fronteira de segurança; parando acima sem novo dwell.",
                 descent.candidates[i].anchor.voltage_mv
             ));
             break;
@@ -6479,6 +6540,7 @@ mod tests {
                         geometry: 5,
                         stream: 6,
                         stream_frame_reference_ms: 20,
+                        boost_frame_reference_us: 30,
                     },
                 )
             ),
@@ -6555,6 +6617,7 @@ mod tests {
                         geometry: 5,
                         stream: 6,
                         stream_frame_reference_ms: 20,
+                        boost_frame_reference_us: 30,
                     },
                 ),
             ),
@@ -6583,6 +6646,7 @@ mod tests {
                         geometry: 5,
                         stream: 6,
                         stream_frame_reference_ms: 20,
+                        boost_frame_reference_us: 30,
                     },
                 ),
             ),
@@ -6607,6 +6671,7 @@ mod tests {
                         geometry: 5,
                         stream: 6,
                         stream_frame_reference_ms: 20,
+                        boost_frame_reference_us: 30,
                     },
                 ),
             ),
@@ -6752,6 +6817,7 @@ mod tests {
             geometry: 55,
             stream: 66,
             stream_frame_reference_ms: 20,
+            boost_frame_reference_us: 30,
         };
         let purpose = F2StressPurpose::V8Qualification(
             F2QualificationPattern::Transitions,
@@ -7161,8 +7227,12 @@ mod tests {
             .contains("blacklisted"));
     }
 
+    // Monotonic field-floor semantics (replaces the old point-scoped rule): a failure at one clock
+    // condemns the SAME-or-lower voltage at every HIGHER clock (dominance), while clocks BELOW the
+    // failure carry no field evidence and stay open. The frontier is never blocked — higher clocks
+    // hit BlacklistedBoundary (stop above, continue), which is boundary knowledge, not an abort.
     #[test]
-    fn f2_blacklist_is_scoped_to_one_clock_and_point() {
+    fn f2_blacklist_caps_higher_clocks_but_never_lower_ones() {
         let c = cand();
         let mut rec = SafeLoopRecord::default();
         rec.blacklist.push(BlacklistRegion::around(
@@ -7171,9 +7241,58 @@ mod tests {
         ));
         assert!(candidate_blacklisted(&rec, 1755, &c));
         assert!(
-            !candidate_blacklisted(&rec, 1770, &c),
-            "one failed clock must not block the remaining multi-clock frontier"
+            candidate_blacklisted(&rec, 1770, &c),
+            "a higher clock at the voltage that already failed is dominated — must be refused"
         );
+        assert!(
+            !candidate_blacklisted(&rec, 1740, &c),
+            "a lower clock has no field evidence against it — the frontier below stays open"
+        );
+    }
+
+    #[test]
+    fn field_floor_interpolates_between_condemned_clocks() {
+        // Fixture values mirror a real field history (data, not algorithm constants): condemned
+        // (1815,843), (1815,862), (1890,918), (1905,906). Envelope: (1815,862)→(1890,918)→(1905,918).
+        let mut rec = SafeLoopRecord::default();
+        for (clock, mv) in [(1815, 843), (1815, 862), (1890, 918), (1905, 906)] {
+            rec.blacklist
+                .push(BlacklistRegion::around(pt(clock, mv), DEFAULT_BLACKLIST_RADIUS));
+        }
+        // Below the lowest condemned clock there is no field evidence — no floor.
+        assert_eq!(field_vf_floor_mv(&rec, 1800), None);
+        // At a condemned clock the floor is the WORST condemned voltage there.
+        assert_eq!(field_vf_floor_mv(&rec, 1815), Some(862));
+        // Between condemned clocks: 862 + ceil(56 * 30 / 75) = 885.
+        assert_eq!(field_vf_floor_mv(&rec, 1845), Some(885));
+        // Beyond the highest condemned clock the running-max envelope holds flat.
+        assert_eq!(field_vf_floor_mv(&rec, 1920), Some(918));
+        // An empty blacklist yields no floor at any clock.
+        assert_eq!(field_vf_floor_mv(&SafeLoopRecord::default(), 1815), None);
+    }
+
+    // Regression for the 2026-07-12 false validation: 1845@863 passed the full 30-min gate while
+    // the field record already held 1815@862 and 1890@918 — 863 mV sits ~22 mV below the
+    // interpolated condemned envelope at 1845 MHz. The floor must refuse it at synthesis time
+    // (zero dwells), and accept a candidate above the floor.
+    #[test]
+    fn candidate_below_interpolated_field_floor_is_refused() {
+        let plan = |mv: u32| PositiveOffsetPlan {
+            index: 0,
+            voltage_mv: mv,
+            base_mhz: 1815,
+            offset_mhz: 30,
+            prev_offset_mhz: 0,
+            step_delta_mhz: 30,
+            effective_mhz: 1845,
+        };
+        let mut rec = SafeLoopRecord::default();
+        rec.blacklist
+            .push(BlacklistRegion::around(pt(1815, 862), DEFAULT_BLACKLIST_RADIUS));
+        rec.blacklist
+            .push(BlacklistRegion::around(pt(1890, 918), DEFAULT_BLACKLIST_RADIUS));
+        assert!(candidate_blacklisted(&rec, 1845, &plan(863)));
+        assert!(!candidate_blacklisted(&rec, 1845, &plan(886)));
     }
 
     #[test]

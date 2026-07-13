@@ -45,6 +45,33 @@ até hoje — ler ESTA seção basta para retomar):
    18:32 morreu "parcial" porque 1905@906, condenado pelo Endurance de 11/07, abortava o publish).
    Cadeia esperada no próximo forge: 1905@906→skip, 1890@900→skip, ~1875@893 publica.
 
+4. **Piso de tensão monotônico de campo (2026-07-12, uncommitted)** — a run de validação ainda
+   publicou 1845@863 (5 bins de gap vs o 1800@875 manual) após 30 min de gate: a blacklist era
+   PONTUAL (Chebyshev raio 1) mas a física V/F é regional/monotônica. Fix: `field_vf_floor_mv`
+   em gpu_undervolt.rs — envelope running-max dos pontos condenados (eixos gpu_freq_mhz/
+   gpu_vf_bin_mv da blacklist, mesmos da sentinela) com interpolação ceil entre clocks
+   condenados; `candidate_blacklisted` agora também recusa candidato ≤ piso. Um chokepoint cobre
+   descida (BlacklistedBoundary), select() pré-write e Apply (abort "blacklisted" → já exclui+
+   ressintetiza via 202689f). 100% data-driven, zero constantes desta GPU; abaixo do menor clock
+   condenado não há piso (fail-open honesto). Ex.: 1815@862+1890@918 condenados ⇒ piso(1845)=885
+   ⇒ 1845@863 morre na síntese com 0 dwells. Semântica antiga "um clock não capa outro"
+   substituída de propósito (teste reescrito: `f2_blacklist_caps_higher_clocks_but_never_lower_ones`).
+   Tests service 364/0; clippy baseline. NÃO testado em HW.
+
+5. **v16.3 cadência real no BoostEdge — DETECÇÃO, não margem (2026-07-12, uncommitted)** — raiz do
+   gap "jogo condena, forja aprova": o BoostEdge caía no pacing genérico (`frames % 3`), submetendo
+   frames leves ENCADEADOS com a fila cheia → fluxo contínuo de potência baixa, quase zero borda de
+   corrente. O lobby real a 400 fps é CPU/engine-bound: a cada frame a GPU DRENA o pipeline, ocia
+   enquanto a CPU monta o próximo, re-rampa → ~400 transições drain→idle→ramp/s NO bin do anchor
+   (o dI/dt que mata undervolt). Fix em gpu-stress/lib.rs: ramo `boost_edge` faz `poll(Wait)` por
+   frame + bolha sub-ms com spin (`BOOST_EDGE_BUBBLE_US`, Windows sleep é ms-coarse), cada frame
+   vira uma borda discreta de boost. **Detector B** (`frame_time_degraded`, pura+testada): silício
+   marginal desacelera antes de errar — frame-time médio > referência stock × 2 ⇒ Unstable (mesmo
+   princípio do gate TextureStream, agora estendido ao BoostEdge). Referência nova
+   `boost_frame_reference_us` no golden (captura por-frame é mais lenta que o dwell ⇒ gate é
+   permissivo por construção, nunca falso-positiva). Genérico, sem constante desta GPU. gpu-stress
+   13/0, service 364/0, clippy baseline. NÃO testado em HW — o re-forge é a validação.
+
 ### PRÓXIMO PASSO (o teste que fecha tudo)
 **Rebuild (service + UI) → re-forge Standard completo.** Esperado: fronteira ~40 min (reuso), gates
 com regime lobby, perfis publicados ABAIXO dos pontos condenados (Godforge ≤1875@893). Depois:

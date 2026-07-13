@@ -1747,14 +1747,16 @@ fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
     }
 
     let stream = capture("texture-stream golden", VfWorkload::TextureStream)?;
+    let boost = capture("boost golden", VfWorkload::BoostEdge)?;
     Ok(RenderGoldens {
         power: capture("power golden", VfWorkload::PowerRender)?.0,
-        boost: capture("boost golden", VfWorkload::BoostEdge)?.0,
+        boost: boost.0,
         texrop: capture("texture/ROP golden", VfWorkload::TextureRop)?.0,
         cadence: capture("frame-cadence golden", VfWorkload::FrameCadence)?.0,
         geometry: capture("geometry/depth golden", VfWorkload::GeometryDepth)?.0,
         stream: stream.0,
         stream_frame_reference_ms: stream.1,
+        boost_frame_reference_us: boost.1,
     })
 }
 

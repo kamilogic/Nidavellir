@@ -39,7 +39,19 @@ const STREAM_PREHANG_BAND_MS: u64 = 500;
 // Sustained frame time beyond reference × this factor (stock, captured with the golden) marks a
 // bin as marginal: silicon slows down (internal retries) before it hangs.
 const STREAM_DEGRADATION_FACTOR: u64 = 2;
+// Same marginal-silicon principle for BoostEdge. The stock reference is captured with a per-frame
+// CPU checksum readback, while the dwell only reads back ~4×/s — so healthy dwell frames run
+// FASTER than the reference and the gate is inherently permissive; only genuine internal-retry
+// slowdown crosses reference × this factor.
+const BOOST_EDGE_DEGRADATION_FACTOR: u64 = 2;
 const GOLDEN_MIN_FRAMES: u64 = 4;
+// v16.3 BoostEdge lobby cadence: drain the pipeline EVERY frame (a CPU/engine-bound game loop
+// finishes the frame, idles while the CPU builds the next one, then ramps again) and insert a
+// varied sub-ms CPU-frame-build bubble before the next submit. Each frame becomes a discrete
+// drain→idle→ramp current edge AT the anchor bin — the field-proven high-FPS killer regime that a
+// saturated submission queue can never produce. Spin-waited (Windows sleep is ms-coarse). Values
+// model CPU frame-build variance at hundreds of fps; not tied to any GPU.
+const BOOST_EDGE_BUBBLE_US: &[u64] = &[0, 200, 500, 900, 300, 800];
 // v15 boost-entry shock: TRUE idle gaps long enough for the driver to leave the high P-state
 // (downclock hysteresis is seconds; 10-30 s is comfortably beyond), then an instant heavy slam.
 // This is the game/benchmark-launch transition — idle P-state → full boost VF ramp + VRM load
@@ -105,6 +117,11 @@ pub struct RenderGoldens {
     /// rejects a bin whose sustained frame time degrades far beyond this reference — marginal
     /// silicon slows down (internal retries) before it hangs.
     pub stream_frame_reference_ms: u32,
+    /// Stock average BoostEdge frame time (µs, drain-per-frame lobby cadence), captured with the
+    /// golden. Same marginal-silicon principle at the light-frame regime. The capture loop reads
+    /// the checksum back on the CPU every frame (slightly slower than the dwell's drain-only
+    /// frames), so the degradation gate errs permissive, never strict.
+    pub boost_frame_reference_us: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +331,37 @@ fn render_integrity_result(crashed: bool, diverged: bool) -> StabilityResult {
         StabilityResult::SilentError
     } else {
         StabilityResult::Stable
+    }
+}
+
+/// Marginal-silicon frame-time gate for the banded/light regimes (TextureStream, BoostEdge): true
+/// when the sustained average frame time exceeds the stock reference by its factor — the silicon is
+/// running internal retries and slowing down before it hangs. Pure so it can be regression-tested
+/// without a GPU. `stream_frame_ms_total` is summed in ms (banded path), `boost_frame_us_total` in
+/// µs; `reference_us` is always µs. Returns false when there is no reference, too few frames, or
+/// (stream) a hard stall already fired.
+fn frame_time_degraded(
+    stream_banded: bool,
+    boost_edge: bool,
+    stalled: bool,
+    frames: u64,
+    stream_frame_ms_total: u64,
+    boost_frame_us_total: u64,
+    reference_us: Option<u64>,
+) -> bool {
+    if frames < GOLDEN_MIN_FRAMES {
+        return false;
+    }
+    let Some(reference_us) = reference_us else {
+        return false;
+    };
+    let reference_us = reference_us.max(1);
+    if stream_banded && !stalled {
+        (stream_frame_ms_total * 1000) / frames > reference_us * STREAM_DEGRADATION_FACTOR
+    } else if boost_edge {
+        boost_frame_us_total / frames > reference_us * BOOST_EDGE_DEGRADATION_FACTOR
+    } else {
+        false
     }
 }
 
@@ -2172,8 +2220,8 @@ impl GpuCtx {
         )
     }
 
-    /// Returns `(checksum, avg_frame_ms)` — the frame-time reference feeds the TextureStream
-    /// degradation gate.
+    /// Returns `(checksum, avg_frame_us)` — the frame-time reference feeds the TextureStream and
+    /// BoostEdge degradation gates.
     pub fn capture_one_golden(
         &self,
         profile: VfWorkload,
@@ -2397,9 +2445,9 @@ impl GpuCtx {
             observe_golden_checksum(&mut golden, checksum, frames)?;
         }
         let checksum = finish_golden_capture(golden, frames)?;
-        let avg_frame_ms =
-            u32::try_from((start.elapsed().as_millis() as u64) / frames.max(1)).unwrap_or(u32::MAX);
-        Ok((checksum, avg_frame_ms))
+        let avg_frame_us =
+            u32::try_from((start.elapsed().as_micros() as u64) / frames.max(1)).unwrap_or(u32::MAX);
+        Ok((checksum, avg_frame_us))
     }
 
     /// Failure-seeking F2 qualification loop. Discovery must keep calling
@@ -2540,9 +2588,14 @@ impl GpuCtx {
                         matches!(other, VfWorkload::IdlePulse),
                         true,
                         goldens.and_then(|g| golden_for_workload(g, other)),
-                        (other == VfWorkload::TextureStream)
-                            .then(|| goldens.map(|g| g.stream_frame_reference_ms))
-                            .flatten(),
+                        match other {
+                            VfWorkload::TextureStream => goldens
+                                .map(|g| u64::from(g.stream_frame_reference_ms) * 1000),
+                            VfWorkload::BoostEdge => {
+                                goldens.map(|g| u64::from(g.boost_frame_reference_us))
+                            }
+                            _ => None,
+                        },
                         cancel,
                     ),
                 };
@@ -2653,7 +2706,7 @@ impl GpuCtx {
         idle_pulses: bool,
         full_workload_duration: bool,
         golden: Option<u32>,
-        stream_frame_reference_ms: Option<u32>,
+        frame_reference_us: Option<u64>,
         cancel: Option<&AtomicBool>,
     ) -> RenderResult {
         let start = std::time::Instant::now();
@@ -2883,12 +2936,17 @@ impl GpuCtx {
         let frame_cadence = profile == VfWorkload::FrameCadence;
         // BoostEntry paces itself too: heavy slam (timed) → true-idle seconds → slam again.
         let boost_entry = profile == VfWorkload::BoostEntry;
+        // BoostEdge (v16.3): drain every frame + sub-ms CPU-build bubble → discrete boost edges at
+        // the anchor bin (the high-FPS/lobby regime). Times each frame in µs for the degradation gate.
+        let boost_edge = profile == VfWorkload::BoostEdge;
         // TextureStream renders in scissor bands, one submit each (preemptible + pre-hang
         // detectable). A stalled band or sustained frame-time collapse fails the dwell as
         // Unstable BEFORE the driver TDR watchdog can fire.
         let stream_banded = profile == VfWorkload::TextureStream;
         let mut stalled = false;
         let mut stream_frame_ms_total: u64 = 0;
+        // Sum of per-frame drain times (µs) for the BoostEdge degradation gate.
+        let mut boost_frame_us_total: u64 = 0;
 
         // v16.1 composite: allocate a near-full VRAM-resident pool (OOM-guarded — fills whatever
         // remains after the render's own buffers, degrading on smaller cards) + a scattered-gather
@@ -3125,6 +3183,27 @@ impl GpuCtx {
                 let gap_ms = FRAME_CADENCE_GAPS_MS
                     [(frames % FRAME_CADENCE_GAPS_MS.len() as u64) as usize];
                 std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+            } else if boost_edge {
+                // v16.3 lobby cadence: drain THIS light frame fully (a CPU/engine-bound game loop
+                // finishes and waits), TIME it for the degradation gate, then spin a sub-ms
+                // CPU-frame-build bubble so the next submit re-ramps the boost VF from idle. Each
+                // frame is a discrete drain→idle→ramp current edge AT the anchor bin — the field
+                // high-FPS killer a saturated submission queue cannot reproduce. Spin, not sleep:
+                // Windows thread sleep is ms-coarse and would swamp the sub-ms cadence.
+                self.device.poll(wgpu::Maintain::Wait);
+                boost_frame_us_total =
+                    boost_frame_us_total.saturating_add(burst_start.elapsed().as_micros() as u64);
+                let bubble_us =
+                    BOOST_EDGE_BUBBLE_US[(frames % BOOST_EDGE_BUBBLE_US.len() as u64) as usize];
+                if bubble_us > 0 {
+                    let spin_start = std::time::Instant::now();
+                    while (spin_start.elapsed().as_micros() as u64) < bubble_us
+                        && !self.crashed.load(Ordering::SeqCst)
+                        && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
+                    {
+                        std::hint::spin_loop();
+                    }
+                }
             } else if frames % 3 == 0 {
                 self.device.poll(wgpu::Maintain::Wait);
             }
@@ -3189,16 +3268,17 @@ impl GpuCtx {
             }
         }
 
-        // Marginal-silicon gate: sustained stream frame time far beyond the stock reference means
-        // internal retries/slowdown — reject before it becomes a hang. Requires a few frames so a
-        // single scheduling hiccup cannot fail a healthy bin.
-        let degraded = stream_banded
-            && !stalled
-            && frames >= 4
-            && stream_frame_reference_ms.is_some_and(|reference| {
-                stream_frame_ms_total / frames
-                    > u64::from(reference.max(1)) * STREAM_DEGRADATION_FACTOR
-            });
+        // Marginal-silicon gate: sustained frame time far beyond the stock reference means internal
+        // retries/slowdown — reject before it becomes a hang (see [`frame_time_degraded`]).
+        let degraded = frame_time_degraded(
+            stream_banded,
+            boost_edge,
+            stalled,
+            frames,
+            stream_frame_ms_total,
+            boost_frame_us_total,
+            frame_reference_us,
+        );
         let mut result = render_integrity_result(self.crashed.load(Ordering::SeqCst), diverged);
         if result == StabilityResult::Stable
             && (stalled || degraded)
@@ -3401,6 +3481,33 @@ mod tests {
     fn lcg_reference_is_deterministic() {
         assert_eq!(lcg(0, 1), C2);
         assert_eq!(lcg(123, 1000), lcg(123, 1000));
+    }
+
+    #[test]
+    fn boost_edge_bubbles_cycle_and_stay_sub_millisecond() {
+        // The lobby cadence relies on varied per-frame bubbles; a degenerate all-zero or
+        // millisecond-scale table would collapse the drain→idle→ramp edge it exists to create.
+        assert!(BOOST_EDGE_BUBBLE_US.iter().any(|&us| us > 0), "some frames must idle");
+        assert!(BOOST_EDGE_BUBBLE_US.iter().all(|&us| us < 1000), "bubbles must stay sub-ms");
+    }
+
+    #[test]
+    fn frame_time_degraded_flags_marginal_slowdown_per_regime() {
+        // No reference / too few frames / neither regime ⇒ never degraded.
+        assert!(!frame_time_degraded(false, false, false, 100, 0, 0, None));
+        assert!(!frame_time_degraded(true, false, false, 3, 999_999, 0, Some(20_000)));
+        assert!(!frame_time_degraded(false, false, false, 100, 999_999, 999_999, Some(10)));
+
+        // BoostEdge: healthy dwell frames (faster than reference) pass; a 2×+ slowdown fails.
+        // reference 400 µs, factor 2 ⇒ threshold 800 µs avg.
+        assert!(!frame_time_degraded(false, true, false, 1000, 0, 500 * 1000, Some(400)));
+        assert!(frame_time_degraded(false, true, false, 1000, 0, 900 * 1000, Some(400)));
+
+        // TextureStream: ms totals scale to µs. reference 20 000 µs, factor 2 ⇒ 40 ms avg threshold.
+        assert!(!frame_time_degraded(true, false, false, 100, 30 * 100, 0, Some(20_000)));
+        assert!(frame_time_degraded(true, false, false, 100, 50 * 100, 0, Some(20_000)));
+        // A hard stall already fired ⇒ the stream degradation branch defers (stall owns the verdict).
+        assert!(!frame_time_degraded(true, false, true, 100, 50 * 100, 0, Some(20_000)));
     }
 
     #[test]
