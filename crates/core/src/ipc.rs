@@ -63,6 +63,27 @@ pub enum IpcRequest {
     ExportForgeLog,
     /// v17: read the TDR sentinel's last action + recommendation (sentinel_status.json). Read-only.
     GetSentinelStatus,
+    /// Game-workload telemetry logger — start a read-only NVML/NVAPI trace (no hardware writes) so
+    /// the real workload's macroscopic fingerprint can be captured while the operator plays.
+    StartGameTrace,
+    StopGameTrace,
+    GetGameTraceStatus,
+}
+
+/// Live status of the read-only game-workload telemetry logger ([`IpcRequest::StartGameTrace`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GameTraceStatus {
+    pub running: bool,
+    /// Absolute path of the JSONL trace being written (retained after stop so the UI can show it).
+    pub out_path: Option<String>,
+    pub samples: u64,
+    pub elapsed_s: u64,
+    /// Last observed readings, for a live at-a-glance card.
+    pub last_power_w: Option<f32>,
+    pub last_core_mhz: Option<u32>,
+    pub last_volt_mv: Option<u32>,
+    /// Short human note (starting / stopped / error).
+    pub note: Option<String>,
 }
 
 /// Result of [`IpcRequest::ExportForgeLog`]: where the rich log was written and how much it covered.
@@ -597,6 +618,7 @@ pub enum ResponseData {
     /// Raw JSON of the sentinel's last action (None = no sentinel event ever recorded).
     /// Struct variant: the enum is internally tagged, which cannot carry a bare Option.
     SentinelStatus { status: Option<String> },
+    GameTrace(GameTraceStatus),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

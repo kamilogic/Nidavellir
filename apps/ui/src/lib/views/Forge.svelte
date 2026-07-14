@@ -1,38 +1,36 @@
 <script>
-  import { Activity, CircleCheck, Play, ShieldCheck, Square, Terminal, TriangleAlert } from "@lucide/svelte";
+  import { open } from "@tauri-apps/plugin-shell";
   import { serviceCall } from "../service.js";
-  import { t } from "../i18n.js";
-  import VfChart from "../components/VfChart.svelte";
-  import DiagnosticsPanel from "../components/forge/DiagnosticsPanel.svelte";
+  import AdvancedDiagnosticsHub from "../components/forge/AdvancedDiagnosticsHub.svelte";
   import ForgeProgress from "../components/forge/ForgeProgress.svelte";
+  import ForgeThemeScreen from "../components/forge/ForgeThemeScreen.svelte";
   import GpuHeroStatus from "../components/forge/GpuHeroStatus.svelte";
-  import LogTerminal from "../components/forge/LogTerminal.svelte";
   import MonitoringPanel from "../components/forge/MonitoringPanel.svelte";
   import ProfileCards from "../components/forge/ProfileCards.svelte";
-  import VfCurvePanel from "../components/forge/VfCurvePanel.svelte";
+
+  let { theme = "command", onThemeChange } = $props();
 
   let error = $state(null);
   let timer = $state(null);
   let hardware = $state(null);
   let safeLoop = $state(null);
-  let realCurve = $state(null);
-  let validation = $state(null);
-  let advanced = $state(false);
-  let expanded = $state(false);
-  let memSweep = $state(null);
-  let memPreflight = $state(false);
+  let activeView = $state("forge");
   let applied = $state(null);
   let verification = $state(null);
-  let verifying = $state(false);
   let exporting = $state(false);
   let exportMsg = $state("");
+  let exportFailed = $state(false);
   // v17 sentinel: last automatic action + recommendation (sentinel_status.json via IPC).
   let sentinel = $state(null);
+  // Game-trace: read-only NVML/NVAPI workload logger.
+  let gameTrace = $state(null);
+  let gameTraceBusy = $state(false);
+  let gameTraceExportBusy = $state(false);
+  let gameTraceExportMsg = $state("");
   // Live GPU telemetry (ReadSensors) + rolling sparkline buffers for the monitoring panel.
   let sensors = $state(null);
   let sparks = $state({ core: [], mem: [], temp: [], power: [], usage: [] });
   const SPARK_CAP = 20;
-  let benchmark = $state(null);
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
   let hardwareLoaded = $state(false);
@@ -41,126 +39,9 @@
   let lastSlowRefreshAt = 0;
 
   const powerRunning = $derived(Boolean(powerSweep?.running));
-  const memRunning = $derived(Boolean(memSweep?.running));
-  const benchRunning = $derived(Boolean(benchmark?.running));
   const hasProfiles = $derived(Boolean(powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm));
-  const hasKnowledge = $derived(
-    Boolean(powerSweep?.points?.length || validation?.result || verification?.status),
-  );
+  const hasKnowledge = $derived(Boolean(powerSweep?.points?.length || verification?.status));
   const hasForgeRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
-
-  // Keep diagnostics output pinned to its newest line.
-  function autoscroll(node, _dep) {
-    const toBottom = () => {
-      node.scrollTop = node.scrollHeight;
-    };
-    toBottom();
-    return { update: toBottom };
-  }
-
-  function fixed(value, digits = 0) {
-    const n = Number(value);
-    return Number.isFinite(n) ? n.toFixed(digits) : "0";
-  }
-
-  function numeric(value) {
-    const n = Number(value);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  function sameNumber(a, b) {
-    return a != null && b != null && Number(a) === Number(b);
-  }
-
-  function normalizeProfile(s) {
-    return String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  }
-
-  const powerProfileSlots = [
-    { key: "godforge", label: "Godforge" },
-    { key: "brokkrs", label: "Brokkr's Best" },
-    { key: "deep_calm", label: "Deep Calm" },
-  ];
-
-  const appliedPowerPoint = $derived.by(() => {
-    if (!applied?.core || !powerSweep) return null;
-    for (const slot of powerProfileSlots) {
-      const point = powerSweep?.[slot.key];
-      if (!point) continue;
-      const labelMatches = normalizeProfile(applied.label) === normalizeProfile(slot.label);
-      const profileClock = powerSweep?.is_undervolt
-        ? (point.target_clock_mhz ?? point.clock_mhz)
-        : point.clock_mhz;
-      const clockMatches = sameNumber(applied.core.freq_mhz, profileClock);
-      if (labelMatches && clockMatches) return { ...slot, point };
-    }
-    return null;
-  });
-
-  function verificationMatchesAppliedProfile() {
-    if (verification?.vf_table_voltage_mv == null || verification?.target_mhz == null || !applied?.core) return false;
-    const targetMatches = sameNumber(verification.target_mhz, applied.core.freq_mhz);
-    const labelMatches =
-      !verification.label ||
-      !applied.label ||
-      normalizeProfile(verification.label) === normalizeProfile(applied.label);
-    return targetMatches && labelMatches;
-  }
-
-  function buildCurveOverlay({ targetMhz, anchorMv = null, anchorSource = "none", anchorPrecise = false }) {
-    const target = numeric(targetMhz);
-    if (target == null) return null;
-    const anchor = numeric(anchorMv);
-    const hasTrustedAnchor = anchor != null && anchorPrecise;
-    return {
-      targetMhz: target,
-      anchorMv: hasTrustedAnchor ? anchor : null,
-      anchorSource,
-      anchorPrecise: hasTrustedAnchor,
-      showBand: hasTrustedAnchor,
-    };
-  }
-
-  const curveOverlay = $derived.by(() => {
-    if (verificationMatchesAppliedProfile()) {
-      return buildCurveOverlay({
-        targetMhz: verification.target_mhz,
-        anchorMv: verification.vf_table_voltage_mv,
-        anchorSource: verification.status === "verified_curve" ? "verified_vf_bin" : "verification_vf_bin",
-        anchorPrecise: true,
-      });
-    }
-
-    if (appliedPowerPoint?.point?.vf_table_voltage_mv != null) {
-      return buildCurveOverlay({
-        targetMhz: powerSweep?.is_undervolt
-          ? (appliedPowerPoint.point.target_clock_mhz ?? appliedPowerPoint.point.clock_mhz)
-          : appliedPowerPoint.point.clock_mhz,
-        anchorMv: appliedPowerPoint.point.vf_table_voltage_mv,
-        anchorSource: "profile_vf_bin",
-        anchorPrecise: true,
-      });
-    }
-
-    if (realCurve?.real && realCurve?.plateau?.voltage_mv != null && realCurve?.plateau?.freq_mhz != null) {
-      return buildCurveOverlay({
-        targetMhz: realCurve.plateau.freq_mhz,
-        anchorMv: realCurve.plateau.voltage_mv,
-        anchorSource: "curve_read_plateau",
-        anchorPrecise: true,
-      });
-    }
-
-    if (applied?.core?.freq_mhz != null) {
-      return buildCurveOverlay({
-        targetMhz: applied.core.freq_mhz,
-        anchorSource: "none",
-        anchorPrecise: false,
-      });
-    }
-
-    return null;
-  });
 
   async function loadHardware() {
     if (hardwareLoaded) return;
@@ -186,16 +67,8 @@
       powerSweep = ps?.data?.type === "PowerSweep" ? ps.data : powerSweep;
       safeLoop = sl?.data?.type === "SafeLoop" ? sl.data : safeLoop;
       if (slowDue) {
-        const [v, ms, ap, bm] = await Promise.all([
-          serviceCall("GetGpuValidation"),
-          serviceCall("GetMemSweepProgress"),
-          serviceCall("GetAppliedProfile"),
-          serviceCall("GetBenchmarkProgress"),
-        ]);
-        validation = v?.data?.type === "GpuValidation" ? v.data : validation;
-        memSweep = ms?.data?.type === "MemSweep" ? ms.data : memSweep;
+        const ap = await serviceCall("GetAppliedProfile");
         applied = ap?.data?.type === "GpuApply" ? ap.data : applied;
-        benchmark = bm?.data?.type === "Benchmark" ? bm.data : benchmark;
         lastSlowRefreshAt = now;
       }
       error = null;
@@ -219,16 +92,6 @@
     }
   }
 
-  const readRealCurve = () =>
-    call("GetGpuCurve", (r) => (realCurve = r?.data?.type === "GpuCurve" ? r.data : realCurve));
-  const startValidation = () =>
-    call("StartGpuValidation", (r) => (validation = r?.data?.type === "GpuValidation" ? r.data : validation));
-  const setMem = (r) => (memSweep = r?.data?.type === "MemSweep" ? r.data : memSweep);
-  const startMem = () => {
-    memPreflight = false;
-    call("StartMemSweep", setMem);
-  };
-  const stopMem = () => call("StopMemSweep", setMem);
   const setApplied = (r) => (applied = r?.data?.type === "GpuApply" ? r.data : applied);
   const resetTuning = async () => {
     const confirmed = globalThis.confirm?.(
@@ -248,9 +111,6 @@
     await call("ResetGpuTuningFull", setApplied);
     await refresh();
   };
-  const setBench = (r) => (benchmark = r?.data?.type === "Benchmark" ? r.data : benchmark);
-  const startBench = () => call("StartBenchmark", setBench);
-  const stopBench = () => call("StopBenchmark", setBench);
   const setPower = (r) => (powerSweep = r?.data?.type === "PowerSweep" ? r.data : powerSweep);
   const POWER_START = {
     fast: "StartPowerSweepFast",
@@ -321,59 +181,27 @@
     await call(POWER_APPLY[which], setApplied);
   };
 
-  async function verifyAppliedProfile() {
-    verifying = true;
-    try {
-      const r = await serviceCall("VerifyAppliedProfile");
-      verification = r?.data?.type === "ApplyVerification" ? r.data : verification;
-      error = null;
-    } catch (e) {
-      error = String(e);
-      verification = { status: "verification_failed", live_curve_match: false, message: String(e) };
-    } finally {
-      verifying = false;
-    }
-  }
-
   async function exportLog() {
     exporting = true;
     exportMsg = "";
+    exportFailed = false;
     try {
       const r = await serviceCall("ExportForgeLog");
       if (r?.data?.type === "ForgeLogExport") {
         exportMsg = `${r.data.note} → ${r.data.path}`;
         error = null;
       } else {
-        exportMsg = r?.error ? String(r.error) : "Falha ao exportar log.";
+        exportFailed = true;
+        exportMsg = r?.error ? String(r.error) : "Unable to export the Forge log.";
       }
     } catch (e) {
+      exportFailed = true;
       error = String(e);
       exportMsg = String(e);
     } finally {
       exporting = false;
     }
   }
-
-  function closeMemPreflight() {
-    memPreflight = false;
-  }
-
-  function closeExpandedCurve() {
-    expanded = false;
-  }
-
-  function handleKeydown(event) {
-    if (event.key !== "Escape") return;
-    if (memPreflight) closeMemPreflight();
-    if (expanded) closeExpandedCurve();
-  }
-
-  const verificationLabel = $derived.by(() => {
-    if (!verification) return "Curve verification: Not checked";
-    if (verification.status === "verified_curve") return "Curve verification: Verified";
-    if (verification.status === "live_mismatch") return "Curve verification: Mismatch";
-    return "Curve verification: Unavailable";
-  });
 
   async function refreshSentinel() {
     try {
@@ -384,6 +212,54 @@
     } catch {
       /* sentinel status is best-effort UI info */
     }
+  }
+
+  async function refreshGameTrace() {
+    try {
+      const r = await serviceCall("GetGameTraceStatus");
+      if (r?.data?.type === "GameTrace") gameTrace = r.data;
+    } catch {
+      /* game-trace status is best-effort UI info */
+    }
+  }
+
+  async function toggleGameTrace() {
+    if (gameTraceBusy) return;
+    gameTraceBusy = true;
+    try {
+      const method = gameTrace?.running ? "StopGameTrace" : "StartGameTrace";
+      const r = await serviceCall(method);
+      if (r?.data?.type === "GameTrace") gameTrace = r.data;
+      gameTraceExportMsg = "";
+    } catch (e) {
+      gameTrace = { ...(gameTrace ?? {}), note: `Error: ${String(e)}` };
+    } finally {
+      gameTraceBusy = false;
+      refreshGameTrace();
+    }
+  }
+
+  async function openGameTraceLog() {
+    if (!gameTrace?.out_path || gameTraceExportBusy) return;
+    gameTraceExportBusy = true;
+    gameTraceExportMsg = "";
+    try {
+      await open(gameTrace.out_path);
+      gameTraceExportMsg = "The exported JSONL was opened with your default application.";
+    } catch (e) {
+      gameTraceExportMsg = `Unable to open the exported log: ${String(e)}`;
+    } finally {
+      gameTraceExportBusy = false;
+    }
+  }
+
+  function closeAdvancedDiagnostics() {
+    changeView("forge");
+  }
+
+  function changeView(view) {
+    activeView = view === "advanced" ? "advanced" : "forge";
+    requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
   }
 
   function pushSpark(arr, value) {
@@ -415,17 +291,17 @@
   const primarySensorGpu = $derived(sensors?.gpu?.[0] ?? null);
   const logLines = $derived(powerSweep?.log ?? []);
   const sentinelState = $derived.by(() => {
-    if (!sentinel) return "Monitorando";
-    if (sentinel.action === "bump") return "Ajuste automático";
-    if (sentinel.action === "stock") return "GPU em stock";
-    return "Ativo";
+    if (!sentinel) return "No events";
+    if (sentinel.action === "bump") return "Automatic adjustment";
+    if (sentinel.action === "stock") return "Returned to stock";
+    return "Event recorded";
   });
   const sentinelSummary = $derived.by(() => {
-    if (!sentinel) return "Nenhum evento recente";
+    if (!sentinel) return "No automatic recovery action recorded.";
     if (sentinel.action === "bump") {
-      return `${sentinel.target_mhz} MHz — rebaixado ${sentinel.failed_mv}→${sentinel.new_mv} mV (strike ${sentinel.strike}/3)`;
+      return `Kept ${sentinel.target_mhz} MHz and moved the unstable point from ${sentinel.failed_mv} to ${sentinel.new_mv} mV (strike ${sentinel.strike}/3).`;
     }
-    return `${sentinel.target_mhz} MHz @ ${sentinel.failed_mv} mV removido — GPU em stock (3 falhas)`;
+    return `Removed ${sentinel.target_mhz} MHz @ ${sentinel.failed_mv} mV and returned the GPU to stock after three failures.`;
   });
 
   $effect(() => {
@@ -433,21 +309,64 @@
     refresh();
     refreshSentinel();
     refreshSensors();
+    refreshGameTrace();
     timer = setInterval(refresh, 500);
     const sentinelTimer = setInterval(refreshSentinel, 10_000);
     const sensorTimer = setInterval(refreshSensors, 2000);
+    const gameTraceTimer = setInterval(refreshGameTrace, 1000);
     return () => {
       clearInterval(timer);
       clearInterval(sentinelTimer);
       clearInterval(sensorTimer);
+      clearInterval(gameTraceTimer);
     };
   });
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<section class={`forge theme-${theme}`}>
+  <ForgeThemeScreen
+    {theme}
+    {hardware}
+    gpu={primarySensorGpu}
+    {sparks}
+    {powerSweep}
+    {safeLoop}
+    {applied}
+    {forgeMode}
+    {powerRunning}
+    {onThemeChange}
+    onForgeModeChange={selectForgeMode}
+    onStartPower={startPower}
+    onStopPower={stopPower}
+    onApplyPower={applyPower}
+    {activeView}
+    onViewChange={changeView}
+  >
+    <AdvancedDiagnosticsHub
+      {theme}
+      embedded
+      {powerSweep}
+      {logLines}
+      {exporting}
+      {exportMsg}
+      {exportFailed}
+      {sentinel}
+      {sentinelState}
+      {sentinelSummary}
+      {gameTrace}
+      {gameTraceBusy}
+      {gameTraceExportBusy}
+      {gameTraceExportMsg}
+      onExportLog={exportLog}
+      onToggleGameTrace={toggleGameTrace}
+      onOpenGameTraceLog={openGameTraceLog}
+      onClose={closeAdvancedDiagnostics}
+    />
+  </ForgeThemeScreen>
 
-<section class="forge">
+  <div class="legacy-forge-content">
   <GpuHeroStatus
+    {theme}
     {error}
     {applied}
     {hardware}
@@ -466,54 +385,6 @@
   />
 
   <MonitoringPanel gpu={primarySensorGpu} {sparks} live={powerRunning} />
-
-  <div class="footer-row">
-    <details class="collapsed-bar log-bar">
-      <summary>
-        <span class="bar-lead">
-          <Terminal size={15} strokeWidth={1.85} />
-          <span class="bar-title">Log Técnico</span>
-        </span>
-        <span class="bar-sub">{logLines.length} {logLines.length === 1 ? "linha" : "linhas"}</span>
-        <span class="bar-toggle">
-          <span class="when-closed">Ver log ▾</span>
-          <span class="when-open">Recolher ▲</span>
-        </span>
-      </summary>
-      <div class="bar-body">
-        <LogTerminal
-          title="nidavellir / core vf forge"
-          status={powerSweep?.running ? powerSweep.phase : "idle"}
-          live={Boolean(powerSweep?.running)}
-          lines={logLines.length ? logLines : ["No technical Forge events recorded yet."]}
-          runningText={powerSweep?.running ? `${powerSweep.phase}...` : null}
-        />
-      </div>
-    </details>
-
-    <details class="collapsed-bar sent-bar" class:stock={sentinel?.action === "stock"}>
-      <summary>
-        <span class="bar-lead">
-          <span class={`sent-dot ${sentinel?.action ?? "idle"}`} aria-hidden="true"></span>
-          <span class="bar-title">Sentinela — {sentinelState}</span>
-        </span>
-        <span class="bar-sub">{sentinelSummary}</span>
-        <span class="bar-toggle">
-          <span class="when-closed">Detalhes ▾</span>
-          <span class="when-open">Recolher ▲</span>
-        </span>
-      </summary>
-      <div class="bar-body">
-        {#if sentinel}
-          <p class="sent-detail">{sentinelSummary}</p>
-          <p class="sent-reco">{sentinel.recommendation}</p>
-          <p class="sent-ts">{sentinel.ts}</p>
-        {:else}
-          <p class="sent-detail">O Sentinela monitora a estabilidade em segundo plano. Nenhum evento automático foi registrado ainda.</p>
-        {/if}
-      </div>
-    </details>
-  </div>
 
   {#if hasForgeRun}
     <ForgeProgress
@@ -556,734 +427,15 @@
     </section>
   {/if}
 
-  <details class="advanced-diagnostics">
-    <summary>
-      <span class="summary-title">
-        <Terminal size={17} strokeWidth={1.85} />
-        <span>Advanced Diagnostics</span>
-      </span>
-      <small>Curve checks, validation, benchmark, applied-profile verification and experimental memory diagnostics</small>
-    </summary>
-
-    <div class="diagnostic-stack">
-      <section class="diagnostic-group">
-        <div class="diagnostic-group-head">
-          <span class="section-kicker">Current safe diagnostics</span>
-          <h4>
-            <Activity size={16} strokeWidth={1.85} />
-            <span>Inspect and verify the current GPU state</span>
-          </h4>
-          <p>These actions are explicit diagnostics. They do not replace the primary Forge GPU path.</p>
-        </div>
-
-        <VfCurvePanel
-          {realCurve}
-          {validation}
-          {curveOverlay}
-          bind:advanced
-          bind:expanded
-          onReadRealCurve={readRealCurve}
-          onStartValidation={startValidation}
-        />
-
-        <DiagnosticsPanel
-          {benchmark}
-          {benchRunning}
-          {applied}
-          onStartBench={startBench}
-          onStopBench={stopBench}
-        />
-
-        <section class="diagnostic-card">
-          <div>
-            <h4 class="section-head">
-              <Terminal size={14} strokeWidth={1.85} />
-              <span>Export forge log</span>
-            </h4>
-            <p class="sub">Writes a rich, human-readable log of the last run — profiles, frontier, live log, and every recorded dwell — to a file under the data dir. Read-only; captures no hardware action.</p>
-          </div>
-          <button class="btn" onclick={exportLog} disabled={exporting}>
-            <Terminal size={15} strokeWidth={1.9} />
-            <span>{exporting ? "Exporting..." : "Export forge log"}</span>
-          </button>
-          {#if exportMsg}
-            <p class="point accent">
-              <CircleCheck size={14} strokeWidth={1.9} />
-              <span>{exportMsg}</span>
-            </p>
-          {/if}
-        </section>
-
-        <section class="diagnostic-card">
-          <div>
-            <h4 class="section-head">
-              <ShieldCheck size={14} strokeWidth={1.85} />
-              <span>Verify applied profile</span>
-            </h4>
-            <p class="sub">Read-only check: compares the live modern VF curve against the applied profile. It does not apply or re-apply tuning.</p>
-          </div>
-          <button class="btn go" onclick={verifyAppliedProfile} disabled={verifying || !applied?.core}>
-            <ShieldCheck size={15} strokeWidth={1.9} />
-            <span>{verifying ? "Verifying..." : "Verify applied profile"}</span>
-          </button>
-          <p
-            class="point"
-            class:accent={verification?.status === "verified_curve"}
-            class:danger={verification?.status === "live_mismatch"}
-          >
-            {#if verification?.status === "verified_curve"}
-              <CircleCheck size={14} strokeWidth={1.9} />
-            {:else if verification?.status === "live_mismatch"}
-              <TriangleAlert size={14} strokeWidth={1.9} />
-            {:else}
-              <ShieldCheck size={14} strokeWidth={1.9} />
-            {/if}
-            <span>{verificationLabel}</span>
-          </p>
-          {#if verification?.message}
-            <p class="sub">{verification.message}</p>
-          {/if}
-          {#if verification?.load_state}
-            <p class="sub">Stored load evidence: {verification.load_state}</p>
-          {/if}
-        </section>
-      </section>
-
-      <section class="diagnostic-group future">
-        <div class="diagnostic-group-head">
-          <span class="section-kicker">Future / experimental pipeline steps</span>
-          <h4>
-            <Activity size={16} strokeWidth={1.85} />
-            <span>VRAM optimization is not part of the current Forge GPU pipeline yet</span>
-          </h4>
-          <p>Memory tuning must come after the core VF curve is forged and validated. This tool is experimental diagnostics only.</p>
-        </div>
-
-        <section class="diagnostic-card">
-          <div class="real-head">
-            <div>
-              <h4 class="section-head">Memory sweep (experimental)</h4>
-              <p class="sub">Future pipeline-related diagnostic. It is not a primary product action and does not define the current Forge GPU path.</p>
-            </div>
-            {#if memRunning}
-              <button class="btn stop" onclick={stopMem}>
-                <Square size={14} strokeWidth={1.9} />
-                <span>Stop memory sweep</span>
-              </button>
-            {:else}
-              <button class="btn" onclick={() => (memPreflight = true)}>
-                <Play size={15} strokeWidth={1.9} />
-                <span>Run memory sweep (experimental)</span>
-              </button>
-            {/if}
-          </div>
-
-          {#if memSweep && memSweep.phase !== "idle"}
-            <div class="terminal">
-              <div class="term-head">
-                <span class="dots"><i></i><i></i><i></i></span>
-                <span class="term-title">nidavellir / memory sweep experimental</span>
-                <span class="term-status" class:live={memRunning}>{memRunning ? "running" : "done"}</span>
-              </div>
-              <div class="term-body" use:autoscroll={(memSweep.points?.length ?? 0) + (memRunning ? 1 : 0)}>
-                <div class="tline base"><span class="gutter">--</span><span class="tlead">base / {fixed(memSweep.baseline_gbps)} GB/s</span></div>
-                {#each memSweep.points as p, i}
-                  <div class="tline">
-                    <span class="gutter">{(i + 1).toString().padStart(2, "0")}</span>
-                    <span class="tlead">+{p.offset_mhz} MHz / {p.mem_mhz} MHz</span>
-                    <span class="tval" class:accent={p.stable} class:danger={!p.stable}>{fixed(p.bandwidth_gbps)} GB/s</span>
-                    {#if p.min_gbps > 0}<span class="tmin">min {fixed(p.min_gbps)}</span>{/if}
-                    <span class="tstatus" class:danger={!p.stable}>{p.stable ? "ok" : "failed"}</span>
-                  </div>
-                {/each}
-                {#if memRunning}
-                  <div class="tline running">
-                    <span class="gutter">&gt;</span>
-                    <span class="cursor"></span>
-                    <span class="tlead">{memSweep.validation_note ?? "..."}</span>
-                  </div>
-                {/if}
-              </div>
-            </div>
-            {#if memSweep.peak_gbps > 0}
-              <p class="point accent">
-                {$t("forge.peakResult", { o: memSweep.peak_offset_mhz, g: fixed(memSweep.peak_gbps) })}
-              </p>
-              {#if !memRunning && memSweep.validation_note}<p class="sub">{memSweep.validation_note}</p>{/if}
-            {/if}
-          {/if}
-        </section>
-      </section>
-    </div>
-  </details>
+  </div>
 </section>
-
-{#if memPreflight}
-  <div class="overlay" onclick={closeMemPreflight} role="presentation">
-    <div
-      class="modal"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="memory-sweep-dialog-title"
-      tabindex="-1"
-    >
-      <div class="modal-head"><strong id="memory-sweep-dialog-title">Memory sweep (experimental)</strong></div>
-      <p class="pre-body">This experimental diagnostic writes memory clocks and is not part of the current Forge GPU pipeline. VRAM optimization is planned for a later pipeline step after the core VF curve is forged and validated.</p>
-      <div class="pre-actions">
-        <button class="btn ghost" onclick={closeMemPreflight}>{$t("forge.preCancel")}</button>
-        <button class="btn go" onclick={startMem}>
-          <Play size={15} strokeWidth={1.9} />
-          <span>Run memory sweep (experimental)</span>
-        </button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if expanded && realCurve?.real}
-  <div class="overlay" onclick={closeExpandedCurve} role="presentation">
-    <div
-      class="modal"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="vf-curve-dialog-title"
-      tabindex="-1"
-    >
-      <div class="modal-head">
-        <strong id="vf-curve-dialog-title">{realCurve.name}</strong>
-        <button class="btn ghost" onclick={closeExpandedCurve}>{$t("forge.close")}</button>
-      </div>
-      <VfChart points={realCurve.points} overlay={curveOverlay} height={560} />
-    </div>
-  </div>
-{/if}
 
 <style>
   .forge {
-    --surface: var(--forge-panel);
-    --border: transparent;
-    --muted: var(--nord-mist);
-    --text: var(--nord-silver);
-    --accent: var(--nord-aurora);
-    display: flex;
-    flex-direction: column;
-    gap: 1.25rem;
-  }
-  .home-section,
-  .advanced-diagnostics {
-    background: var(--forge-panel-bg);
-    border: 1px solid var(--forge-line);
-    border-radius: 12px;
-    padding: 1rem 1.1rem;
-    box-shadow: var(--forge-panel-edge);
-  }
-  .home-section {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-  }
-  .section-kicker {
-    display: block;
-    font-size: 0.68rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--nord-dim);
-    margin-bottom: 0.35rem;
-  }
-  .home-section h3 {
-    margin: 0;
-    color: var(--text);
-    font-size: 1rem;
-  }
-  .home-section p {
-    margin: 0.35rem 0 0;
-    color: var(--muted);
-    font-size: 0.86rem;
-    line-height: 1.5;
-  }
-  .profile-section.active-forging {
-    background: rgba(14, 18, 24, 0.58);
-    border-color: rgba(255, 255, 255, 0.045);
-    box-shadow: none;
-  }
-  .profile-section.active-forging h3 {
-    color: var(--nord-mist);
-  }
-  .profile-section.active-forging :global(.profiles) {
-    opacity: 0.88;
-  }
-  .advanced-diagnostics > summary {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    gap: 0.7rem;
-    align-items: center;
-    cursor: pointer;
-    color: var(--text);
-    font-weight: 700;
-    list-style: none;
-  }
-  .advanced-diagnostics > summary::-webkit-details-marker {
-    display: none;
-  }
-  .advanced-diagnostics > summary::after {
-    content: "+";
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 1.55rem;
-    height: 1.55rem;
-    border: 1px solid var(--forge-line);
-    border-radius: 999px;
-    color: var(--forge-gold);
-    background: rgba(214, 168, 93, 0.08);
-    font-weight: 800;
-  }
-  .advanced-diagnostics[open] > summary::after {
-    content: "-";
-  }
-  .advanced-diagnostics > summary span,
-  .advanced-diagnostics > summary small {
     display: block;
   }
-  .advanced-diagnostics > summary .summary-title {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.42rem;
-  }
-  .advanced-diagnostics > summary .summary-title span {
-    display: inline;
-  }
-  .advanced-diagnostics > summary small {
-    color: var(--muted);
-    font-size: 0.78rem;
-    font-weight: 500;
-    line-height: 1.4;
-  }
-  .diagnostic-stack {
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-    margin-top: 1rem;
-    padding-top: 1rem;
-    border-top: 1px solid var(--forge-line);
-  }
-  .diagnostic-group,
-  .diagnostic-card {
-    border: 1px solid rgba(255, 255, 255, 0.055);
-    border-radius: 10px;
-    background: rgba(5, 7, 11, 0.22);
-  }
-  .diagnostic-group {
-    padding: 0.9rem;
-  }
-  .diagnostic-card {
-    margin-top: 1rem;
-    padding: 0.85rem;
-  }
-  .diagnostic-group.future {
-    border-style: dashed;
-  }
-  .diagnostic-group-head {
-    margin-bottom: 0.85rem;
-  }
-  .diagnostic-group-head h4 {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.42rem;
-    margin: 0;
-    color: var(--text);
-    font-size: 0.95rem;
-  }
-  .diagnostic-group-head p {
-    margin: 0.35rem 0 0;
-    color: var(--muted);
-    font-size: 0.84rem;
-    line-height: 1.5;
-  }
-  .btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.42rem;
-    border: 1px solid var(--border);
-    border-radius: 9px;
-    padding: 0.55rem 1.1rem;
-    font-weight: 600;
-    font-size: 0.85rem;
-    cursor: pointer;
-    background: rgba(8, 11, 16, 0.66);
-    color: var(--text);
-    transition:
-      border-color 0.15s ease,
-      color 0.15s ease,
-      background 0.15s ease;
-  }
-  .btn:hover {
-    border-color: var(--forge-line-strong);
-    color: var(--forge-gold);
-  }
-  .btn.go {
-    background: rgba(214, 168, 93, 0.13);
-    color: var(--forge-gold);
-    border-color: rgba(214, 168, 93, 0.42);
-  }
-  .btn.stop {
-    background: rgba(191, 97, 106, 0.16);
-    color: #f3b9bd;
-    border-color: rgba(191, 97, 106, 0.45);
-  }
-  .btn.ghost {
-    background: transparent;
-    color: var(--muted);
-  }
-  .btn:disabled {
-    opacity: 0.55;
-    cursor: default;
-  }
-  .real-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 1rem;
-  }
-  .section-head {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin: 0 0 0.5rem;
-    font-size: 0.72rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-  .point {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.38rem;
-    margin: 0.45rem 0 0;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    color: var(--text);
-  }
-  .point.accent {
-    color: var(--accent);
-  }
-  .point.danger {
-    color: var(--nord-danger);
-  }
-  .sub {
-    margin: 0.25rem 0;
-    font-size: 0.82rem;
-    color: var(--muted);
-    line-height: 1.45;
-  }
-  .overlay {
-    --surface: var(--forge-panel);
-    --border: transparent;
-    --muted: var(--nord-mist);
-    --text: var(--nord-silver);
-    --accent: var(--nord-aurora);
-    position: fixed;
-    inset: 0;
-    background: rgba(4, 6, 12, 0.78);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 2rem;
-    z-index: 50;
-  }
-  .modal {
-    background: var(--forge-panel-bg);
-    border: 1px solid var(--forge-line);
-    border-radius: 14px;
-    padding: 1.1rem;
-    width: min(1100px, 95vw);
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-  }
-  .modal-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 0.6rem;
-    color: var(--text);
-  }
-  .pre-body {
-    color: var(--muted);
-    font-size: 0.9rem;
-    line-height: 1.55;
-    margin: 0 0 1rem;
-  }
-  .pre-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.6rem;
-  }
-  .terminal {
-    font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
-    font-size: 0.8rem;
-    background: rgba(5, 7, 11, 0.92);
-    border: 1px solid var(--forge-line);
-    border-radius: 10px;
-    overflow: hidden;
-    box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.04), 0 8px 24px rgba(0, 0, 0, 0.35);
-  }
-  .term-head {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.4rem 0.7rem;
-    background: rgba(214, 168, 93, 0.055);
-    border-bottom: 1px solid var(--forge-line);
-  }
-  .dots {
-    display: inline-flex;
-    gap: 0.32rem;
-  }
-  .dots i {
-    width: 0.62rem;
-    height: 0.62rem;
-    border-radius: 50%;
-    background: var(--nord-dim);
-    opacity: 0.6;
-  }
-  .dots i:nth-child(1) {
-    background: var(--nord-danger);
-  }
-  .dots i:nth-child(2) {
-    background: var(--nord-ember-bright);
-  }
-  .dots i:nth-child(3) {
-    background: var(--nord-aurora);
-  }
-  .term-title {
-    color: var(--nord-mist);
-    font-size: 0.74rem;
-    letter-spacing: 0.04em;
-  }
-  .term-status {
-    margin-left: auto;
-    font-size: 0.68rem;
-    text-transform: lowercase;
-    color: var(--nord-dim);
-    padding: 0.08rem 0.5rem;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-  }
-  .term-status.live {
-    color: var(--nord-ember-bright);
-    border-color: rgba(235, 203, 139, 0.4);
-    background: rgba(235, 203, 139, 0.08);
-  }
-  .term-body {
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-    padding: 0.55rem 0.7rem;
-    max-height: 340px;
-    overflow-y: auto;
-    scroll-behavior: smooth;
-  }
-  .term-body::-webkit-scrollbar {
-    width: 8px;
-  }
-  .term-body::-webkit-scrollbar-thumb {
-    background: rgba(214, 168, 93, 0.18);
-    border-radius: 8px;
-  }
-  .tline {
-    display: flex;
-    align-items: baseline;
-    gap: 0.75rem;
-    padding: 0.12rem 0;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-    border-radius: 4px;
-  }
-  .gutter {
-    color: var(--nord-dim);
-    opacity: 0.55;
-    min-width: 1.4rem;
-    text-align: right;
-    user-select: none;
-    flex-shrink: 0;
-  }
-  .tline.base {
-    color: var(--nord-dim);
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 0.3rem;
-    margin-bottom: 0.2rem;
-  }
-  .tlead {
-    min-width: 16rem;
-    color: var(--text);
-  }
-  .cursor {
-    display: inline-block;
-    width: 0.5rem;
-    height: 0.85rem;
-    background: var(--nord-ember-bright);
-    align-self: center;
-    animation: blink 1s steps(2, start) infinite;
-    flex-shrink: 0;
-  }
-  @keyframes blink {
-    50% {
-      opacity: 0;
-    }
-  }
-  .tval {
-    min-width: 5rem;
-    text-align: right;
-  }
-  .tval.accent {
-    color: var(--accent);
-  }
-  .tval.danger,
-  .tstatus.danger {
-    color: var(--nord-danger);
-  }
-  .tmin {
-    min-width: 5rem;
-    text-align: right;
-    color: var(--nord-dim);
-    font-size: 0.72rem;
-  }
-  .tstatus {
-    color: var(--nord-aurora);
-    font-size: 0.72rem;
-    opacity: 0.8;
-  }
-  .tline.running {
-    color: var(--nord-ember-bright);
-  }
-  @media (max-width: 760px) {
-    .advanced-diagnostics > summary {
-      grid-template-columns: minmax(0, 1fr) auto;
-    }
-    .advanced-diagnostics > summary small {
-      grid-column: 1 / -1;
-    }
-    .advanced-diagnostics > summary::after {
-      grid-column: 2;
-      grid-row: 1;
-      justify-self: end;
-    }
-    .real-head,
-    .pre-actions {
-      align-items: stretch;
-      flex-direction: column;
-    }
-    .btn {
-      width: fit-content;
-    }
-  }
-  .footer-row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.75rem;
-  }
-  .collapsed-bar {
-    min-width: 0;
-    background: var(--forge-panel);
-    border: 1px solid var(--forge-border-neutral);
-    border-radius: 10px;
-    padding: 0.72rem 1rem;
-  }
-  .collapsed-bar > summary {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    cursor: pointer;
-    list-style: none;
-  }
-  .collapsed-bar > summary::-webkit-details-marker {
+
+  .legacy-forge-content {
     display: none;
-  }
-  .bar-lead {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.42rem;
-    color: var(--forge-muted);
-    flex-shrink: 0;
-  }
-  .bar-title {
-    color: var(--forge-text);
-    font-size: 0.82rem;
-    font-weight: 700;
-    white-space: nowrap;
-  }
-  .bar-sub {
-    flex: 1;
-    min-width: 0;
-    color: var(--forge-muted);
-    font-size: 0.74rem;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .bar-toggle {
-    flex-shrink: 0;
-    color: var(--forge-gold);
-    font-size: 0.72rem;
-    font-weight: 700;
-    white-space: nowrap;
-  }
-  .when-open {
-    display: none;
-  }
-  .collapsed-bar[open] .when-open {
-    display: inline;
-  }
-  .collapsed-bar[open] .when-closed {
-    display: none;
-  }
-  .bar-body {
-    margin-top: 0.7rem;
-  }
-  .log-bar[open] {
-    grid-column: 1 / -1;
-  }
-  .sent-dot {
-    width: 0.5rem;
-    height: 0.5rem;
-    border-radius: 999px;
-    background: var(--forge-green);
-    flex-shrink: 0;
-  }
-  .sent-dot.bump {
-    background: var(--forge-gold);
-  }
-  .sent-dot.stock {
-    background: var(--forge-red);
-  }
-  .sent-detail {
-    margin: 0;
-    color: var(--text);
-    font-size: 0.82rem;
-    line-height: 1.5;
-  }
-  .sent-reco {
-    margin: 0.35rem 0 0;
-    color: var(--muted);
-    font-size: 0.8rem;
-    line-height: 1.45;
-  }
-  .sent-ts {
-    margin: 0.3rem 0 0;
-    color: var(--nord-dim);
-    font-size: 0.72rem;
-    opacity: 0.75;
-  }
-  @media (max-width: 760px) {
-    .footer-row {
-      grid-template-columns: 1fr;
-    }
   }
 </style>

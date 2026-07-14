@@ -24,6 +24,11 @@
       "csp": null
     }
   },
+  "plugins": {
+    "shell": {
+      "open": "^C:\\\\ProgramData\\\\Nidavellir\\\\game-trace-[0-9]+\\.jsonl$"
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis"],

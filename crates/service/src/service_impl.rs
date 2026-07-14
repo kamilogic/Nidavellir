@@ -63,6 +63,7 @@ pub fn run_service() -> windows_service::Result<()> {
         // Seed from the persisted forge result so a restart restores forged
         // profiles/points instead of showing an unforged GPU.
         power_sweep: crate::gpu_power_sweep::restore_handle(),
+        game_trace: crate::game_trace::GameTraceHandle::default(),
     }));
 
     let pipe_state = Arc::clone(&state);

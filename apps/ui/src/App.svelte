@@ -4,8 +4,10 @@
   import SafeLoop from "./lib/views/SafeLoop.svelte";
   import Forge from "./lib/views/Forge.svelte";
   import { t, locale, locales } from "./lib/i18n.js";
+  import "./lib/theme.css";
 
   function initialOnboarded() {
+    if (typeof window !== "undefined" && !("__TAURI_INTERNALS__" in window)) return true;
     try {
       return localStorage.getItem("nidavellir-gpu-onboarded") === "true";
     } catch {
@@ -13,9 +15,19 @@
     }
   }
 
+  function initialTheme() {
+    try {
+      const saved = localStorage.getItem("nidavellir-ui-theme");
+      return ["command", "instrument", "workshop"].includes(saved) ? saved : "command";
+    } catch {
+      return "command";
+    }
+  }
+
   let onboarded = $state(initialOnboarded());
   let onboardingStep = $state(1);
   let activeTab = $state("forge");
+  let uiTheme = $state(initialTheme());
 
   function finishOnboarding(_goal) {
     onboarded = true;
@@ -24,42 +36,55 @@
       localStorage.setItem("nidavellir-gpu-onboarded", "true");
     } catch {}
   }
+
+  function setTheme(event) {
+    applyTheme(event.currentTarget.value);
+  }
+
+  function applyTheme(nextTheme) {
+    uiTheme = nextTheme;
+    try {
+      localStorage.setItem("nidavellir-ui-theme", uiTheme);
+    } catch {}
+  }
 </script>
 
-<main>
-  <header class="top">
-    <div>
-      <h1>Nidavellir</h1>
-      <p class="tagline">{$t("app.tagline")}</p>
-    </div>
-    <div class="top-right">
-      {#if onboarded}
-        <nav>
-          <button class:active={activeTab === "forge"} onclick={() => (activeTab = "forge")}>
-            {$t("nav.forge")}
-          </button>
-          <button class:active={activeTab === "dashboard"} onclick={() => (activeTab = "dashboard")}>
-            {$t("nav.sensors")}
-          </button>
-          <button class:active={activeTab === "safety"} onclick={() => (activeTab = "safety")}>
-            {$t("nav.safety")}
-          </button>
-        </nav>
-      {/if}
-      {#if locales.length > 1}
-        <select class="lang" bind:value={$locale} aria-label="Language">
-          {#each locales as l}
-            <option value={l.id}>{l.label}</option>
-          {/each}
-        </select>
-      {/if}
-    </div>
-  </header>
+<main data-ui-theme={uiTheme} class:forge-shell={onboarded && activeTab === "forge"}>
+  {#if !onboarded || activeTab !== "forge"}
+    <header class="top">
+      <div>
+        <h1>Nidavellir</h1>
+        <p class="tagline">{$t("app.tagline")}</p>
+      </div>
+      <div class="top-right">
+        {#if onboarded}
+          <nav>
+            <button class:active={activeTab === "forge"} onclick={() => (activeTab = "forge")}>{$t("nav.forge")}</button>
+            <button class:active={activeTab === "dashboard"} onclick={() => (activeTab = "dashboard")}>{$t("nav.sensors")}</button>
+            <button class:active={activeTab === "safety"} onclick={() => (activeTab = "safety")}>{$t("nav.safety")}</button>
+          </nav>
+        {/if}
+        {#if locales.length > 1}
+          <select class="lang" bind:value={$locale} aria-label="Language">
+            {#each locales as l}<option value={l.id}>{l.label}</option>{/each}
+          </select>
+        {/if}
+        <label class="theme-picker">
+          <span>Theme</span>
+          <select value={uiTheme} onchange={setTheme} aria-label="Interface theme">
+            <option value="command">Command Deck</option>
+            <option value="instrument">Instrument Panel</option>
+            <option value="workshop">Quiet Workshop</option>
+          </select>
+        </label>
+      </div>
+    </header>
+  {/if}
 
   {#if !onboarded}
     <Onboarding bind:step={onboardingStep} onComplete={finishOnboarding} />
   {:else if activeTab === "forge"}
-    <Forge />
+    <Forge theme={uiTheme} onThemeChange={applyTheme} />
   {:else if activeTab === "dashboard"}
     <Dashboard />
   {:else}
@@ -208,6 +233,36 @@
     padding: 0.45rem 0.6rem;
     font-size: 0.8rem;
     font-weight: 600;
+    cursor: pointer;
+  }
+
+  main.forge-shell {
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: 0;
+  }
+  .theme-picker {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
+    min-height: 2.5rem;
+    color: var(--nord-dim);
+    font-size: 0.68rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .theme-picker select {
+    min-height: 2.5rem;
+    border: 0;
+    border-radius: 999px;
+    padding: 0.45rem 0.7rem;
+    background: var(--forge-panel-raised);
+    color: var(--nord-mist);
+    font: inherit;
+    letter-spacing: 0.02em;
+    text-transform: none;
     cursor: pointer;
   }
   nav {

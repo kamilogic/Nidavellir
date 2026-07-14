@@ -1,0 +1,47 @@
+/* Theme-specific layout lives with ForgeThemeScreen. These tokens also keep
+ * the advanced diagnostics workspace compatible with the selected surface. */
+
+main[data-ui-theme="command"] {
+  --forge-void: #080b0d;
+  --forge-night: #090c0e;
+  --forge-iron: #101416;
+  --forge-panel: #13181b;
+  --forge-panel-raised: #1a2024;
+  --forge-graphite: #272e33;
+  --forge-line: rgba(174, 181, 186, 0.2);
+  --forge-line-strong: rgba(203, 137, 74, 0.55);
+  --forge-gold: #c58a51;
+  --forge-copper: #a96642;
+  --forge-blue: #8da8be;
+  --forge-green: #83bb37;
+}
+
+main[data-ui-theme="instrument"] {
+  --forge-void: #0b0f0f;
+  --forge-night: #0d1111;
+  --forge-iron: #151918;
+  --forge-panel: #191e1d;
+  --forge-panel-raised: #202523;
+  --forge-graphite: #2a302e;
+  --forge-line: rgba(186, 182, 166, 0.22);
+  --forge-line-strong: rgba(196, 162, 99, 0.58);
+  --forge-gold: #c6a268;
+  --forge-copper: #a47a4f;
+  --forge-blue: #9bb5c8;
+  --forge-green: #8bb73e;
+}
+
+main[data-ui-theme="workshop"] {
+  --forge-void: #0d1010;
+  --forge-night: #101212;
+  --forge-iron: #151817;
+  --forge-panel: #181b1a;
+  --forge-panel-raised: #202322;
+  --forge-graphite: #292d2b;
+  --forge-line: rgba(218, 213, 202, 0.14);
+  --forge-line-strong: rgba(196, 126, 83, 0.5);
+  --forge-gold: #ca8a61;
+  --forge-copper: #b97550;
+  --forge-blue: #8caedf;
+  --forge-green: #78bd70;
+}

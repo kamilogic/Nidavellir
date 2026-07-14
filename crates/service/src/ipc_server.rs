@@ -448,6 +448,20 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             .ok();
             IpcResponse::success(ResponseData::SentinelStatus { status })
         }
+        IpcRequest::StartGameTrace => {
+            if guard.game_trace.start() {
+                IpcResponse::success(ResponseData::GameTrace(guard.game_trace.status()))
+            } else {
+                IpcResponse::failure("Game trace already running")
+            }
+        }
+        IpcRequest::StopGameTrace => {
+            guard.game_trace.stop();
+            IpcResponse::success(ResponseData::GameTrace(guard.game_trace.status()))
+        }
+        IpcRequest::GetGameTraceStatus => {
+            IpcResponse::success(ResponseData::GameTrace(guard.game_trace.status()))
+        }
         IpcRequest::ExportForgeLog => {
             let prog = guard.power_sweep.progress();
             match crate::gpu_power_sweep::export_forge_log(&prog) {

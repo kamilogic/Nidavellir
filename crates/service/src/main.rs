@@ -1,3 +1,4 @@
+mod game_trace;
 mod gpu_apply;
 mod gpu_benchmark;
 mod gpu_f2_sweep;
@@ -42,6 +43,7 @@ pub struct AppState {
     pub forge_all: ForgeAllHandle,
     pub benchmark: BenchmarkHandle,
     pub power_sweep: PowerSweepHandle,
+    pub game_trace: game_trace::GameTraceHandle,
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -64,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "verify-applied" => return run_verify_only(),
             "build-frontier" => return run_build_frontier_cmd(&args),
             "undervolt-probe" => return run_undervolt_probe_cmd(&args),
+            "game-trace" => return game_trace::run(&args),
             _ => {}
         }
     }
@@ -381,6 +384,7 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         // Seed from the persisted forge result so a restart restores forged
         // profiles/points instead of showing an unforged GPU.
         power_sweep: gpu_power_sweep::restore_handle(),
+        game_trace: game_trace::GameTraceHandle::default(),
     }));
     #[cfg(windows)]
     console_shutdown::install(Arc::clone(&state));
