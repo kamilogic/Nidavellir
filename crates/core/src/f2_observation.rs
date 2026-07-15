@@ -70,7 +70,12 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// covered is folded INTO the candidate-only Endurance soak as an interleaved VramPressure segment
 /// under sustained worst-case load (stronger than the isolated pass ever was). Different set →
 /// pre-v14 evidence quarantined; full re-forge required.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 14;
+/// v15 (2026-07-13): the Texture qualifier is now LOBBY-FIRST — it leads with a long isolated
+/// sustained BoostEdge block (real drain-per-frame cadence + degradation gate) reproducing the
+/// field-proven anchor-bin residency regime that a game trace caught TDR'ing 1845@862 cool/low-power
+/// while the old texrop-first plan passed it. The descent's own 60 s dwell now exercises that regime.
+/// The qualifier content changed → pre-v15 Texture evidence quarantined; full re-forge required.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 15;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.

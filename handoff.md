@@ -72,6 +72,45 @@ até hoje — ler ESTA seção basta para retomar):
    permissivo por construção, nunca falso-positiva). Genérico, sem constante desta GPU. gpu-stress
    13/0, service 364/0, clippy baseline. NÃO testado em HW — o re-forge é a validação.
 
+### FERRAMENTA NOVA (2026-07-13) — game-trace: medir o jogo p/ endurecer o teste
+O run limpo REBUILDADO ainda publicou 1845@862 e 1890@900 (ambos suspeitos de campo); TODA falha na
+descida foi `texture-rop`, **zero `boost-edge`** — mesmo com a cadência real, o texture-rop corre na
+frente e é otimista (aprovou 1815@837 enquanto o campo condenou 1815@862/843). Conclusão: o gap é
+elétrico (nosso sintético é mais mole que o lobby), não só térmico. Em vez de adivinhar, medimos:
+- **`NvmlSampler`** (core/nvml_gpu.rs): handle NVML persistente p/ poll rápido (power, clock, util,
+  temp, throttle_bits crus). **`game-trace`** (service/game_trace.rs): logger read-only → JSONL
+  (power + |ΔP/Δt| proxy de dI/dt, residência de bin V/F, throttle, tensão NVAPI amostrada a 200ms).
+  CLI (`nidavellir-service game-trace [--out --secs --interval-ms --volt-ms]`) E task de background.
+- **Card na UI** (Forge.svelte, padrão sentinela): toggle Iniciar/Parar + amostras/tempo/W/MHz/mV ao
+  vivo + caminho do arquivo. IPC novo: `StartGameTrace`/`StopGameTrace`/`GetGameTraceStatus` +
+  `GameTraceHandle` no AppState + `GameTraceStatus`/`ResponseData::GameTrace` no core. Read-only, NÃO
+  no `gpu_write_requires_idle` (roda durante o jogo de propósito).
+- **`scripts/dev.ps1`**: launcher de dev único — serviço elevado (cargo-watch se instalado → auto
+  rebuild/restart) + UI com hot-reload (`tauri:dev`), numa janela cada (serviço admin / UI usuário).
+- Validado: core 82/0, service 367/0, frontend `vite build` OK, clippy baseline. NÃO rodado em HW
+  (precisa serviço elevado). **PROTOCOLO**: operador joga o lobby OW com o card ligado até crashar →
+  manda o JSONL → escrevo o analisador offline (fingerprint + diff vs BoostEdge) → endurecer o teste.
+
+### SOLUÇÃO v18 (2026-07-13) — descida LOBBY-FIRST + contrato 14→15
+O game trace do 1845@862 **capturou o TDR real** (t=363s, 6min: sob carga 99% util / 144W / 65°C →
+gap de 2s ≈ watchdog TDR → colapso pra idle; sentinela pegou+blacklistou). Provou: killer = residência
+SUSTENTADA no bin do anchor no regime light-frame, **frio e com potência ABAIXO do nosso sintético**
+(144W < 172W texrop < 200W cap) — não é potência nem calor, é o transiente no bin fixado. NVML power
+é inútil pra dI/dt (p95 ΔP=0, contador cacheado); pegamos pela residência (94% em 1845, 82% em 862mV)
++ o gap de freeze.
+- **Fix cirúrgico**: `V8_TEXTURE` reordenado para **LIDERAR com bloco sustentado de BoostEdge isolado
+  (~44% do dwell)** — antes o texture-rop rodava primeiro e mascarava (só ~6% boost, saía cedo). Agora
+  o dwell de 60s da PRÓPRIA descida exercita o regime lobby (cadência real drain-por-frame + gate de
+  degradação, pré-cursor de TDR) e reprova o ponto barato; texrop + TextureStream hang-prone seguem
+  depois. Sem refactor de enum; só o array do plano. Contrato `F2_QUALIFICATION_CONTRACT_VERSION`
+  14→15 (evidência pré-v15 quarentenada, re-forge completo obrigatório).
+- Validado: gpu-stress 13/0, core 82/0, service 367/0, clippy baseline. **NÃO testado em HW.**
+- **INCERTEZA HONESTA**: 26s de boost sustentado na descida (60s) podem não reproduzir um TDR que no
+  jogo levou 6min — nosso sintético precisa ser MAIS duro que o lobby p/ falhar mais rápido. O re-forge
+  dirá. Se não pegar 1845@862-classe na descida: (a) subir `qualification_dwell_ms`, ou (b) endurecer a
+  cadência via PresentMon (frame-times reais do lobby). Piso de campo + blacklist da sentinela JÁ
+  protegem 1845@862 no próximo forge independentemente disto.
+
 ### PRÓXIMO PASSO (o teste que fecha tudo)
 **Rebuild (service + UI) → re-forge Standard completo.** Esperado: fronteira ~40 min (reuso), gates
 com regime lobby, perfis publicados ABAIXO dos pontos condenados (Godforge ≤1875@893). Depois:

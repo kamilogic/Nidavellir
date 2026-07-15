@@ -1,6 +1,7 @@
 <script>
   import { Check, ChevronDown, CircleCheck, Play, RotateCcw, ShieldCheck, TriangleAlert } from "@lucide/svelte";
   import StatusBadge from "./StatusBadge.svelte";
+  import gpuHero from "../../assets/gpu-hero.png";
 
   let {
     error = null,
@@ -12,6 +13,7 @@
     hasProfiles = false,
     hasKnowledge = false,
     verification = null,
+    theme = "command",
     forgeMode = "standard",
     onStartPower,
     onForgeModeChange,
@@ -247,6 +249,9 @@
 
 <section class={`gpu-hero ${forgeStateClass}`}>
   <div class="id-strip">
+    {#if theme === "command"}
+      <img class="command-gpu-art" src={gpuHero} alt="" aria-hidden="true" />
+    {/if}
     <div class="id-left">
       <span class="gpu-swatch" aria-hidden="true"></span>
       <div class="id-copy">

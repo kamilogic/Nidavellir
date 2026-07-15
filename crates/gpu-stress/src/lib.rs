@@ -468,22 +468,29 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
     // Severity ladder: graceful silent-error detectors (L2 TextureRop, cadence) run FIRST; the
     // hang-prone memory detectors (VramPressure, TextureStream) run LAST — a bad bin usually
     // dies cheaply by wrong-pixel checksum long before anything TDR-prone executes.
-    const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 15] = [
-        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
-        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
-        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
+    // v18: LOBBY-FIRST. The 2026-07-13 game trace proved the real killer is SUSTAINED residency at
+    // the anchor bin under the light-frame/high-FPS regime (1845@862 TDR'd in the OW lobby at 65 °C,
+    // 144 W — cool and BELOW our synthetic power), NOT texture-rop. The old plan ran texture-rop
+    // FIRST and only ~6% BoostEdge, so a failing bin died on texture-rop before the lobby block ever
+    // ran, and the lobby-unstable-but-texrop-stable points (the field failures) slipped through. Now
+    // the qualifier LEADS with one long isolated BoostEdge block (real drain-per-frame cadence +
+    // degradation gate) so the descent's own 60 s dwell reproduces the lobby regime and fails those
+    // points cheaply — then keeps the texture-rop + hang-prone TextureStream coverage after it.
+    const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 12] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 3),
+        // Sustained isolated lobby block FIRST (~44% of the dwell): the field-proven anchor-bin
+        // residency regime. Golden-checked + frame-time degradation gate (pre-TDR precursor).
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 42),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 5),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 4),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 3),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 3),
-        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
-        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 5),
-        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
-        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 8),
-        (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 8),
-        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 7),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 5),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 8),
+        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 4),
+        (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 5),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 3),
     ];
     const V8_TRANSITIONS: [(VfQualifierPhase, VfWorkload, u64); 20] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),

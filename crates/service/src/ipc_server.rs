@@ -339,6 +339,10 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                     if let Err(e) = crate::gpu_power_sweep::clear_persisted_forge_state() {
                         problems.push(format!("forge checkpoint: {e}"));
                     }
+                    // The sentinel's persisted history (baseline, status card, event log) is part of
+                    // the learned state — wipe it too so a full reset leaves nothing inconsistent with
+                    // the now-empty blacklist.
+                    problems.extend(crate::tdr_sentinel::reset_sentinel_state());
                     guard.power_sweep.recover_after_reset(
                         "Reset completo concluído; GPU em stock, Safe Loop desarmado e todo o aprendizado apagado.",
                     );

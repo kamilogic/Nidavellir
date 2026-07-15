@@ -196,6 +196,32 @@ fn append_sentinel_log(entry: &str) {
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
+/// Delete a file, treating "already absent" as success — a reset must be idempotent.
+fn remove_if_exists(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Wipe ALL persisted sentinel state so a full "forget everything" reset (which drops the Safe Loop
+/// blacklist and every learned observation) leaves the sentinel CONSISTENT with that clean slate:
+/// the boot baseline, the last-action dedup stamp, the UI status card, and the append-only event log.
+/// The running watcher thread keeps its in-memory `last_handled` pinned to the newest event, so it
+/// never re-handles an old TDR, and the profile it guards was just cleared to stock — nothing is lost
+/// by starting the history fresh. Returns the name of any file that could not be removed.
+pub fn reset_sentinel_state() -> Vec<String> {
+    let dir = nidavellir_core::safe_loop::default_data_dir();
+    let mut problems = Vec::new();
+    for name in ["sentinel_baseline.txt", "sentinel_status.json", "sentinel_log.jsonl"] {
+        if let Err(e) = remove_if_exists(&dir.join(name)) {
+            problems.push(format!("sentinel {name}: {e}"));
+        }
+    }
+    LAST_ACTION_EPOCH_S.store(0, std::sync::atomic::Ordering::SeqCst);
+    problems
+}
+
 /// Cross-LAYER episode dedup: the canary (stall) and the event-log watcher (the driver's 153 from
 /// the same episode, seconds later) must never both act — observed in the field as a doubled
 /// "ladder exhausted" 4 s apart. Any layer that ACTS stamps this; the other skips within the window.
@@ -457,6 +483,17 @@ pub fn spawn(store: SafeLoopStore) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_if_exists_is_idempotent() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("nid-sentinel-reset-test-{}.tmp", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        assert!(remove_if_exists(&path).is_ok(), "removes an existing file");
+        assert!(!path.exists());
+        // Second call on the now-missing file must still succeed (reset is idempotent).
+        assert!(remove_if_exists(&path).is_ok(), "missing file is not an error");
+    }
 
     #[test]
     fn sentinel_ladder_bumps_three_bins_then_goes_stock() {
