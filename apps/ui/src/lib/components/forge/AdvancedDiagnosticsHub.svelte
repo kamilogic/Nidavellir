@@ -22,6 +22,7 @@
     sentinelSummary = "No automatic recovery action recorded.",
     gameTrace = null,
     gameTraceBusy = false,
+    gameTraceActionError = "",
     gameTraceExportBusy = false,
     gameTraceExportMsg = "",
     onExportLog,
@@ -48,7 +49,7 @@
     {
       id: "game-trace",
       label: "Game Trace",
-      detail: gameTrace?.running ? "On" : "Off",
+      detail: gameTrace?.running ? `Gravando · ${gameTrace.samples ?? 0}` : "Parado",
       icon: Radio,
     },
   ]);
@@ -107,7 +108,7 @@
       >
         <tab.icon size={18} strokeWidth={1.75} />
         <span>{tab.label}</span>
-        <small>{tab.detail}</small>
+        <small aria-hidden="true">{tab.detail}</small>
       </button>
     {/each}
   </div>
@@ -197,7 +198,7 @@
         <div>
           <span class="panel-kicker">Read-only workload recorder</span>
           <h3>Game Trace</h3>
-          <p>Records the clocks, power and voltage your game actually creates without changing the GPU.</p>
+          <p>Grava telemetria da GPU (potência, clock, tensão, throttle) enquanto você joga, para depois comparar com o teste sintético. Somente leitura.</p>
         </div>
         <button
           class="trace-switch"
@@ -205,18 +206,30 @@
           type="button"
           role="switch"
           aria-checked={Boolean(gameTrace?.running)}
+          aria-label="Gravação do Game Trace"
+          aria-busy={gameTraceBusy}
           onclick={onToggleGameTrace}
           disabled={!traceReady || gameTraceBusy}
         >
           <span class="switch-track" aria-hidden="true"><i></i></span>
-          <span>{gameTraceBusy ? "Updating…" : gameTrace?.running ? "On" : "Off"}</span>
+          <span>{gameTraceBusy ? "Atualizando…" : gameTrace?.running ? "Parar gravação" : "Iniciar gravação"}</span>
         </button>
       </div>
+
+      {#if gameTraceActionError}
+        <p class="inline-message error trace-action-error" role="alert">{gameTraceActionError}</p>
+      {/if}
 
       <p class="trace-note" class:recording={Boolean(gameTrace?.running)}>
         <i aria-hidden="true"></i>
         {traceReady ? traceNote(gameTrace?.note) : "Loading recorder status…"}
       </p>
+
+      {#if gameTrace?.running}
+        <p class="trace-live-status">
+          {metric(gameTrace.samples)} amostras · {metric(gameTrace.elapsed_s, "s")} · {metric(gameTrace.last_power_w?.toFixed?.(0), " W")} · {metric(gameTrace.last_core_mhz, " MHz")} · {metric(gameTrace.last_volt_mv, " mV")}
+        </p>
+      {/if}
 
       <dl class="trace-metrics">
         <div>
@@ -589,7 +602,9 @@
     display: inline-flex;
     align-items: center;
     gap: 0.65rem;
-    min-width: 104px;
+    min-width: 190px;
+    min-height: 44px;
+    justify-content: center;
     padding: 0.55rem 0.8rem;
     color: var(--diag-muted);
     background: transparent;
@@ -635,6 +650,19 @@
     margin-bottom: 0.9rem;
   }
 
+  .trace-action-error {
+    margin-top: -0.35rem;
+  }
+
+  .trace-live-status {
+    margin: -0.25rem 0 1rem;
+    color: var(--forge-green);
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+  }
+
   .trace-metrics {
     display: grid;
     grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -676,6 +704,7 @@
     color: var(--forge-blue);
     font: 0.76rem/1.5 "Cascadia Code", "Consolas", ui-monospace, monospace;
     overflow-wrap: anywhere;
+    word-break: break-all;
   }
 
   @media (max-width: 780px) {

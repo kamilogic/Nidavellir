@@ -25,8 +25,11 @@
   // Game-trace: read-only NVML/NVAPI workload logger.
   let gameTrace = $state(null);
   let gameTraceBusy = $state(false);
+  let gameTraceActionError = $state("");
   let gameTraceExportBusy = $state(false);
   let gameTraceExportMsg = $state("");
+  let fullResetBusy = $state(false);
+  let fullResetFeedback = $state(null);
   // Live GPU telemetry (ReadSensors) + rolling sparkline buffers for the monitoring panel.
   let sensors = $state(null);
   let sparks = $state({ core: [], mem: [], temp: [], power: [], usage: [] });
@@ -102,15 +105,62 @@
     await call("ResetGpuTuning", setApplied);
     await refresh();
   };
-  const fullResetTuning = async () => {
-    const confirmed = globalThis.confirm?.(
-      "Full reset will return the GPU to stock AND delete learned Forge observations, legacy GPU knowledge, and the Safe Loop blacklist. Use this only when you want to start this GPU from zero. Continue?",
-    ) ?? true;
-    if (!confirmed) return;
-    verification = null;
-    await call("ResetGpuTuningFull", setApplied);
-    await refresh();
-  };
+  async function refreshForgeStateAfterReset() {
+    const [ps, sl, ap] = await Promise.all([
+      serviceCall("GetPowerSweepProgress"),
+      serviceCall("GetSafeLoopStatus"),
+      serviceCall("GetAppliedProfile"),
+    ]);
+    const failed = [ps, sl, ap].find((response) => response?.ok === false);
+    if (failed) throw new Error(failed.error || "Unable to refresh Forge state");
+    if (ps?.data?.type !== "PowerSweep") throw new Error("Invalid Forge status response");
+    if (sl?.data?.type !== "SafeLoop") throw new Error("Invalid Safe Loop status response");
+    if (ap?.data?.type !== "GpuApply") throw new Error("Invalid applied profile response");
+    powerSweep = ps.data;
+    safeLoop = sl.data;
+    applied = ap.data;
+    lastSlowRefreshAt = Date.now();
+    await refreshSentinel();
+  }
+
+  async function fullResetTuning() {
+    if (fullResetBusy) return false;
+    fullResetBusy = true;
+    fullResetFeedback = null;
+    try {
+      const response = await serviceCall("ResetGpuTuningFull");
+      if (response?.ok === false) {
+        throw new Error(response.error || "Unable to reset all GPU learning");
+      }
+      if (response?.data?.type !== "GpuApply") {
+        throw new Error("Invalid full reset response");
+      }
+
+      applied = response.data;
+      verification = null;
+      const message = response.data.message || "Full reset completed";
+      const partial = /some state could not be cleared/i.test(message);
+      fullResetFeedback = { tone: partial ? "warning" : "success", message };
+
+      try {
+        await refreshForgeStateAfterReset();
+      } catch (refreshError) {
+        fullResetFeedback = {
+          tone: "warning",
+          message: `${message}. The reset ran, but the UI could not refresh immediately: ${String(refreshError)}`,
+        };
+      }
+      return true;
+    } catch (resetError) {
+      fullResetFeedback = {
+        tone: "error",
+        message: `Full reset failed: ${String(resetError)}`,
+      };
+      return false;
+    } finally {
+      fullResetBusy = false;
+    }
+  }
   const setPower = (r) => (powerSweep = r?.data?.type === "PowerSweep" ? r.data : powerSweep);
   const POWER_START = {
     fast: "StartPowerSweepFast",
@@ -206,18 +256,23 @@
   async function refreshSentinel() {
     try {
       const r = await serviceCall("GetSentinelStatus");
-      if (r?.data?.type === "SentinelStatus" && r.data.status) {
-        sentinel = JSON.parse(r.data.status);
+      if (r?.ok === false) throw new Error(r.error || "Unable to read Sentinel status");
+      if (r?.data?.type === "SentinelStatus") {
+        sentinel = r.data.status ? JSON.parse(r.data.status) : null;
       }
     } catch {
       /* sentinel status is best-effort UI info */
     }
   }
 
-  async function refreshGameTrace() {
+  async function refreshGameTrace(clearRecoveredError = true) {
     try {
       const r = await serviceCall("GetGameTraceStatus");
-      if (r?.data?.type === "GameTrace") gameTrace = r.data;
+      if (r?.ok === false) throw new Error(r.error || "Unable to read Game Trace status");
+      if (r?.data?.type === "GameTrace") {
+        gameTrace = r.data;
+        if (clearRecoveredError && !gameTraceBusy) gameTraceActionError = "";
+      }
     } catch {
       /* game-trace status is best-effort UI info */
     }
@@ -226,16 +281,19 @@
   async function toggleGameTrace() {
     if (gameTraceBusy) return;
     gameTraceBusy = true;
+    gameTraceActionError = "";
     try {
       const method = gameTrace?.running ? "StopGameTrace" : "StartGameTrace";
       const r = await serviceCall(method);
-      if (r?.data?.type === "GameTrace") gameTrace = r.data;
+      if (r?.ok === false) throw new Error(r.error || "Unable to update Game Trace");
+      if (r?.data?.type !== "GameTrace") throw new Error("Invalid Game Trace response");
+      gameTrace = r.data;
       gameTraceExportMsg = "";
     } catch (e) {
-      gameTrace = { ...(gameTrace ?? {}), note: `Error: ${String(e)}` };
+      gameTraceActionError = String(e);
     } finally {
+      await refreshGameTrace(false);
       gameTraceBusy = false;
-      refreshGameTrace();
     }
   }
 
@@ -258,7 +316,7 @@
   }
 
   function changeView(view) {
-    activeView = view === "advanced" ? "advanced" : "forge";
+    activeView = view === "advanced" || view === "settings" ? view : "forge";
     requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "auto" }));
   }
 
@@ -334,11 +392,15 @@
     {applied}
     {forgeMode}
     {powerRunning}
+    {fullResetBusy}
+    {fullResetFeedback}
     {onThemeChange}
     onForgeModeChange={selectForgeMode}
     onStartPower={startPower}
     onStopPower={stopPower}
     onApplyPower={applyPower}
+    onFullReset={fullResetTuning}
+    onDismissFullResetFeedback={() => (fullResetFeedback = null)}
     {activeView}
     onViewChange={changeView}
   >
@@ -355,6 +417,7 @@
       {sentinelSummary}
       {gameTrace}
       {gameTraceBusy}
+      {gameTraceActionError}
       {gameTraceExportBusy}
       {gameTraceExportMsg}
       onExportLog={exportLog}

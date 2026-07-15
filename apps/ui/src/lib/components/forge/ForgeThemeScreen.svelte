@@ -10,16 +10,16 @@
     Feather,
     Gauge,
     Hammer,
-    Minus,
     Settings,
     ShieldCheck,
-    Square,
     Star,
     Thermometer,
+    Trash2,
+    TriangleAlert,
     X,
     Zap,
   } from "@lucide/svelte";
-  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import ForgeSettingsPage from "./ForgeSettingsPage.svelte";
   import TelemetrySpark from "./TelemetrySpark.svelte";
   import commandGpu from "../../assets/themes/command-gpu.png";
   import commandMark from "../../assets/themes/nidavellir-mark.png";
@@ -40,15 +40,22 @@
     applied = null,
     forgeMode = "standard",
     powerRunning = false,
+    fullResetBusy = false,
+    fullResetFeedback = null,
     onThemeChange,
     onForgeModeChange,
     onStartPower,
     onStopPower,
     onApplyPower,
+    onFullReset,
+    onDismissFullResetFeedback,
     onViewChange,
   } = $props();
 
-  let settingsOpen = $state(false);
+  let resetConfirmOpen = $state(false);
+  let resetDialog = $state(null);
+  let resetTrigger = $state(null);
+  let resetCancelButton = $state(null);
 
   const profileMeta = [
     {
@@ -220,28 +227,47 @@
   }
 
   function chooseTheme(next) {
-    settingsOpen = false;
     onThemeChange?.(next);
   }
 
   function navigate(target) {
-    if (target === "settings") {
-      settingsOpen = !settingsOpen;
-      return;
-    }
-    settingsOpen = false;
-    onViewChange?.(target === "advanced" ? "advanced" : "forge");
+    onViewChange?.(["forge", "advanced", "settings"].includes(target) ? target : "forge");
   }
 
-  async function windowAction(action) {
-    try {
-      const window = getCurrentWindow();
-      if (action === "minimize") await window.minimize();
-      if (action === "maximize") await window.toggleMaximize();
-      if (action === "close") await window.close();
-    } catch {
-      /* Browser preview has no Tauri window. */
-    }
+  function openResetConfirmation(event) {
+    if (fullResetBusy) return;
+    resetTrigger = event.currentTarget;
+    resetConfirmOpen = true;
+    requestAnimationFrame(() => {
+      resetDialog?.showModal();
+      resetCancelButton?.focus();
+    });
+  }
+
+  function closeResetConfirmation() {
+    if (fullResetBusy) return;
+    resetDialog?.close();
+    resetConfirmOpen = false;
+    requestAnimationFrame(() => resetTrigger?.focus());
+  }
+
+  async function confirmFullReset() {
+    if (fullResetBusy) return;
+    await onFullReset?.();
+    resetDialog?.close();
+    resetConfirmOpen = false;
+    requestAnimationFrame(() => resetTrigger?.focus());
+  }
+
+  function handleResetDialogCancel(event) {
+    event.preventDefault();
+    closeResetConfirmation();
+  }
+
+  function handleResetDialogKeydown(event) {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    closeResetConfirmation();
   }
 
   function elapsed() {
@@ -259,6 +285,22 @@
   const backgroundStyle = `--forge-texture: url('${forgeTexture}')`;
 </script>
 
+{#snippet fullResetControl()}
+  {#if !powerRunning}
+    <section class="full-reset-strip" aria-label="Reset total">
+      <div class="full-reset-copy">
+        <span>RECUPERAÇÃO DESTRUTIVA</span>
+        <strong>Reset Total</strong>
+        <p>Volta a GPU para stock e apaga perfis, aprendizado e histórico do Sentinela.</p>
+      </div>
+      <button class="full-reset-action" type="button" onclick={openResetConfirmation} disabled={fullResetBusy}>
+        <Trash2 size={18} strokeWidth={1.7} />
+        <span>Reset Total</span>
+      </button>
+    </section>
+  {/if}
+{/snippet}
+
 <section class={`forge-theme-screen ${theme}`} style={backgroundStyle}>
   {#if theme === "command"}
     <header class="command-header">
@@ -268,20 +310,17 @@
       </button>
       <nav class="command-nav" aria-label="Primary navigation">
         <button class:active={activeView === "forge"} onclick={() => navigate("forge")}>Forge</button>
-        <button class:active={settingsOpen} onclick={() => navigate("settings")}>Settings</button>
+        <button class:active={activeView === "settings"} onclick={() => navigate("settings")}>Settings</button>
       </nav>
       <div class="connected" class:pending={!primaryGpu}>
         <i></i>
         <span><strong>{gpuConnectionLabel}</strong><small>{gpuName}</small></span>
       </div>
-      <div class="window-controls">
-        <button onclick={() => windowAction("minimize")} aria-label="Minimize"><Minus size={20} /></button>
-        <button onclick={() => windowAction("maximize")} aria-label="Maximize"><Square size={16} /></button>
-        <button onclick={() => windowAction("close")} aria-label="Close"><X size={20} /></button>
-      </div>
     </header>
 
-    {#if activeView === "advanced"}
+    {#if activeView === "settings"}
+      <div class="command-page"><ForgeSettingsPage {theme} onThemeChange={chooseTheme} /></div>
+    {:else if activeView === "advanced"}
       <div class="command-page">{@render children?.()}</div>
     {:else}
     <div class="command-body">
@@ -365,6 +404,8 @@
         {/each}
       </section>
 
+      {@render fullResetControl()}
+
       <button class="command-advanced" onclick={() => navigate("advanced")}
         ><span>Advanced diagnostics <ChevronRight size={22} /></span><small>Live log, Sentinel and Game Trace</small><ChevronDown size={24} /></button
       >
@@ -376,19 +417,15 @@
         <button class="instrument-lockup" onclick={() => navigate("forge")} aria-label="Nidavellir Forge home"><img src={instrumentLockup} alt="Nidavellir Forge" /></button>
         <nav aria-label="Primary navigation">
           <button class:active={activeView === "forge"} onclick={() => navigate("forge")}><Anvil size={31} /><span>Forge</span></button>
-          <button class:active={settingsOpen} onclick={() => navigate("settings")}><Settings size={31} /><span>Settings</span></button>
+          <button class:active={activeView === "settings"} onclick={() => navigate("settings")}><Settings size={31} /><span>Settings</span></button>
         </nav>
         <div class="rail-gpu"><span class="nvidia-mark">NVIDIA</span><strong>{gpuName.replace(/^NVIDIA\s+/i, "")}</strong><small>{primaryGpu?.driver ?? "Waiting for driver"}</small></div>
       </aside>
 
-      <div class="instrument-window-controls window-controls">
-        <button onclick={() => windowAction("minimize")} aria-label="Minimize"><Minus size={20} /></button>
-        <button onclick={() => windowAction("maximize")} aria-label="Maximize"><Square size={16} /></button>
-        <button onclick={() => windowAction("close")} aria-label="Close"><X size={20} /></button>
-      </div>
-
-      <main class="instrument-content" class:diagnostics-view={activeView === "advanced"}>
-        {#if activeView === "advanced"}
+      <main class="instrument-content" class:diagnostics-view={activeView !== "forge"}>
+        {#if activeView === "settings"}
+          <div class="instrument-page"><ForgeSettingsPage {theme} onThemeChange={chooseTheme} /></div>
+        {:else if activeView === "advanced"}
           <div class="instrument-page">{@render children?.()}</div>
         {:else}
         <div class="instrument-main-column">
@@ -444,6 +481,7 @@
               {/each}
             </div>
           </section>
+          {@render fullResetControl()}
         </div>
 
         <aside class="instrument-action-panel">
@@ -480,16 +518,13 @@
       <nav>
         <button class:active={activeView === "forge"} onclick={() => navigate("forge")}>Forge</button>
       </nav>
-      <button class="workshop-settings" onclick={() => navigate("settings")} aria-label="Settings"><Settings size={27} /></button>
-      <div class="window-controls">
-        <button onclick={() => windowAction("minimize")} aria-label="Minimize"><Minus size={20} /></button>
-        <button onclick={() => windowAction("maximize")} aria-label="Maximize"><Square size={16} /></button>
-        <button onclick={() => windowAction("close")} aria-label="Close"><X size={20} /></button>
-      </div>
+      <button class="workshop-settings" class:active={activeView === "settings"} onclick={() => navigate("settings")} aria-label="Settings"><Settings size={27} /></button>
     </header>
 
-    <main class="workshop-content" class:diagnostics-view={activeView === "advanced"}>
-      {#if activeView === "advanced"}
+    <main class="workshop-content" class:diagnostics-view={activeView !== "forge"}>
+      {#if activeView === "settings"}
+        <div class="workshop-page"><ForgeSettingsPage {theme} onThemeChange={chooseTheme} /></div>
+      {:else if activeView === "advanced"}
         <div class="workshop-page">{@render children?.()}</div>
       {:else}
       <section class="workshop-hero">
@@ -530,6 +565,8 @@
         {/each}
       </section>
 
+      {@render fullResetControl()}
+
       <section class="workshop-telemetry" aria-label="Live telemetry">
         {#each [
           { key: "temp", label: "Temperature", value: temperature, unit: "°C" },
@@ -554,13 +591,53 @@
     </main>
   {/if}
 
-  {#if settingsOpen}
-    <div class="theme-switcher" role="dialog" aria-label="Interface theme">
-      <div><strong>Interface theme</strong><button onclick={() => (settingsOpen = false)} aria-label="Close theme selector"><X size={18} /></button></div>
-      <button class:active={theme === "command"} onclick={() => chooseTheme("command")}><span>Command Deck</span><small>Wide control surface</small></button>
-      <button class:active={theme === "instrument"} onclick={() => chooseTheme("instrument")}><span>Instrument Panel</span><small>Industrial side rail</small></button>
-      <button class:active={theme === "workshop"} onclick={() => chooseTheme("workshop")}><span>Quiet Workshop</span><small>Focused daily view</small></button>
-    </div>
+  {#if fullResetFeedback?.message}
+    <aside
+      class={`reset-feedback ${fullResetFeedback.tone ?? "success"}`}
+      role={fullResetFeedback.tone === "error" ? "alert" : "status"}
+      aria-live={fullResetFeedback.tone === "error" ? "assertive" : "polite"}
+    >
+      {#if fullResetFeedback.tone === "success"}
+        <ShieldCheck size={22} strokeWidth={1.8} />
+      {:else}
+        <TriangleAlert size={22} strokeWidth={1.8} />
+      {/if}
+      <div>
+        <strong>{fullResetFeedback.tone === "success" ? "Reset concluído" : fullResetFeedback.tone === "warning" ? "Reset concluído com aviso" : "Falha no reset"}</strong>
+        <p>{fullResetFeedback.message}</p>
+      </div>
+      <button type="button" onclick={onDismissFullResetFeedback} aria-label="Fechar mensagem do reset">
+        <X size={18} />
+      </button>
+    </aside>
+  {/if}
+
+  {#if resetConfirmOpen}
+    <dialog
+      bind:this={resetDialog}
+      class="reset-dialog"
+      aria-labelledby="reset-dialog-title"
+      aria-describedby="reset-dialog-description"
+      oncancel={handleResetDialogCancel}
+      onkeydown={handleResetDialogKeydown}
+    >
+      <div class="reset-dialog-heading">
+        <span class="reset-dialog-icon"><TriangleAlert size={25} strokeWidth={1.7} /></span>
+        <div>
+          <span>CONFIRMAÇÃO OBRIGATÓRIA</span>
+          <h2 id="reset-dialog-title">Reset Total</h2>
+        </div>
+      </div>
+      <p id="reset-dialog-description">Isto apaga TODOS os perfis forjados e todo o aprendizado — a GPU volta a stock e a forja recomeça do zero.</p>
+      <p class="reset-dialog-note">Esta ação é destrutiva, irreversível e também apaga o histórico do Sentinela.</p>
+      <div class="reset-dialog-actions">
+        <button bind:this={resetCancelButton} class="reset-cancel" type="button" onclick={closeResetConfirmation} disabled={fullResetBusy}>Cancelar</button>
+        <button class="reset-confirm" type="button" onclick={confirmFullReset} disabled={fullResetBusy}>
+          <Trash2 size={18} strokeWidth={1.8} />
+          <span>{fullResetBusy ? "Apagando…" : "Apagar tudo e recomeçar"}</span>
+        </button>
+      </div>
+    </dialog>
   {/if}
 </section>
 
@@ -627,83 +704,276 @@
     scale: 0.96;
   }
 
-  .window-controls {
+  .full-reset-strip {
     display: flex;
-    align-items: stretch;
-    height: 100%;
-  }
-
-  .window-controls button {
-    width: 48px;
-    min-height: 40px;
-    border: 0;
-    background: transparent;
-    color: #b4b7ba;
-    cursor: pointer;
-  }
-
-  .window-controls button:hover {
-    color: #fff;
-    background: rgba(255, 255, 255, 0.05);
-  }
-
-  .theme-switcher {
-    position: fixed;
-    z-index: 100;
-    top: 74px;
-    right: 26px;
-    width: 270px;
-    padding: 12px;
-    background: #111516;
-    box-shadow: 0 0 0 1px rgba(225, 172, 102, 0.34), 0 22px 54px rgba(0, 0, 0, 0.5);
-  }
-
-  .theme-switcher > div {
-    display: flex;
+    min-width: 0;
+    min-height: 68px;
     align-items: center;
     justify-content: space-between;
-    padding: 5px 7px 11px;
-    color: #d6b383;
+    gap: 24px;
+    border: 1px solid rgba(174, 91, 72, 0.38);
+    padding: 12px 18px;
+    background: rgba(40, 15, 12, 0.12);
   }
 
-  .theme-switcher > div button {
-    width: 40px;
-    min-height: 40px;
-    border: 0;
-    background: transparent;
-    cursor: pointer;
+  .full-reset-copy {
+    display: grid;
+    min-width: 0;
+    grid-template-columns: auto 1fr;
+    align-items: baseline;
+    gap: 3px 14px;
   }
 
-  .theme-switcher > button {
-    display: flex;
-    width: 100%;
-    min-height: 58px;
-    flex-direction: column;
-    align-items: flex-start;
+  .full-reset-copy > span {
+    grid-column: 1 / -1;
+    color: #936f66;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+  }
+
+  .full-reset-copy > strong {
+    color: #d3b3aa;
+    font-size: 15px;
+    font-weight: 560;
+    white-space: nowrap;
+  }
+
+  .full-reset-copy > p {
+    margin: 0;
+    color: #878c8e;
+    font-size: 12px;
+    line-height: 1.45;
+    text-wrap: pretty;
+  }
+
+  .full-reset-action,
+  .reset-dialog-actions button {
+    display: inline-flex;
+    min-height: 44px;
+    align-items: center;
     justify-content: center;
-    gap: 3px;
-    border: 0;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    padding: 8px 11px;
+    gap: 9px;
+    border: 1px solid rgba(193, 96, 76, 0.65);
+    padding: 0 16px;
     background: transparent;
-    color: #a7aaad;
+    color: #d8a398;
     cursor: pointer;
+    transition:
+      color 150ms ease,
+      background-color 150ms ease,
+      border-color 150ms ease,
+      opacity 150ms ease;
   }
 
-  .theme-switcher > button.active,
-  .theme-switcher > button:hover {
-    background: rgba(199, 143, 89, 0.1);
-    color: #efc18d;
+  .full-reset-action:hover:not(:disabled),
+  .reset-confirm:hover:not(:disabled) {
+    border-color: #d27361;
+    background: rgba(145, 50, 35, 0.14);
+    color: #f0b1a4;
   }
 
-  .theme-switcher small {
-    color: #6f757a;
+  .full-reset-action:focus-visible,
+  .reset-dialog-actions button:focus-visible,
+  .reset-feedback button:focus-visible {
+    outline: 2px solid #cf8f79;
+    outline-offset: 3px;
+  }
+
+  .full-reset-action:disabled,
+  .reset-dialog-actions button:disabled {
+    cursor: not-allowed;
+    opacity: 0.48;
+  }
+
+  .instrument .full-reset-strip {
+    margin-top: 18px;
+    border-color: #62534b;
+    background: rgba(20, 14, 12, 0.28);
+    box-shadow: inset 0 0 0 3px rgba(0, 0, 0, 0.2);
+  }
+
+  .workshop .full-reset-strip {
+    min-height: 74px;
+    margin: 0 40px;
+    border: 0;
+    border-bottom: 1px solid #373a3a;
+    padding-inline: 0;
+    background: transparent;
+  }
+
+  .reset-dialog::backdrop {
+    background: rgba(3, 5, 6, 0.82);
+    backdrop-filter: blur(4px);
+  }
+
+  .reset-dialog {
+    box-sizing: border-box;
+    width: min(570px, 100%);
+    max-height: calc(100vh - 48px);
+    margin: auto;
+    border: 1px solid #765249;
+    padding: 26px;
+    background-color: #111516;
+    background-image: var(--forge-texture);
+    background-size: 1024px 683px;
+    color: #dedbd7;
+    overflow-y: auto;
+    box-shadow:
+      inset 0 0 0 3px rgba(0, 0, 0, 0.32),
+      0 28px 80px rgba(0, 0, 0, 0.68);
+  }
+
+  .instrument .reset-dialog {
+    border-color: #81715c;
+    box-shadow:
+      inset 0 0 0 4px #171a19,
+      inset 0 0 0 5px #75634e,
+      0 28px 80px rgba(0, 0, 0, 0.68);
+  }
+
+  .workshop .reset-dialog {
+    border-color: #6e4b43;
+    background-color: #121516;
+  }
+
+  .reset-dialog-heading {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid rgba(204, 116, 96, 0.28);
+  }
+
+  .reset-dialog-icon {
+    display: grid;
+    width: 46px;
+    height: 46px;
+    flex: 0 0 auto;
+    place-items: center;
+    border: 1px solid #8f5b50;
+    color: #dd8d7b;
+    background: rgba(117, 41, 29, 0.16);
+  }
+
+  .reset-dialog-heading > div {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .reset-dialog-heading > div > span {
+    color: #9b746b;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+  }
+
+  .reset-dialog h2 {
+    margin: 0;
+    color: #eee9e5;
+    font-size: 25px;
+    font-weight: 560;
+    letter-spacing: -0.02em;
+  }
+
+  .reset-dialog > p {
+    margin: 20px 0 0;
+    color: #d4ccc7;
+    font-size: 15px;
+    line-height: 1.6;
+    text-wrap: pretty;
+  }
+
+  .reset-dialog > .reset-dialog-note {
+    margin-top: 10px;
+    color: #9c8e89;
+    font-size: 12px;
+  }
+
+  .reset-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 24px;
+  }
+
+  .reset-dialog-actions .reset-cancel {
+    border-color: #4d5457;
+    color: #c7c9c8;
+  }
+
+  .reset-dialog-actions .reset-cancel:hover:not(:disabled) {
+    border-color: #727a7d;
+    background: rgba(255, 255, 255, 0.04);
+    color: #f0f0ee;
+  }
+
+  .reset-confirm {
+    min-width: 226px;
+  }
+
+  .reset-feedback {
+    position: fixed;
+    z-index: 260;
+    right: 24px;
+    bottom: 24px;
+    display: grid;
+    width: min(500px, calc(100% - 48px));
+    grid-template-columns: auto 1fr auto;
+    align-items: start;
+    gap: 12px;
+    border: 1px solid #4f585b;
+    border-left: 3px solid #6ca25b;
+    padding: 14px 12px 14px 15px;
+    background: #111617;
+    color: #7fbb6d;
+    box-shadow: 0 18px 52px rgba(0, 0, 0, 0.55);
+  }
+
+  .reset-feedback.warning {
+    border-left-color: #c19057;
+    color: #d2a267;
+  }
+
+  .reset-feedback.error {
+    border-left-color: #c56857;
+    color: #d98270;
+  }
+
+  .reset-feedback > div {
+    min-width: 0;
+  }
+
+  .reset-feedback strong {
+    color: #e1dfda;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .reset-feedback p {
+    margin: 4px 0 0;
+    color: #a5aaab;
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
+  .reset-feedback button {
+    display: grid;
+    width: 44px;
+    min-height: 44px;
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: #8f9698;
+    cursor: pointer;
   }
 
   /* Command Deck */
   .command-header {
     display: grid;
-    grid-template-columns: 285px minmax(520px, 1fr) 295px 145px;
+    grid-template-columns: 285px minmax(520px, 1fr) 320px;
     align-items: center;
     height: 102px;
     border-bottom: 1px solid rgba(164, 171, 177, 0.35);
@@ -773,7 +1043,7 @@
     gap: 13px;
     min-height: 54px;
     border-left: 1px solid rgba(255, 255, 255, 0.18);
-    padding-left: 18px;
+    padding: 0 28px 0 18px;
   }
 
   .connected i {
@@ -1291,26 +1561,18 @@
 
   .rail-gpu small { color: #929795; }
 
-  .instrument-window-controls {
-    position: absolute;
-    z-index: 3;
-    top: 4px;
-    right: 7px;
-    height: 48px;
-  }
-
   .instrument-content {
     display: grid;
     grid-template-columns: minmax(680px, 1fr) 405px;
     grid-template-rows: 1fr auto;
     gap: 20px 0;
-    padding: 53px 14px 51px 22px;
+    padding: 32px 14px 51px 22px;
   }
 
   .instrument-content.diagnostics-view {
     display: block;
     min-width: 0;
-    padding: 53px 24px 40px;
+    padding: 32px 24px 40px;
   }
 
   .instrument-page {
@@ -1724,7 +1986,7 @@
 
   .workshop-header {
     display: grid;
-    grid-template-columns: 270px 1fr 64px 175px;
+    grid-template-columns: 270px 1fr 64px;
     align-items: center;
     height: 70px;
     border-bottom: 1px solid #333636;
@@ -1769,10 +2031,16 @@
     align-items: center;
     justify-content: center;
     border: 0;
-    border-right: 1px solid #333636;
+    border-left: 1px solid #333636;
     background: transparent;
     color: #b8b8b5;
     cursor: pointer;
+  }
+
+  .workshop-settings.active,
+  .workshop-settings:hover {
+    color: #d29063;
+    background: rgba(210, 144, 99, 0.06);
   }
 
   .workshop-content { min-height: calc(100vh - 70px); }
@@ -2063,7 +2331,6 @@
 
   @media (max-width: 1180px) {
     .command-header { grid-template-columns: 250px 1fr 240px; }
-    .command-header > .window-controls { display: none; }
     .command-nav { gap: 2px; }
     .command-nav button { min-width: auto; padding-inline: 10px; }
     .command-hero { grid-template-columns: 330px 1fr; }
@@ -2076,6 +2343,24 @@
   }
 
   @media (max-width: 820px) {
+    .full-reset-strip {
+      min-height: 0;
+      align-items: stretch;
+      flex-direction: column;
+      gap: 14px;
+      padding: 16px;
+    }
+    .full-reset-copy { grid-template-columns: 1fr; }
+    .full-reset-copy > span,
+    .full-reset-copy > strong,
+    .full-reset-copy > p { grid-column: 1; }
+    .full-reset-action { width: 100%; }
+    .workshop .full-reset-strip { margin-inline: 24px; padding-inline: 0; }
+    .reset-dialog { padding: 20px; }
+    .reset-dialog-actions { flex-direction: column-reverse; }
+    .reset-dialog-actions button { width: 100%; }
+    .reset-confirm { min-width: 0; }
+    .reset-feedback { right: 12px; bottom: 12px; width: calc(100% - 24px); }
     .command-header { grid-template-columns: 1fr auto; height: auto; min-height: 82px; }
     .command-brand { padding-left: 20px; }
     .command-nav { grid-column: 1 / -1; order: 3; overflow-x: auto; height: 58px; padding-left: 10px; }
@@ -2109,10 +2394,16 @@
     .instrument-profile-grid article + article { border-top: 1px solid #4b504e; border-left: 0; }
     .workshop-header { grid-template-columns: 1fr auto; padding-inline: 18px; }
     .workshop-header nav { grid-column: 1 / -1; order: 3; }
-    .workshop-header > .window-controls { display: none; }
     .workshop-profile { grid-template-columns: 1fr 1fr; padding-inline: 24px; }
     .workshop-current { grid-column: 1 / -1; border-right: 0; }
     .workshop-content.diagnostics-view { padding: 22px 18px 36px; }
     .workshop-telemetry { grid-template-columns: 1fr 1fr; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .full-reset-action,
+    .reset-dialog-actions button {
+      transition: none;
+    }
   }
 </style>
