@@ -107,6 +107,7 @@ pub fn observation_from_anchored_step(
             .qualification_coverage
             .clone()
             .or_else(|| ctx.qualification_coverage.clone()),
+        evidence_provenance: report.evidence_provenance.clone(),
         mode: ctx.mode,
         target_mhz,
         requested_start_mv: ctx.requested_start_mv,
@@ -581,6 +582,19 @@ mod tests {
             dwell_duration_ms: Some(15_000),
             sample_count: Some(300),
             qualification_coverage: None,
+            evidence_provenance: Some(
+                nidavellir_core::f2_observation::F2EvidenceProvenance {
+                    build_version: Some("0.1.0".into()),
+                    build_revision: Some("test-revision".into()),
+                    workload_fingerprint: Some("test-workload-v16".into()),
+                    render_backend: Some("dx12".into()),
+                    adapter_name: Some("test-adapter".into()),
+                    driver_name: Some("test-driver".into()),
+                    driver_info: Some("test-driver-info".into()),
+                    checksum_method: Some("test-checksum".into()),
+                    golden_config: Some("test-golden".into()),
+                },
+            ),
             reset_ok: Some(true),
             boot_flag_cleared: true,
             blacklisted: false,
@@ -597,7 +611,12 @@ mod tests {
 
     #[test]
     fn mapper_captures_validated_point() {
-        let o = observation_from_anchored_step(&ctx(), 1800, &anchored(975, 1785, 1800), &validated_step(),
+        let report = validated_step();
+        let o = observation_from_anchored_step(
+            &ctx(),
+            1800,
+            &anchored(975, 1785, 1800),
+            &report,
         );
         assert_eq!(o.target_mhz, 1800);
         assert_eq!((o.anchor_mv, o.base_mhz, o.offset_mhz), (975, 1785, 15));
@@ -621,6 +640,10 @@ mod tests {
         );
         assert_eq!((o.render_frames, o.render_fps), (Some(900), Some(60.0)));
         assert_eq!(o.outcome, F2ObsOutcome::Validated);
+        assert_eq!(
+            o.evidence_provenance.as_ref().and_then(|p| p.render_backend.as_deref()),
+            Some("dx12")
+        );
         assert!(o.reset_to_stock_ok && o.boot_flag_cleared);
         assert!(o.confidence.unwrap() >= 0.85);
     }

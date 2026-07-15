@@ -70,12 +70,15 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// covered is folded INTO the candidate-only Endurance soak as an interleaved VramPressure segment
 /// under sustained worst-case load (stronger than the isolated pass ever was). Different set →
 /// pre-v14 evidence quarantined; full re-forge required.
-/// v15 (2026-07-13): the Texture qualifier is now LOBBY-FIRST — it leads with a long isolated
-/// sustained BoostEdge block (real drain-per-frame cadence + degradation gate) reproducing the
-/// field-proven anchor-bin residency regime that a game trace caught TDR'ing 1845@862 cool/low-power
-/// while the old texrop-first plan passed it. The descent's own 60 s dwell now exercises that regime.
-/// The qualifier content changed → pre-v15 Texture evidence quarantined; full re-forge required.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 15;
+/// v15 (2026-07-13): the Texture qualifier became LOBBY-FIRST after an initial interpretation of a
+/// field trace favored sustained BoostEdge residency. Follow-up comparison showed the same external
+/// clock/power/utilization envelope surviving in the lobby while a real match failed, so residency
+/// alone was not causal; v15 evidence must not be described as reproducing the field failure.
+/// v16 (2026-07-15): MixedGame is interleaved per frame, BoostEdge/MixedGame integrity sampling is
+/// sparse GPU-side, and every dwell records the exact workload/build/adapter/golden provenance that
+/// produced it. Positive evidence additionally requires confirmed stock reset and boot-flag cleanup.
+/// Pre-v16 positives describe a different workload and cannot unlock Apply.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 16;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -87,6 +90,62 @@ pub enum F2EvidenceKind {
     Discovery,
     Qualification,
     ApplyQualification,
+}
+
+/// Reproducibility metadata for the exact executable, workload and graphics stack that produced an
+/// F2 dwell. Every field is optional so observations written before provenance existed remain
+/// readable; current writers fill every value the active backend exposes rather than fabricating
+/// unavailable data.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct F2EvidenceProvenance {
+    /// Service package version that wrote the observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
+    /// Source revision embedded at build time (with a `-dirty` suffix for local dirty builds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_revision: Option<String>,
+    /// Stable semantic fingerprint exported by the workload implementation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_fingerprint: Option<String>,
+    /// Actual wgpu backend selected for this dwell, not merely the requested backend set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_backend: Option<String>,
+    /// Adapter name reported by the graphics API, useful for matching it to `gpu_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_name: Option<String>,
+    /// Driver family/name reported by the selected graphics adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_name: Option<String>,
+    /// Driver version/details reported by the selected graphics adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_info: Option<String>,
+    /// Canonical description of the active integrity/checksum method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_method: Option<String>,
+    /// Canonical capture configuration and stock golden values used by this dwell, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden_config: Option<String>,
+}
+
+impl F2EvidenceProvenance {
+    /// A positive may be reused only when the executable, semantic workload, selected graphics
+    /// stack and integrity oracle can all be identified. Driver APIs occasionally omit either the
+    /// short driver name or the detailed version string, so one non-empty driver identifier is
+    /// sufficient; every other identity component is mandatory.
+    fn is_reproducible(&self) -> bool {
+        fn present(value: &Option<String>) -> bool {
+            value.as_deref().is_some_and(|value| !value.trim().is_empty())
+        }
+
+        present(&self.build_version)
+            && present(&self.build_revision)
+            && present(&self.workload_fingerprint)
+            && present(&self.render_backend)
+            && present(&self.adapter_name)
+            && (present(&self.driver_name) || present(&self.driver_info))
+            && present(&self.checksum_method)
+            && present(&self.golden_config)
+    }
 }
 
 /// Whether a stable qualification dwell exercised every required phase strongly enough to count.
@@ -350,6 +409,10 @@ pub struct F2Observation {
     pub qualification_contract_version: Option<u32>,
     #[serde(default)]
     pub qualification_coverage: Option<F2QualificationCoverage>,
+    /// Exact build/workload/backend provenance for the dwell. Absent on legacy lines or attempts that
+    /// failed before a workload context could be created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_provenance: Option<F2EvidenceProvenance>,
     pub mode: F2ObsMode,
     pub target_mhz: u32,
     #[serde(default)]
@@ -565,26 +628,45 @@ pub fn last_good_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<&F
         .min_by_key(|o| o.anchor_mv)
 }
 
-/// True when an observation can define the current PowerRender discovery frontier. Discovery v4
-/// requires confirmed p99 evidence, so older or telemetry-inconclusive positives cannot seed the
-/// current frontier. Negative observations remain version-independent and conservative.
+/// Positive evidence is reusable only after the candidate transaction proved that the GPU returned
+/// to stock and the Safe Loop boot flag was cleared. Missing legacy fields deserialize as `false`,
+/// so incomplete observations fail closed.
+fn has_proven_cleanup(o: &F2Observation) -> bool {
+    o.reset_to_stock_ok && o.boot_flag_cleared
+}
+
+fn has_reproducible_provenance(o: &F2Observation) -> bool {
+    o.evidence_provenance
+        .as_ref()
+        .is_some_and(F2EvidenceProvenance::is_reproducible)
+}
+
+/// True when an observation can define the current PowerRender discovery frontier. Discovery v5
+/// requires confirmed p99 evidence and proven cleanup, so older, telemetry-inconclusive or
+/// transaction-incomplete positives cannot seed the current frontier. Negative observations remain
+/// version-independent and conservative.
 pub fn is_current_discovery_evidence(o: &F2Observation) -> bool {
     o.evidence_kind == F2EvidenceKind::Discovery
         && o.discovery_contract_version == Some(F2_DISCOVERY_CONTRACT_VERSION)
         && o.power_p99_confirmed
+        && has_proven_cleanup(o)
+        && has_reproducible_provenance(o)
 }
 
 /// True only for a fully-covered pass from the current qualification contract. Legacy positives and
-/// passes from older qualifiers can guide a start point but can never unlock Apply.
+/// passes from older qualifiers or without proven cleanup can guide a start point but can never
+/// unlock Apply.
 pub fn is_current_qualification_pass(o: &F2Observation) -> bool {
     o.evidence_kind == F2EvidenceKind::Qualification
         && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
         && o.outcome.is_validated()
+        && has_proven_cleanup(o)
+        && has_reproducible_provenance(o)
         && o.qualification_coverage
             .as_ref()
             .is_some_and(|coverage| {
                 coverage.strength == F2QualificationStrength::Fsgl4
-                    && coverage.pattern.is_some_and(is_v7_qualification_pattern)
+                    && coverage.pattern.is_some_and(is_required_qualification_pattern)
                     && coverage.verdict == F2QualificationVerdict::Pass
             })
 }
@@ -593,19 +675,29 @@ pub fn is_current_qualification_pass(o: &F2Observation) -> bool {
 /// qualification contract. Kept separate from frontier qualification so an Apply failure caused by
 /// a higher boost regime does not rewrite the learned voltage boundary.
 pub fn is_current_apply_qualification_pass(o: &F2Observation) -> bool {
+    is_current_apply_qualification_evidence(o)
+        && o.qualification_coverage
+            .as_ref()
+            .and_then(|coverage| coverage.pattern)
+            .is_some_and(is_required_qualification_pattern)
+}
+
+fn is_current_apply_qualification_evidence(o: &F2Observation) -> bool {
     o.evidence_kind == F2EvidenceKind::ApplyQualification
         && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
         && o.outcome.is_validated()
+        && has_proven_cleanup(o)
+        && has_reproducible_provenance(o)
         && o.qualification_coverage
             .as_ref()
             .is_some_and(|coverage| {
                 coverage.strength == F2QualificationStrength::Fsgl4
-                    && coverage.pattern.is_some_and(is_v7_qualification_pattern)
+                    && coverage.pattern.is_some()
                     && coverage.verdict == F2QualificationVerdict::Pass
             })
 }
 
-fn is_v7_qualification_pattern(pattern: F2QualificationPattern) -> bool {
+fn is_required_qualification_pattern(pattern: F2QualificationPattern) -> bool {
     required_pattern_index(pattern).is_some()
 }
 
@@ -852,7 +944,7 @@ pub fn to_power_sweep_point(entry: &F2FrontierEntry) -> (PowerSweepPoint, f64) {
     (point, entry.confidence)
 }
 
-/// Highest sustained-p99 discovery observation for one exact target/apply anchor. Only current v4,
+/// Highest sustained-p99 discovery observation for one exact target/apply anchor. Only current v5,
 /// p99-confirmed, reset-clean, thermally valid PowerRender evidence is eligible. A power-bound clock
 /// drop remains valid power/clock telemetry for the apply bin, but it is never promoted into
 /// stability evidence. Repeated measurements deliberately choose the largest measured p99 so a
@@ -911,7 +1003,7 @@ fn apply_qual_reading_trustworthy(o: &F2Observation, target_mhz: u32) -> bool {
         .is_some_and(|held| held + F2_APPLY_CLOCK_HOLD_TOL_MHZ >= target_mhz)
 }
 
-/// Highest sustained p99 measured by a complete, reset-clean v7 three-pattern set at one exact Apply
+/// Highest sustained p99 measured by the complete, reset-clean current required set at one exact Apply
 /// anchor in one run. Partial sets, failed/inconclusive passes, old qualification contracts, and
 /// thermal slowdowns that sagged the sustained clock are excluded; a thermal-slowdown flag that
 /// still HELD the target clock is trusted (see `apply_qual_reading_trustworthy`). The maximum across
@@ -961,7 +1053,7 @@ fn apply_qualification_p99_at_anchor(
         .max_by(f32::total_cmp)
 }
 
-/// Highest sustained p99 from the complete approved v7 set produced by one exact Forge run.
+/// Highest sustained p99 from the complete approved current set produced by one exact Forge run.
 pub fn current_apply_qualification_p99_at_anchor(
     obs: &[F2Observation],
     run_id: &str,
@@ -972,7 +1064,7 @@ pub fn current_apply_qualification_p99_at_anchor(
     apply_qualification_p99_at_anchor(obs, Some(run_id), target_mhz, anchor_mv, gpu_key)
 }
 
-/// Highest sustained p95 clock reached by a complete, reset-clean v7 set at one exact Apply pair.
+/// Highest sustained p95 clock reached by a complete, reset-clean current set at one exact Apply pair.
 /// Missing telemetry in any required pattern fails closed.
 pub fn current_apply_qualification_p95_clock_at_anchor(
     obs: &[F2Observation],
@@ -1014,10 +1106,9 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
 /// `(target_mhz, apply_mv)` pair on this GPU — requires BOTH the v15 TransitionShock (idle→slam
 /// launch-transition cycles) AND the v14 Endurance soak (continuous worst-realistic ~20 min).
 /// These gates only TIGHTEN Apply — they are not part of [`REQUIRED_QUALIFICATION_PATTERNS`] and
-/// never touch the frontier descent — so they carry no contract-version bump; the publish gate is
-/// run_id-scoped evidence instead. Each requires an [`F2EvidenceKind::ApplyQualification`]
-/// Validated observation with that pattern and a `Pass` verdict, reset-clean and
-/// boot-flag-cleared. Fail closed: legacy or absent evidence reads `false` and can never publish.
+/// never touch the frontier descent. They still share the current qualification contract and full
+/// reproducibility/cleanup requirements; the publish gate is also run_id-scoped. Fail closed:
+/// legacy, incomplete or absent evidence reads `false` and can never publish.
 pub fn point_has_current_endurance_qualification(
     obs: &[F2Observation],
     run_id: &str,
@@ -1033,14 +1124,9 @@ pub fn point_has_current_endurance_qualification(
                     && o.target_mhz == target_mhz
                     && o.anchor_mv == apply_mv
                     && o.gpu_key.as_deref() == Some(gpu_key)
-                    && o.evidence_kind == F2EvidenceKind::ApplyQualification
-                    && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
-                    && o.outcome.is_validated()
-                    && o.reset_to_stock_ok
-                    && o.boot_flag_cleared
+                    && is_current_apply_qualification_evidence(o)
                     && o.qualification_coverage.as_ref().is_some_and(|coverage| {
                         coverage.pattern == Some(*required)
-                            && coverage.verdict == F2QualificationVerdict::Pass
                     })
             })
         })
@@ -1066,9 +1152,7 @@ pub fn worst_current_apply_qualification_power_at_anchor(
                 && o.target_mhz == target_mhz
                 && o.anchor_mv == apply_mv
                 && o.gpu_key.as_deref() == Some(gpu_key)
-                && o.evidence_kind == F2EvidenceKind::ApplyQualification
-                && o.qualification_contract_version == Some(F2_QUALIFICATION_CONTRACT_VERSION)
-                && o.outcome.is_validated()
+                && is_current_apply_qualification_evidence(o)
         })
         .flat_map(|o| {
             o.power_p99_w
@@ -1079,7 +1163,7 @@ pub fn worst_current_apply_qualification_power_at_anchor(
         .max_by(f32::total_cmp)
 }
 
-/// Highest sustained p99 across every complete current-contract v7 run for one exact Apply pair.
+/// Highest sustained p99 across every complete current-contract run for one exact Apply pair.
 /// This restores the conservative published wattage when a qualified Forge snapshot is reloaded.
 pub fn highest_apply_qualification_p99_at_anchor(
     obs: &[F2Observation],
@@ -1196,6 +1280,20 @@ impl F2ObservationStore {
 mod tests {
     use super::*;
 
+    fn reproducible_provenance() -> F2EvidenceProvenance {
+        F2EvidenceProvenance {
+            build_version: Some("0.1.0".into()),
+            build_revision: Some("d449b63-dirty".into()),
+            workload_fingerprint: Some("vf-qualifier-v16-texture".into()),
+            render_backend: Some("dx12".into()),
+            adapter_name: Some("NVIDIA GeForce RTX 3060 Ti".into()),
+            driver_name: Some("NVIDIA".into()),
+            driver_info: Some("32.0.15.7688".into()),
+            checksum_method: Some("gpu-reduction-sparse-readback".into()),
+            golden_config: Some("capture_ms=2000;power=1;boost=2;texrop=3".into()),
+        }
+    }
+
     fn obs(target: u32, anchor: u32, outcome: F2ObsOutcome) -> F2Observation {
         F2Observation {
             run_id: "run-test".into(),
@@ -1205,6 +1303,7 @@ mod tests {
             discovery_contract_version: Some(F2_DISCOVERY_CONTRACT_VERSION),
             qualification_contract_version: None,
             qualification_coverage: None,
+            evidence_provenance: Some(reproducible_provenance()),
             mode: F2ObsMode::TargetSweep,
             target_mhz: target,
             requested_start_mv: None,
@@ -1651,7 +1750,102 @@ mod tests {
     }
 
     #[test]
-    fn discovery_v4_rejects_v3_and_unconfirmed_positive_evidence() {
+    fn current_positive_evidence_requires_proven_cleanup() {
+        let discovery = obs(1800, 962, F2ObsOutcome::Validated);
+        assert!(is_current_discovery_evidence(&discovery));
+
+        let mut discovery_reset_failed = discovery.clone();
+        discovery_reset_failed.reset_to_stock_ok = false;
+        assert!(!is_current_discovery_evidence(&discovery_reset_failed));
+
+        let mut discovery_flag_retained = discovery.clone();
+        discovery_flag_retained.boot_flag_cleared = false;
+        assert!(!is_current_discovery_evidence(&discovery_flag_retained));
+
+        let qualification = qualification_pass(discovery.clone());
+        assert!(is_current_qualification_pass(&qualification));
+
+        let mut qualification_reset_failed = qualification.clone();
+        qualification_reset_failed.reset_to_stock_ok = false;
+        assert!(!is_current_qualification_pass(&qualification_reset_failed));
+
+        let mut qualification_flag_retained = qualification.clone();
+        qualification_flag_retained.boot_flag_cleared = false;
+        assert!(!is_current_qualification_pass(&qualification_flag_retained));
+
+        let apply = apply_qualification_pass(discovery, F2QualificationPattern::Texture);
+        assert!(is_current_apply_qualification_pass(&apply));
+
+        let mut apply_reset_failed = apply.clone();
+        apply_reset_failed.reset_to_stock_ok = false;
+        assert!(!is_current_apply_qualification_pass(&apply_reset_failed));
+
+        let mut apply_flag_retained = apply;
+        apply_flag_retained.boot_flag_cleared = false;
+        assert!(!is_current_apply_qualification_pass(&apply_flag_retained));
+    }
+
+    #[test]
+    fn current_positive_evidence_requires_reproducible_provenance() {
+        let discovery = obs(1800, 962, F2ObsOutcome::Validated);
+        assert!(is_current_discovery_evidence(&discovery));
+
+        let mut missing = discovery.clone();
+        missing.evidence_provenance = None;
+        assert!(!is_current_discovery_evidence(&missing));
+
+        let mut unknown_build = discovery.clone();
+        unknown_build
+            .evidence_provenance
+            .as_mut()
+            .unwrap()
+            .build_revision = None;
+        assert!(!is_current_discovery_evidence(&unknown_build));
+
+        let mut missing_driver = qualification_pass(discovery.clone());
+        let provenance = missing_driver.evidence_provenance.as_mut().unwrap();
+        provenance.driver_name = None;
+        provenance.driver_info = None;
+        assert!(!is_current_qualification_pass(&missing_driver));
+
+        let mut missing_checksum = apply_qualification_pass(
+            discovery,
+            F2QualificationPattern::Texture,
+        );
+        missing_checksum
+            .evidence_provenance
+            .as_mut()
+            .unwrap()
+            .checksum_method = Some(" ".into());
+        assert!(!is_current_apply_qualification_pass(&missing_checksum));
+    }
+
+    #[test]
+    fn missing_legacy_cleanup_fields_default_false_and_cannot_qualify() {
+        let discovery = obs(1800, 962, F2ObsOutcome::Validated);
+        let mut legacy_discovery = serde_json::to_value(discovery).unwrap();
+        let discovery_object = legacy_discovery.as_object_mut().unwrap();
+        discovery_object.remove("reset_to_stock_ok");
+        discovery_object.remove("boot_flag_cleared");
+        let legacy_discovery: F2Observation = serde_json::from_value(legacy_discovery).unwrap();
+        assert!(!legacy_discovery.reset_to_stock_ok);
+        assert!(!legacy_discovery.boot_flag_cleared);
+        assert!(!is_current_discovery_evidence(&legacy_discovery));
+
+        let qualification = qualification_pass(obs(1800, 962, F2ObsOutcome::Validated));
+        let mut legacy_qualification = serde_json::to_value(qualification).unwrap();
+        let qualification_object = legacy_qualification.as_object_mut().unwrap();
+        qualification_object.remove("reset_to_stock_ok");
+        qualification_object.remove("boot_flag_cleared");
+        let legacy_qualification: F2Observation =
+            serde_json::from_value(legacy_qualification).unwrap();
+        assert!(!legacy_qualification.reset_to_stock_ok);
+        assert!(!legacy_qualification.boot_flag_cleared);
+        assert!(!is_current_qualification_pass(&legacy_qualification));
+    }
+
+    #[test]
+    fn discovery_v5_rejects_v4_and_unconfirmed_positive_evidence() {
         let mut old = obs(1800, 962, F2ObsOutcome::Validated);
         old.discovery_contract_version = Some(3);
         assert!(!is_current_discovery_evidence(&old));
@@ -1862,6 +2056,15 @@ mod tests {
             pass("R1", F2QualificationPattern::Endurance, F2ObsOutcome::Validated),
         ];
         assert!(point_has_current_endurance_qualification(&both, "R1", 1935, 956, "RTX 4070"));
+        let mut missing_provenance = both.clone();
+        missing_provenance[0].evidence_provenance = None;
+        assert!(!point_has_current_endurance_qualification(
+            &missing_provenance,
+            "R1",
+            1935,
+            956,
+            "RTX 4070"
+        ));
         // Run-scoped: the same evidence never publishes a different run.
         assert!(!point_has_current_endurance_qualification(&both, "R2", 1935, 956, "RTX 4070"));
         // Endurance alone is NOT enough (v15: the launch-transition shock is also required)…
@@ -1908,6 +2111,19 @@ mod tests {
         assert_eq!(
             worst_current_apply_qualification_power_at_anchor(&set, "R1", 1920, 918, "RTX 4070"),
             Some(189.0)
+        );
+        let mut missing_provenance = set.clone();
+        missing_provenance[1].evidence_provenance = None;
+        assert_eq!(
+            worst_current_apply_qualification_power_at_anchor(
+                &missing_provenance,
+                "R1",
+                1920,
+                918,
+                "RTX 4070"
+            ),
+            Some(175.0),
+            "an untraceable soak cannot raise the published power basis"
         );
         // Run-scoped: another run's evidence never feeds this run's off-cap basis.
         assert_eq!(
@@ -1979,6 +2195,20 @@ mod tests {
         let parsed = parse_observations(&data);
         assert_eq!(parsed.len(), 2); // both good lines; blank + malformed skipped
         assert_eq!(parsed[0].target_mhz, 1800);
+    }
+
+    #[test]
+    fn evidence_provenance_round_trips_and_legacy_lines_default_to_none() {
+        let mut current = obs(1800, 962, F2ObsOutcome::Validated);
+        current.evidence_provenance = Some(reproducible_provenance());
+        let encoded = serde_json::to_string(&current).unwrap();
+        let decoded: F2Observation = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, current);
+
+        let mut legacy = serde_json::to_value(current).unwrap();
+        legacy.as_object_mut().unwrap().remove("evidence_provenance");
+        let decoded_legacy: F2Observation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded_legacy.evidence_provenance, None);
     }
 
     #[test]

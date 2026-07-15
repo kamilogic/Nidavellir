@@ -28,20 +28,15 @@ const SENTINEL_COOLDOWN_MS: u64 = 60_000;
 const SENTINEL_TDR_BUMP_BINS: usize = 3;
 /// A canary-detected silent error is boundary-class → +2 bins at the same clock.
 const SENTINEL_SILENT_BUMP_BINS: usize = 2;
-/// Canary cadence + kernel budget: ~5 ms of known-answer ALU every 30 s (<0.02% GPU), and ONLY
-/// while the GPU is under real load (silent errors at elastic idle voltages are meaningless and
-/// the kernel must never keep an idle card awake).
+/// Canary cadence: one owned TextureRop self-check every 20 s, and ONLY while the GPU is under
+/// real load (silent errors at elastic idle voltages are meaningless and the canary must never
+/// keep an idle card awake).
 const SENTINEL_CANARY_POLL_MS: u64 = 20_000;
 /// TextureRop self-check burst: long enough for ≥2 of the 250 ms checksum windows (reference +
 /// compare). ~700 ms of shared GPU load every 20 s ≈ 3.5% duty while gaming — the price of a
 /// canary that samples the BINDING failure path instead of being statistically blind.
 const SENTINEL_CANARY_KERNEL_MS: u64 = 700;
 const SENTINEL_CANARY_MIN_UTIL_PCT: f64 = 30.0;
-/// Stall watchdog: the canary normally returns in well under a second. If it has not come back by
-/// this deadline the GPU is ALREADY stalling — that IS the pre-hang precursor of the BusReset
-/// cascade. Act immediately (stock reset from this thread) instead of waiting for the driver's
-/// ~2 s TDR watchdog to start the cascade.
-const SENTINEL_CANARY_STALL_MS: u64 = 3_000;
 /// Operator policy (2026-07-12, after the first successful field recovery): THREE strikes —
 /// two automatic bumps, the third failure resets to stock and clears the profile. On the field
 /// case (1815@843 → 862 exhausted at 2 strikes) the third bump would have landed 875 mV — the
@@ -59,6 +54,13 @@ pub(crate) enum SentinelAction {
     Bump { target_mhz: u32, new_anchor_mv: u32 },
     /// Ladder exhausted (or no higher bin exists): stay stock, clear the applied profile.
     Stock { target_mhz: u32, failed_anchor_mv: u32 },
+}
+
+/// Only a completed canary verdict can drive the silent-error fallback. A stalled GPU call stays
+/// owned by the dedicated canary thread; the Event Log layer and boot reconciliation remain the
+/// authoritative recovery paths for TDRs and hard wedges.
+fn canary_returned_failure(verdict: &nidavellir_core::gpu_sweep::StabilityResult) -> bool {
+    !matches!(verdict, nidavellir_core::gpu_sweep::StabilityResult::Stable)
 }
 
 /// Pure fallback-ladder decision. `bins_above` are the physical VF bins strictly above the failed
@@ -235,6 +237,30 @@ fn epoch_s() -> u64 {
         .unwrap_or(0)
 }
 
+/// Atomically claim one cross-layer recovery episode. The watcher and canary are independent
+/// threads; a load followed by an unconditional store lets both mutate the GPU when they observe
+/// the same failure concurrently. Compare-exchange makes exactly one layer the recovery owner.
+fn claim_action_epoch(
+    last_action: &std::sync::atomic::AtomicU64,
+    now: u64,
+) -> bool {
+    loop {
+        let previous = last_action.load(std::sync::atomic::Ordering::SeqCst);
+        if previous != 0 && now.saturating_sub(previous) < CROSS_LAYER_DEDUP_S {
+            return false;
+        }
+        match last_action.compare_exchange(
+            previous,
+            now,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(_) => continue,
+        }
+    }
+}
+
 /// Handle one confirmed failure (TDR event or canary silent error). Returns true on a bump.
 fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usize, kind: &str) -> bool {
     let last = LAST_ACTION_EPOCH_S.load(std::sync::atomic::Ordering::SeqCst);
@@ -265,7 +291,13 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
             false
         }
         SentinelAction::Bump { target_mhz, new_anchor_mv } => {
-            LAST_ACTION_EPOCH_S.store(epoch_s(), std::sync::atomic::Ordering::SeqCst);
+            if !claim_action_epoch(&LAST_ACTION_EPOCH_S, now) {
+                info!("sentinel: {kind} recovery was claimed concurrently by the other layer");
+                append_sentinel_log(&format!(
+                    "\"event\":\"{kind}\",\"action\":\"same-episode-skip\""
+                ));
+                return false;
+            }
             let (_, failed_mv) = applied.expect("Bump implies applied");
             warn!(
                 "sentinel: in-game TDR at {target_mhz} MHz @ {failed_mv} mV — resetting to stock, \
@@ -330,7 +362,13 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
             }
         }
         SentinelAction::Stock { target_mhz, failed_anchor_mv } => {
-            LAST_ACTION_EPOCH_S.store(epoch_s(), std::sync::atomic::Ordering::SeqCst);
+            if !claim_action_epoch(&LAST_ACTION_EPOCH_S, now) {
+                info!("sentinel: {kind} recovery was claimed concurrently by the other layer");
+                append_sentinel_log(&format!(
+                    "\"event\":\"{kind}\",\"action\":\"same-episode-skip\""
+                ));
+                return false;
+            }
             warn!(
                 "sentinel: TDR at {target_mhz} MHz @ {failed_anchor_mv} mV after a previous bump \
                  this session — staying at stock (ladder exhausted); profile cleared"
@@ -407,13 +445,13 @@ pub fn spawn(store: SafeLoopStore) {
         });
     }
 
-    // Layer 2 — GPU canary (v17.2, ACTIVE): a ~700 ms TextureRop SELF-CHECK every 20 s, ONLY while
+    // Layer 2 — GPU canary (v17.3, ACTIVE): a ~700 ms TextureRop SELF-CHECK every 20 s, ONLY while
     // an undervolt is applied AND the GPU is under real load (>30% util — an idle card is never
-    // woken). Two jobs: (1) silent-error detection on the BINDING path (texture-rop — where every
-    // forge failure fired; the old 5 ms ALU kernel was statistically blind: wrong unit, 0.017%
-    // duty); (2) STALL WATCHDOG — a canary that never returns is the pre-hang itself, and we reset
-    // to stock BEFORE the driver's 2 s TDR watchdog can start the cascade. Honest limit: a
-    // full bus wedge can still freeze even our reset call — boot reconciliation is the final net.
+    // woken). It detects returned non-stable verdicts on the binding TextureRop path.
+    // The check runs synchronously on this dedicated thread so its GPU context is never detached:
+    // if the driver stalls, no replacement worker is spawned and no reset races a still-running
+    // canary. The independent Event Log layer handles a recovered TDR; boot reconciliation remains
+    // the final net for a full machine wedge.
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(SENTINEL_CANARY_POLL_MS));
         let applied = crate::gpu_apply::load_applied().and_then(|p| p.undervolt);
@@ -431,48 +469,21 @@ pub fn spawn(store: SafeLoopStore) {
         if !under_load {
             continue;
         }
-        // v17.2: the canary runs on ITS OWN thread with a stall watchdog. Normal return: a
-        // TextureRop self-check verdict (the BINDING detector — every forge boundary failure fired
-        // in texture-rop, never ALU). No return by the deadline: the GPU is already stalling — the
-        // pre-hang precursor of the BusReset cascade — and we act from HERE, before the driver's
-        // ~2 s watchdog starts the cascade the operator had to power-cycle out of.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let verdict = nidavellir_gpu_stress::GpuCtx::new().map(|ctx| {
-                ctx.run_canary_texture_selfcheck(SENTINEL_CANARY_KERNEL_MS).result
-            });
-            let _ = tx.send(verdict);
-        });
-        let outcome =
-            rx.recv_timeout(std::time::Duration::from_millis(SENTINEL_CANARY_STALL_MS));
-        let (failed, kind) = match outcome {
-            // Healthy canary — clean self-consistent render.
-            Ok(Ok(nidavellir_core::gpu_sweep::StabilityResult::Stable)) => (false, ""),
+        // Keep the context and call owned by this thread for their entire lifetime. Rust threads
+        // cannot be cancelled safely; a recv_timeout around an inner worker would only abandon the
+        // worker and let recovery mutate the GPU while that worker was still running.
+        let verdict = match nidavellir_gpu_stress::GpuCtx::new() {
+            Ok(ctx) => {
+                ctx.run_canary_texture_selfcheck(SENTINEL_CANARY_KERNEL_MS)
+                    .result
+            }
             // Context creation failed (driver busy/hiccup) — inconclusive, never a fallback.
-            Ok(Err(_)) => (false, ""),
-            // Corruption or in-canary crash at the applied point.
-            Ok(Ok(verdict)) => {
-                warn!("sentinel: texture canary detected {verdict:?} at the applied point");
-                (true, "silent-canary")
-            }
-            // Stall: the canary never came back — the GPU is hanging RIGHT NOW.
-            Err(_) => {
-                warn!(
-                    "sentinel: canary STALLED >{SENTINEL_CANARY_STALL_MS} ms — pre-hang; acting \
-                     before the driver TDR cascade"
-                );
-                (true, "pre-hang-canary")
-            }
+            Err(_) => continue,
         };
-        if failed {
+        if canary_returned_failure(&verdict) {
+            warn!("sentinel: texture canary detected {verdict:?} at the applied point");
             let n = bumps.load(std::sync::atomic::Ordering::SeqCst);
-            // Pre-hang is TDR-grade (+3 bins); corruption is boundary-grade (+2 bins).
-            let bins = if kind == "pre-hang-canary" {
-                SENTINEL_TDR_BUMP_BINS
-            } else {
-                SENTINEL_SILENT_BUMP_BINS
-            };
-            if handle_failure(&store, n, bins, kind) {
+            if handle_failure(&store, n, SENTINEL_SILENT_BUMP_BINS, "silent-canary") {
                 bumps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             std::thread::sleep(std::time::Duration::from_millis(SENTINEL_COOLDOWN_MS));
@@ -531,6 +542,28 @@ mod tests {
         );
         // Stock / F1 applied → nothing to do.
         assert_eq!(sentinel_decide(None, false, 0, &bins, SENTINEL_TDR_BUMP_BINS), SentinelAction::Ignore);
+    }
+
+    #[test]
+    fn canary_only_acts_on_a_returned_failure_verdict() {
+        use nidavellir_core::gpu_sweep::StabilityResult;
+
+        assert!(!canary_returned_failure(&StabilityResult::Stable));
+        assert!(canary_returned_failure(&StabilityResult::SilentError));
+        assert!(canary_returned_failure(&StabilityResult::Unstable));
+        assert!(canary_returned_failure(&StabilityResult::Crash));
+    }
+
+    #[test]
+    fn cross_layer_recovery_claim_is_atomic_and_respects_the_dedup_window() {
+        let last = std::sync::atomic::AtomicU64::new(0);
+        assert!(claim_action_epoch(&last, 1_000));
+        assert!(!claim_action_epoch(&last, 1_000));
+        assert!(!claim_action_epoch(
+            &last,
+            1_000 + CROSS_LAYER_DEDUP_S - 1
+        ));
+        assert!(claim_action_epoch(&last, 1_000 + CROSS_LAYER_DEDUP_S));
     }
 
     #[test]

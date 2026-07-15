@@ -15,33 +15,32 @@
 
 ## Now — Product model (see product.md)
 Reframed around 3 profiles forged from a clock×power frontier. Phases:
-- **Current F2 frontier (2026-07-01)** — code-complete: the live Forge starts at the highest real
-  clock, discovers Cmax through power-bound voltage descent, and characterizes every real bin through
-  90% Cmax. Autonomous descent has no arbitrary step budget; Fast is provisional discovery;
-  Standard/Long use FSGL3 A/B 2×60 s as the default interleaved per-bin qualifier.
-  Discovery keeps the homogeneous game-power render while qualification uses versioned
-  stock-golden evidence, 100% frame checks and deliberate droop probes; an FSGL3 rejection stops the
-  descent with the last FSGL3-qualified physical bin;
-  observations checkpoint/resume by GPU UUID; discovery v4 carries mean/p99/raw-peak watts plus
-  thermal/voltage/render validity, confirms anomalous p99 steps by exact-bin repeats, uses p99 for
-  power-bound descent and synthesizes profiles from the exact post-margin apply bin, backfilling
-  only missing exact-bin PowerRender telemetry after frontier completion; partial UI progress is
-  durable. Compatible same-GPU v4 history and a short isotonic cross-clock trend predict the next
-  boundary, always starting one physical bin above it and falling back when inputs disagree by more
-  than 25 mV. Confirmed power-bound spans may advance 4/2/1 bins by p5 deficit under 25 mV and writer
-  offset-step guards; any jumped failure recovers upward before exact adjacent-bin qualification.
-   Deployable synthesis still requires the complete range and successful qualification. Contract v6
-   reconciles any target/p5 gap beyond one 15 MHz bin against the higher regime's measured Apply
-   anchor, then soaks each unique selected post-margin pair with FSGL3 A+B for 5 minutes per pattern.
-   Reset-clean rejection blocks lower-anchor aliases and re-synthesizes another measured candidate;
-   p95 remains the visible upper sustained clock at that exact pair.
-  Qualification now stops on a relative heavy-phase p5 margin collapse, retries weak coverage twice
-  and continues across clocks. Supervised F2 TDR recovery is learning rather than normal-use crash
-  budget, interrupted runs resume on UI reconnect, and Apply requests +12 mV then snaps to a valid
-  physical bin (clamped to the highest valid anchor when necessary). The explicit F2 Apply path remains verified and legacy F1 remains
-  intact. **Next: supervised Leva 1 gate** against the known 1920 MHz @ 912 mV and 1935 MHz @ 918 mV
-  failures, then validate reconnect recovery and the applied margin bin in game. Only after those
-  measurements calibrate transition dispersion should Leva 2 begin; bisection remains separately gated.
+- **Current F2 frontier (2026-07-15)** — code-complete: Forge now normalizes stock
+  deterministically before reading the live domain. **Ctable** (sane physical-table ceiling/count),
+  **Cboost** (post-preheat observed boost) and **Cmax** (first sustainable clock proved by discovery)
+  are distinct facts. Preheat requires two converged usable 10 s windows and fails closed before any
+  candidate if stock temperature/p5, throttle or telemetry cannot be trusted. The measured frontier
+  still covers Cmax→90% Cmax; Fast remains provisional and Standard/Long remain deployability modes.
+  Discovery contract v5 runs each candidate attempt as one Candidate Transaction: one Safe Loop arm
+  and curve apply/verify, PowerRender plus active qualification phases without reapplying, then one
+  checked reset and boot-flag clear. Qualification is persisted before discovery so resume cannot see
+  a positive discovery without its same-curve rejection evidence. A positive observation becomes
+  reusable only after cleanup is proven. Numeric p99 classification has hysteresis: NearCap ≥99%,
+  OffCap ≤98%, and the middle band retries or ends inconclusive. Qualification contract v16 records
+  complete build/workload/graphics/golden provenance; older positives remain readable but are
+  ineligible. MixedGame now records BoostEdge + TextureRop + PowerRender in every frame/submit;
+  BoostEdge/MixedGame checksum reduction is sparse GPU-side and every sampled mismatch accumulates.
+  The exact-Apply closure is deliberately unchanged: Texture 5 min, TransitionShock 8 min and
+  Endurance 20 min per unique selected pair. The additive ForgeProgress preheat/Ctable/Cboost fields
+  expose this domain without parsing logs. The explicit F2 Apply path and legacy F1 remain intact.
+  The first post-reset Standard hardware cycle completed across a resumed two-run sequence and
+  published `1890@893`, `1845@862` and `1740@800`. Endurance rejected stochastic `1905@900` and
+  `1860@868`, but the known field discriminator `1845@862` still passed. During unattended descent the
+  operator returned to a Windows login after a reported TDR/reboot; no observation or sentinel event
+  attributed the active point before checkpoint resume. **Next evidence/safety gates:** supervised
+  in-game A/B of `1845@862`, plus P0 restart reconciliation that persists the active intent, enters
+  Needs Attention and requires acknowledgement instead of silently resuming. DX11 and any reduction
+  of the exact-Apply gate remain deferred until field discrimination is demonstrated.
 - **F1 — Profile model**: 3-profile synthesis (Godforge=clock / Brokkr's=R / Deep
   Calm=MHz/W) + V2 confidence gate.
   - **F1a (DONE)** — pure `synthesize_forge_profiles` + unit tests. Not yet wired.
@@ -68,13 +67,19 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   **V3** (confidence-maturing trials) folds into F1b/F4.
 
 ## Near-term
+- **P0 unaccounted-restart safety:** bind checkpoints to a boot/run epoch and active candidate; on an
+  unexplained restart, reconcile durable crash evidence, block automatic continuation in Needs
+  Attention, and require explicit operator acknowledgement.
+- **P0 evidence/export identity:** give dirty builds a content identity (or reject reuse), and export
+  the current run separately from historical observation rows plus reconciled runtime incidents.
 - **Godforge** as a real OC profile (currently the max-voltage stock point).
 - **In-game apply test** of Brokkr's via the VF ceiling (user present) — the final
   consistency verdict.
 - **Safe-Loop → knowledge integration**: on a boot-flag-detected reboot, fold the
   crash offset (with `Reboot` severity) into `gpu_knowledge.json` automatically
   (today only in-sweep SilentError/TDR auto-record).
-- Address thermal run-to-run variance (e.g. temp-gate the sweep start / settle).
+- **Physical qualifier calibration**: compare 1845 MHz @ 862 mV with known-safe bins before adding
+  DX11 or shortening Texture 5 min + TransitionShock 8 min + Endurance 20 min.
 
 ## Deferred (per project design)
 - AMD path (ADLX) — currently NVIDIA/NVAPI only.

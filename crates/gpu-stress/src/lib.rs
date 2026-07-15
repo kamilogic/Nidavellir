@@ -45,11 +45,16 @@ const STREAM_DEGRADATION_FACTOR: u64 = 2;
 // slowdown crosses reference × this factor.
 const BOOST_EDGE_DEGRADATION_FACTOR: u64 = 2;
 const GOLDEN_MIN_FRAMES: u64 = 4;
+// BoostEdge and MixedGame keep their rendered workload dominant by validating only one out of
+// every N frames. The reduction and golden comparison still run on the GPU; the CPU only reads the
+// 4-byte accumulated mismatch counter on the existing ~250 ms health cadence.
+const SPARSE_CHECKSUM_FRAME_INTERVAL: u64 = 16;
 // v16.3 BoostEdge lobby cadence: drain the pipeline EVERY frame (a CPU/engine-bound game loop
 // finishes the frame, idles while the CPU builds the next one, then ramps again) and insert a
 // varied sub-ms CPU-frame-build bubble before the next submit. Each frame becomes a discrete
-// drain→idle→ramp current edge AT the anchor bin — the field-proven high-FPS killer regime that a
-// saturated submission queue can never produce. Spin-waited (Windows sleep is ms-coarse). Values
+// drain→idle→ramp current edge at the anchor bin — one useful high-FPS stress class that a
+// saturated submission queue cannot reproduce. Field telemetry did not prove this cadence caused
+// the game TDR, so it remains one detector inside the mixed qualifier, not a causal model. Values
 // model CPU frame-build variance at hundreds of fps; not tied to any GPU.
 const BOOST_EDGE_BUBBLE_US: &[u64] = &[0, 200, 500, 900, 300, 800];
 // v15 boost-entry shock: TRUE idle gaps long enough for the driver to leave the high P-state
@@ -119,9 +124,16 @@ pub struct RenderGoldens {
     pub stream_frame_reference_ms: u32,
     /// Stock average BoostEdge frame time (µs, drain-per-frame lobby cadence), captured with the
     /// golden. Same marginal-silicon principle at the light-frame regime. The capture loop reads
-    /// the checksum back on the CPU every frame (slightly slower than the dwell's drain-only
-    /// frames), so the degradation gate errs permissive, never strict.
+    /// the checksum back on the CPU every frame (slower than the dwell's sparse GPU-side checksum),
+    /// so the degradation gate errs permissive, never strict.
     pub boost_frame_reference_us: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderIntegrityGoldens {
+    Single(u32),
+    /// BoostEdge, TextureRop, PowerRender, matching `MIXED_GAME_WORKLOADS`.
+    Mixed([u32; 3]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +141,8 @@ pub struct VfPhaseReport {
     pub phase: VfQualifierPhase,
     pub result: StabilityResult,
     pub frames: u64,
+    /// Number of framebuffer outputs reduced and checked. Sparse modes intentionally report fewer
+    /// checks than frames; consumers can pair this with [`vf_qualifier_checksum_method`].
     pub checksum_count: u32,
     pub elapsed_ms: u64,
 }
@@ -277,6 +291,58 @@ pub enum VfWorkload {
     CompositeGameLoad,
 }
 
+const MIXED_GAME_WORKLOADS: [VfWorkload; 3] = [
+    VfWorkload::BoostEdge,
+    VfWorkload::TextureRop,
+    VfWorkload::PowerRender,
+];
+
+fn sparse_checksum_workload(workload: VfWorkload) -> bool {
+    matches!(workload, VfWorkload::BoostEdge | VfWorkload::MixedGame)
+}
+
+fn sparse_checksum_due(frame: u64) -> bool {
+    frame.is_multiple_of(SPARSE_CHECKSUM_FRAME_INTERVAL)
+}
+
+/// Draw order for one MixedGame frame. Every frame contains all three workloads in one command
+/// encoder and one queue submit; the last output rotates so sparse checksum samples cover each
+/// workload's deterministic image without three full-frame copies per sample.
+fn mixed_game_draw_order(frame: u64) -> [usize; 3] {
+    match frame % MIXED_GAME_WORKLOADS.len() as u64 {
+        0 => [1, 2, 0],
+        1 => [2, 0, 1],
+        _ => [0, 1, 2],
+    }
+}
+
+/// Stable provenance token for the exact qualifier workload semantics. Change the token whenever
+/// a pattern's plan or the execution semantics of one of its workloads changes.
+pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'static str {
+    match pattern {
+        VfQualifierPattern::Fsgl1 => "f2q-mix3-rotating-final-sparse16-r1/fsgl1",
+        VfQualifierPattern::Fsgl2A => "f2q-mix3-rotating-final-sparse16-r1/fsgl2-a",
+        VfQualifierPattern::Fsgl2B => "f2q-mix3-rotating-final-sparse16-r1/fsgl2-b",
+        VfQualifierPattern::Fsgl3A => "f2q-mix3-rotating-final-sparse16-r1/fsgl3-a",
+        VfQualifierPattern::Fsgl3B => "f2q-mix3-rotating-final-sparse16-r1/fsgl3-b",
+        VfQualifierPattern::V8HighFps => "f2q-mix3-rotating-final-sparse16-r1/v8-high-fps",
+        VfQualifierPattern::V8Texture => "f2q-mix3-rotating-final-sparse16-r1/v8-texture",
+        VfQualifierPattern::V8Transitions => {
+            "f2q-mix3-rotating-final-sparse16-r1/v8-transitions"
+        }
+        VfQualifierPattern::V8Memory => "f2q-mix3-rotating-final-sparse16-r1/v8-memory",
+        VfQualifierPattern::Endurance => "f2q-mix3-rotating-final-sparse16-r1/endurance",
+        VfQualifierPattern::TransitionShock => {
+            "f2q-mix3-rotating-final-sparse16-r1/transition-shock"
+        }
+    }
+}
+
+/// Stable description of the framebuffer integrity mechanism persisted with F2 evidence.
+pub fn vf_qualifier_checksum_method() -> &'static str {
+    "reduce3-gpu-compare-r1;dense-default;sparse16=boost-edge,mixed-game;mixed-game=rotating-final"
+}
+
 fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u32> {
     match workload {
         // BoostEntry / CompositeGameLoad slam the same 8-instance heavy frame → same golden image
@@ -295,6 +361,21 @@ fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u
         VfWorkload::TextureStream => Some(goldens.stream),
         // VramPressure is compute-path: its gather sum is a known answer, self-verified.
         VfWorkload::ComputeBurst | VfWorkload::MixedGame | VfWorkload::VramPressure => None,
+    }
+}
+
+fn integrity_goldens_for_workload(
+    goldens: RenderGoldens,
+    workload: VfWorkload,
+) -> Option<RenderIntegrityGoldens> {
+    if workload == VfWorkload::MixedGame {
+        Some(RenderIntegrityGoldens::Mixed([
+            goldens.boost,
+            goldens.texrop,
+            goldens.power,
+        ]))
+    } else {
+        golden_for_workload(goldens, workload).map(RenderIntegrityGoldens::Single)
     }
 }
 
@@ -468,18 +549,16 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
     // Severity ladder: graceful silent-error detectors (L2 TextureRop, cadence) run FIRST; the
     // hang-prone memory detectors (VramPressure, TextureStream) run LAST — a bad bin usually
     // dies cheaply by wrong-pixel checksum long before anything TDR-prone executes.
-    // v18: LOBBY-FIRST. The 2026-07-13 game trace proved the real killer is SUSTAINED residency at
-    // the anchor bin under the light-frame/high-FPS regime (1845@862 TDR'd in the OW lobby at 65 °C,
-    // 144 W — cool and BELOW our synthetic power), NOT texture-rop. The old plan ran texture-rop
-    // FIRST and only ~6% BoostEdge, so a failing bin died on texture-rop before the lobby block ever
-    // ran, and the lobby-unstable-but-texrop-stable points (the field failures) slipped through. Now
-    // the qualifier LEADS with one long isolated BoostEdge block (real drain-per-frame cadence +
-    // degradation gate) so the descent's own 60 s dwell reproduces the lobby regime and fails those
-    // points cheaply — then keeps the texture-rop + hang-prone TextureStream coverage after it.
+    // v18 introduced LOBBY-FIRST after the initial 2026-07-13 trace interpretation. Later comparison
+    // showed that essentially the same external residence/power envelope survived in the lobby and
+    // failed only in a match, so the trace did not isolate residence as the cause. Keep this long
+    // BoostEdge block as high-FPS/cadence coverage, then exercise TextureRop, mixed and memory paths;
+    // qualification v16 fingerprints the complete composition instead of claiming one causal model.
     const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 12] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 3),
-        // Sustained isolated lobby block FIRST (~44% of the dwell): the field-proven anchor-bin
-        // residency regime. Golden-checked + frame-time degradation gate (pre-TDR precursor).
+        // Sustained isolated lobby-like block FIRST (~44% of the dwell): exercises anchor-bin
+        // residency with a golden + frame-time degradation gate. This is coverage for one plausible
+        // failure class, not proof that the field TDR was caused by residency alone.
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 42),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
         (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 5),
@@ -572,7 +651,7 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         // v16.1 composite: heavy render + near-full VRAM-resident gather SIMULTANEOUSLY (real game
         // load: compute + texture + memory controller on the shared rail at once). Golden-checked.
         (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 14),
-        // v16.2 LOBBY REGIME (field-proven killer): sustained BoostEdge — hundreds of LIGHT frames
+        // v16.2 LOBBY-LIKE REGIME: sustained BoostEdge — hundreds of LIGHT frames
         // per second riding the TOP of the boost curve, i.e. continuous residency AT the anchor bin
         // + kHz-scale VRM ripple. This is the OW-lobby/high-FPS regime that killed 1815@843/862 and
         // 1890@900/918 in real use while every heavy pattern passed: heavy loads sit power-bound
@@ -1225,11 +1304,20 @@ fn affine_pow_mod(n: u64, mask: u32) -> (u32, u32) {
     result
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuAdapterIdentity {
+    pub name: String,
+    pub backend: String,
+    pub driver: String,
+    pub driver_info: String,
+}
+
 /// A live GPU device for running the battery (set up once, reused per stage).
 pub struct GpuCtx {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub adapter_name: String,
+    adapter_identity: GpuAdapterIdentity,
     /// Largest single storage buffer we may allocate (bytes).
     pub max_buffer_bytes: u64,
     crashed: Arc<AtomicBool>,
@@ -1247,7 +1335,14 @@ impl GpuCtx {
             force_fallback_adapter: false,
         }))
         .ok_or_else(|| "no suitable GPU adapter found".to_string())?;
-        let adapter_name = adapter.get_info().name;
+        let adapter_info = adapter.get_info();
+        let adapter_name = adapter_info.name.clone();
+        let adapter_identity = GpuAdapterIdentity {
+            name: adapter_name.clone(),
+            backend: format!("{:?}", adapter_info.backend).to_ascii_lowercase(),
+            driver: adapter_info.driver,
+            driver_info: adapter_info.driver_info,
+        };
         // Request the adapter's full limits so we can allocate large
         // VRAM-resident buffers (cache-busting + VRAM coverage).
         let limits = adapter.limits();
@@ -1270,7 +1365,18 @@ impl GpuCtx {
                 crashed.store(true, Ordering::SeqCst);
             }));
         }
-        Ok(Self { device, queue, adapter_name, max_buffer_bytes, crashed })
+        Ok(Self {
+            device,
+            queue,
+            adapter_name,
+            adapter_identity,
+            max_buffer_bytes,
+            crashed,
+        })
+    }
+
+    pub fn adapter_identity(&self) -> GpuAdapterIdentity {
+        self.adapter_identity.clone()
     }
 
     fn verdict(&self, mismatches: u32, mapped_ok: bool) -> StabilityResult {
@@ -2529,96 +2635,80 @@ impl GpuCtx {
                 break;
             }
             phase_state.store(segment.phase.code(), Ordering::SeqCst);
-            let single = [segment.workload];
-            let mixed = [
-                VfWorkload::BoostEdge,
-                VfWorkload::TextureRop,
-                VfWorkload::PowerRender,
-            ];
-            let workloads: &[VfWorkload] =
-                if segment.workload == VfWorkload::MixedGame { &mixed } else { &single };
-            let workload_ms = segment.duration_ms / workloads.len() as u64;
-            let mut assigned = 0u64;
-
-            for (index, &workload) in workloads.iter().enumerate() {
-                let duration_ms = if index + 1 == workloads.len() {
-                    segment.duration_ms.saturating_sub(assigned)
-                } else {
-                    workload_ms
-                };
-                assigned = assigned.saturating_add(duration_ms);
-                let result = match workload {
-                    VfWorkload::ComputeBurst => {
-                        let stage = self.run_alu_with_cancel(
-                            "VF qualifier compute burst",
-                            262_144,
-                            256,
-                            duration_ms,
-                            cancel,
-                        );
-                        RenderResult {
-                            result: stage.result,
-                            frames: 0,
-                            fps: 0.0,
-                            failure_phase: (stage.result != StabilityResult::Stable)
-                                .then_some(segment.phase),
-                            phase_reports: vec![VfPhaseReport {
-                                phase: segment.phase,
-                                result: stage.result,
-                                frames: 0,
-                                checksum_count: 1,
-                                elapsed_ms: stage.elapsed_ms,
-                            }],
-                        }
-                    }
-                    VfWorkload::VramPressure => {
-                        let stage = self.run_vram_pressure_with_cancel(duration_ms, cancel);
-                        RenderResult {
-                            result: stage.result,
-                            frames: 0,
-                            fps: 0.0,
-                            failure_phase: (stage.result != StabilityResult::Stable)
-                                .then_some(segment.phase),
-                            phase_reports: vec![VfPhaseReport {
-                                phase: segment.phase,
-                                result: stage.result,
-                                frames: 0,
-                                checksum_count: 1,
-                                elapsed_ms: stage.elapsed_ms,
-                            }],
-                        }
-                    }
-                    other => self.run_render_profile(
-                        duration_ms,
-                        other,
-                        Some(segment.phase),
-                        matches!(other, VfWorkload::IdlePulse),
-                        true,
-                        goldens.and_then(|g| golden_for_workload(g, other)),
-                        match other {
-                            VfWorkload::TextureStream => goldens
-                                .map(|g| u64::from(g.stream_frame_reference_ms) * 1000),
-                            VfWorkload::BoostEdge => {
-                                goldens.map(|g| u64::from(g.boost_frame_reference_us))
-                            }
-                            _ => None,
-                        },
+            let workload = segment.workload;
+            let result = match workload {
+                VfWorkload::ComputeBurst => {
+                    let stage = self.run_alu_with_cancel(
+                        "VF qualifier compute burst",
+                        262_144,
+                        256,
+                        segment.duration_ms,
                         cancel,
-                    ),
-                };
-                frames = frames.saturating_add(result.frames);
-                reports.extend(result.phase_reports);
-                if result.result != StabilityResult::Stable {
-                    phase_state.store(VfQualifierPhase::NONE_CODE, Ordering::SeqCst);
-                    let secs = started.elapsed().as_secs_f64().max(0.001);
-                    return RenderResult {
-                        result: result.result,
-                        frames,
-                        fps: frames as f64 / secs,
-                        failure_phase: result.failure_phase.or(Some(segment.phase)),
-                        phase_reports: reports,
-                    };
+                    );
+                    RenderResult {
+                        result: stage.result,
+                        frames: 0,
+                        fps: 0.0,
+                        failure_phase: (stage.result != StabilityResult::Stable)
+                            .then_some(segment.phase),
+                        phase_reports: vec![VfPhaseReport {
+                            phase: segment.phase,
+                            result: stage.result,
+                            frames: 0,
+                            checksum_count: 1,
+                            elapsed_ms: stage.elapsed_ms,
+                        }],
+                    }
                 }
+                VfWorkload::VramPressure => {
+                    let stage =
+                        self.run_vram_pressure_with_cancel(segment.duration_ms, cancel);
+                    RenderResult {
+                        result: stage.result,
+                        frames: 0,
+                        fps: 0.0,
+                        failure_phase: (stage.result != StabilityResult::Stable)
+                            .then_some(segment.phase),
+                        phase_reports: vec![VfPhaseReport {
+                            phase: segment.phase,
+                            result: stage.result,
+                            frames: 0,
+                            checksum_count: 1,
+                            elapsed_ms: stage.elapsed_ms,
+                        }],
+                    }
+                }
+                other => self.run_render_profile(
+                    segment.duration_ms,
+                    other,
+                    Some(segment.phase),
+                    matches!(other, VfWorkload::IdlePulse),
+                    true,
+                    goldens.and_then(|g| integrity_goldens_for_workload(g, other)),
+                    match other {
+                        VfWorkload::TextureStream => {
+                            goldens.map(|g| u64::from(g.stream_frame_reference_ms) * 1000)
+                        }
+                        VfWorkload::BoostEdge => {
+                            goldens.map(|g| u64::from(g.boost_frame_reference_us))
+                        }
+                        _ => None,
+                    },
+                    cancel,
+                ),
+            };
+            frames = frames.saturating_add(result.frames);
+            reports.extend(result.phase_reports);
+            if result.result != StabilityResult::Stable {
+                phase_state.store(VfQualifierPhase::NONE_CODE, Ordering::SeqCst);
+                let secs = started.elapsed().as_secs_f64().max(0.001);
+                return RenderResult {
+                    result: result.result,
+                    frames,
+                    fps: frames as f64 / secs,
+                    failure_phase: result.failure_phase.or(Some(segment.phase)),
+                    phase_reports: reports,
+                };
             }
         }
 
@@ -2712,7 +2802,7 @@ impl GpuCtx {
         phase: Option<VfQualifierPhase>,
         idle_pulses: bool,
         full_workload_duration: bool,
-        golden: Option<u32>,
+        goldens: Option<RenderIntegrityGoldens>,
         frame_reference_us: Option<u64>,
         cancel: Option<&AtomicBool>,
     ) -> RenderResult {
@@ -2784,7 +2874,8 @@ impl GpuCtx {
             | VfWorkload::HeavySpike
             | VfWorkload::IdlePulse
             | VfWorkload::BoostEntry
-            | VfWorkload::CompositeGameLoad => {
+            | VfWorkload::CompositeGameLoad
+            | VfWorkload::MixedGame => {
                 (RENDER_SHADER, 8, wgpu::BlendState::REPLACE)
             }
             VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
@@ -2796,7 +2887,7 @@ impl GpuCtx {
                 (GEOMETRY_DEPTH_SHADER, GEOMETRY_DEPTH_INSTANCES, wgpu::BlendState::REPLACE)
             }
             VfWorkload::TextureStream => (TEXTURE_STREAM_SHADER, 2, wgpu::BlendState::REPLACE),
-            VfWorkload::ComputeBurst | VfWorkload::MixedGame | VfWorkload::VramPressure => {
+            VfWorkload::ComputeBurst | VfWorkload::VramPressure => {
                 unreachable!("non-render workload")
             }
         };
@@ -2853,15 +2944,96 @@ impl GpuCtx {
             ],
         });
 
+        // MixedGame is one continuous frame loop. Each frame records BoostEdge, TextureRop and
+        // PowerRender passes into this function's single command encoder, then submits once. The
+        // final pass rotates so the sparse integrity sample eventually validates every component.
+        let mixed_game = profile == VfWorkload::MixedGame;
+        let mixed_resources = mixed_game.then(|| {
+            let create_resources =
+                |label: &'static str, shader_source: &'static str, blend: wgpu::BlendState| {
+                    let shader =
+                        self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some(label),
+                            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+                        });
+                    let pipeline =
+                        self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                            label: Some(label),
+                            layout: None,
+                            vertex: wgpu::VertexState {
+                                module: &shader,
+                                entry_point: "vs",
+                                buffers: &[],
+                                compilation_options: Default::default(),
+                            },
+                            primitive: wgpu::PrimitiveState::default(),
+                            depth_stencil: None,
+                            multisample: wgpu::MultisampleState::default(),
+                            fragment: Some(wgpu::FragmentState {
+                                module: &shader,
+                                entry_point: "fs",
+                                targets: &[Some(wgpu::ColorTargetState {
+                                    format: wgpu::TextureFormat::Rgba8Unorm,
+                                    blend: Some(blend),
+                                    write_mask: wgpu::ColorWrites::ALL,
+                                })],
+                                compilation_options: Default::default(),
+                            }),
+                            multiview: None,
+                        });
+                    let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout: &pipeline.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&src_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&sampler),
+                            },
+                        ],
+                    });
+                    (pipeline, bind)
+                };
+            let (boost_pipeline, boost_bind) = create_resources(
+                "mixed-game-boost",
+                BOOST_EDGE_SHADER,
+                wgpu::BlendState::REPLACE,
+            );
+            let (texrop_pipeline, texrop_bind) = create_resources(
+                "mixed-game-texrop",
+                TEXTURE_ROP_SHADER,
+                wgpu::BlendState::ALPHA_BLENDING,
+            );
+            (boost_pipeline, boost_bind, texrop_pipeline, texrop_bind)
+        });
+
         // Readback: copy the frame to a buffer, reduce to one checksum u32.
         let px_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("render-px"), size: (DIM as u64) * (DIM as u64) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
         });
-        let sum_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("render-sum"), size: 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
-        });
+        let checksum_slots = if mixed_game { MIXED_GAME_WORKLOADS.len() } else { 1 };
+        let sum_bufs: Vec<wgpu::Buffer> = (0..checksum_slots)
+            .map(|_| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("render-sum"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+        let golden_values: Vec<u32> = match (mixed_game, goldens) {
+            (false, Some(RenderIntegrityGoldens::Single(golden))) => vec![golden],
+            (true, Some(RenderIntegrityGoldens::Mixed(goldens))) => goldens.to_vec(),
+            _ => Vec::new(),
+        };
+        let golden_mode = golden_values.len() == checksum_slots;
         let n = DIM * DIM;
         let red_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("render-rp"), contents: bytemuck::bytes_of(&Quad { a: n, b: 0, c: 0, d: 0 }), usage: wgpu::BufferUsages::UNIFORM,
@@ -2869,21 +3041,36 @@ impl GpuCtx {
         let red_mod = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("reduce"),
             source: wgpu::ShaderSource::Wgsl(
-                if golden.is_some() { REDUCE3_SHADER } else { REDUCE_SHADER }.into(),
+                if golden_mode { REDUCE3_SHADER } else { REDUCE_SHADER }.into(),
             ),
         });
         let red_pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("reduce"), layout: None, module: &red_mod, entry_point: "main", compilation_options: Default::default(),
         });
-        let red_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("reduce"), layout: &red_pipe.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: px_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: sum_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: red_params.as_entire_binding() },
-            ],
-        });
-        let golden_mismatch_buf = golden.map(|_| {
+        let red_binds: Vec<wgpu::BindGroup> = sum_bufs
+            .iter()
+            .map(|sum_buf| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("reduce"),
+                    layout: &red_pipe.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: px_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: sum_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: red_params.as_entire_binding(),
+                        },
+                    ],
+                })
+            })
+            .collect();
+        let golden_mismatch_buf = golden_mode.then(|| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("render-golden-mismatch"),
                 size: 4,
@@ -2893,14 +3080,17 @@ impl GpuCtx {
                 mapped_at_creation: false,
             })
         });
-        let compare_params = golden.map(|g| {
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("render-golden-params"),
-                contents: bytemuck::bytes_of(&Quad { a: g, b: 0, c: 0, d: 0 }),
-                usage: wgpu::BufferUsages::UNIFORM,
+        let compare_params: Vec<wgpu::Buffer> = golden_values
+            .iter()
+            .map(|&golden| {
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("render-golden-params"),
+                    contents: bytemuck::bytes_of(&Quad { a: golden, b: 0, c: 0, d: 0 }),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
             })
-        });
-        let compare_mod = golden.map(|_| {
+            .collect();
+        let compare_mod = golden_mode.then(|| {
             self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("checksum-compare"),
                 source: wgpu::ShaderSource::Wgsl(CHECKSUM_COMPARE_SHADER.into()),
@@ -2915,29 +3105,44 @@ impl GpuCtx {
                 compilation_options: Default::default(),
             })
         });
-        let compare_bind = match (&compare_pipe, &golden_mismatch_buf, &compare_params) {
-            (Some(pipe), Some(mismatch), Some(params)) => Some(
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("checksum-compare"),
-                    layout: &pipe.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: sum_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: mismatch.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
-                    ],
-                }),
-            ),
-            _ => None,
+        let compare_binds: Vec<wgpu::BindGroup> = match (&compare_pipe, &golden_mismatch_buf) {
+            (Some(pipe), Some(mismatch)) => sum_bufs
+                .iter()
+                .zip(compare_params.iter())
+                .map(|(sum_buf, params)| {
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("checksum-compare"),
+                        layout: &pipe.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: sum_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: mismatch.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: params.as_entire_binding(),
+                            },
+                        ],
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
         };
 
-        let mut reference = None;
+        let mut references = vec![None; checksum_slots];
+        let mut sample_sequences = vec![0u64; checksum_slots];
+        let mut observed_sequences = vec![0u64; checksum_slots];
         let mut diverged = false;
         let mut checksum_count = 0u32;
         let mut last_check = std::time::Instant::now();
         let workload_start =
             if full_workload_duration { std::time::Instant::now() } else { start };
         let mut last_idle = workload_start;
-        let golden_mode = golden.is_some();
+        let sparse_checksum = sparse_checksum_workload(profile);
         // FrameCadence paces itself per frame (sync + gap after every submit below), so the
         // coarser droop-burst / idle-pulse pacing must not also fire.
         let frame_cadence = profile == VfWorkload::FrameCadence;
@@ -3037,7 +3242,11 @@ impl GpuCtx {
         {
             if frame_cadence {
                 // paced after submit
-            } else if golden_mode && frames > 0 && frames.is_multiple_of(DROOP_BURST) {
+            } else if golden_mode
+                && !sparse_checksum
+                && frames > 0
+                && frames.is_multiple_of(DROOP_BURST)
+            {
                 self.device.poll(wgpu::Maintain::Wait);
                 std::thread::sleep(std::time::Duration::from_millis(DROOP_GAP_MS));
             } else if !golden_mode && idle_pulses && last_idle.elapsed().as_millis() >= 750 {
@@ -3097,7 +3306,35 @@ impl GpuCtx {
                 }
             }
             let mut enc = self.device.create_command_encoder(&Default::default());
-            if !stream_banded {
+            let mixed_order = mixed_game.then(|| mixed_game_draw_order(frames));
+            if let (Some((boost_pipe, boost_bind, texrop_pipe, texrop_bind)), Some(order)) =
+                (&mixed_resources, mixed_order)
+            {
+                for workload_index in order {
+                    let (draw_pipeline, draw_bind, draw_instances) = match workload_index {
+                        0 => (boost_pipe, boost_bind, 1),
+                        1 => (texrop_pipe, texrop_bind, 4),
+                        _ => (&pipeline, &tex_bind, 8),
+                    };
+                    let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("mixed-game"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    rp.set_pipeline(draw_pipeline);
+                    rp.set_bind_group(0, draw_bind, &[]);
+                    rp.draw(0..3, 0..draw_instances);
+                }
+            } else if !stream_banded {
                 let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("render"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3120,26 +3357,32 @@ impl GpuCtx {
                 rp.set_bind_group(0, &tex_bind, &[]);
                 rp.draw(0..vertex_count, 0..instances);
             }
-            if golden_mode {
+            let checksum_slot = mixed_order.map(|order| order[2]).unwrap_or(0);
+            let checksum_due = !sparse_checksum || sparse_checksum_due(frames);
+            if (golden_mode || sparse_checksum) && checksum_due {
                 enc.copy_texture_to_buffer(
                     wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                     wgpu::ImageCopyBuffer { buffer: &px_buf, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(DIM * 4), rows_per_image: Some(DIM) } },
                     wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
                 );
-                enc.clear_buffer(&sum_buf, 0, None);
+                enc.clear_buffer(&sum_bufs[checksum_slot], 0, None);
                 {
                     let mut cp = enc.begin_compute_pass(&Default::default());
                     cp.set_pipeline(&red_pipe);
-                    cp.set_bind_group(0, &red_bind, &[]);
+                    cp.set_bind_group(0, &red_binds[checksum_slot], &[]);
                     cp.dispatch_workgroups(256, 1, 1);
                 }
-                if let (Some(pipe), Some(bind)) = (&compare_pipe, &compare_bind) {
+                if let (Some(pipe), Some(bind)) =
+                    (&compare_pipe, compare_binds.get(checksum_slot))
+                {
                     let mut cp = enc.begin_compute_pass(&Default::default());
                     cp.set_pipeline(pipe);
                     cp.set_bind_group(0, bind, &[]);
                     cp.dispatch_workgroups(1, 1, 1);
                 }
                 checksum_count = checksum_count.saturating_add(1);
+                sample_sequences[checksum_slot] =
+                    sample_sequences[checksum_slot].saturating_add(1);
             }
             // v16.1: the VRAM-resident gather rides in the SAME submit as the render frame — the
             // heavy texture render and the DRAM/memory-controller pressure hit the shared core rail
@@ -3194,8 +3437,9 @@ impl GpuCtx {
                 // v16.3 lobby cadence: drain THIS light frame fully (a CPU/engine-bound game loop
                 // finishes and waits), TIME it for the degradation gate, then spin a sub-ms
                 // CPU-frame-build bubble so the next submit re-ramps the boost VF from idle. Each
-                // frame is a discrete drain→idle→ramp current edge AT the anchor bin — the field
-                // high-FPS killer a saturated submission queue cannot reproduce. Spin, not sleep:
+                // frame is a discrete drain→idle→ramp current edge at the anchor bin — a useful
+                // high-FPS stress class that a saturated submission queue cannot reproduce. Spin,
+                // not sleep:
                 // Windows thread sleep is ms-coarse and would swamp the sub-ms cadence.
                 self.device.poll(wgpu::Maintain::Wait);
                 boost_frame_us_total =
@@ -3231,6 +3475,18 @@ impl GpuCtx {
                         break;
                     }
                 }
+            } else if sparse_checksum && last_check.elapsed().as_millis() >= 250 {
+                last_check = std::time::Instant::now();
+                self.device.poll(wgpu::Maintain::Wait);
+                diverged = self.sparse_checksums_diverged(
+                    &sum_bufs,
+                    &mut references,
+                    &sample_sequences,
+                    &mut observed_sequences,
+                );
+                if diverged {
+                    break;
+                }
             } else if last_check.elapsed().as_millis() >= 250 {
                 last_check = std::time::Instant::now();
                 let mut enc = self.device.create_command_encoder(&Default::default());
@@ -3239,39 +3495,50 @@ impl GpuCtx {
                     wgpu::ImageCopyBuffer { buffer: &px_buf, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(DIM * 4), rows_per_image: Some(DIM) } },
                     wgpu::Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
                 );
-                enc.clear_buffer(&sum_buf, 0, None);
+                enc.clear_buffer(&sum_bufs[0], 0, None);
                 {
                     let mut cp = enc.begin_compute_pass(&Default::default());
-                    cp.set_pipeline(&red_pipe); cp.set_bind_group(0, &red_bind, &[]);
+                    cp.set_pipeline(&red_pipe); cp.set_bind_group(0, &red_binds[0], &[]);
                     cp.dispatch_workgroups(256, 1, 1);
                 }
                 self.queue.submit(Some(enc.finish()));
                 self.device.poll(wgpu::Maintain::Wait);
-                let sum = self.read_u32(&sum_buf);
+                let sum = self.read_u32(&sum_bufs[0]);
                 checksum_count = checksum_count.saturating_add(1);
-                match reference {
-                    None => reference = Some(sum),
-                    Some(r) => {
-                        if sum != r {
+                match references[0] {
+                    None => references[0] = Some(sum),
+                    Some(reference) => {
+                        if sum != reference {
                             diverged = true;
                             break;
                         }
                     }
                 }
             }
-            self.device.poll(wgpu::Maintain::Wait);
+            if !sparse_checksum {
+                self.device.poll(wgpu::Maintain::Wait);
+            }
         }
-        if golden_mode
-            && !diverged
+        if !diverged
             && !self.crashed.load(Ordering::SeqCst)
             && !cancel.is_some_and(|token| token.load(Ordering::SeqCst))
         {
-            self.device.poll(wgpu::Maintain::Wait);
-            if golden_mismatch_buf
-                .as_ref()
-                .is_some_and(|buf| self.read_u32(buf) > 0)
-            {
-                diverged = true;
+            if golden_mode {
+                self.device.poll(wgpu::Maintain::Wait);
+                if golden_mismatch_buf
+                    .as_ref()
+                    .is_some_and(|buf| self.read_u32(buf) > 0)
+                {
+                    diverged = true;
+                }
+            } else if sparse_checksum {
+                self.device.poll(wgpu::Maintain::Wait);
+                diverged = self.sparse_checksums_diverged(
+                    &sum_bufs,
+                    &mut references,
+                    &sample_sequences,
+                    &mut observed_sequences,
+                );
             }
         }
 
@@ -3423,6 +3690,28 @@ impl GpuCtx {
     }
 
     /// Read a single u32 from a COPY_SRC buffer.
+    fn sparse_checksums_diverged(
+        &self,
+        sum_bufs: &[wgpu::Buffer],
+        references: &mut [Option<u32>],
+        sample_sequences: &[u64],
+        observed_sequences: &mut [u64],
+    ) -> bool {
+        for checksum_slot in 0..sum_bufs.len() {
+            if observed_sequences[checksum_slot] == sample_sequences[checksum_slot] {
+                continue;
+            }
+            let sum = self.read_u32(&sum_bufs[checksum_slot]);
+            observed_sequences[checksum_slot] = sample_sequences[checksum_slot];
+            match references[checksum_slot] {
+                None => references[checksum_slot] = Some(sum),
+                Some(reference) if reference != sum => return true,
+                Some(_) => {}
+            }
+        }
+        false
+    }
+
     fn read_u32(&self, buffer: &wgpu::Buffer) -> u32 {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("u32-staging"),
@@ -3496,6 +3785,44 @@ mod tests {
         // millisecond-scale table would collapse the drain→idle→ramp edge it exists to create.
         assert!(BOOST_EDGE_BUBBLE_US.iter().any(|&us| us > 0), "some frames must idle");
         assert!(BOOST_EDGE_BUBBLE_US.iter().all(|&us| us < 1000), "bubbles must stay sub-ms");
+    }
+
+    #[test]
+    fn sparse_checksum_cadence_is_explicit_and_starts_on_first_frame() {
+        assert!(sparse_checksum_workload(VfWorkload::BoostEdge));
+        assert!(sparse_checksum_workload(VfWorkload::MixedGame));
+        assert!(!sparse_checksum_workload(VfWorkload::TextureRop));
+        assert!(sparse_checksum_due(0));
+        assert!(!sparse_checksum_due(SPARSE_CHECKSUM_FRAME_INTERVAL - 1));
+        assert!(sparse_checksum_due(SPARSE_CHECKSUM_FRAME_INTERVAL));
+        assert!(vf_qualifier_checksum_method().contains("sparse16"));
+    }
+
+    #[test]
+    fn mixed_game_interleaves_every_workload_and_rotates_checked_output() {
+        for frame in 0..6 {
+            let mut order = mixed_game_draw_order(frame);
+            order.sort_unstable();
+            assert_eq!(order, [0, 1, 2], "each frame must draw all workloads");
+        }
+        let checked_outputs = [
+            0,
+            SPARSE_CHECKSUM_FRAME_INTERVAL,
+            SPARSE_CHECKSUM_FRAME_INTERVAL * 2,
+        ]
+        .map(|frame| mixed_game_draw_order(frame)[2]);
+        assert_eq!(checked_outputs, [0, 1, 2]);
+        assert_eq!(MIXED_GAME_WORKLOADS[0], VfWorkload::BoostEdge);
+        assert_eq!(MIXED_GAME_WORKLOADS[1], VfWorkload::TextureRop);
+        assert_eq!(MIXED_GAME_WORKLOADS[2], VfWorkload::PowerRender);
+    }
+
+    #[test]
+    fn workload_fingerprints_are_pattern_specific_and_capture_mix_revision() {
+        let texture = vf_qualifier_workload_fingerprint(VfQualifierPattern::V8Texture);
+        let endurance = vf_qualifier_workload_fingerprint(VfQualifierPattern::Endurance);
+        assert_ne!(texture, endurance);
+        assert!(texture.contains("mix3-rotating-final-sparse16-r1"));
     }
 
     #[test]
@@ -3707,7 +4034,7 @@ mod tests {
             // v16.1 composite: heavy render + near-full VRAM-resident gather SIMULTANEOUSLY
             // (replaces the standalone Memory pass AND the sequential VramPressure segments).
             VfWorkload::CompositeGameLoad,
-            // v16.2 lobby regime: sustained light-frame anchor-bin residency (the field killer).
+            // v16.2 lobby-like regime: sustained light-frame anchor-bin residency coverage.
             VfWorkload::BoostEdge,
         ] {
             assert!(

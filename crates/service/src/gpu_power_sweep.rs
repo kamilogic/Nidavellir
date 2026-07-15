@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
 use nidavellir_core::f2_observation::{
-    F2Observation, F2QualificationCoverage, F2QualificationPattern, F2QualificationPhaseMetric,
-    F2QualificationStrength, F2QualificationVerdict,
+    F2EvidenceProvenance, F2Observation, F2QualificationCoverage, F2QualificationPattern,
+    F2QualificationPhaseMetric, F2QualificationStrength, F2QualificationVerdict,
 };
 use nidavellir_core::gpu_sweep::StabilityResult;
 use nidavellir_core::ipc::{DwellQuality, PowerSweepPoint, PowerSweepProgress};
@@ -54,6 +54,21 @@ const V8_GOLDEN_SAMPLE_MS: u64 = 2_000;
 /// soaks the actual deployable pair for fifteen minutes; inconclusive debt may extend it.
 #[cfg(windows)]
 const F2_APPLY_QUALIFICATION_DWELL_MS: u64 = 300_000;
+/// Stock thermal normalization runs in bounded windows. Each window exceeds the six-second
+/// telemetry ramp discard, so its retained tail can prove both temperature and sustained-clock
+/// convergence without turning preheat into an unbounded wait.
+#[cfg(windows)]
+const F2_PREHEAT_WINDOW_MS: u64 = 10_000;
+#[cfg(windows)]
+const F2_PREHEAT_MAX_WINDOWS: usize = 6;
+#[cfg(windows)]
+const F2_PREHEAT_TEMP_DELTA_C: f32 = 2.0;
+#[cfg(windows)]
+const F2_PREHEAT_CLOCK_DELTA_MHZ: u32 = 30;
+/// The retained tail must reach at least medium telemetry quality; one late sample would otherwise
+/// make start/end temperature identical and falsely look converged after a sensor stall.
+#[cfg(windows)]
+const F2_PREHEAT_MIN_SAMPLES: u32 = 30;
 
 /// Upward-recovery budget when a clock's STARTING bin fails qualification. A start-bin rejection
 /// usually means the warm-start/isotonic prediction (seeded by a neighbouring clock's boundary)
@@ -907,7 +922,7 @@ fn classify_failure(
 
 /// Precise per-dwell measurement under the max-power load. Returns the stability
 /// verdict and steady-state stats: (mean_clock, mean_power, max_power, std_power,
-/// power_capped_fraction). The first ~1.5 s of samples are discarded so only the
+/// power_capped_fraction). The first six seconds of power-characterization samples are discarded so only the
 /// thermally/clock-settled steady state is measured (precision for the knee +
 /// Brokkr's headroom calc).
 // Several stats fields are the full dwell telemetry record `load_and_measure` always captures;
@@ -951,6 +966,7 @@ struct Measured {
     render_frames: Option<u64>,
     render_fps: Option<f64>,
     qualification_coverage: Option<F2QualificationCoverage>,
+    evidence_provenance: Option<F2EvidenceProvenance>,
     prehang_stall_detected: bool,
 }
 
@@ -985,9 +1001,77 @@ impl Measured {
             render_frames: None,
             render_fps: None,
             qualification_coverage: None,
+            evidence_provenance: None,
             prehang_stall_detected: false,
         }
     }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct F2PreheatWindow {
+    stable: bool,
+    cancelled: bool,
+    thermal_throttled: bool,
+    prehang_stall_detected: bool,
+    sample_count: u32,
+    p5_clock_mhz: u32,
+    start_temp_c: Option<f32>,
+    end_temp_c: Option<f32>,
+}
+
+#[cfg(windows)]
+impl From<&Measured> for F2PreheatWindow {
+    fn from(measured: &Measured) -> Self {
+        Self {
+            stable: matches!(measured.result, StabilityResult::Stable),
+            cancelled: measured.cancelled,
+            thermal_throttled: measured.thermal_throttled,
+            prehang_stall_detected: measured.prehang_stall_detected,
+            sample_count: measured.sample_count,
+            p5_clock_mhz: measured.p5_clock_mhz,
+            start_temp_c: measured.start_temp_c,
+            end_temp_c: measured.end_temp_c,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn f2_preheat_window_usable(window: F2PreheatWindow) -> bool {
+    let (Some(start_temp_c), Some(end_temp_c)) = (window.start_temp_c, window.end_temp_c)
+    else {
+        return false;
+    };
+    window.stable
+        && !window.cancelled
+        && !window.thermal_throttled
+        && !window.prehang_stall_detected
+        && window.sample_count >= F2_PREHEAT_MIN_SAMPLES
+        && window.p5_clock_mhz > 0
+        && start_temp_c.is_finite()
+        && end_temp_c.is_finite()
+        && (end_temp_c - start_temp_c).abs() <= F2_PREHEAT_TEMP_DELTA_C
+}
+
+#[cfg(windows)]
+fn f2_preheat_pair_converged(previous: F2PreheatWindow, current: F2PreheatWindow) -> bool {
+    let (Some(previous_end_temp_c), Some(current_end_temp_c)) =
+        (previous.end_temp_c, current.end_temp_c)
+    else {
+        return false;
+    };
+    f2_preheat_window_usable(previous)
+        && f2_preheat_window_usable(current)
+        && (current_end_temp_c - previous_end_temp_c).abs() <= F2_PREHEAT_TEMP_DELTA_C
+        && current.p5_clock_mhz.abs_diff(previous.p5_clock_mhz) <= F2_PREHEAT_CLOCK_DELTA_MHZ
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct F2PreheatResult {
+    sustained_clock_mhz: u32,
+    temperature_c: f32,
+    windows: usize,
 }
 
 #[cfg(windows)]
@@ -1258,6 +1342,52 @@ fn worst_quality(a: DwellQuality, b: DwellQuality) -> DwellQuality {
 enum RenderStressPurpose {
     PowerCharacterization,
     VfQualification(VfQualifierPattern, RenderGoldens),
+}
+
+#[cfg(windows)]
+fn f2_evidence_provenance(
+    ctx: &nidavellir_gpu_stress::GpuCtx,
+    purpose: RenderStressPurpose,
+) -> F2EvidenceProvenance {
+    fn present(value: String) -> Option<String> {
+        (!value.trim().is_empty()).then_some(value)
+    }
+
+    let adapter = ctx.adapter_identity();
+    let (workload_fingerprint, checksum_method, golden_config) = match purpose {
+        RenderStressPurpose::PowerCharacterization => (
+            "power-characterization-v5/power-render".to_owned(),
+            "full-frame-rgba8-gpu-reduction-self-reference".to_owned(),
+            "source=self-reference;stock_golden=none".to_owned(),
+        ),
+        RenderStressPurpose::VfQualification(pattern, goldens) => (
+            nidavellir_gpu_stress::vf_qualifier_workload_fingerprint(pattern).to_owned(),
+            nidavellir_gpu_stress::vf_qualifier_checksum_method().to_owned(),
+            format!(
+                "source=stock;capture_ms={V8_GOLDEN_SAMPLE_MS};power={};boost={};texrop={};cadence={};geometry={};stream={};stream_frame_reference_ms={};boost_frame_reference_us={}",
+                goldens.power,
+                goldens.boost,
+                goldens.texrop,
+                goldens.cadence,
+                goldens.geometry,
+                goldens.stream,
+                goldens.stream_frame_reference_ms,
+                goldens.boost_frame_reference_us,
+            ),
+        ),
+    };
+    let revision = env!("NIDAVELLIR_BUILD_REVISION");
+    F2EvidenceProvenance {
+        build_version: Some(env!("CARGO_PKG_VERSION").into()),
+        build_revision: (revision != "unknown").then(|| revision.to_owned()),
+        workload_fingerprint: Some(workload_fingerprint),
+        render_backend: present(adapter.backend),
+        adapter_name: present(adapter.name),
+        driver_name: present(adapter.driver),
+        driver_info: present(adapter.driver_info),
+        checksum_method: Some(checksum_method),
+        golden_config: Some(golden_config),
+    }
 }
 
 #[cfg(windows)]
@@ -1647,7 +1777,7 @@ fn calibrate_f2_profile_power(
         .ok_or_else(|| {
             format!(
                 "{target_mhz} MHz @ {apply_mv} mV has no current, reset-clean, thermally valid \
-                 discovery-v4 confirmed sustained-p99 power measurement"
+                 discovery-v5 confirmed sustained-p99 power measurement"
             )
         })?;
         let mean_power = measured.watts.unwrap_or(0) as f32;
@@ -1778,6 +1908,7 @@ fn load_and_measure_for(
         Ok(c) => c,
         Err(_) => return Measured::degenerate(StabilityResult::Crash, 0),
     };
+    let evidence_provenance = Some(f2_evidence_provenance(&ctx, purpose));
     let sampler_stop = Arc::new(AtomicBool::new(false));
     // Collect raw samples in the sampler thread for precise stats (mean/max/std + the
     // richer min/p5/temperature stats). Tuple: (clock_mhz, power_w, capped, temp_c, qualifier_phase).
@@ -1924,6 +2055,7 @@ fn load_and_measure_for(
             render_frames,
             render_fps,
             qualification_coverage,
+            evidence_provenance,
             prehang_stall_detected,
             ..Measured::degenerate(res, volt_mv)
         };
@@ -1977,8 +2109,92 @@ fn load_and_measure_for(
         render_frames,
         render_fps,
         qualification_coverage,
+        evidence_provenance,
         prehang_stall_detected,
     }
+}
+
+#[cfg(windows)]
+fn run_f2_stock_preheat(
+    progress: &Arc<Mutex<PowerSweepProgress>>,
+    stop: &AtomicBool,
+    prog: &mut PowerSweepProgress,
+) -> Result<F2PreheatResult, String> {
+    let mut previous = None;
+    for index in 0..F2_PREHEAT_MAX_WINDOWS {
+        if stop.load(Ordering::SeqCst) {
+            return Err("parada solicitada durante a normalização stock".into());
+        }
+
+        let measured = load_and_measure_for(
+            F2_PREHEAT_WINDOW_MS,
+            RenderStressPurpose::PowerCharacterization,
+            None,
+            Some(stop),
+        );
+        let window = F2PreheatWindow::from(&measured);
+        let temperature = match (window.start_temp_c, window.end_temp_c) {
+            (Some(start), Some(end)) => format!("{start:.1}→{end:.1} °C"),
+            _ => "sensor indisponível".into(),
+        };
+        prog.log.push(format!(
+            "Preheat stock {}/{}: p5 {} MHz, temperatura {}, {} amostras{}{}.",
+            index + 1,
+            F2_PREHEAT_MAX_WINDOWS,
+            window.p5_clock_mhz,
+            temperature,
+            window.sample_count,
+            if window.thermal_throttled { ", thermal throttle" } else { "" },
+            if window.prehang_stall_detected { ", stall de telemetria" } else { "" },
+        ));
+        set(progress, prog.clone());
+
+        if window.cancelled {
+            return Err("parada solicitada durante a normalização stock".into());
+        }
+        if !window.stable {
+            return Err(format!(
+                "workload stock falhou no preheat {}/{} ({:?})",
+                index + 1,
+                F2_PREHEAT_MAX_WINDOWS,
+                measured.result
+            ));
+        }
+        if window.thermal_throttled {
+            return Err(format!(
+                "thermal throttling detectado em stock no preheat {}/{}; a curva não é evidência comparável",
+                index + 1,
+                F2_PREHEAT_MAX_WINDOWS
+            ));
+        }
+        if window.prehang_stall_detected {
+            return Err(format!(
+                "telemetria stock perdeu progresso no preheat {}/{}; convergência não pode ser provada",
+                index + 1,
+                F2_PREHEAT_MAX_WINDOWS
+            ));
+        }
+
+        if previous.is_some_and(|prior| f2_preheat_pair_converged(prior, window)) {
+            let temperature_c = window
+                .end_temp_c
+                .ok_or_else(|| "preheat convergiu sem temperatura final utilizável".to_owned())?;
+            return Ok(F2PreheatResult {
+                sustained_clock_mhz: window.p5_clock_mhz,
+                temperature_c,
+                windows: index + 1,
+            });
+        }
+        previous = Some(window);
+    }
+
+    Err(format!(
+        "stock não convergiu após {} janelas de {} s (exige duas janelas consecutivas com ΔT ≤ {:.1} °C e Δp5 ≤ {} MHz)",
+        F2_PREHEAT_MAX_WINDOWS,
+        F2_PREHEAT_WINDOW_MS / 1000,
+        F2_PREHEAT_TEMP_DELTA_C,
+        F2_PREHEAT_CLOCK_DELTA_MHZ
+    ))
 }
 
 /// Find the perf/watt knee: the point of the (power, clock) curve farthest above
@@ -4338,6 +4554,7 @@ pub(crate) struct SingleDwell {
     pub duration_ms: u64,
     pub sample_count: u32,
     pub qualification_coverage: Option<F2QualificationCoverage>,
+    pub evidence_provenance: Option<F2EvidenceProvenance>,
     pub prehang_stall_detected: bool,
 }
 
@@ -4404,6 +4621,7 @@ fn single_dwell_from_measured(m: Measured) -> SingleDwell {
         duration_ms: m.duration_ms,
         sample_count: m.sample_count,
         qualification_coverage: m.qualification_coverage,
+        evidence_provenance: m.evidence_provenance,
         prehang_stall_detected: m.prehang_stall_detected,
     }
 }
@@ -5438,16 +5656,26 @@ fn run_power_sweep(
     info!("Power sweep finished");
 }
 
-/// Every distinct frequency present in the sane static VF table, highest first. These are the GPU's
-/// real clock bins; no synthetic 30 MHz ladder and no mode-specific truncation.
+/// Every distinct thermally normalized live frequency whose physical index is present in the sane
+/// static VF table, highest first. The base table defines Ctable identity; the post-preheat status
+/// supplies the observed clock for that same physical bin. No synthetic ladder or mode truncation.
 #[cfg(windows)]
-fn f2_real_clock_targets(curve: &[(usize, u32, u32)], clock_ceiling_mhz: u32) -> Vec<u32> {
-    let mut clocks: Vec<u32> = curve
+fn f2_real_clock_targets(
+    base_curve: &[(usize, u32, u32)],
+    live_curve: &[(usize, u32, u32)],
+    clock_ceiling_mhz: u32,
+) -> Vec<u32> {
+    let mut clocks: Vec<u32> = base_curve
         .iter()
-        .filter(|&&(_, mv, mhz)| {
-            is_sane_core_point(mv, mhz) && mhz <= clock_ceiling_mhz
+        .filter(|&&(_, mv, mhz)| is_sane_core_point(mv, mhz))
+        .filter_map(|&(index, _, _)| {
+            live_curve
+                .iter()
+                .find(|&&(live_index, _, _)| live_index == index)
+                .copied()
         })
-        .map(|&(_, _, mhz)| mhz)
+        .filter(|&(_, mv, mhz)| is_sane_core_point(mv, mhz) && mhz <= clock_ceiling_mhz)
+        .map(|(_, _, mhz)| mhz)
         .collect();
     clocks.sort_unstable_by(|a, b| b.cmp(a));
     clocks.dedup();
@@ -5829,6 +6057,44 @@ fn measure_multiclock_undervolt_forge(
         warn!("f2-forge: modern VF curve API unsupported — fail closed");
         return;
     }
+
+    prog.phase = "preheat".into();
+    prog.preheat_converged = Some(false);
+    prog.log.push(format!(
+        "Normalização stock: até {} janelas de {} s; convergência exige duas janelas consecutivas sem throttle, com ΔT ≤ {:.1} °C e Δp5 ≤ {} MHz.",
+        F2_PREHEAT_MAX_WINDOWS,
+        F2_PREHEAT_WINDOW_MS / 1000,
+        F2_PREHEAT_TEMP_DELTA_C,
+        F2_PREHEAT_CLOCK_DELTA_MHZ
+    ));
+    set(progress, prog.clone());
+    let preheat = match run_f2_stock_preheat(progress, stop.as_ref(), &mut prog) {
+        Ok(preheat) => preheat,
+        Err(e) => {
+            let reset = final_reset(store, true);
+            prog.running = false;
+            prog.phase = "incomplete".into();
+            prog.note = Some(format!(
+                "Forja F2 abortada antes de Cboost — preheat stock inconclusivo: {e}. {}",
+                reset
+                    .err()
+                    .map(|reset_error| format!("Reset final também falhou: {reset_error}"))
+                    .unwrap_or_else(|| "GPU restaurada ao stock; nada aplicado.".into())
+            ));
+            set(progress, prog);
+            warn!("f2-forge: stock preheat failed closed: {e}");
+            return;
+        }
+    };
+    prog.preheat_converged = Some(true);
+    prog.preheat_temperature_c = Some(preheat.temperature_c);
+    prog.stock_clock_mhz = preheat.sustained_clock_mhz;
+    prog.log.push(format!(
+        "Stock normalizado em {} janelas: p5 sustentado {} MHz a {:.1} °C.",
+        preheat.windows, preheat.sustained_clock_mhz, preheat.temperature_c
+    ));
+    set(progress, prog.clone());
+
     let live = gpu::read_vf_curve_modern();
     let seed = match derive_core_seed(&live) {
         Ok(s) => s,
@@ -5888,7 +6154,17 @@ fn measure_multiclock_undervolt_forge(
     } else {
         None
     };
-    let targets = f2_real_clock_targets(&live, seed.stock_boost_max_mhz);
+    let clock_table_ceiling_mhz = f2_inputs
+        .sane_base_curve
+        .iter()
+        .map(|&(_, _, clock_mhz)| clock_mhz)
+        .max()
+        .unwrap_or(0);
+    let targets = f2_real_clock_targets(
+        &f2_inputs.sane_base_curve,
+        &live,
+        seed.stock_boost_max_mhz,
+    );
     if targets.is_empty() {
         let _ = final_reset(store, true);
         prog.running = false;
@@ -5901,7 +6177,21 @@ fn measure_multiclock_undervolt_forge(
         warn!("f2-forge: no candidate clocks derived — fail closed");
         return;
     }
-    prog.stock_clock_mhz = seed.stock_sustained_mhz;
+    prog.observed_boost_clock_mhz = Some(seed.stock_boost_max_mhz);
+    prog.clock_table_bin_count = Some(
+        f2_inputs
+            .sane_base_curve
+            .len()
+            .try_into()
+            .unwrap_or(u32::MAX),
+    );
+    prog.clock_table_ceiling_mhz = Some(clock_table_ceiling_mhz);
+    prog.log.push(format!(
+        "Domínio stock: Ctable {} MHz / {} bins físicos; Cboost {} MHz após preheat; Cmax ainda não provado.",
+        clock_table_ceiling_mhz,
+        f2_inputs.sane_base_curve.len(),
+        seed.stock_boost_max_mhz
+    ));
     let estimated_targets: Vec<u32> = targets
         .iter()
         .copied()
@@ -6329,7 +6619,7 @@ fn measure_multiclock_undervolt_forge(
                 .total_steps_estimate
                 .saturating_add(missing_power.len().try_into().unwrap_or(u32::MAX));
             prog.log.push(format!(
-                "Calibração p99: {} bin(s) exato(s) de Apply sem medição v4; preenchendo somente essas lacunas com PowerRender.",
+                "Calibração p99: {} bin(s) exato(s) de Apply sem medição v5; preenchendo somente essas lacunas com PowerRender.",
                 missing_power.len()
             ));
             let calibration_upper_ms =
@@ -7133,13 +7423,24 @@ mod tests {
         };
 
         let measured = F2Observation {
-            run_id: "power-v4".into(),
+            run_id: "power-v5".into(),
             timestamp: "2026-07-01T00:00:00Z".into(),
             gpu_key: Some("GPU-1".into()),
             evidence_kind: F2EvidenceKind::Discovery,
             discovery_contract_version: Some(F2_DISCOVERY_CONTRACT_VERSION),
             qualification_contract_version: None,
             qualification_coverage: None,
+            evidence_provenance: Some(F2EvidenceProvenance {
+                build_version: Some("0.1.0".into()),
+                build_revision: Some("test-revision".into()),
+                workload_fingerprint: Some("power-characterization-v5".into()),
+                render_backend: Some("dx12".into()),
+                adapter_name: Some("test-adapter".into()),
+                driver_name: Some("test-driver".into()),
+                driver_info: Some("test-driver-info".into()),
+                checksum_method: Some("test-checksum".into()),
+                golden_config: Some("test-golden".into()),
+            }),
             mode: F2ObsMode::LadderSweep,
             target_mhz: 1920,
             requested_start_mv: None,
@@ -7301,7 +7602,7 @@ mod tests {
         let mut missing_p99 = measured;
         missing_p99.power_p99_w = None;
         let err = calibrate_f2_profile_power(&mut points, &[missing_p99], "GPU-1").unwrap_err();
-        assert!(err.contains("discovery-v4 confirmed sustained-p99"));
+        assert!(err.contains("discovery-v5 confirmed sustained-p99"));
     }
 
     #[cfg(windows)]
@@ -7673,16 +7974,26 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn f2_uses_every_real_clock_bin_and_stops_below_90_percent_of_cmax() {
-        let curve = vec![
+        let base_curve = vec![
+            (0, 900, 1875),
+            (1, 925, 1890),
+            (2, 950, 1905),
+            (3, 975, 1920),
+            (4, 1000, 1935),
+            (5, 1025, 1950),
+            (6, 1050, 1965), // static bin missing from live status: ignored fail-closed
+        ];
+        let live_curve = vec![
             (0, 900, 1905),
             (1, 925, 1950),
             (2, 950, 1935),
             (3, 975, 1905),
             (4, 1000, 1890),
             (5, 1025, 1845),
+            (99, 1050, 1965), // live-only index is not part of Ctable
         ];
         assert_eq!(
-            f2_real_clock_targets(&curve, 1950),
+            f2_real_clock_targets(&base_curve, &live_curve, 1950),
             vec![1950, 1935, 1905, 1890, 1845]
         );
         let stock_curve: Vec<(usize, u32, u32)> = (0..8)
@@ -7691,6 +8002,48 @@ mod tests {
         assert_eq!(f2_stock_clock_ceiling(&stock_curve).unwrap(), 1950);
         assert!(f2_clock_within_cmax_floor(1755, 1950));
         assert!(!f2_clock_within_cmax_floor(1740, 1950));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f2_preheat_requires_two_clean_temperature_and_clock_converged_windows() {
+        let clean = |start_temp_c, end_temp_c, p5_clock_mhz| F2PreheatWindow {
+            stable: true,
+            cancelled: false,
+            thermal_throttled: false,
+            prehang_stall_detected: false,
+            sample_count: 120,
+            p5_clock_mhz,
+            start_temp_c: Some(start_temp_c),
+            end_temp_c: Some(end_temp_c),
+        };
+        let previous = clean(63.5, 65.0, 1815);
+        let current = clean(65.0, 66.0, 1800);
+        assert!(f2_preheat_pair_converged(previous, current));
+
+        assert!(!f2_preheat_pair_converged(
+            previous,
+            clean(65.0, 67.1, 1800)
+        ));
+        assert!(!f2_preheat_pair_converged(
+            previous,
+            clean(65.0, 66.0, 1784)
+        ));
+        assert!(!f2_preheat_pair_converged(
+            previous,
+            F2PreheatWindow { thermal_throttled: true, ..current }
+        ));
+        assert!(!f2_preheat_pair_converged(
+            previous,
+            F2PreheatWindow { end_temp_c: None, ..current }
+        ));
+        assert!(!f2_preheat_pair_converged(
+            previous,
+            F2PreheatWindow {
+                sample_count: F2_PREHEAT_MIN_SAMPLES - 1,
+                ..current
+            }
+        ));
     }
 
     #[cfg(windows)]
@@ -8343,6 +8696,7 @@ mod tests {
             render_frames: Some(900),
             render_fps: Some(60.0),
             qualification_coverage: None,
+            evidence_provenance: None,
             prehang_stall_detected: false,
         }
     }
@@ -10407,6 +10761,11 @@ mod tests {
         prog.running = true; // a running snapshot must restore as NOT running
         prog.learned_points = 7;
         prog.stock_clock_mhz = 1786;
+        prog.observed_boost_clock_mhz = Some(1950);
+        prog.clock_table_bin_count = Some(67);
+        prog.clock_table_ceiling_mhz = Some(1950);
+        prog.preheat_converged = Some(true);
+        prog.preheat_temperature_c = Some(66.0);
         prog.points = vec![fp(1830, 200.0), fp(1815, 181.0)];
         prog.godforge = Some(fp(1830, 200.0));
         prog.brokkrs = Some(fp(1815, 181.0));
@@ -10422,6 +10781,11 @@ mod tests {
                 assert_eq!(p.godforge.unwrap().clock_mhz, 1830);
                 assert_eq!(p.brokkrs.unwrap().clock_mhz, 1815);
                 assert_eq!(p.stock_clock_mhz, 1786);
+                assert_eq!(p.observed_boost_clock_mhz, Some(1950));
+                assert_eq!(p.clock_table_bin_count, Some(67));
+                assert_eq!(p.clock_table_ceiling_mhz, Some(1950));
+                assert_eq!(p.preheat_converged, Some(true));
+                assert_eq!(p.preheat_temperature_c, Some(66.0));
             }
             other => panic!("expected Loaded, got {other:?}"),
         }
@@ -10469,6 +10833,11 @@ mod tests {
             "cmax_clock_mhz",
             "frontier_floor_clock_mhz",
             "frontier_clock_count",
+            "observed_boost_clock_mhz",
+            "clock_table_bin_count",
+            "clock_table_ceiling_mhz",
+            "preheat_converged",
+            "preheat_temperature_c",
             "learned_points",
             "last_outcome",
             "learning_saved",
@@ -10484,6 +10853,11 @@ mod tests {
         assert_eq!(restored.cmax_clock_mhz, None);
         assert_eq!(restored.frontier_floor_clock_mhz, None);
         assert_eq!(restored.frontier_clock_count, None);
+        assert_eq!(restored.observed_boost_clock_mhz, None);
+        assert_eq!(restored.clock_table_bin_count, None);
+        assert_eq!(restored.clock_table_ceiling_mhz, None);
+        assert_eq!(restored.preheat_converged, None);
+        assert_eq!(restored.preheat_temperature_c, None);
         assert!(!restored.learning_saved);
         assert!(!restored.frontier_complete);
         assert!(!restored.profiles_qualified);

@@ -6,15 +6,16 @@ the methodology, the problems we hit, and how we solved them.
 
 > Status: **real hardware** (NVIDIA / NVAPI). No simulation. Verified on an
 > RTX 3060 Ti + i7-13700K dev rig. Deployability is decided automatically by the
-> conservative qualification contract; normal users are not required to supply
-> manual voltage knowledge or validate profiles in games.
+> conservative qualification contract, but no finite synthetic suite proves every game/driver
+> path. Runtime field failures remain first-class Safe Loop evidence and can tighten the next Forge;
+> manual voltage knowledge is never encoded as source policy.
 
 ## Components
 
 | Crate / module | Role |
 |---|---|
 | `crates/gpu-nvapi` | NVAPI bindings (via the `nvapi` crate). Read V/F curve; write core clock offset, core voltage lock, memory clock offset; `reset_all`. |
-| `crates/gpu-stress` | Real GPU compute battery via **wgpu/Vulkan**: ALU known-answer, memory-bound (large VRAM table), VRAM integrity, pointer-chase, bandwidth, **combined core+mem**. |
+| `crates/gpu-stress` | Real GPU compute/render battery via **wgpu** (actual selected backend/adapter/driver recorded per F2 dwell): known-answer ALU, render/ROP/texture, memory-bound VRAM, pointer-chase, bandwidth and combined core+mem. |
 | `crates/service/gpu_real.rs` | `Validate stability` battery (VRAM + ALU + memory + mixed). |
 | `crates/service/gpu_sweep_real.rs` | Core undervolt/OC sweep (lock voltage, raise clock, combined load, Phase-E soak). |
 | `crates/service/gpu_mem_sweep.rs` | Memory sweep — finds the GDDR6 **effective-bandwidth peak** with consistency + combined soak. |
@@ -51,90 +52,86 @@ is load-only.
 
 ### Live F2 render workload split
 
-The live F2 Forge deliberately asks two different questions with two different render dwells:
+The live F2 Forge asks two separate questions: homogeneous `PowerRender` characterizes power and
+the voltage boundary; the failure-seeking qualifier tries to reject a point before it can become a
+deployable profile. The current contracts are discovery v5 and qualification **v16**.
 
-- **Discovery / Fast:** the steady eight-instance textured `PowerRender` determines Cmax,
-  near-power-limit behavior, sustained p5 and the voltage boundary. Its homogeneous load keeps
-  clock/power measurements comparable across physical VF bins. Discovery v4 keeps mean power,
-  sustained p99 and the highest post-ramp sample separate and records maximum temperature, measured
-  voltage, render coverage and NVML thermal slowdown. P99 uses nearest-rank over every retained
-  post-ramp sample; fewer than 100 samples fall back to raw max. An anomalous adjacent-bin p99 in the
-  same p5 regime repeats the exact bin up to three total attempts; two must agree and calibration
-  uses the highest measured p99. A bin without consensus is ineligible.
-   If cross-clock warm-start pruning skipped the later +12 mV Apply bin for that exact target, Forge
-   performs a discovery-only PowerRender backfill at that bin after the frontier completes.
-- **Standard / Long qualification:** contract v7 runs three interleaved per-bin patterns:
-  **High-FPS**, **Texture** and **Transitions**. Before
-  descent, stock captures deterministic power, boost and texture/ROP checksums with one fresh
-  `GpuCtx` per render configuration. The patterns respectively bias rapid boost/submission cadence,
-  texture/ROP/mixed graphics pressure, and repeated idle→burst→heavy transitions. They cross the
-  same eight telemetry phases and verify every rendered frame on-GPU against the matching stock golden.
-  Six-frame bursts separated by 4 ms deliberately probe the first frame after a current step.
-  FSGL1/FSGL2/FSGL3 remain readable as legacy evidence but cannot unlock v7 Apply.
+**Deterministic stock normalization and clock domain.** Before any candidate write, Forge resets to
+stock and runs up to six 10 s preheat windows. It requires two consecutive usable windows with no
+thermal throttle or telemetry failure, an end-temperature difference no greater than 2 °C, and a p5
+difference no greater than 30 MHz. Failure to converge aborts before tuning. Forge then reports three
+different facts instead of treating every upper clock as “Cmax”:
 
-**Interleaved per-bin descent (Standard / Long).** Discovery does not run `PowerRender` all the way to
-the deepest survivable bin and only then qualify it — `PowerRender` tolerates more than the
-failure-seeking qualifier (and than real games), so the deepest PowerRender point is often too aggressive
-and qualifying it there risks a TDR. Instead, the descent stops at the FIRST sustained (under-cap)
-point, qualifies it with all three v7 patterns, and only then steps one real VF bin lower:
-`PowerRender` there measures that bin's power and gates whether to attempt v7 at all. Each deeper
-bin is v7-qualified before going lower; the first v7 failure stops the descent and leaves the
-last v7-qualified bin as the accepted boundary. (Fast keeps descending to the PowerRender floor —
-it is provisional and never qualifies.) Negative observations make the learned frontier automatically
-select the deepest bin that still has current three-pattern evidence.
+- **Ctable** — the maximum clock and bin count in the sane static physical V/F table.
+- **Cboost** — the maximum live boost observed after stock preheat.
+- **Cmax** — the first reset-clean sustainable clock actually proved by discovery.
 
-A discovery `ClockDrop` remains power-bound when p99 is at least 99% of the numeric board cap. It is
-then labeled `PowerBoundClockDrop` and voltage descent continues even if that clock sustained at a
-shallower bin. Once p99 leaves the cap, the normal clock-drop boundary applies.
+Only live bins that also have a sane static-table identity and do not exceed Cboost enter the initial
+candidate domain. Once Cmax exists, the measured profile frontier remains the inclusive Cmax→90%
+Cmax range.
 
-The qualifier is an orthogonal rejection test, not a replacement for power characterization.
-Its aggregate p5 includes intentional light phases and therefore cannot create `ClockDrop`; that
-classification remains exclusive to the steady discovery render. Qualification evidence is versioned
-separately from discovery evidence. Contract v7 keeps frontier `Qualification` and post-margin
-`ApplyQualification` distinct; deployability requires High-FPS + Texture + Transitions at the exact
-selected target/VF pair. FSGL1/FSGL2/FSGL3,
-legacy-qualified and discovery-only points remain provisional. Goldens are session-only and are not
-written to Forge state. No manual bad-point registry is encoded, and Standard/Long never qualify an
-old `prior_good` boundary without current-run rediscovery first. This is conservative automated
-qualification, not a mathematical proof over every future driver/workload; profile generation does
-not depend on user-supplied technical values or a post-Forge game-validation step.
+**Candidate Transaction (discovery).** One candidate attempt is one owned transaction:
 
-**Applied-bin power calibration.** The learned boundary and the applied point are deliberately
-different: Leva 1 adds +12 mV and snaps upward to a physical VF bin. Profile synthesis therefore
-resolves the current PowerRender observation for that exact apply bin and uses its sustained p99 and
-p5 for Godforge/Brokkr's/Deep Calm scoring. A reset-clean power-bound clock drop can supply this
-calibration telemetry without becoming stability evidence. A missing, old-contract or thermally
-throttled apply-bin measurement fails closed with no new profile.
+1. Arm the Safe Loop boot flag, apply the anchored curve once, and verify the positive offset.
+2. Run `PowerRender` and, for Standard/Long, the active qualification phases without resetting or
+   reapplying between them; every phase therefore observes the same curve instance.
+3. Perform one checked reset to stock, then clear the boot flag exactly once.
+4. Persist same-curve `Qualification` observations before the `Discovery` observation.
 
-**Electrical-regime reconciliation.** A calibrated profile may sustain a p95 above its configured
-target because the VF target is not a hard runtime clock lock. Contract v7 has zero deployable-bin
-tolerance: synthesis maps any higher sustained p95 to the nearest measured target at/above it and requires the maximum
-Apply anchor across that span. For example, `1860@893` sustaining p95 1890 cannot alias a qualified
-1890 regime that requires 918 mV. It is excluded: performance resolves to the canonical support,
-while efficiency profiles fall to another measured self-consistent target. Standard/Long also require
-current three-pattern evidence for the supporting regime. Exact-Apply rejection/inconclusion blocks every
-lower-anchor alias of the same regime. No power or voltage is interpolated.
+No positive phase is reusable before step 3 proves both `reset_to_stock_ok` and
+`boot_flag_cleared`. A reset, clear or persistence failure is terminal/inconclusive, never positive;
+device loss retains the boot flag for recovery. A p99-consensus retry closes its current transaction
+cleanly before a new attempt is armed.
 
-**Exact-Apply stability closure.** Standard/Long treat reconciled profiles as provisional until every
-unique selected `(target, Apply VF bin)` completes five minutes each of High-FPS, Texture and
-Transitions at that exact pair. Adding voltage can raise the sustained GPU Boost regime, so stability is never
-inherited from the lower boundary. Clock p95 is stored beside target, average and p5 to describe that
-upper sustained regime. After the three exact-Apply patterns pass, their highest measured p95 is fed
-back through the same strict regime reconciliation; a newly exposed higher regime triggers automatic
-re-synthesis instead of being silently accepted. Any inconclusive attempt creates debt and requires two consecutive clean
-passes for the pattern. A reset-clean rejection excludes only that candidate and re-synthesizes from
-the remaining measured points; hard failures still abort. Once the v7 set passes, the profile publishes the
-larger sustained p99 observed by its PowerRender calibration or any approved v7 pattern. This
-does not change homogeneous frontier scoring, but prevents the card from understating power already
-measured at the exact deployable pair. Old pre-v7 qualification cannot be applied.
+**Power-cap hysteresis.** A valid numeric board limit outranks the sampled cap flag. Sustained p99 is
+`NearCap` at **≥99%**, `OffCap` at **≤98%**, and `Ambiguous` strictly between those thresholds;
+missing/invalid p99 is also ambiguous. If the numeric limit is unavailable, the sampled cap flag is
+the compatibility fallback. The ambiguous band receives bounded exact-candidate retries; persistent
+ambiguity stays inconclusive and cannot define the frontier. `ClockDrop` classification remains
+exclusive to homogeneous `PowerRender`, not the qualifier's light/heavy mix.
+
+**Qualification v16 provenance and integrity.** Every current dwell records the service build
+version/revision, semantic workload fingerprint, actual selected wgpu backend, adapter and driver
+identity/details, checksum method, and the stock-golden capture configuration/values. Older JSONL
+lines remain readable, but pre-v16 positive evidence cannot unlock Apply. Current positive discovery,
+frontier qualification and exact-Apply qualification additionally require proven transaction cleanup.
+
+`MixedGame` is now genuinely interleaved: every frame records BoostEdge, TextureRop and PowerRender
+as three render passes in one encoder/frame/submit instead of time-slicing whole workload blocks.
+BoostEdge and MixedGame use a GPU reduction/compare every 16 frames. The check is sparse to keep the
+render workload dominant, but mismatch state is cumulative: every sampled mismatch contributes to
+the final verdict and `checksum_count` reports the checks actually performed.
+
+The qualifier remains an orthogonal rejection test, not a replacement for power characterization.
+Stock goldens are session-scoped; no old `prior_good` can become current without current-run evidence.
+No finite synthetic suite is a proof over every future game/driver path.
+
+**Applied-bin power and electrical reconciliation.** The learned boundary and applied point differ:
+the policy adds +12 mV and snaps upward to a physical V/F bin. Profile synthesis therefore requires
+current, thermally valid `PowerRender` p99/p5 calibration at that exact apply bin. A calibrated point
+whose measured p95 reaches a higher electrical regime must use that regime's measured Apply anchor
+and current qualification; no power or voltage is interpolated.
+
+**Exact-Apply stability closure.** Standard/Long remain provisional until every unique selected
+`(target, Apply VF bin)` completes, in order, **Texture for 5 minutes**, **TransitionShock for
+8 minutes**, and **Endurance for 20 minutes**. Adding voltage can expose a higher sustained boost
+regime, so this gate is not inherited from the lower boundary. A reset-clean rejection removes the
+candidate and triggers re-synthesis; inconclusive evidence remains debt; hard recovery failures abort.
+The published profile power remains the conservative maximum confirmed across homogeneous
+PowerRender calibration and the approved exact-Apply dwells.
+
+The field-failed **1845 MHz @ 862 mV** point is the calibration discriminator for the next physical
+A/B against known-safe bins. **DX11 coverage is not implemented and the final gate is not shortened**
+until that A/B shows that the proposed change distinguishes the failed point without losing safe-bin
+specificity. The long Endurance stage remains necessary because the latest field failure appeared
+well after the shorter Texture and TransitionShock stages had passed.
 
 **Cooperative cancellation and UI headroom.** Every live discovery/qualification render receives
-the Forge cancellation token and checks it between bounded GPU frames/dispatches. Stop immediately
-enters `stopping`, submits no new batches, drains the current bounded work and performs the normal
-checked stock reset. Cancellation is recorded as inconclusive/cancelled, never as bad or validated
-evidence. The UI prevents overlapping refreshes, polls only progress/safety at 500 ms while Forge is
-active, refreshes secondary diagnostics every 3 s, and the service caps the IPC-visible log tail
-while retaining completed evidence in `f2_observations.jsonl`.
+the Forge cancellation token and checks it between bounded GPU frames/dispatches. Stop enters
+`stopping`, submits no new batches, drains the current bounded work and performs checked transaction
+cleanup. Cancellation is recorded as inconclusive/cancelled, never as bad or validated evidence. The
+UI reads structured progress fields rather than parsing logs; completed evidence remains durable in
+`f2_observations.jsonl`.
 
 ## Problems hit → solutions
 

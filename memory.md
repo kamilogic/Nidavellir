@@ -8,6 +8,59 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-15) — evidence-integrity rebuild + first HW cycle; restart attribution is P0
+- The post-reset Standard hardware cycle spans two run IDs (127 observations, then 59 after resume).
+  The resumed run completed in 175.1 min and published `1890@893`, `1845@862` and `1740@800` with
+  qualification v16. All persisted rows report confirmed stock reset and boot-flag cleanup.
+- Operator evidence supersedes the recorded-row summary: while descent was unattended, the PC was
+  later found at the Windows login screen after a reported TDR/reboot. Reopening the app resumed Forge
+  from its checkpoint. No row recorded `DeviceLost`/`tdr_or_crash` and no sentinel event survived the
+  full-reset cycle, so the exact active candidate cannot be assigned. Treat the export's apparent
+  zero-TDR result as incomplete.
+- Open P0: an unexplained boot/run discontinuity must preserve the active intent, reconcile it into
+  explicit crash evidence, stop at Needs Attention and require acknowledgement before Forge resumes.
+  The exported log must filter/group by run ID and include reconciled incidents.
+- The long gate caught stochastic failures that short phases missed: `1905@900` passed Endurance in
+  the first run and failed in the resumed run; `1860@868` also failed Endurance. Conversely,
+  `1845@862` passed the complete synthetic gate despite its historical in-game failure, so the new
+  workload is not yet a sufficient proxy for deployability.
+- All v16 rows identify the build only as `d449b63...-dirty`. This records dirty state but not the
+  patch content; before the next evidence-compatible update, use a clean commit or embed a content
+  hash so two different dirty builds cannot share provenance.
+- The field trace did **not** prove that sustained BoostEdge/anchor-bin residence caused the game
+  TDR: the lobby survived essentially the same external clock, voltage, utilization and power
+  envelope. Contract v15's causal wording was wrong. The likely missing variable is workload/driver
+  composition, so old positives are quarantined by qualification contract v16.
+- Every new F2 dwell carries build revision/dirty state, workload fingerprint, actual wgpu backend,
+  adapter/driver identity, checksum method and golden configuration. A discovery, qualification or
+  exact-Apply positive is current only when reset-to-stock **and** boot-flag cleanup are proven.
+- Forge normalizes stock first in bounded PowerRender windows and fails closed unless temperature
+  and sustained p5 converge twice without thermal throttle. Ctable (static physical table), Cboost
+  (post-preheat live top) and Cmax (first workload-proven sustainable clock) are now distinct facts
+  in IPC/UI. Clock candidates require an index present in the static table and the normalized live
+  curve.
+- Power-cap policy is hysteretic: p99 >=99% is `NearCap`, <=98% is `OffCap`, and the middle band is
+  `Ambiguous`. Ambiguous data repeats up to the bounded p99 budget and remains inconclusive if it
+  never resolves; a numeric limit always outranks sampled cap flags.
+- Discovery now owns each usable final attempt as one Candidate Transaction: select/precheck,
+  Safe Loop arm, curve apply/verify, PowerDiscovery and immediate boundary qualification share the
+  same applied curve. Bounded p99 rechecks close cleanly between attempts; the decisive off-cap
+  attempt transitions to qualification without reapply, then performs one reset/boot-flag cleanup.
+  Qualification records are persisted before discovery positives, and no positive is exposed if
+  reset, boot-flag clear, blacklist persistence or observation persistence fails.
+- MixedGame now records BoostEdge + TextureRop + PowerRender in one encoder/frame/submit and rotates
+  the checked final output. BoostEdge/MixedGame reduce and compare on-GPU every 16 frames instead of
+  serializing every light frame; checksum mismatch evidence remains accumulated.
+- Sentinel canary execution is owned synchronously by its dedicated thread; the false 3 s
+  "pre-hang before a 2 s watchdog" claim and detached worker were removed. Canary/Event Log recovery
+  ownership is atomically deduplicated. Its TextureRop reference remains execution-local, so it is an
+  auxiliary consistency detector, not a stock-golden or game-correctness oracle. Exact-Apply Texture
+  + TransitionShock + Endurance remains the deployability barrier.
+- `1845 MHz @ 862 mV` remains historical field evidence for this GPU, but the intentional full reset
+  removed the old blacklist before evaluating the new method. The clean learning cycle re-published
+  that exact pair, which keeps DX11/workload coverage and any final-gate change blocked on an
+  attributable in-game A/B rather than treating the synthetic pass as proof of safety.
+
 ## Latest (2026-07-06, late) — v12: regime lift replaces reconciliation exclusion (code-complete)
 - v11 run data: detect-before-TDR worked (zero TDRs, texture-rop silent errors as graceful killer,
   frontier monotonic except 1875@912 outlier) — but exact-Apply ran only 3 patterns (hardcoded

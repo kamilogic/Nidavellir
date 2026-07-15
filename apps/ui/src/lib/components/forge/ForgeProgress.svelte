@@ -41,6 +41,27 @@
     if (cmax == null || floor == null) return null;
     return `${fixed(cmax)} → ${fixed(floor)} MHz${clockCount == null ? "" : ` · ${fixed(clockCount)} physical clocks`}`;
   });
+  const clockDomain = $derived.by(() => {
+    const boost = positiveNumber(powerSweep?.observed_boost_clock_mhz);
+    const bins = positiveNumber(powerSweep?.clock_table_bin_count);
+    const tableCeiling = positiveNumber(powerSweep?.clock_table_ceiling_mhz);
+    const temperature = positiveNumber(powerSweep?.preheat_temperature_c);
+    const converged = powerSweep?.preheat_converged;
+    if (boost == null && bins == null && tableCeiling == null && temperature == null && converged == null) return null;
+    const parts = [];
+    if (tableCeiling != null || bins != null) {
+      parts.push(
+        `Ctable${tableCeiling == null ? "" : ` ${fixed(tableCeiling)} MHz`}${bins == null ? "" : ` / ${fixed(bins)} bins`}`,
+      );
+    }
+    if (boost != null) parts.push(`Cboost ${fixed(boost)} MHz observed`);
+    if (converged === true) {
+      parts.push(`preheat converged${temperature == null ? "" : ` at ${fixed(temperature)}°C`}`);
+    } else if (converged === false) {
+      parts.push("preheat not converged");
+    }
+    return parts.join(" · ");
+  });
   const progressPercent = $derived.by(() => {
     if (!totalSteps) return 0;
     return Math.min(100, Math.max(0, (completedSteps / totalSteps) * 100));
@@ -133,6 +154,11 @@
       };
     }
     switch (currentPhase) {
+      case "preheat":
+        return {
+          label: "Normalizing stock conditions",
+          detail: "Waiting for temperature and sustained clock to converge before sampling Cboost.",
+        };
       case "power":
         return {
           label: "Finding sustainable maximum",
@@ -318,6 +344,9 @@
         <span>Live estimate · {estimateStage.label}</span>
         {#if frontierPlan}
           <strong>{frontierPlan}</strong>
+        {/if}
+        {#if clockDomain}
+          <small class="clock-domain">{clockDomain}</small>
         {/if}
       </div>
       <small>{estimateStage.detail}</small>
@@ -635,6 +664,16 @@
     color: var(--forge-gold);
     font-size: 0.78rem;
     font-variant-numeric: tabular-nums;
+  }
+  .estimate-stage .clock-domain {
+    display: block;
+    margin-top: 0.22rem;
+    color: var(--muted);
+    font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.35;
+    text-align: left;
+    text-wrap: pretty;
   }
   .estimate-stage small {
     max-width: 28rem;

@@ -2,6 +2,39 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Qualification evidence is reproducible; Ctable, Cboost and Cmax are separate (2026-07-15)
+- **Corrected premise**: the field trace did not isolate sustained BoostEdge/bin residence as the
+  cause of the game TDR. Equivalent external telemetry survived in the lobby. Treat workload and
+  driver-path composition as the missing variable; do not encode the old causal claim in policy.
+- **Evidence contract**: qualification v16 stores build revision/dirty state, workload fingerprint,
+  actual render backend, adapter/driver, checksum method and golden configuration. Current positive
+  discovery, boundary and exact-Apply evidence requires both confirmed stock reset and boot-flag
+  cleanup. Compatibility means old lines remain readable, not eligible.
+- **Stock domain**: Ctable comes from static physical VF indices, Cboost is sampled only after a
+  bounded thermal/p5 preheat converges, and Cmax is the first clock the Forge proves sustainable.
+  Failure to converge, missing temperature, telemetry stall or stock throttle aborts before tuning.
+- **Power policy**: p99 >=99% of the numeric limit is NearCap, <=98% is OffCap, and the interval is
+  Ambiguous. Ambiguity must repeat within the bounded p99 budget and otherwise fails inconclusive.
+  `power_capped_frac` is fallback only when no valid numeric limit exists.
+- **Candidate Transaction**: the final usable discovery attempt arms/applies/verifies once, runs
+  PowerDiscovery and the boundary qualifier under that same curve, then owns one reset/boot-flag
+  cleanup. p99 rechecks close cleanly before a new attempt. Persist qualification before discovery
+  because JSONL is not transactional; expose no positive/callback until both records and cleanup are
+  proven. DeviceLost retains the boot flag, and reset/clear/blacklist-save/persistence failures dominate
+  any otherwise positive dwell.
+- **Qualifier**: MixedGame interleaves BoostEdge, TextureRop and PowerRender within one frame/submit;
+  BoostEdge/MixedGame integrity checks run GPU-side every 16 frames with accumulated mismatches. This
+  removes the every-frame full-copy/wait distortion without discarding known-answer coverage.
+- **Sentinel**: a Rust thread cannot safely cancel a stuck GPU worker. The canary therefore owns its
+  call synchronously; a timeout may not abandon a live context. Canary and Event Log atomically claim
+  recovery ownership so one episode cannot trigger two concurrent GPU mutations. Its TextureRop
+  baseline remains execution-local, so the canary detects returned stochastic/self-consistency
+  failures but is not represented as a stock-known-answer or game-correctness oracle.
+- **Safety trade-off**: exact-Apply Texture + TransitionShock + Endurance stays mandatory. A native
+  DX11 qualifier and shorter final soak remain deferred until A/B calibration separates known-bad
+  `1845@862` from safe controls with acceptable false positives. No source policy hard-codes that GPU
+  point; it remains local field evidence in Safe Loop.
+
 ## v13: absolute NVML max-clock ceiling for every F2 dwell AND Apply (2026-07-06)
 - **Problem**: the anchored plateau caps are per-point offsets relative to the base V/F curve, which
   the driver shifts with temperature — the full 2026-07-06 run measured p5/p95 = label **+15/+30 MHz**

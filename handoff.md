@@ -1,17 +1,80 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. State as of 2026-07-04: the F2 live Forge keeps homogeneous PowerRender
-discovery/p99 calibration, but deployability now requires qualification contract v8: High-FPS,
-Texture and Transitions — each including the new FrameCadence phase (game-frame-scale droop
-transients, own stock golden) — at the boundary and exact Apply. P5 remains the performance floor;
-p95 owns the electrical support regime with zero bin tolerance. Stop is cooperative inside GPU loops
-and the UI avoids overlapping polling. Apply still requests 12 mV above the learned boundary, snaps
-to a valid physical VF bin and exposes both values. `finished` means current v8 profiles are
-qualified. **The supervised v8/v12 hardware gate PASSED on 2026-07-06 (see HW-run checkpoint
-below), but root-cause analysis of the +15/+30 MHz regime overshoot set the next direction:
-v13 absolute clock ceiling — `docs/clock-lock-v13-plan.md`. Leva 2 remains blocked.**
-Earlier roadmap: `docs/qualification-v8-plan.md`.
+How to pick this up cold. Current state is the 2026-07-15 qualification-integrity rebuild below.
+Older dated sections remain as history; where they claim that BoostEdge residence was a proven field
+cause, or that a detached 3 s canary timeout predicted a roughly 2 s watchdog, this section supersedes
+them. Apply still requests 12 mV above the learned boundary, snaps upward to a physical VF bin and
+must pass the complete exact-Apply gate before publication.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## START-HERE (2026-07-15) — contract v16 + first hardware cycle; unaccounted TDR/reboot found
+
+### Hardware checkpoint and operator-reported TDR
+- A Standard cycle after the intentional full reset produced two run IDs: the first persisted 127
+  observations and the resumed run persisted 59 more, completed the frontier and published Godforge
+  `1890@893`, Brokkr's `1845@862` and Deep Calm `1740@800` under qualification contract v16.
+- During the unattended descent, the operator returned to the PC at the Windows login screen and
+  reports a TDR/reboot. After the app was opened again, Forge resumed from its checkpoint and later
+  finished. This is useful recovery, but automatic continuation without first surfacing the crash is
+  not an acceptable final safety flow.
+- No persisted observation is marked `DeviceLost`/`tdr_or_crash`, and the post-reset sentinel log is
+  absent. The exact active point and timestamp therefore cannot be attributed honestly; do not infer
+  them from neighboring observations. The exported log's recorded-dwell table also aggregates both
+  run IDs, so its apparent absence of TDR is incomplete rather than proof that none occurred.
+- **P0 before unattended Forge:** persist/restore a boot or run epoch plus the active candidate,
+  reconcile an unexplained restart into explicit crash evidence, stop in Needs Attention and require
+  operator acknowledgement before continuing. Export must separate the current run from historical
+  observations and include reconciled operator/runtime incidents.
+- The long gate remains valuable: `1905@900` passed Endurance in the first run but failed it in the
+  resumed run, and `1860@868` also failed late. However, the exact field discriminator `1845@862`
+  passed the complete synthetic gate, so the qualifier is not yet sufficient evidence for unattended
+  deployment or ordinary profile use.
+
+### Corrected diagnosis
+- The game trace proved the TDR/recovery timeline, not its internal workload cause. Lobby and match
+  shared nearly the same external clock/voltage/utilization/power envelope while only the match
+  failed. Sustained bin residence is therefore insufficient, and v15's stronger causal wording was
+  corrected.
+- `1845@862` remains durable historical field-failure evidence for this GPU. The full reset
+  intentionally removed prior learning before the hardware cycle; the point is a regression control,
+  not a hard-coded GPU constant in source. Its re-publication is evidence that the synthetic gate did
+  not yet reproduce the real workload failure.
+
+### Code-complete implementation exercised by the hardware checkpoint above
+1. **Qualification v16 provenance** — every dwell records build SHA/dirty state, semantic workload
+   fingerprint, actual backend, adapter/driver, checksum method and stock golden configuration.
+   Legacy JSONL remains readable, but a positive is reusable only with current contract plus proven
+   reset-to-stock and boot-flag cleanup.
+2. **Deterministic stock domain** — bounded preheat requires two consecutive clean windows with
+   temperature and p5 convergence. IPC/UI show Ctable (static physical table), Cboost (normalized
+   live observation) and Cmax (workload-proven) separately. Missing sensors, throttle, telemetry
+   stall or non-convergence fail closed before any tuning write.
+3. **Power-cap hysteresis** — `>=99%` NearCap, `<=98%` OffCap, `98–99%` Ambiguous. Ambiguity repeats
+   within the existing bounded p99 budget and becomes inconclusive if unresolved; numeric ratio has
+   priority over `power_capped_frac`.
+4. **Candidate Transaction fail-closed** — the decisive discovery attempt applies/verifies once,
+   runs PowerDiscovery and boundary qualification on the same active curve, then resets/clears once.
+   Bounded p99 rechecks are separate clean transactions. Qualification is persisted before discovery;
+   callbacks and positives occur only after both writes and proven cleanup. DeviceLost, reset/clear,
+   blacklist-save or observation-save failures cannot leave reusable positive evidence.
+5. **Failure-seeking workload without per-frame serialization** — MixedGame interleaves BoostEdge,
+   TextureRop and PowerRender in one frame/encoder/submit. BoostEdge/MixedGame use sparse16 GPU-side
+   reduction/comparison with accumulated mismatch evidence.
+6. **Sentinel ownership** — no detached canary worker and no false pre-hang deadline. The dedicated
+   canary thread owns its GPU call synchronously; Event Log and boot reconciliation remain independent
+   recovery nets, with an atomic cross-layer claim preventing duplicate reset/reapply. Its TextureRop
+   reference is still local to that execution: useful for stochastic divergence, but not a stock-golden
+   oracle and never a substitute for the exact-Apply gate.
+7. **Deployability unchanged** — exact-Apply Texture, TransitionShock and Endurance remain mandatory.
+   DX11 and shorter final gates are explicitly evidence-gated, not part of this patch.
+
+### Next physical gate
+Preserve this checkpoint, then run a supervised in-game trace of the newly published `1845@862`
+profile against stock/the same known scene. A repeated field failure confirms a synthetic false
+negative and should drive workload/API coverage plus the P0 restart reconciliation; survival across
+repeated comparable sessions requires checking driver/workload drift before changing policy. Do not
+reduce Texture/TransitionShock/Endurance or promote a DX11 renderer until that discriminator is
+demonstrated and recorded with attributable v16 provenance.
 
 ## START-HERE (2026-07-12) — pipeline completo forja↔sentinela FECHADO; próximo = re-forge de validação
 Tudo commitado+pushado até `202689f`. Estado consolidado da sessão 2026-07-10→12 (a mais produtiva

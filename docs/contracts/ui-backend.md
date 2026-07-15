@@ -6,6 +6,61 @@
 
 
 
+\## Current F2 reference (2026-07-15): contract v16, Candidate Transaction and stock domain
+
+This section is the normative current behavior and supersedes the dated v4/v6/v7 runtime descriptions
+below where they conflict. Historical notes remain in place to explain payload evolution. No IPC method
+or existing field was removed.
+
+\- **Evidence contract v16.** Every current F2 dwell persists `evidence_provenance` with the service
+  build version/revision, semantic workload fingerprint, actual selected render backend, adapter name,
+  driver name/details, checksum method and stock-golden configuration/values. Pre-v16 positive evidence
+  remains readable but cannot unlock Apply. Positive discovery, frontier qualification and exact-Apply
+  qualification additionally require `reset_to_stock_ok == true` and `boot_flag_cleared == true`.
+
+\- **Deterministic preheat and distinct clocks.** Before any candidate write, backend phase
+  `"preheat"` runs up to six 10 s stock windows and requires two consecutive usable windows converged
+  within 2 °C and 30 MHz p5, with no throttle or telemetry failure. It fails closed before tuning.
+  Ctable is the sane physical-table ceiling/count, Cboost is the live maximum observed after preheat,
+  and Cmax remains the first reset-clean sustainable clock proved by discovery. They are not aliases.
+
+\- **Candidate Transaction for discovery.** Each candidate attempt arms Safe Loop and applies/verifies
+  the curve once, then runs PowerRender plus any active qualification phases under that same curve and
+  performs one checked stock reset/boot-flag clear. Same-curve Qualification observations are persisted
+  before Discovery, preventing resume from seeing an unpaired positive discovery. A p99 retry closes the
+  current transaction cleanly before the next attempt; reset/clear failure can never become positive.
+
+\- **Power-cap hysteresis.** With a valid numeric board limit, p99 ≥99% is `NearCap`, p99 ≤98% is
+  `OffCap`, and the interval between them is `Ambiguous`. The sampled cap flag is only a fallback when
+  the numeric limit is unavailable. Ambiguous evidence receives bounded retries and remains
+  inconclusive if it does not resolve.
+
+\- **Interleaved MixedGame and sparse integrity.** Every MixedGame frame records BoostEdge,
+  TextureRop and PowerRender as three passes in one encoder/frame/submit. BoostEdge and MixedGame run
+  GPU reduction/compare every 16 frames; mismatch state accumulates across all sampled checks and
+  `checksum_count` reports the checks actually executed. The UI must not describe this as 100% frame
+  checksum coverage.
+
+\- **Exact Apply is unchanged.** Every unique selected `(target, Apply VF bin)` still requires Texture
+  5 min, TransitionShock 8 min and Endurance 20 min. DX11 coverage and any shorter final gate are
+  explicitly deferred until physical A/B of the field-failed 1845 MHz @ 862 mV point against known-safe
+  bins proves that the alternative discriminates both populations.
+
+\- **Additive/defaulted `PowerSweepProgress` fields:**
+  - `observed_boost_clock_mhz: Option<u32>` — Cboost observed after deterministic stock preheat.
+  - `clock_table_bin_count: Option<u32>` — number of sane static physical V/F bins (Ctable domain).
+  - `clock_table_ceiling_mhz: Option<u32>` — highest sane static physical V/F clock (Ctable ceiling).
+  - `preheat_converged: Option<bool>` — `false` while normalization is unresolved, `true` only after
+    deterministic convergence.
+  - `preheat_temperature_c: Option<f32>` — converged stock temperature.
+
+  Existing `cmax_clock_mhz` retains the proved Cmax meaning. `ForgeProgress.svelte` renders the
+  Ctable/Cboost/preheat facts from these structured fields and labels `phase == "preheat"` as stock
+  normalization. Legacy/interrupted payloads deserialize the new fields as `None`; frontend fallback
+  must remain display-only and must not infer safety or eligibility from logs.
+
+
+
 \## Purpose
 
 

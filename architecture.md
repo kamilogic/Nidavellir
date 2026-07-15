@@ -16,9 +16,11 @@ over a named pipe; the service does all hardware access (NVAPI, NVML, PawnIO).
   modern **ClkVfPoints** FFI (the VF ceiling). Most `unsafe` lives here.
 - **crates/gpu-stress**: wgpu (Vulkan/DX12) loads — `run_render_stress` (steady
   FurMark-class textured render = game power), `run_vf_qualifier_stress`
-  (FailureSeekingGameLoop: render/ROP/texture/compute/idle transients with per-phase checksums),
-  `run_power_load` (compute), `run_combined`, bandwidth. Each load returns a
-  `StabilityResult` (Stable / SilentError / Crash).
+  (FailureSeekingGameLoop: render/ROP/texture/compute/idle transients),
+  `run_power_load` (compute), `run_combined`, bandwidth. `MixedGame` records
+  BoostEdge + TextureRop + PowerRender in every frame/submit; BoostEdge and
+  MixedGame use sparse GPU-side reduction/compare and accumulate every sampled
+  mismatch. Each load returns a `StabilityResult` (Stable / SilentError / Crash).
 - **crates/driver-pawnio**: MSR / SuperIO access via the PawnIO driver (CPU/RAM
   factory-clock detection, fan/sensor reads).
 
@@ -33,36 +35,29 @@ headless client used for sweeps/benchmarks. Requests/responses are the
   boot-flag (the tuning point) before a risky apply/measure; on reboot a still-armed
   flag means the last op crashed → don't re-apply; blacklist the region; after 3
   consecutive crashes → Safe Mode (stock, hands-off). Persists to ProgramData.
-- **Live F2 Forge** (`gpu_power_sweep.rs` + `gpu_undervolt.rs`): resets to stock,
-  then enumerates every real live-VF clock from the highest bin downward. For each clock, it raises a
-  lower-voltage anchor to the target and caps higher bins to that target, then runs
-  the fail-closed dwell/reset motor until the voltage boundary or physical floor.
-  Power-bound clock drops continue the same clock whenever sustained p99 remains at the cap, even
-  after that clock previously sustained; the first sustained
-  clock is Cmax. The complete profile frontier spans Cmax→90% Cmax so Deep Calm is selected from
-  measured data. Fast produces a provisional map; Standard/Long capture three stock render goldens
-  with fresh contexts, then use FSGL3 A+B 2×60 s as the default interleaved per-bin qualifier.
-  Discovery predicts the next boundary from compatible same-GPU v4 history and a short isotonic
-  cross-clock trend, but starts one physical bin above it and remeasures all evidence. In a confirmed
-  power-bound region it may skip 4/2/1 bins by p5 deficit, bounded by 25 mV and the existing writer
-  offset-step cap. A reset-clean failure after a jump is recovered only upward by midpoint; after the
-  first approved off-cap point the exact boundary is finished one physical bin at a time.
-  Discovery keeps the homogeneous power render so p5, power-limit and `ClockDrop` stay comparable.
-  Discovery contract v4 preserves mean/p99/raw-peak watts and thermal validity separately, rechecks
-  anomalous adjacent-bin p99 at the exact bin, and excludes unconfirmed/v3 positives. Standard/Long
-  defer frontier FSGL3 while confirmed p99 remains at cap. After the +12 mV apply policy snaps to a
-  physical bin, any missing exact-target/apply-bin power telemetry is backfilled with discovery-only
-  PowerRender, and profile synthesis uses that exact bin's confirmed conservative p99 and p5.
-  Standard/Long then run a distinct long FSGL3 A+B gate at every unique selected Apply pair; p95 is
-  retained beside target/avg/p5 to expose the higher sustained boost regime;
-  qualification uses TextureRop/MixedGame-biased transients, deliberate droop bursts and on-GPU
-  verification of every rendered frame. A rejected FSGL3 candidate stops descent at the last
-  FSGL3-qualified physical bin. Qualification contract v6 first reconciles target against sustained
-  p5: aliases beyond one 15 MHz bin inherit the higher regime's conservative Apply anchor and
-  qualification state. It then requires exact-Apply A+B; a reset-clean rejection also blocks
-  lower-anchor aliases of that regime before re-synthesis. The published profile watt is the maximum
-  confirmed p99 across PowerRender calibration and the approved A+B pair; old payloads fail closed;
-  FSGL1/FSGL2 remain readable legacy evidence and retain their original stress behavior.
+- **Live F2 Forge** (`gpu_power_sweep.rs` + `gpu_undervolt.rs`, current
+  2026-07-15): first proves a deterministic stock preheat, then keeps three clock
+  facts separate: **Ctable** is the ceiling/count of sane physical base-table bins,
+  **Cboost** is the maximum live boost observed after preheat, and **Cmax** is the
+  first reset-clean sustainable clock proved by discovery. Preheat uses up to six
+  10 s stock windows and requires two consecutive usable windows with no throttle,
+  temperature convergence within 2 °C and p5 convergence within 30 MHz; an
+  inconclusive preheat aborts before tuning. The frontier remains Cmax→90% Cmax.
+  Each discovery attempt is a **Candidate Transaction**: arm Safe Loop and
+  apply/verify the curve once, run PowerRender plus any active qualifier phases
+  under that same curve, then perform one checked reset/boot-flag cleanup.
+  Qualification observations are persisted before their discovery observation;
+  positive evidence is reusable only after both reset-to-stock and flag clear are
+  proven. Power-cap classification is hysteretic: NearCap at p99 ≥99% of the
+  numeric limit, OffCap at ≤98%, and the interval between them is Ambiguous and
+  must retry or end inconclusive. Qualification contract **v16** records build
+  version/revision, workload fingerprint, selected backend/adapter/driver,
+  checksum method and golden configuration. Pre-v16 positives remain readable
+  but cannot unlock Apply. `MixedGame` is truly interleaved per frame, with sparse
+  GPU-side checks whose mismatch total is cumulative. Standard/Long keep the
+  exact-Apply gate at every selected pair: Texture 5 min, TransitionShock 8 min,
+  then Endurance 20 min. DX11 coverage and any reduction of that final gate remain
+  gated on physical A/B calibration of 1845 MHz @ 862 mV against known-safe bins.
 - **Anchored VF undervolt** (`gpu-nvapi`): raises exactly one real lower-voltage
   anchor and caps higher-voltage bins to the target via per-point ClkVfPoints
   offsets — no voltage lock / no NVML clock pin, so lower bins retain elasticity.
@@ -78,7 +73,8 @@ headless client used for sweeps/benchmarks. Requests/responses are the
 - `gpu_applied.json` — the currently applied profile (re-applied on boot).
 - `gpu_knowledge.json` — per-GPU stability knowledge (frontier + per-point stats).
 - `f2_observations.jsonl` — append-only, GPU-UUID-scoped F2 discovery/qualification evidence,
-  contract versions, coverage summaries and crash-safe resume checkpoints.
+  contract versions, full v16 provenance, cleanup proof, coverage summaries and
+  crash-safe resume checkpoints.
 - `forge_state.json` — last complete usable forged profile snapshot; partial F2 runs
   never overwrite it.
 - `boot_flag.json` / `heartbeat.txt` — Safe Loop liveness/boot detection.

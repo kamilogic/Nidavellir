@@ -256,6 +256,23 @@ pub struct PowerSweepProgress {
     pub deep_calm: Option<PowerSweepPoint>,
     /// Stock baseline sustained clock (MHz) under the same load, for reference.
     pub stock_clock_mhz: u32,
+    /// Stock boost top observed after the F2 thermal-convergence preheat. Kept separate from Cmax,
+    /// which is the first clock the candidate transaction actually proves sustainable.
+    #[serde(default)]
+    pub observed_boost_clock_mhz: Option<u32>,
+    /// Number of index-aligned physical bins supplied by the static base VF table for this run.
+    #[serde(default)]
+    pub clock_table_bin_count: Option<u32>,
+    /// Highest stock clock represented by the static base VF table (Ctable). This remains separate
+    /// from the thermally observed Cboost and the workload-proven Cmax.
+    #[serde(default)]
+    pub clock_table_ceiling_mhz: Option<u32>,
+    /// Whether stock temperature/clock converged before the live boost domain was sampled.
+    #[serde(default)]
+    pub preheat_converged: Option<bool>,
+    /// Final stock preheat temperature, when the sensor returned a usable value.
+    #[serde(default)]
+    pub preheat_temperature_c: Option<f32>,
     pub note: Option<String>,
     /// True when the forged profiles came from the F2 ANCHORED UNDERVOLT path
     /// (a lower-voltage operating point), NOT the F1 flatten-down ceiling. The
@@ -714,6 +731,11 @@ mod tests {
             cmax_clock_mhz: Some(1935),
             frontier_floor_clock_mhz: Some(1755),
             frontier_clock_count: Some(13),
+            observed_boost_clock_mhz: Some(1950),
+            clock_table_bin_count: Some(67),
+            clock_table_ceiling_mhz: Some(1950),
+            preheat_converged: Some(true),
+            preheat_temperature_c: Some(66.0),
             ..Default::default()
         };
         let json = serde_json::to_string(&p).unwrap();
@@ -725,6 +747,11 @@ mod tests {
         assert_eq!(back.cmax_clock_mhz, Some(1935));
         assert_eq!(back.frontier_floor_clock_mhz, Some(1755));
         assert_eq!(back.frontier_clock_count, Some(13));
+        assert_eq!(back.observed_boost_clock_mhz, Some(1950));
+        assert_eq!(back.clock_table_bin_count, Some(67));
+        assert_eq!(back.clock_table_ceiling_mhz, Some(1950));
+        assert_eq!(back.preheat_converged, Some(true));
+        assert_eq!(back.preheat_temperature_c, Some(66.0));
     }
 
     #[test]
@@ -745,6 +772,11 @@ mod tests {
         assert_eq!(p.cmax_clock_mhz, None);
         assert_eq!(p.frontier_floor_clock_mhz, None);
         assert_eq!(p.frontier_clock_count, None);
+        assert_eq!(p.observed_boost_clock_mhz, None);
+        assert_eq!(p.clock_table_bin_count, None);
+        assert_eq!(p.clock_table_ceiling_mhz, None);
+        assert_eq!(p.preheat_converged, None);
+        assert_eq!(p.preheat_temperature_c, None);
         assert_eq!(p.stock_clock_mhz, 1800);
     }
 }

@@ -43,8 +43,8 @@
 use std::ffi::OsString;
 
 use nidavellir_core::f2_observation::{
-    F2QualificationCoverage, F2QualificationPattern, F2QualificationStrength,
-    F2QualificationVerdict,
+    F2EvidenceKind, F2EvidenceProvenance, F2QualificationCoverage, F2QualificationPattern,
+    F2QualificationStrength, F2QualificationVerdict,
 };
 use nidavellir_core::safe_loop::{
     SafeLoopRecord, SafeLoopStore, TuningPoint, SAFE_MODE_CRASH_THRESHOLD,
@@ -1242,6 +1242,8 @@ pub struct F2DwellResult {
     pub duration_ms: u64,
     pub sample_count: u32,
     pub qualification_coverage: Option<F2QualificationCoverage>,
+    /// Exact executable/workload/graphics-stack identity for the dwell.
+    pub evidence_provenance: Option<F2EvidenceProvenance>,
 }
 
 /// Terminal classification of a confirmed single step. The most-severe applicable variant wins
@@ -1289,23 +1291,46 @@ pub enum F2DiscoveryDecision {
     AbortForge,
 }
 
-/// True when the dwell was effectively at the board power limit. The direct power ratio is the
-/// primary signal requested by F2 (99–100% of the cap); the sampled cap flag is only a fallback when
-/// the driver did not expose a usable numeric limit.
+/// Hysteretic classification of a PowerRender p99 against the board power limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum F2PowerCapState {
+    /// p99 is at least 99% of a valid numeric limit, or the legacy cap-flag fallback is active.
+    NearCap,
+    /// p99 is at most 98% of a valid numeric limit, or the legacy cap-flag fallback is inactive.
+    OffCap,
+    /// p99 is between 98% and 99%, or is unavailable/invalid.
+    Ambiguous,
+}
+
+/// Classify the dwell without letting the sampled cap flag override a usable numeric ratio. When a
+/// numeric limit is unavailable, the prior `power_capped_frac >= 0.5` fallback remains unchanged.
+pub fn f2_power_cap_state(
+    power_p99_w: Option<f32>,
+    power_limit_w: Option<f32>,
+    power_capped_frac: Option<f32>,
+) -> F2PowerCapState {
+    let Some(power_p99) = power_p99_w.filter(|power| power.is_finite() && *power > 0.0) else {
+        return F2PowerCapState::Ambiguous;
+    };
+    match power_limit_w.filter(|limit| limit.is_finite() && *limit > 0.0) {
+        Some(limit) if power_p99 >= limit * 0.99 => F2PowerCapState::NearCap,
+        Some(limit) if power_p99 <= limit * 0.98 => F2PowerCapState::OffCap,
+        Some(_) => F2PowerCapState::Ambiguous,
+        None if power_capped_frac.is_some_and(|f| f.is_finite() && f >= 0.5) => {
+            F2PowerCapState::NearCap
+        }
+        None => F2PowerCapState::OffCap,
+    }
+}
+
+/// Compatibility wrapper for existing callers that only need the positive near-cap decision.
 pub fn f2_near_power_limit(
     power_p99_w: Option<f32>,
     power_limit_w: Option<f32>,
     power_capped_frac: Option<f32>,
 ) -> bool {
-    let Some(power_p99) = power_p99_w.filter(|power| power.is_finite() && *power > 0.0) else {
-        return false;
-    };
-    match power_limit_w {
-        Some(limit) if limit.is_finite() && limit > 0.0 => {
-            power_p99 / limit >= 0.99
-        }
-        _ => power_capped_frac.is_some_and(|f| f.is_finite() && f >= 0.5),
-    }
+    f2_power_cap_state(power_p99_w, power_limit_w, power_capped_frac)
+        == F2PowerCapState::NearCap
 }
 
 #[cfg(windows)]
@@ -1319,7 +1344,24 @@ fn f2_power_p99_requires_recheck(
     previous: Option<(f32, u32)>,
     report: &F2StepReport,
 ) -> bool {
-    if !f2_power_measurement_usable(report) {
+    f2_power_p99_requires_recheck_with(previous, report, f2_power_measurement_usable)
+}
+
+#[cfg(windows)]
+fn f2_power_p99_content_requires_recheck(
+    previous: Option<(f32, u32)>,
+    report: &F2StepReport,
+) -> bool {
+    f2_power_p99_requires_recheck_with(previous, report, f2_power_measurement_content_usable)
+}
+
+#[cfg(windows)]
+fn f2_power_p99_requires_recheck_with(
+    previous: Option<(f32, u32)>,
+    report: &F2StepReport,
+    usable: fn(&F2StepReport) -> bool,
+) -> bool {
+    if !usable(report) {
         return false;
     }
     let Some((previous_p99, previous_p5)) = previous else {
@@ -1338,8 +1380,14 @@ fn f2_power_p99_requires_recheck(
 
 #[cfg(windows)]
 fn f2_power_measurement_usable(report: &F2StepReport) -> bool {
-    matches!(report.outcome, F2Outcome::Validated | F2Outcome::ClockDrop)
+    f2_power_measurement_content_usable(report)
         && report.reset_ok == Some(true)
+        && report.boot_flag_cleared
+}
+
+#[cfg(windows)]
+fn f2_power_measurement_content_usable(report: &F2StepReport) -> bool {
+    matches!(report.outcome, F2Outcome::Validated | F2Outcome::ClockDrop)
         && !report.thermal_throttled
         && report
             .power_p99_w
@@ -1359,6 +1407,34 @@ fn f2_power_attempts_have_consistent_pair(reports: &[F2StepReport]) -> bool {
             .skip(i + 1)
             .any(|b| f2_power_p99_pair_consistent(*a, *b))
     })
+}
+
+#[cfg(windows)]
+fn f2_power_cap_state_for_attempts(
+    reports: &[F2StepReport],
+    power_limit_w: Option<f32>,
+) -> F2PowerCapState {
+    let power_p99_w = reports
+        .iter()
+        .filter(|report| f2_power_measurement_usable(report))
+        .filter_map(|report| report.power_p99_w)
+        .reduce(f32::max);
+    let power_capped_frac = reports
+        .iter()
+        .filter(|report| f2_power_measurement_usable(report))
+        .filter_map(|report| report.power_capped_frac)
+        .reduce(f32::max);
+    f2_power_cap_state(power_p99_w, power_limit_w, power_capped_frac)
+}
+
+#[cfg(windows)]
+fn f2_power_recheck_resolved(
+    reports: &[F2StepReport],
+    power_limit_w: Option<f32>,
+) -> bool {
+    f2_power_attempts_have_consistent_pair(reports)
+        && f2_power_cap_state_for_attempts(reports, power_limit_w)
+            != F2PowerCapState::Ambiguous
 }
 
 /// Confirm a normal single dwell, or require a consistent pair after an anomalous adjacent-bin
@@ -1454,6 +1530,31 @@ fn f2_aggregate_power_attempts(
     aggregate.max_temp_c = reports.iter().filter_map(|r| r.max_temp_c).reduce(f32::max);
     aggregate.thermal_throttled = reports.iter().any(|r| r.thermal_throttled);
     aggregate
+}
+
+#[cfg(windows)]
+fn f2_finalize_power_cap_state(
+    reports: &mut [F2StepReport],
+    aggregate: &mut F2StepReport,
+    power_limit_w: Option<f32>,
+) -> F2PowerCapState {
+    let cap_state = f2_power_cap_state(
+        aggregate.power_p99_w,
+        power_limit_w,
+        aggregate.power_capped_frac,
+    );
+    if cap_state == F2PowerCapState::Ambiguous && aggregate.power_p99_confirmed {
+        aggregate.outcome = F2Outcome::Inconclusive;
+        aggregate.power_p99_confirmed = false;
+        for report in reports
+            .iter_mut()
+            .filter(|report| report.power_p99_confirmed)
+        {
+            report.outcome = F2Outcome::Inconclusive;
+            report.power_p99_confirmed = false;
+        }
+    }
+    cap_state
 }
 
 fn f2_power_bound_clock_drop(outcome: &F2Outcome, near_power_limit: bool) -> F2Outcome {
@@ -1625,11 +1726,21 @@ pub struct F2StepReport {
     pub dwell_duration_ms: Option<u64>,
     pub sample_count: Option<u32>,
     pub qualification_coverage: Option<F2QualificationCoverage>,
+    pub evidence_provenance: Option<F2EvidenceProvenance>,
     /// `Some(true)` reset confirmed, `Some(false)` reset failed/unconfirmed, `None` not reached.
     pub reset_ok: Option<bool>,
     pub boot_flag_cleared: bool,
     pub blacklisted: bool,
     pub validated: bool,
+}
+
+fn current_build_provenance() -> F2EvidenceProvenance {
+    let revision = env!("NIDAVELLIR_BUILD_REVISION");
+    F2EvidenceProvenance {
+        build_version: Some(env!("CARGO_PKG_VERSION").into()),
+        build_revision: (revision != "unknown").then(|| revision.to_owned()),
+        ..F2EvidenceProvenance::default()
+    }
 }
 
 /// The hardware / Safe-Loop operations a confirmed F2 single step performs. Abstracted so the
@@ -1653,11 +1764,8 @@ pub trait F2Ops {
     fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String>;
 }
 
-/// Drive the confirmed single step. Preflight refusal is handled by the caller via
-/// [`confirmed_f2_refusal`]; this assumes a vetted candidate and executes the fail-closed sequence.
-/// Returns a full report. NEVER persists/applies/promotes a profile (no such op exists).
-pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
-    let mut r = F2StepReport {
+fn empty_f2_step_report() -> F2StepReport {
+    F2StepReport {
         outcome: F2Outcome::Validated, // overwritten before return
         armed: false,
         applied: false,
@@ -1683,11 +1791,53 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
         dwell_duration_ms: None,
         sample_count: None,
         qualification_coverage: None,
+        evidence_provenance: Some(current_build_provenance()),
         reset_ok: None,
         boot_flag_cleared: false,
         blacklisted: false,
         validated: false,
+    }
+}
+
+fn populate_f2_dwell_report(mut report: F2StepReport, dwell: F2DwellResult) -> F2StepReport {
+    report.dwell = Some(dwell.outcome);
+    report.avg_clock_mhz = Some(dwell.avg_clock_mhz);
+    report.p5_clock_mhz = Some(dwell.p5_clock_mhz);
+    report.p95_clock_mhz = Some(dwell.p95_clock_mhz);
+    report.power_w = Some(dwell.power_w.round() as u32);
+    report.max_power_w = Some(dwell.max_power_w.round() as u32);
+    report.power_p99_w = dwell.power_p99_w;
+    report.power_capped_frac = Some(dwell.power_capped_frac);
+    report.max_temp_c = dwell.max_temp_c;
+    report.thermal_throttled = dwell.thermal_throttled;
+    report.measured_voltage_min_mv = dwell.measured_voltage_min_mv;
+    report.measured_voltage_avg_mv = dwell.measured_voltage_avg_mv;
+    report.measured_voltage_max_mv = dwell.measured_voltage_max_mv;
+    report.measured_voltage_sample_count = dwell.measured_voltage_sample_count;
+    report.render_frames = dwell.render_frames;
+    report.render_fps = dwell.render_fps;
+    report.dwell_duration_ms = Some(dwell.duration_ms);
+    report.sample_count = Some(dwell.sample_count);
+    report.qualification_coverage = dwell.qualification_coverage;
+    if dwell.evidence_provenance.is_some() {
+        report.evidence_provenance = dwell.evidence_provenance;
+    }
+    report.outcome = match dwell.outcome {
+        F2DwellOutcome::DeviceLost => F2Outcome::DeviceLost,
+        F2DwellOutcome::SilentError => F2Outcome::SilentError,
+        F2DwellOutcome::Unstable => F2Outcome::Unstable,
+        F2DwellOutcome::ClockDrop => F2Outcome::ClockDrop,
+        F2DwellOutcome::Inconclusive => F2Outcome::Inconclusive,
+        F2DwellOutcome::Stable => F2Outcome::Validated,
     };
+    report
+}
+
+/// Drive the confirmed single step. Preflight refusal is handled by the caller via
+/// [`confirmed_f2_refusal`]; this assumes a vetted candidate and executes the fail-closed sequence.
+/// Returns a full report. NEVER persists/applies/promotes a profile (no such op exists).
+pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
+    let mut r = empty_f2_step_report();
 
     // 1. ARM the boot flag BEFORE any write. If it fails, nothing was written; best-effort reset
     //    (idempotent), leave the (un-armed) flag alone.
@@ -1715,26 +1865,9 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
 
     // 4. DWELL once under load.
     let d = ops.dwell();
-    r.dwell = Some(d.outcome);
-    r.avg_clock_mhz = Some(d.avg_clock_mhz);
-    r.p5_clock_mhz = Some(d.p5_clock_mhz);
-    r.p95_clock_mhz = Some(d.p95_clock_mhz);
-    r.power_w = Some(d.power_w.round() as u32);
-    r.max_power_w = Some(d.max_power_w.round() as u32);
-    r.power_p99_w = d.power_p99_w;
-    r.power_capped_frac = Some(d.power_capped_frac);
-    r.max_temp_c = d.max_temp_c;
-    r.thermal_throttled = d.thermal_throttled;
-    r.measured_voltage_min_mv = d.measured_voltage_min_mv;
-    r.measured_voltage_avg_mv = d.measured_voltage_avg_mv;
-    r.measured_voltage_max_mv = d.measured_voltage_max_mv;
-    r.measured_voltage_sample_count = d.measured_voltage_sample_count;
-    r.render_frames = d.render_frames;
-    r.render_fps = d.render_fps;
-    r.dwell_duration_ms = Some(d.duration_ms);
-    r.sample_count = Some(d.sample_count);
-    r.qualification_coverage = d.qualification_coverage.clone();
-    match d.outcome {
+    let outcome = d.outcome;
+    r = populate_f2_dwell_report(r, d);
+    match outcome {
         F2DwellOutcome::DeviceLost => {
             // Crash / TDR: best-effort reset, record the blacklist, and RETAIN the boot flag — a
             // reboot may be imminent, so startup recovery must still fire. Never validate.
@@ -1744,25 +1877,20 @@ pub fn run_confirmed_f2_step<O: F2Ops>(ops: &mut O) -> F2StepReport {
             r
         }
         F2DwellOutcome::SilentError => {
-            r.outcome = F2Outcome::SilentError;
             finish_after_write(ops, r, true)
         }
         F2DwellOutcome::Unstable => {
-            r.outcome = F2Outcome::Unstable;
             finish_after_write(ops, r, true)
         }
         F2DwellOutcome::ClockDrop => {
             // Stable but the sustained clock sagged below tolerance — not a crash/instability to
             // blacklist; reset, clear on a confirmed reset, never validate, and stop the descent.
-            r.outcome = F2Outcome::ClockDrop;
             finish_after_write(ops, r, false)
         }
         F2DwellOutcome::Inconclusive => {
-            r.outcome = F2Outcome::Inconclusive;
             finish_after_write(ops, r, false)
         }
         F2DwellOutcome::Stable => {
-            r.outcome = F2Outcome::Validated;
             finish_after_write(ops, r, false)
         }
     }
@@ -1779,9 +1907,19 @@ fn finish_after_write<O: F2Ops>(ops: &mut O, mut r: F2StepReport, blacklist: boo
     }
     if reset.is_ok() {
         // Reset confirmed → GPU recovered, no offset left applied → safe to clear the boot flag.
-        r.boot_flag_cleared = ops.clear_boot_flag().is_ok();
-        if r.outcome == F2Outcome::Validated {
-            r.validated = true;
+        match ops.clear_boot_flag() {
+            Ok(()) => {
+                r.boot_flag_cleared = true;
+                if r.outcome == F2Outcome::Validated {
+                    r.validated = true;
+                }
+            }
+            Err(_) => {
+                // An uncleared recovery intent is terminal even after a confirmed stock reset. A
+                // positive report must never be reusable while startup recovery still owns it.
+                r.outcome = F2Outcome::ResetFailed;
+                r.validated = false;
+            }
         }
     } else {
         // Reset NOT confirmed → retain the flag; the most severe outcome dominates.
@@ -2395,6 +2533,203 @@ impl F2StressPurpose {
     }
 }
 
+/// Discovery-only extension that changes the workload while keeping the same verified VF write
+/// active. Exact-Apply and every other `run_confirmed_f2_step` caller remain independent steps.
+#[cfg(windows)]
+trait F2CandidateTransactionOps: F2Ops {
+    fn configure_phase(&mut self, dwell_ms: u64, purpose: F2StressPurpose);
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct F2TimedPhaseReport {
+    timestamp: String,
+    evidence_kind: F2EvidenceKind,
+    report: F2StepReport,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct F2TransactionCleanup {
+    clean: bool,
+    retain_boot_flag: bool,
+    stop_reason: Option<String>,
+}
+
+#[cfg(windows)]
+fn finish_f2_transaction_reports<O: F2Ops>(
+    ops: &mut O,
+    reports: &mut [F2StepReport],
+) -> F2TransactionCleanup {
+    let device_lost_index = reports
+        .iter()
+        .position(|report| matches!(report.outcome, F2Outcome::DeviceLost));
+    let boundary_failure_index = reports.iter().position(|report| {
+        matches!(report.outcome, F2Outcome::SilentError | F2Outcome::Unstable)
+    });
+
+    let reset = ops.reset_to_stock();
+    let reset_ok = reset.is_ok();
+    for report in reports.iter_mut() {
+        report.reset_ok = Some(reset_ok);
+        report.boot_flag_cleared = false;
+        report.validated = false;
+    }
+
+    let blacklist_result = match device_lost_index.or(boundary_failure_index) {
+        Some(index) => {
+            let result = ops.blacklist_point(device_lost_index.is_some());
+            reports[index].blacklisted = result.is_ok();
+            Some(result)
+        }
+        None => None,
+    };
+
+    if device_lost_index.is_some() {
+        return F2TransactionCleanup {
+            clean: false,
+            retain_boot_flag: true,
+            stop_reason: Some("DeviceLost".into()),
+        };
+    }
+    if let Some(Err(error)) = blacklist_result {
+        if let Some(last) = reports.last_mut() {
+            last.outcome = F2Outcome::ResetFailed;
+        }
+        return F2TransactionCleanup {
+            clean: false,
+            retain_boot_flag: true,
+            stop_reason: Some(format!("BlacklistPersistFailed: {error}")),
+        };
+    }
+    if let Err(error) = reset {
+        if let Some(last) = reports.last_mut() {
+            last.outcome = F2Outcome::ResetFailed;
+        }
+        return F2TransactionCleanup {
+            clean: false,
+            retain_boot_flag: true,
+            stop_reason: Some(format!("TransactionResetFailed: {error}")),
+        };
+    }
+
+    match ops.clear_boot_flag() {
+        Ok(()) => {
+            for report in reports.iter_mut() {
+                report.boot_flag_cleared = true;
+                report.validated = matches!(report.outcome, F2Outcome::Validated);
+            }
+            F2TransactionCleanup {
+                clean: true,
+                retain_boot_flag: false,
+                stop_reason: None,
+            }
+        }
+        Err(error) => {
+            if let Some(last) = reports.last_mut() {
+                last.outcome = F2Outcome::ResetFailed;
+            }
+            F2TransactionCleanup {
+                clean: false,
+                retain_boot_flag: true,
+                stop_reason: Some(format!("BootFlagClearFailed: {error}")),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[must_use = "an active candidate transaction must be finished explicitly"]
+struct ActiveF2Candidate<O: F2CandidateTransactionOps> {
+    ops: Option<O>,
+    base_report: F2StepReport,
+    active: bool,
+}
+
+#[cfg(windows)]
+impl<O: F2CandidateTransactionOps> ActiveF2Candidate<O> {
+    fn run_phase(&mut self, dwell_ms: u64, purpose: F2StressPurpose) -> F2StepReport {
+        let ops = self.ops.as_mut().expect("active transaction owns ops");
+        ops.configure_phase(dwell_ms, purpose);
+        populate_f2_dwell_report(self.base_report.clone(), ops.dwell())
+    }
+
+    fn finish(mut self, reports: &mut [F2StepReport]) -> (O, F2TransactionCleanup) {
+        self.active = false;
+        let mut ops = self.ops.take().expect("active transaction owns ops");
+        let cleanup = finish_f2_transaction_reports(&mut ops, reports);
+        (ops, cleanup)
+    }
+
+    fn finish_timed(self, reports: &mut [F2TimedPhaseReport]) -> (O, F2TransactionCleanup) {
+        let mut bare_reports: Vec<F2StepReport> = reports
+            .iter()
+            .map(|timed| timed.report.clone())
+            .collect();
+        let (ops, cleanup) = self.finish(&mut bare_reports);
+        for (timed, report) in reports.iter_mut().zip(bare_reports) {
+            timed.report = report;
+        }
+        (ops, cleanup)
+    }
+}
+
+#[cfg(windows)]
+impl<O: F2CandidateTransactionOps> Drop for ActiveF2Candidate<O> {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            if let Some(ops) = self.ops.as_mut() {
+                let _ = ops.reset_to_stock();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+// Failure must return the selected hardware executor together with its complete safety report so
+// the caller can persist the terminal evidence and continue owning cleanup state.
+#[allow(clippy::result_large_err)]
+fn begin_f2_candidate_transaction<O: F2CandidateTransactionOps>(
+    mut ops: O,
+) -> Result<ActiveF2Candidate<O>, (O, F2StepReport, F2TransactionCleanup)> {
+    let mut report = empty_f2_step_report();
+    if let Err(error) = ops.arm_boot_flag() {
+        report.reset_ok = Some(ops.reset_to_stock().is_ok());
+        report.outcome = F2Outcome::ArmFailed(error);
+        return Err((
+            ops,
+            report,
+            F2TransactionCleanup {
+                clean: false,
+                retain_boot_flag: false,
+                stop_reason: Some("TransactionArmFailed".into()),
+            },
+        ));
+    }
+    report.armed = true;
+    if let Err(error) = ops.apply_positive_offset() {
+        report.outcome = F2Outcome::ApplyFailed(error);
+        let cleanup =
+            finish_f2_transaction_reports(&mut ops, std::slice::from_mut(&mut report));
+        return Err((ops, report, cleanup));
+    }
+    report.applied = true;
+    let verification = ops.verify();
+    report.verify = Some(verification);
+    if verification != PositiveOffsetVerification::RaiseVerified {
+        report.outcome = F2Outcome::VerifyFailed;
+        let cleanup =
+            finish_f2_transaction_reports(&mut ops, std::slice::from_mut(&mut report));
+        return Err((ops, report, cleanup));
+    }
+    Ok(ActiveF2Candidate {
+        ops: Some(ops),
+        base_report: report,
+        active: true,
+    })
+}
+
 #[cfg(windows)]
 fn classify_f2_stress_dwell(
     s: &crate::gpu_power_sweep::SingleDwell,
@@ -2646,6 +2981,7 @@ impl F2Ops for RealF2Ops<'_> {
             duration_ms: s.duration_ms,
             sample_count: s.sample_count,
             qualification_coverage: s.qualification_coverage,
+            evidence_provenance: s.evidence_provenance,
         }
     }
 
@@ -2738,6 +3074,17 @@ impl F2Ops for RealF2MultiOps<'_> {
     }
     fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String> {
         self.cur.as_mut().expect("select before use").blacklist_point(counts_as_crash)
+    }
+}
+
+#[cfg(windows)]
+impl F2CandidateTransactionOps for RealF2MultiOps<'_> {
+    fn configure_phase(&mut self, dwell_ms: u64, purpose: F2StressPurpose) {
+        self.dwell_ms = dwell_ms;
+        self.stress_purpose = purpose;
+        let current = self.cur.as_mut().expect("select before use");
+        current.dwell_ms = dwell_ms;
+        current.stress_purpose = purpose;
     }
 }
 
@@ -3902,10 +4249,11 @@ fn f2_optimized_next_clock_start(
         .or(conservative_start_mv)
 }
 
-/// Result of running the full N-pass FailureSeekingGameLoop qualification on ONE anchored candidate.
+/// Result of running the full FailureSeekingGameLoop pattern set on one still-active candidate.
+/// The caller owns the single transaction cleanup before it treats this result as clock evidence.
 #[cfg(windows)]
 enum F2QualificationOutcome {
-    /// All `qualification_passes` passes validated reset-clean.
+    /// All requested patterns passed; the shared reset/BootFlag cleanup is still pending.
     Qualified,
     /// A reset-clean instability — the qualifier rejected this point. Carries the failing outcome's
     /// debug string (purely for the stop reason / logs).
@@ -4071,18 +4419,13 @@ fn annotate_qualification_report(
     }
 }
 
-/// Run the v8 qualification (`qualification_passes` independent reset/reapply patterns) on ONE
-/// already-PowerRender-validated anchored candidate. Each pass uses the proven
-/// arm→write→verify→dwell→reset motor and is persisted immediately as Qualification evidence. Pure
-/// hardware sequencing — all policy (what to do with the result) stays in the caller.
+/// Run every candidate qualifier while the PowerDiscovery write remains active. Cleanup and
+/// persistence are deliberately owned by the caller so all phases share one safety transaction.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
-fn qualify_anchored_candidate(
-    store: &SafeLoopStore,
-    obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
-    qual_ctx: &mut crate::gpu_f2_sweep::ObsContext,
-    sane: &[(usize, u32, u32)],
-    limits: &PositiveOffsetLimits,
+fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
+    active: &mut ActiveF2Candidate<O>,
+    reports: &mut Vec<F2TimedPhaseReport>,
     target_mhz: u32,
     candidate: &AnchoredPositiveOffsetPlan,
     candidate_count: usize,
@@ -4093,12 +4436,9 @@ fn qualify_anchored_candidate(
     render_goldens: Option<RenderGoldens>,
     stop: &std::sync::atomic::AtomicBool,
     logs: &mut Vec<String>,
-    executed_steps: &mut usize,
     on_progress: &mut dyn FnMut(F2ClockDiscoveryProgress),
 ) -> F2QualificationOutcome {
     use std::sync::atomic::Ordering;
-
-    use nidavellir_core::f2_observation::now_rfc3339;
 
     let Some(goldens) = render_goldens else {
         return F2QualificationOutcome::Aborted {
@@ -4116,25 +4456,6 @@ fn qualify_anchored_candidate(
             }
             let attempt_dwell_ms =
                 qualification_attempt_dwell_ms(qualification_dwell_ms, inconclusive_retries);
-            let mut validation_ops = RealF2MultiOps {
-                store,
-                curve: sane.to_vec(),
-                candidates: vec![candidate.clone()],
-                limits: *limits,
-                target_mhz,
-                baseline_offset_mhz: 0,
-                prev_offset_override_mhz: None,
-                dwell_ms: attempt_dwell_ms,
-                stress_purpose: F2StressPurpose::V8Qualification(pattern, goldens),
-                cancel: Some(stop),
-                cur: None,
-            };
-            if let Err(e) = validation_ops.select(0) {
-                return F2QualificationOutcome::Aborted {
-                    stop_reason: format!("QualificationPrecheckFailed: {e}"),
-                    retain_boot_flag: false,
-                };
-            }
             on_progress(F2ClockDiscoveryProgress {
                 target_mhz,
                 planned_steps: candidate_count,
@@ -4150,7 +4471,10 @@ fn qualify_anchored_candidate(
                     attempt_dwell_ms / 1000
                 ),
             });
-            let mut report = run_confirmed_f2_step(&mut validation_ops);
+            let mut report = active.run_phase(
+                attempt_dwell_ms,
+                F2StressPurpose::V8Qualification(pattern, goldens),
+            );
             annotate_qualification_report(
                 &mut report,
                 F2QualificationStrength::Fsgl4,
@@ -4190,36 +4514,28 @@ fn qualify_anchored_candidate(
                 patterns.len(),
                 report.outcome
             ));
-            qual_ctx.timestamp = now_rfc3339();
-            let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
-                qual_ctx,
-                target_mhz,
-                candidate,
-                &report,
-            );
-            if let Err(e) = obs_store.append(&observation) {
-                return F2QualificationOutcome::Aborted {
-                    stop_reason: format!("ObservationPersistFailed: {e}"),
-                    retain_boot_flag: false,
-                };
-            }
-            *executed_steps = executed_steps.saturating_add(1);
+            let outcome = report.outcome.clone();
+            reports.push(F2TimedPhaseReport {
+                timestamp: nidavellir_core::f2_observation::now_rfc3339(),
+                evidence_kind: F2EvidenceKind::Qualification,
+                report,
+            });
             on_progress(F2ClockDiscoveryProgress {
                 target_mhz,
                 planned_steps: candidate_count,
                 unpruned_steps,
                 anchor_mv: Some(candidate.anchor.voltage_mv),
-                outcome: Some(format!("{:?}", report.outcome)),
+                outcome: None,
                 line: format!(
-                    "{target_mhz} MHz @ {} mV · v8 {} {}/{} → {:?} · aprendizado salvo",
+                    "{target_mhz} MHz @ {} mV · v8 {} {}/{} → {:?} · aguardando cleanup",
                     candidate.anchor.voltage_mv,
                     qualification_pattern_label(pattern),
                     pass_index,
                     patterns.len(),
-                    report.outcome
+                    outcome
                 ),
             });
-            match &report.outcome {
+            match &outcome {
                 F2Outcome::Validated => break,
                 F2Outcome::DeviceLost
                 | F2Outcome::ResetFailed
@@ -4227,8 +4543,8 @@ fn qualify_anchored_candidate(
                 | F2Outcome::ApplyFailed(_)
                 | F2Outcome::VerifyFailed => {
                     return F2QualificationOutcome::Aborted {
-                        stop_reason: format!("QualificationAborted: {:?}", report.outcome),
-                        retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
+                        stop_reason: format!("QualificationAborted: {outcome:?}"),
+                        retain_boot_flag: f2_outcome_retains_boot_flag(&outcome),
                     };
                 }
                 F2Outcome::Inconclusive => {
@@ -4250,6 +4566,58 @@ fn qualify_anchored_candidate(
         }
     }
     F2QualificationOutcome::Qualified
+}
+
+#[cfg(windows)]
+fn f2_candidate_persist_order(
+    reports: &[F2TimedPhaseReport],
+    cleanup_clean: bool,
+) -> Vec<usize> {
+    if !cleanup_clean {
+        return reports.len().checked_sub(1).into_iter().collect();
+    }
+    reports
+        .iter()
+        .enumerate()
+        .filter_map(|(index, timed)| {
+            (timed.evidence_kind == F2EvidenceKind::Qualification).then_some(index)
+        })
+        .chain(reports.iter().enumerate().filter_map(|(index, timed)| {
+            (timed.evidence_kind == F2EvidenceKind::Discovery).then_some(index)
+        }))
+        .collect()
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn persist_f2_candidate_reports(
+    obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
+    discovery_ctx: &crate::gpu_f2_sweep::ObsContext,
+    qualification_ctx: &crate::gpu_f2_sweep::ObsContext,
+    target_mhz: u32,
+    candidate: &AnchoredPositiveOffsetPlan,
+    reports: &[F2TimedPhaseReport],
+    cleanup_clean: bool,
+) -> Result<usize, String> {
+    let order = f2_candidate_persist_order(reports, cleanup_clean);
+    for index in &order {
+        let timed = &reports[*index];
+        let mut ctx = match timed.evidence_kind {
+            F2EvidenceKind::Qualification => qualification_ctx.clone(),
+            _ => discovery_ctx.clone(),
+        };
+        ctx.timestamp.clone_from(&timed.timestamp);
+        let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+            &ctx,
+            target_mhz,
+            candidate,
+            &timed.report,
+        );
+        obs_store
+            .append(&observation)
+            .map_err(|error| format!("ObservationPersistFailed: {error}"))?;
+    }
+    Ok(order.len())
 }
 
 #[cfg(windows)]
@@ -4737,7 +5105,7 @@ pub(crate) fn run_confirmed_f2_apply_qualification(
     }
 }
 
-/// Measure a missing exact Apply bin with the same supervised PowerRender motor and discovery-v4
+/// Measure a missing exact Apply bin with the same supervised PowerRender motor and discovery-v5
 /// p99 consistency contract used by frontier descent. The qualified frontier is not changed and
 /// this function contributes only card/profile power calibration; the separate post-synthesis
 /// gate proves exact-Apply stability. Every raw attempt is persisted; no consensus remains neutral
@@ -4860,12 +5228,20 @@ pub(crate) fn run_confirmed_f2_power_calibration(
         ),
     });
     let initial_report = run_confirmed_f2_step(&mut ops);
-    let rechecked =
+    let anomalous_p99 =
         f2_power_p99_requires_recheck(previous_confirmed_power, &initial_report);
+    let initial_cap_state = f2_power_cap_state(
+        initial_report.power_p99_w,
+        power_limit_w,
+        initial_report.power_capped_frac,
+    );
+    let cap_ambiguous = f2_power_measurement_usable(&initial_report)
+        && initial_cap_state == F2PowerCapState::Ambiguous;
+    let rechecked = anomalous_p99 || cap_ambiguous;
     let mut attempts = vec![initial_report];
     if rechecked {
         logs.push(format!(
-            "{target_mhz} MHz @ {apply_mv} mV calibration: salto p99 anômalo; repetindo o mesmo bin"
+            "{target_mhz} MHz @ {apply_mv} mV calibration: p99 requer consenso (anômalo={anomalous_p99}, cap={initial_cap_state:?}); repetindo o mesmo bin"
         ));
         while attempts.len() < POWER_P99_MAX_ATTEMPTS
             && !stop.load(Ordering::SeqCst)
@@ -4893,9 +5269,7 @@ pub(crate) fn run_confirmed_f2_power_calibration(
                     | F2Outcome::Unstable
             );
             attempts.push(repeated);
-            if terminal_failure
-                || f2_power_attempts_have_consistent_pair(&attempts)
-            {
+            if terminal_failure || f2_power_recheck_resolved(&attempts, power_limit_w) {
                 break;
             }
         }
@@ -4903,11 +5277,9 @@ pub(crate) fn run_confirmed_f2_power_calibration(
 
     let conservative_p99 = f2_confirm_power_attempts(&mut attempts, rechecked);
     let mut aggregate = f2_aggregate_power_attempts(&attempts, conservative_p99);
-    let near_cap = f2_near_power_limit(
-        aggregate.power_p99_w,
-        power_limit_w,
-        aggregate.power_capped_frac,
-    );
+    let cap_state =
+        f2_finalize_power_cap_state(&mut attempts, &mut aggregate, power_limit_w);
+    let near_cap = cap_state == F2PowerCapState::NearCap;
     aggregate.outcome = f2_power_bound_clock_drop(&aggregate.outcome, near_cap);
     for attempt in &mut attempts {
         if attempt.power_p99_confirmed {
@@ -5186,7 +5558,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             logs,
         };
     }
-    let mut ops = RealF2MultiOps {
+    let mut ops_slot = Some(RealF2MultiOps {
         store,
         curve: sane.to_vec(),
         candidates: descent.candidates.clone(),
@@ -5198,8 +5570,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         stress_purpose: F2StressPurpose::PowerDiscovery,
         cancel: Some(stop),
         cur: None,
-    };
-    let mut ctx = crate::gpu_f2_sweep::ObsContext {
+    });
+    let ctx = crate::gpu_f2_sweep::ObsContext {
         run_id: run_id.to_string(),
         timestamp: now_rfc3339(),
         gpu_key: Some(gpu_key.to_string()),
@@ -5285,7 +5657,10 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             stop_reason = "Cancelled".into();
             break;
         }
-        ops.prev_offset_override_mhz = Some(reference_offset_mhz);
+        ops_slot
+            .as_mut()
+            .expect("candidate transaction returned executor")
+            .prev_offset_override_mhz = Some(reference_offset_mhz);
         // A blacklisted NEXT candidate during the frontier DESCENT is BOUNDARY knowledge ("a prior
         // run's crash/TDR proved this (clock, vf_bin) unsafe — don't undervolt this low here"), NOT a
         // live safety emergency. Treat it like reaching the physical floor: stop THIS clock at the last
@@ -5295,8 +5670,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         // genuine live safety refusals (Safe Mode active / boot flag already armed) still hard-abort via
         // `select` below; those are current-state emergencies, not boundary knowledge.
         if candidate_blacklisted(
-            &ops.store.load_record(),
-            ops.target_mhz,
+            &store.load_record(),
+            target_mhz,
             &descent.candidates[i].anchor,
         ) {
             completed = true;
@@ -5307,7 +5682,11 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             ));
             break;
         }
-        if let Err(e) = ops.select(i) {
+        if let Err(e) = ops_slot
+            .as_mut()
+            .expect("candidate transaction returned executor")
+            .select(i)
+        {
             aborted = true;
             stop_reason = format!("SafetyPrecheckFailed: {e}");
             break;
@@ -5321,13 +5700,56 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             outcome: None,
             line: format!("Testing {target_mhz} MHz @ {anchor_mv} mV — dwell em andamento…"),
         });
-        let initial_report = run_confirmed_f2_step(&mut ops);
-        let rechecked =
-            f2_power_p99_requires_recheck(previous_confirmed_power, &initial_report);
-        let mut attempts = vec![initial_report];
+        let mut phase_reports = Vec::<F2TimedPhaseReport>::new();
+        let mut active_start = 0usize;
+        let mut final_cleanup: Option<F2TransactionCleanup> = None;
+        let mut transaction_abort_reason: Option<String> = None;
+        let mut active = match begin_f2_candidate_transaction(
+            ops_slot
+                .take()
+                .expect("candidate transaction executor available"),
+        ) {
+            Ok(active) => Some(active),
+            Err((returned_ops, report, cleanup)) => {
+                ops_slot = Some(returned_ops);
+                transaction_abort_reason = Some(format!(
+                    "TransactionStartFailed: {:?}",
+                    report.outcome
+                ));
+                phase_reports.push(F2TimedPhaseReport {
+                    timestamp: now_rfc3339(),
+                    evidence_kind: F2EvidenceKind::Discovery,
+                    report,
+                });
+                final_cleanup = Some(cleanup);
+                None
+            }
+        };
+        if let Some(transaction) = active.as_mut() {
+            let report = transaction.run_phase(
+                discovery_dwell_ms,
+                F2StressPurpose::PowerDiscovery,
+            );
+            phase_reports.push(F2TimedPhaseReport {
+                timestamp: now_rfc3339(),
+                evidence_kind: F2EvidenceKind::Discovery,
+                report,
+            });
+        }
+        let initial_report = &phase_reports[0].report;
+        let anomalous_p99 =
+            f2_power_p99_content_requires_recheck(previous_confirmed_power, initial_report);
+        let initial_cap_state = f2_power_cap_state(
+            initial_report.power_p99_w,
+            power_limit_w,
+            initial_report.power_capped_frac,
+        );
+        let cap_ambiguous = f2_power_measurement_content_usable(initial_report)
+            && initial_cap_state == F2PowerCapState::Ambiguous;
+        let rechecked = anomalous_p99 || cap_ambiguous;
         if rechecked {
             logs.push(format!(
-                "{target_mhz} MHz @ {anchor_mv} mV: salto p99 anômalo detectado; repetindo o mesmo bin até {} tentativas reset-clean",
+                "{target_mhz} MHz @ {anchor_mv} mV: p99 requer consenso (anômalo={anomalous_p99}, cap={initial_cap_state:?}); repetindo o mesmo bin até {} tentativas reset-clean",
                 POWER_P99_MAX_ATTEMPTS
             ));
             on_progress(F2ClockDiscoveryProgress {
@@ -5337,11 +5759,30 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 anchor_mv: Some(anchor_mv),
                 outcome: None,
                 line: format!(
-                    "{target_mhz} MHz @ {anchor_mv} mV → p99 anômalo; repetindo exatamente o mesmo bin…"
+                    "{target_mhz} MHz @ {anchor_mv} mV → p99/cap requer consenso; repetindo exatamente o mesmo bin…"
                 ),
             });
-            while attempts.len() < POWER_P99_MAX_ATTEMPTS {
-                let attempt_number = attempts.len() + 1;
+            if let Some(transaction) = active.take() {
+                let (returned_ops, cleanup) =
+                    transaction.finish_timed(&mut phase_reports[active_start..]);
+                ops_slot = Some(returned_ops);
+                if !cleanup.clean {
+                    transaction_abort_reason.clone_from(&cleanup.stop_reason);
+                }
+                final_cleanup = Some(cleanup);
+            }
+            while phase_reports
+                .iter()
+                .filter(|timed| timed.evidence_kind == F2EvidenceKind::Discovery)
+                .count()
+                < POWER_P99_MAX_ATTEMPTS
+                && transaction_abort_reason.is_none()
+            {
+                let attempt_number = phase_reports
+                    .iter()
+                    .filter(|timed| timed.evidence_kind == F2EvidenceKind::Discovery)
+                    .count()
+                    + 1;
                 on_progress(F2ClockDiscoveryProgress {
                     target_mhz,
                     planned_steps: candidate_count,
@@ -5352,7 +5793,43 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                         "Reteste p99 {attempt_number}/{POWER_P99_MAX_ATTEMPTS}: {target_mhz} MHz @ {anchor_mv} mV — dwell em andamento…"
                     ),
                 });
-                let repeated = run_confirmed_f2_step(&mut ops);
+                if let Err(error) = ops_slot
+                    .as_mut()
+                    .expect("candidate transaction returned executor")
+                    .select(i)
+                {
+                    transaction_abort_reason = Some(format!("P99RetryPrecheckFailed: {error}"));
+                    break;
+                }
+                active_start = phase_reports.len();
+                active = match begin_f2_candidate_transaction(
+                    ops_slot
+                        .take()
+                        .expect("candidate transaction executor available"),
+                ) {
+                    Ok(transaction) => Some(transaction),
+                    Err((returned_ops, report, cleanup)) => {
+                        ops_slot = Some(returned_ops);
+                        transaction_abort_reason = Some(format!(
+                            "P99RetryStartFailed: {:?}",
+                            report.outcome
+                        ));
+                        phase_reports.push(F2TimedPhaseReport {
+                            timestamp: now_rfc3339(),
+                            evidence_kind: F2EvidenceKind::Discovery,
+                            report,
+                        });
+                        final_cleanup = Some(cleanup);
+                        None
+                    }
+                };
+                let Some(transaction) = active.as_mut() else {
+                    break;
+                };
+                let repeated = transaction.run_phase(
+                    discovery_dwell_ms,
+                    F2StressPurpose::PowerDiscovery,
+                );
                 let terminal_safety_failure = matches!(
                     repeated.outcome,
                     F2Outcome::DeviceLost
@@ -5360,17 +5837,61 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                         | F2Outcome::ArmFailed(_)
                         | F2Outcome::ApplyFailed(_)
                         | F2Outcome::VerifyFailed
+                        | F2Outcome::SilentError
+                        | F2Outcome::Unstable
                 );
-                attempts.push(repeated);
+                phase_reports.push(F2TimedPhaseReport {
+                    timestamp: now_rfc3339(),
+                    evidence_kind: F2EvidenceKind::Discovery,
+                    report: repeated,
+                });
+                let mut provisional_attempts: Vec<F2StepReport> = phase_reports
+                    .iter()
+                    .filter(|timed| timed.evidence_kind == F2EvidenceKind::Discovery)
+                    .map(|timed| timed.report.clone())
+                    .collect();
+                if let Some(last) = provisional_attempts.last_mut() {
+                    last.reset_ok = Some(true);
+                    last.boot_flag_cleared = true;
+                }
                 if terminal_safety_failure
-                    || f2_power_attempts_have_consistent_pair(&attempts)
+                    || f2_power_recheck_resolved(&provisional_attempts, power_limit_w)
                 {
                     break;
                 }
+                if let Some(transaction) = active.take() {
+                    let (returned_ops, cleanup) =
+                        transaction.finish_timed(&mut phase_reports[active_start..]);
+                    ops_slot = Some(returned_ops);
+                    if !cleanup.clean {
+                        transaction_abort_reason.clone_from(&cleanup.stop_reason);
+                    }
+                    final_cleanup = Some(cleanup);
+                }
+            }
+        }
+        let discovery_indices: Vec<usize> = phase_reports
+            .iter()
+            .enumerate()
+            .filter_map(|(index, timed)| {
+                (timed.evidence_kind == F2EvidenceKind::Discovery).then_some(index)
+            })
+            .collect();
+        let mut attempts: Vec<F2StepReport> = discovery_indices
+            .iter()
+            .map(|index| phase_reports[*index].report.clone())
+            .collect();
+        if active.is_some() {
+            if let Some(last) = attempts.last_mut() {
+                // Provisional analytics only. The actual report remains untrusted until `finish`.
+                last.reset_ok = Some(true);
+                last.boot_flag_cleared = true;
             }
         }
         let conservative_p99 = f2_confirm_power_attempts(&mut attempts, rechecked);
         let mut report = f2_aggregate_power_attempts(&attempts, conservative_p99);
+        let cap_state =
+            f2_finalize_power_cap_state(&mut attempts, &mut report, power_limit_w);
         let near_cap =
             f2_near_power_limit(report.power_p99_w, power_limit_w, report.power_capped_frac);
         report.outcome = f2_power_bound_clock_drop(&report.outcome, near_cap);
@@ -5379,12 +5900,127 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 attempt.outcome = f2_power_bound_clock_drop(&attempt.outcome, near_cap);
             }
         }
+        for (index, analyzed) in discovery_indices.iter().zip(&attempts) {
+            let actual = &mut phase_reports[*index].report;
+            actual.outcome = analyzed.outcome.clone();
+            actual.power_p99_confirmed = analyzed.power_p99_confirmed;
+            actual.power_p99_attempts = analyzed.power_p99_attempts;
+        }
 
-        if let (Some(power_p99), Some(p5)) = (conservative_p99, report.p5_clock_mhz) {
-            previous_confirmed_power = Some((power_p99, p5));
+        let mut qualification_outcome = None;
+        if transaction_abort_reason.is_none()
+            && f2_should_qualify_discovery_candidate(
+                &report.outcome,
+                near_cap,
+                qualification_passes,
+            )
+        {
+            if let Some(active_candidate) = active.as_mut() {
+                qualification_outcome = if stop.load(Ordering::SeqCst) {
+                    Some(F2QualificationOutcome::Cancelled)
+                } else {
+                    Some(qualify_active_anchored_candidate(
+                        active_candidate,
+                        &mut phase_reports,
+                        target_mhz,
+                        &descent.candidates[i],
+                        candidate_count,
+                        unpruned_steps,
+                        qualification_dwell_ms,
+                        qualification_passes,
+                        &mut qualification_margin_history,
+                        render_goldens,
+                        stop,
+                        &mut logs,
+                        on_progress,
+                    ))
+                };
+            }
+        }
+        if let Some(transaction) = active.take() {
+            let (returned_ops, cleanup) =
+                transaction.finish_timed(&mut phase_reports[active_start..]);
+            ops_slot = Some(returned_ops);
+            final_cleanup = Some(cleanup);
+        }
+        let cleanup = final_cleanup.unwrap_or(F2TransactionCleanup {
+            clean: false,
+            retain_boot_flag: true,
+            stop_reason: Some("TransactionCleanupMissing".into()),
+        });
+        if !cleanup.clean {
+            let terminal_outcome = phase_reports
+                .iter()
+                .find(|timed| matches!(timed.report.outcome, F2Outcome::DeviceLost))
+                .map(|_| F2Outcome::DeviceLost)
+                .unwrap_or(F2Outcome::ResetFailed);
+            report.outcome = terminal_outcome;
+            report.validated = false;
+            report.reset_ok = phase_reports.last().and_then(|timed| timed.report.reset_ok);
+            report.boot_flag_cleared = false;
+            let reason = cleanup
+                .stop_reason
+                .clone()
+                .unwrap_or_else(|| "TransactionCleanupFailed".into());
+            transaction_abort_reason = Some(reason.clone());
+            if qualification_outcome.is_some() {
+                qualification_outcome = Some(F2QualificationOutcome::Aborted {
+                    stop_reason: reason,
+                    retain_boot_flag: cleanup.retain_boot_flag,
+                });
+            }
+        } else {
+            report.reset_ok = Some(true);
+            report.boot_flag_cleared = true;
+            report.validated = matches!(report.outcome, F2Outcome::Validated);
+        }
+
+        let persisted = match persist_f2_candidate_reports(
+            obs_store,
+            &ctx,
+            &qual_ctx,
+            target_mhz,
+            &descent.candidates[i],
+            &phase_reports,
+            cleanup.clean,
+        ) {
+            Ok(count) => count,
+            Err(error) => {
+                aborted = true;
+                stop_reason = error;
+                break;
+            }
+        };
+        executed_steps = executed_steps.saturating_add(persisted);
+        for index in f2_candidate_persist_order(&phase_reports, cleanup.clean) {
+            let timed = &phase_reports[index];
+            if timed.evidence_kind == F2EvidenceKind::Qualification {
+                on_progress(F2ClockDiscoveryProgress {
+                    target_mhz,
+                    planned_steps: candidate_count,
+                    unpruned_steps,
+                    anchor_mv: Some(anchor_mv),
+                    outcome: Some(format!("{:?}", timed.report.outcome)),
+                    line: format!(
+                        "{target_mhz} MHz @ {anchor_mv} mV · qualificação → {:?} · aprendizado salvo",
+                        timed.report.outcome
+                    ),
+                });
+            }
+        }
+        if let Some(reason) = transaction_abort_reason {
+            aborted = true;
+            retain_boot_flag |= cleanup.retain_boot_flag;
+            stop_reason = reason;
+            break;
+        }
+        if report.power_p99_confirmed {
+            if let (Some(power_p99), Some(p5)) = (conservative_p99, report.p5_clock_mhz) {
+                previous_confirmed_power = Some((power_p99, p5));
+            }
         }
         logs.push(format!(
-            "{target_mhz} MHz @ {anchor_mv} mV: {:?}, attempts={}, p5={:?} MHz, power_avg={:?} W, power_p99_conservative={:?} W, cap_near={near_cap}",
+            "{target_mhz} MHz @ {anchor_mv} mV: {:?}, attempts={}, p5={:?} MHz, power_avg={:?} W, power_p99_conservative={:?} W, cap={cap_state:?}",
             report.outcome,
             attempts.len(),
             report.p5_clock_mhz,
@@ -5402,19 +6038,6 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 attempt.power_p99_w,
                 attempt.power_p99_confirmed
             ));
-            ctx.timestamp = now_rfc3339();
-            let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
-                &ctx,
-                target_mhz,
-                &descent.candidates[i],
-                attempt,
-            );
-            if let Err(e) = obs_store.append(&observation) {
-                aborted = true;
-                stop_reason = format!("ObservationPersistFailed: {e}");
-                break;
-            }
-            executed_steps = executed_steps.saturating_add(1);
             on_progress(F2ClockDiscoveryProgress {
                 target_mhz,
                 planned_steps: candidate_count,
@@ -5436,9 +6059,6 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 ),
             });
         }
-        if aborted {
-            break;
-        }
         if rechecked {
             on_progress(F2ClockDiscoveryProgress {
                 target_mhz,
@@ -5446,12 +6066,12 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 unpruned_steps,
                 anchor_mv: Some(anchor_mv),
                 outcome: Some(format!("{:?}", report.outcome)),
-                line: match conservative_p99 {
-                    Some(power) => format!(
+                line: match (report.power_p99_confirmed, conservative_p99) {
+                    (true, Some(power)) => format!(
                         "{target_mhz} MHz @ {anchor_mv} mV → consenso p99 confirmado; valor conservador {power:.0} W"
                     ),
-                    None => format!(
-                        "{target_mhz} MHz @ {anchor_mv} mV → p99 inconclusivo após {} tentativa(s); bin inelegível",
+                    _ => format!(
+                        "{target_mhz} MHz @ {anchor_mv} mV → p99/cap inconclusivo após {} tentativa(s); bin inelegível",
                         attempts.len()
                     ),
                 },
@@ -5519,25 +6139,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                     // measures its power and gates the next qualification); if it fails we stop here with
                     // the last qualified bin as the boundary — the heavy qualifier never runs more than
                     // one bin below a proven point, so an over-aggressive bin can no longer TDR here.
-                    let qualification_outcome = qualify_anchored_candidate(
-                        store,
-                        obs_store,
-                        &mut qual_ctx,
-                        sane,
-                        limits,
-                        target_mhz,
-                        &descent.candidates[i],
-                        candidate_count,
-                        unpruned_steps,
-                        qualification_dwell_ms,
-                        qualification_passes,
-                        &mut qualification_margin_history,
-                        render_goldens,
-                        stop,
-                        &mut logs,
-                        &mut executed_steps,
-                        on_progress,
-                    );
+                    let qualification_outcome = qualification_outcome
+                        .expect("eligible candidate was qualified before transaction cleanup");
                     let qualification_completed = qualification_outcome.completes_clock();
                     match qualification_outcome {
                         F2QualificationOutcome::Qualified => {
@@ -6339,6 +6942,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn power_cap_hysteresis_classifies_98_98_5_and_99_percent() {
+        assert_eq!(
+            f2_power_cap_state(Some(196.0), Some(200.0), Some(1.0)),
+            F2PowerCapState::OffCap
+        );
+        assert_eq!(
+            f2_power_cap_state(Some(197.0), Some(200.0), Some(1.0)),
+            F2PowerCapState::Ambiguous
+        );
+        assert_eq!(
+            f2_power_cap_state(Some(198.0), Some(200.0), Some(0.0)),
+            F2PowerCapState::NearCap
+        );
+        assert!(!f2_near_power_limit(
+            Some(197.0),
+            Some(200.0),
+            Some(1.0)
+        ));
+    }
+
     fn power_report(power_p99_w: f32, p5_clock_mhz: u32) -> F2StepReport {
         F2StepReport {
             outcome: F2Outcome::Validated,
@@ -6366,11 +6990,25 @@ mod tests {
             dwell_duration_ms: Some(10_000),
             sample_count: Some(100),
             qualification_coverage: None,
+            evidence_provenance: None,
             reset_ok: Some(true),
             boot_flag_cleared: true,
             blacklisted: false,
             validated: true,
         }
+    }
+
+    #[test]
+    fn power_content_is_analyzable_active_but_not_reusable_before_cleanup() {
+        let mut report = power_report(189.0, 1815);
+        report.reset_ok = None;
+        report.boot_flag_cleared = false;
+        assert!(f2_power_measurement_content_usable(&report));
+        assert!(!f2_power_measurement_usable(&report));
+        report.reset_ok = Some(true);
+        assert!(!f2_power_measurement_usable(&report));
+        report.boot_flag_cleared = true;
+        assert!(f2_power_measurement_usable(&report));
     }
 
     #[test]
@@ -6396,6 +7034,31 @@ mod tests {
         assert!(reports
             .iter()
             .all(|report| report.power_p99_attempts == 3));
+    }
+
+    #[test]
+    fn persistent_ambiguous_power_cap_is_inconclusive_after_max_attempts() {
+        let mut reports = vec![
+            power_report(197.0, 1890),
+            power_report(197.0, 1890),
+            power_report(197.0, 1890),
+        ];
+        assert_eq!(reports.len(), POWER_P99_MAX_ATTEMPTS);
+        assert!(!f2_power_recheck_resolved(&reports, Some(200.0)));
+
+        let conservative_p99 = f2_confirm_power_attempts(&mut reports, true);
+        assert_eq!(conservative_p99, Some(197.0));
+        let mut aggregate = f2_aggregate_power_attempts(&reports, conservative_p99);
+        assert_eq!(
+            f2_finalize_power_cap_state(&mut reports, &mut aggregate, Some(200.0)),
+            F2PowerCapState::Ambiguous
+        );
+        assert_eq!(aggregate.outcome, F2Outcome::Inconclusive);
+        assert!(!aggregate.power_p99_confirmed);
+        assert!(reports
+            .iter()
+            .all(|report| report.outcome == F2Outcome::Inconclusive));
+        assert!(reports.iter().all(|report| !report.power_p99_confirmed));
     }
 
     #[test]
@@ -6516,6 +7179,7 @@ mod tests {
             duration_ms: 60_000,
             sample_count: 1_000,
             qualification_coverage: None,
+            evidence_provenance: None,
             prehang_stall_detected: false,
         };
         assert_eq!(
@@ -6600,6 +7264,7 @@ mod tests {
             duration_ms: 300_000,
             sample_count: 5_000,
             qualification_coverage: None,
+            evidence_provenance: None,
             prehang_stall_detected: false,
         };
         // Held clock (p5 == target) despite the throttle flag → hard point exercised → validate.
@@ -7355,6 +8020,7 @@ mod tests {
                 duration_ms: 15_000,
                 sample_count: 300,
                 qualification_coverage: None,
+                evidence_provenance: None,
             }
         }
         fn reset_to_stock(&mut self) -> Result<(), String> { self.log.push("reset"); self.reset.clone() }
@@ -7362,6 +8028,123 @@ mod tests {
         fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String> {
             self.log.push(if counts_as_crash { "blacklist-crash" } else { "blacklist" });
             self.blacklist.clone()
+        }
+    }
+
+    struct TransactionMockOps {
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        dwells: std::collections::VecDeque<F2DwellOutcome>,
+        reset: Result<(), String>,
+        clear: Result<(), String>,
+        blacklist: Result<(), String>,
+    }
+
+    impl TransactionMockOps {
+        fn new(dwells: impl IntoIterator<Item = F2DwellOutcome>) -> Self {
+            Self {
+                log: Default::default(),
+                dwells: dwells.into_iter().collect(),
+                reset: Ok(()),
+                clear: Ok(()),
+                blacklist: Ok(()),
+            }
+        }
+
+        fn log_handle(&self) -> std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> {
+            self.log.clone()
+        }
+
+        fn push(&self, entry: &'static str) {
+            self.log.borrow_mut().push(entry);
+        }
+
+        fn dwell_result(outcome: F2DwellOutcome) -> F2DwellResult {
+            F2DwellResult {
+                outcome,
+                avg_clock_mhz: 1815,
+                p5_clock_mhz: 1815,
+                p95_clock_mhz: 1815,
+                power_w: 183.0,
+                max_power_w: 191.0,
+                power_p99_w: Some(189.0),
+                power_capped_frac: 0.0,
+                max_temp_c: Some(62.0),
+                thermal_throttled: false,
+                measured_voltage_min_mv: Some(949),
+                measured_voltage_avg_mv: Some(950),
+                measured_voltage_max_mv: Some(951),
+                measured_voltage_sample_count: 20,
+                render_frames: Some(900),
+                render_fps: Some(60.0),
+                duration_ms: 15_000,
+                sample_count: 300,
+                qualification_coverage: None,
+                evidence_provenance: None,
+            }
+        }
+    }
+
+    impl F2Ops for TransactionMockOps {
+        fn arm_boot_flag(&mut self) -> Result<(), String> {
+            self.push("arm");
+            Ok(())
+        }
+
+        fn apply_positive_offset(&mut self) -> Result<(), String> {
+            self.push("apply");
+            Ok(())
+        }
+
+        fn verify(&mut self) -> PositiveOffsetVerification {
+            self.push("verify");
+            PositiveOffsetVerification::RaiseVerified
+        }
+
+        fn dwell(&mut self) -> F2DwellResult {
+            self.push("dwell");
+            Self::dwell_result(self.dwells.pop_front().expect("scripted dwell"))
+        }
+
+        fn reset_to_stock(&mut self) -> Result<(), String> {
+            self.push("reset");
+            self.reset.clone()
+        }
+
+        fn clear_boot_flag(&mut self) -> Result<(), String> {
+            self.push("clear");
+            self.clear.clone()
+        }
+
+        fn blacklist_point(&mut self, counts_as_crash: bool) -> Result<(), String> {
+            self.push(if counts_as_crash {
+                "blacklist-crash"
+            } else {
+                "blacklist"
+            });
+            self.blacklist.clone()
+        }
+    }
+
+    impl F2CandidateTransactionOps for TransactionMockOps {
+        fn configure_phase(&mut self, _dwell_ms: u64, purpose: F2StressPurpose) {
+            self.push(match purpose {
+                F2StressPurpose::PowerDiscovery => "phase:power",
+                F2StressPurpose::V8Qualification(_, _) => "phase:qualification",
+                F2StressPurpose::ApplyQualification(_, _) => "phase:apply-qualification",
+            });
+        }
+    }
+
+    fn test_render_goldens() -> RenderGoldens {
+        RenderGoldens {
+            power: 0,
+            boost: 0,
+            texrop: 0,
+            cadence: 0,
+            geometry: 0,
+            stream: 0,
+            stream_frame_reference_ms: 0,
+            boost_frame_reference_us: 0,
         }
     }
 
@@ -7377,6 +8160,20 @@ mod tests {
         assert_eq!(r.power_w, Some(183));
         assert_eq!(r.max_power_w, Some(191));
         assert_eq!(r.power_p99_w, Some(189.0));
+        assert_eq!(
+            r.evidence_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.build_version.as_deref()),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let embedded_revision = env!("NIDAVELLIR_BUILD_REVISION");
+        assert!(!embedded_revision.trim().is_empty());
+        assert_eq!(
+            r.evidence_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.build_revision.as_deref()),
+            (embedded_revision != "unknown").then_some(embedded_revision)
+        );
         assert!(!r.blacklisted);
     }
 
@@ -7483,6 +8280,276 @@ mod tests {
         assert!(r.boot_flag_cleared); // reset ok, no device loss → safe to clear
         assert_eq!(r.reset_ok, Some(true));
         assert!(!ops.log.contains(&"blacklist"));
+    }
+
+    #[test]
+    fn confirmed_clear_failure_is_terminal_and_never_validated() {
+        let mut ops = MockOps::happy();
+        ops.clear = Err("boot flag write failed".into());
+        let report = run_confirmed_f2_step(&mut ops);
+        assert_eq!(report.outcome, F2Outcome::ResetFailed);
+        assert_eq!(report.reset_ok, Some(true));
+        assert!(!report.boot_flag_cleared);
+        assert!(!report.validated);
+    }
+
+    #[test]
+    fn candidate_transaction_reuses_one_write_for_power_and_qualification_retry() {
+        let ops = TransactionMockOps::new([
+            F2DwellOutcome::Stable,
+            F2DwellOutcome::Inconclusive,
+            F2DwellOutcome::Stable,
+        ]);
+        let log = ops.log_handle();
+        let Some(mut active) = begin_f2_candidate_transaction(ops).ok() else {
+            panic!("transaction should start");
+        };
+        let power = active.run_phase(15_000, F2StressPurpose::PowerDiscovery);
+        let mut reports = vec![F2TimedPhaseReport {
+            timestamp: "power".into(),
+            evidence_kind: F2EvidenceKind::Discovery,
+            report: power,
+        }];
+        let candidate = plan_anchored_undervolt_descent(
+            &t_base(),
+            1755,
+            None,
+            &cand_limits(),
+            1,
+        )
+        .candidates
+        .remove(0);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcome = qualify_active_anchored_candidate(
+            &mut active,
+            &mut reports,
+            1755,
+            &candidate,
+            1,
+            1,
+            30_000,
+            1,
+            &mut F2QualificationMarginHistory::default(),
+            Some(test_render_goldens()),
+            &stop,
+            &mut Vec::new(),
+            &mut |_| {},
+        );
+        assert!(matches!(outcome, F2QualificationOutcome::Qualified));
+        let (ops, cleanup) = active.finish_timed(&mut reports);
+        assert!(cleanup.clean);
+        assert!(reports
+            .iter()
+            .all(|timed| timed.report.reset_ok == Some(true)
+                && timed.report.boot_flag_cleared));
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "arm",
+                "apply",
+                "verify",
+                "phase:power",
+                "dwell",
+                "phase:qualification",
+                "dwell",
+                "phase:qualification",
+                "dwell",
+                "reset",
+                "clear",
+            ]
+        );
+        assert_eq!(ops.dwells.len(), 0);
+    }
+
+    #[test]
+    fn candidate_transaction_device_lost_blacklists_once_and_retains_flag() {
+        let ops = TransactionMockOps::new([F2DwellOutcome::DeviceLost]);
+        let log = ops.log_handle();
+        let Some(mut active) = begin_f2_candidate_transaction(ops).ok() else {
+            panic!("transaction should start");
+        };
+        let report = active.run_phase(15_000, F2StressPurpose::PowerDiscovery);
+        let mut reports = [report];
+        let (_ops, cleanup) = active.finish(&mut reports);
+        assert!(!cleanup.clean);
+        assert!(cleanup.retain_boot_flag);
+        assert_eq!(reports[0].outcome, F2Outcome::DeviceLost);
+        assert!(reports[0].blacklisted);
+        assert_eq!(
+            log.borrow().iter().filter(|entry| **entry == "blacklist-crash").count(),
+            1
+        );
+        assert!(!log.borrow().contains(&"clear"));
+    }
+
+    #[test]
+    fn candidate_transaction_silent_error_blacklists_once_then_clears() {
+        let ops = TransactionMockOps::new([F2DwellOutcome::SilentError]);
+        let log = ops.log_handle();
+        let Some(mut active) = begin_f2_candidate_transaction(ops).ok() else {
+            panic!("transaction should start");
+        };
+        let report = active.run_phase(15_000, F2StressPurpose::PowerDiscovery);
+        let mut reports = [report];
+        let (_ops, cleanup) = active.finish(&mut reports);
+        assert!(cleanup.clean);
+        assert_eq!(reports[0].outcome, F2Outcome::SilentError);
+        assert!(reports[0].blacklisted && reports[0].boot_flag_cleared);
+        assert_eq!(
+            log.borrow().iter().filter(|entry| **entry == "blacklist").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn candidate_transaction_clear_failure_is_terminal_without_positive() {
+        let mut ops = TransactionMockOps::new([F2DwellOutcome::Stable]);
+        ops.clear = Err("clear failed".into());
+        let Some(mut active) = begin_f2_candidate_transaction(ops).ok() else {
+            panic!("transaction should start");
+        };
+        let report = active.run_phase(15_000, F2StressPurpose::PowerDiscovery);
+        let mut reports = [report];
+        let (_ops, cleanup) = active.finish(&mut reports);
+        assert!(!cleanup.clean && cleanup.retain_boot_flag);
+        assert!(cleanup
+            .stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("BootFlagClearFailed")));
+        assert_eq!(reports[0].outcome, F2Outcome::ResetFailed);
+        assert!(!reports[0].validated && !reports[0].boot_flag_cleared);
+    }
+
+    #[test]
+    fn candidate_transaction_blacklist_failure_aborts_without_clearing() {
+        let mut ops = TransactionMockOps::new([F2DwellOutcome::Unstable]);
+        ops.blacklist = Err("blacklist save failed".into());
+        let log = ops.log_handle();
+        let Some(mut active) = begin_f2_candidate_transaction(ops).ok() else {
+            panic!("transaction should start");
+        };
+        let report = active.run_phase(15_000, F2StressPurpose::PowerDiscovery);
+        let mut reports = [report];
+        let (_ops, cleanup) = active.finish(&mut reports);
+        assert!(!cleanup.clean && cleanup.retain_boot_flag);
+        assert_eq!(reports[0].outcome, F2Outcome::ResetFailed);
+        assert!(!log.borrow().contains(&"clear"));
+    }
+
+    #[test]
+    fn candidate_transaction_drop_resets_best_effort_without_clearing() {
+        let ops = TransactionMockOps::new([F2DwellOutcome::Stable]);
+        let log = ops.log_handle();
+        {
+            let Some(_active) = begin_f2_candidate_transaction(ops).ok() else {
+                panic!("transaction should start");
+            };
+        }
+        assert!(log.borrow().contains(&"reset"));
+        assert!(!log.borrow().contains(&"clear"));
+    }
+
+    #[test]
+    fn candidate_transaction_cancel_between_phases_finishes_clean() {
+        let ops = TransactionMockOps::new([F2DwellOutcome::Stable]);
+        let log = ops.log_handle();
+        let Some(mut active) = begin_f2_candidate_transaction(ops).ok() else {
+            panic!("transaction should start");
+        };
+        let power = active.run_phase(15_000, F2StressPurpose::PowerDiscovery);
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let candidate = plan_anchored_undervolt_descent(
+            &t_base(),
+            1755,
+            None,
+            &cand_limits(),
+            1,
+        )
+        .candidates
+        .remove(0);
+        let mut timed = vec![F2TimedPhaseReport {
+            timestamp: "power".into(),
+            evidence_kind: F2EvidenceKind::Discovery,
+            report: power,
+        }];
+        let outcome = qualify_active_anchored_candidate(
+            &mut active,
+            &mut timed,
+            1755,
+            &candidate,
+            1,
+            1,
+            30_000,
+            1,
+            &mut F2QualificationMarginHistory::default(),
+            Some(test_render_goldens()),
+            &stop,
+            &mut Vec::new(),
+            &mut |_| {},
+        );
+        assert!(matches!(outcome, F2QualificationOutcome::Cancelled));
+        let (_ops, cleanup) = active.finish_timed(&mut timed);
+        assert!(cleanup.clean);
+        assert_eq!(log.borrow().iter().filter(|entry| **entry == "dwell").count(), 1);
+        assert!(log.borrow().ends_with(&["reset", "clear"]));
+    }
+
+    #[test]
+    fn candidate_transaction_p99_retry_is_reset_clean_before_reselect() {
+        let ops = TransactionMockOps::new([
+            F2DwellOutcome::Stable,
+            F2DwellOutcome::Stable,
+            F2DwellOutcome::Stable,
+        ]);
+        let log = ops.log_handle();
+        log.borrow_mut().push("select");
+        let Some(mut first) = begin_f2_candidate_transaction(ops).ok() else {
+            panic!("first transaction should start");
+        };
+        let mut first_reports = [first.run_phase(15_000, F2StressPurpose::PowerDiscovery)];
+        let (ops, first_cleanup) = first.finish(&mut first_reports);
+        assert!(first_cleanup.clean);
+        log.borrow_mut().push("select");
+        let Some(mut second) = begin_f2_candidate_transaction(ops).ok() else {
+            panic!("second transaction should start");
+        };
+        let mut second_reports = [
+            second.run_phase(15_000, F2StressPurpose::PowerDiscovery),
+            second.run_phase(
+                30_000,
+                F2StressPurpose::V8Qualification(
+                    F2QualificationPattern::Texture,
+                    test_render_goldens(),
+                ),
+            ),
+        ];
+        let (_ops, second_cleanup) = second.finish(&mut second_reports);
+        assert!(second_cleanup.clean);
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "select", "arm", "apply", "verify", "phase:power", "dwell", "reset",
+                "clear", "select", "arm", "apply", "verify", "phase:power", "dwell",
+                "phase:qualification", "dwell", "reset", "clear",
+            ]
+        );
+    }
+
+    #[test]
+    fn candidate_transaction_persists_qualification_before_discovery() {
+        let timed = |kind| F2TimedPhaseReport {
+            timestamp: String::new(),
+            evidence_kind: kind,
+            report: empty_f2_step_report(),
+        };
+        let reports = vec![
+            timed(F2EvidenceKind::Discovery),
+            timed(F2EvidenceKind::Qualification),
+            timed(F2EvidenceKind::Qualification),
+            timed(F2EvidenceKind::Discovery),
+        ];
+        assert_eq!(f2_candidate_persist_order(&reports, true), vec![1, 2, 0, 3]);
+        assert_eq!(f2_candidate_persist_order(&reports, false), vec![3]);
     }
 
     #[test]
@@ -7669,6 +8736,7 @@ mod tests {
                 duration_ms: 15_000,
                 sample_count: 300,
                 qualification_coverage: None,
+                evidence_provenance: None,
             }
         }
         fn reset_to_stock(&mut self) -> Result<(), String> { self.log.push(format!("reset{}", self.cur)); self.s().reset.clone() }
@@ -7886,6 +8954,7 @@ mod tests {
                 duration_ms: 15_000,
                 sample_count: 300,
                 qualification_coverage: None,
+                evidence_provenance: None,
             }
         }
         fn reset_to_stock(&mut self) -> Result<(), String> { self.log.push(format!("reset{}", self.cur)); self.s().reset.clone() }
