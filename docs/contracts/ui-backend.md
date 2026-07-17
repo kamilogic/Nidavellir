@@ -5,6 +5,51 @@
 > surface (methods + payload shapes). Keep it current when the IPC changes.
 
 
+\## 2026-07-16 (additive): explicit Forge pause/resume, structured tasks and durable condemnations
+
+\- **Manual cooperative pause:** `StopPowerSweep` remains the existing unit method. While the
+  active GPU task cooperates, progress reports `phase: "stopping"`. Only after the worker has
+  stopped, restored/confirmed stock and persisted all completed F2 observations plus
+  `forge_state.json`, progress becomes `phase: "paused"`. A TDR, panic, recovery Reset or Sentinel
+  cancellation is not labelled as a manual pause.
+\- **New explicit resume method:** `ResumePowerSweep`, wire
+  `{"method":"ResumePowerSweep"}`. It returns the normal `PowerSweep` response. A plain
+  `StartPowerSweep*` never implicitly resumes a manual Stop; the frontend must invoke this method.
+  Resume continues the same `run_id`/`run_sequence`, so already completed evidence is reused and a
+  clean-run checkpoint retains its run-scoped ledger semantics.
+\- **Fail-closed compatibility:** a paused checkpoint is resumable only when all of the exact
+  `program_version`, embedded `build_revision`, NVML GPU identity, selected adapter name, driver
+  name and driver version/details match the current backend. Legacy checkpoints without that
+  identity remain inspectable but cannot resume. Additive/defaulted progress fields:
+  `resume_compatibility: Option<ForgeResumeCompatibility>`, `resume_available: bool` and
+  `resume_block_reason: Option<String>`.
+\- **Cumulative timing:** `elapsed_ms` remains cumulative across resume sessions and never restarts
+  near zero. Existing `estimated_remaining_ms` / `estimated_total_upper_ms` keep their total-run
+  meanings.
+\- **Structured current/next work:** `PowerSweepProgress` adds defaulted
+  `current_task: Option<String>`, `current_task_elapsed_ms: u64`,
+  `current_task_estimated_total_ms: Option<u64>`, `next_task: Option<String>` and
+  `next_task_estimated_duration_ms: Option<u64>`. Stable task IDs currently include
+  `prepare_stock`, `stock_preheat`, `capture_goldens`, `frontier_descent`, `profile_synthesis`,
+  `power_calibration`, `apply_qualification` and `final_stock_reset`. These fields are the canonical
+  UI source; do not infer task/progress from localized log text. Current/next task IDs clear in
+  non-running terminal states.
+\- **Sentinel durable blacklist view:** `SafeLoopStatus` adds defaulted
+  `condemnations: Vec<CondemnationEvent>`. It is the newest 100 effective (non-rehabilitated)
+  append-only ledger events and includes `target_mhz`, `vf_bin_mv`, `severity`, `kind`, `run_id`,
+  timestamp and optional note/GPU identity. `blacklist` remains the operational Safe Loop regions;
+  Sentinel should display both because durable rigid/quarantine evidence can survive their reset.
+\- **Live GPU telemetry:** `GpuSensors` adds defaulted/optional `fan_speed_pct` and
+  `voltage_source`. `voltage_mv` is now populated read-only from NVAPI when sane; fan duty is the
+  average of every NVML fan exposed by the card, with `nvidia-smi fan.speed` as fallback. `None`
+  means unavailable and must render as such; numeric zero is a valid reading and must not be hidden.
+  Existing `memory_clock_mhz`, `vram_total_mb` and `vram_used_mb` remain the VRAM speed/capacity
+  contract. GPU sensor caching is one second so the live cards track the existing UI polling cadence.
+\- **Live-log tone is presentation only:** the frontend may classify localized line text into
+  red/neutral/green for readability, but no safety, resume, qualification or profile decision may be
+  inferred from that color. All behavior continues to use the structured fields above.
+
+
 
 \## 2026-07-16 (additive): `StartPowerSweepClean` — experimental organic clean run
 
@@ -26,15 +71,15 @@
   `forge-archive/<run_id>/clean-run-manifest.txt` as log-independent proof of the mode. Added
   after the 2026-07-17 run proved the live-log tail cannot evidence which policy executed.
 
-\## Current F2 reference (2026-07-15): contract v17, native DX11 gate and Candidate Transaction
+\## Current F2 reference (2026-07-16): contract v18, Texture-first gate and profile-aware closure
 
 This section is the normative current behavior and supersedes the dated v4/v6/v7 runtime descriptions
 below where they conflict. Historical notes remain in place to explain payload evolution. No IPC method
 or existing field was removed.
 
-\- **Evidence contract v17.** Every current F2 dwell persists `evidence_provenance` with the service
+\- **Evidence contract v18.** Every current F2 dwell persists `evidence_provenance` with the service
   build version/revision, semantic workload fingerprint, actual selected render backend, adapter name,
-  driver name/details, checksum method and stock-golden configuration/values. Pre-v17 positive evidence
+  driver name/details, checksum method and stock-golden configuration/values. Pre-v18 positive evidence
   remains readable but cannot unlock Apply. Positive discovery, frontier qualification and exact-Apply
   qualification additionally require `reset_to_stock_ok == true` and `boot_flag_cleared == true`.
 
@@ -61,10 +106,25 @@ or existing field was removed.
   `checksum_count` reports the checks actually executed. The UI must not describe this as 100% frame
   checksum coverage.
 
-\- **Exact Apply adds native DX11.** Every unique selected `(target, Apply VF bin)` requires Texture
-  5 min, native offscreen DX11 5 min, TransitionShock 8 min and Endurance 20 min. DX11 captures a stock
-  golden on an explicitly selected NVIDIA adapter, records/matches its LUID, performs periodic readback
-  integrity checks and fails inconclusive when coverage cannot be proved. No existing dwell was shortened.
+\- **Texture v9 and exact-Apply duration.** Texture v9 enters the golden-checked TextureRop detector
+  immediately after its short opening and returns to it before later cadence/mixed/VRAM coverage.
+  Every unique selected `(target, Apply VF bin)` requires Texture v9 5 min + one continuous Endurance
+  20 min. Endurance front-loads TextureRop, composite game load and cap-slam cycles so a bad candidate
+  can reject before the long thermal tier; a pass still completes the entire 20-minute transaction.
+  DX11 and standalone TransitionShock are legacy-readable but no longer execute in the mandatory gate,
+  and current startup no longer captures a DX11 golden. Passing-pair dwell is 25 rather than 38 minutes.
+
+\- **Profile-aware vertical closure.** A reset-clean physical gate failure excludes the exact bin and
+  tries every viable higher physical bin at the same clock; there is no attempt-count budget. The
+  backend refreshes the effective condemnation view before each decision. Inconclusive, coverage and
+  orchestration failures stop fail-closed without blacklist or inferred voltage movement. Only an
+  actual exact-Apply SilentError is persisted under the silent-error quarantine kind.
+
+\- **Profile electrical roles.** The common publication ceiling remains 94% of the numeric board cap.
+  Godforge may climb the full physical voltage domain under it. Brokkr's voltage ceiling is one real
+  bin below Godforge, and Deep Calm one real bin below the lowest stronger profile. After Godforge
+  exhausts a clock, it may carry that voltage to the next lower real clock, but the carried pair must
+  receive fresh exact-bin power calibration and the complete v18 gate before publication.
 
 \- **Additive/defaulted `PowerSweepProgress` fields:**
   - `observed_boost_clock_mhz: Option<u32>` — Cboost observed after deterministic stock preheat.

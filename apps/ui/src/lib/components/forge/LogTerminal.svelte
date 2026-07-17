@@ -1,4 +1,6 @@
 <script>
+  import { classifyForgeLogLine } from "../../logTone.js";
+
   let { title = "nidavellir", status = "idle", live = false, lines = [], runningText = null } = $props();
 
   function autoscroll(node, _dep) {
@@ -20,7 +22,7 @@
   </div>
   <div class="term-body" use:autoscroll={dep}>
     {#each lines as line, i}
-      <div class="tline">
+      <div class={`tline ${classifyForgeLogLine(line)}`}>
         <span class="gutter">{(i + 1).toString().padStart(2, "0")}</span>
         <span class="tlead">{line}</span>
       </div>
@@ -128,6 +130,21 @@
   .tlead {
     min-width: 16rem;
     color: var(--text);
+    overflow-wrap: anywhere;
+  }
+  .tline.bad .tlead {
+    color: #ef8078;
+  }
+  .tline.bad .gutter {
+    color: #d96862;
+    opacity: 0.88;
+  }
+  .tline.good .tlead {
+    color: #79d29a;
+  }
+  .tline.good .gutter {
+    color: #53b77a;
+    opacity: 0.82;
   }
   .cursor {
     display: inline-block;

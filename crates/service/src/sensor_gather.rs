@@ -26,5 +26,12 @@ pub fn gather_sensor_input(driver: &DriverManager, motherboard: &MotherboardInfo
         }
     }
 
+    if let Some(mv) = nidavellir_gpu_nvapi::read_core_voltage_mv()
+        .filter(|mv| (400..=1500).contains(mv))
+    {
+        input.gpu_voltage_mv = Some(mv);
+        input.gpu_voltage_source = Some(SensorSource::Nvapi);
+    }
+
     input
 }

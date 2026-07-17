@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::capability::CapabilityReport;
+use crate::condemnation::CondemnationEvent;
 use crate::detector::HardwareInfo;
 use crate::gpu_sweep::{GpuSweepProgress, StabilityResult, SweepPhase, VfPoint};
 use crate::safe_loop::{BlacklistRegion, CrashClass, ForgeIncident, SafeLoopState, TuningPoint};
@@ -63,6 +64,10 @@ pub enum IpcRequest {
     /// dwells and independent repeated validations. Additive.
     StartPowerSweepLong,
     StopPowerSweep,
+    /// Explicitly resume a cooperatively paused F2 Forge checkpoint. The backend accepts this only
+    /// when the checkpoint was created by a manual `StopPowerSweep` and its program build, GPU and
+    /// graphics-driver identity still match the current machine exactly.
+    ResumePowerSweep,
     GetPowerSweepProgress,
     ApplyPowerGodforge,
     ApplyPowerBrokkrs,
@@ -255,6 +260,24 @@ pub struct PowerSweepPoint {
     pub apply_qualification_version: Option<u32>,
 }
 
+/// Exact executable/GPU/driver identity required to resume a manually paused Forge checkpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeResumeCompatibility {
+    /// Cargo package version of the service that created the checkpoint.
+    pub program_version: String,
+    /// Exact embedded source revision. This prevents a same-version development build from
+    /// resuming evidence produced by different Forge code.
+    pub build_revision: String,
+    /// Stable GPU identity used by the F2 observation store (normally the NVML UUID).
+    pub gpu_key: String,
+    /// Graphics adapter selected by the qualification backend.
+    pub adapter_name: String,
+    /// Driver family/name reported by the graphics API.
+    pub driver_name: String,
+    /// Driver version/details reported by the graphics API.
+    pub driver_info: String,
+}
+
 /// Power-target sweep: for a range of locked voltages, the max stable clock and
 /// the sustained power it draws under a heavy load — used to find the perf/watt
 /// knee (best performance just before diminishing returns) under the power cap.
@@ -363,6 +386,32 @@ pub struct PowerSweepProgress {
     /// qualification requirements. Fast intentionally leaves this false and is preview-only.
     #[serde(default)]
     pub profiles_qualified: bool,
+    /// Exact identity stamped into a resumable checkpoint. Legacy checkpoints default to `None`
+    /// and therefore cannot be resumed (fail closed), though their learned observations remain.
+    #[serde(default)]
+    pub resume_compatibility: Option<ForgeResumeCompatibility>,
+    /// True only after a manual cooperative Stop has reached stock, persisted its checkpoint and
+    /// passed compatibility validation against the currently running backend.
+    #[serde(default)]
+    pub resume_available: bool,
+    /// Structured human-readable reason why `ResumePowerSweep` is currently unavailable.
+    #[serde(default)]
+    pub resume_block_reason: Option<String>,
+    /// Stable identifier for the active backend task; the UI must not infer this from log text.
+    #[serde(default)]
+    pub current_task: Option<String>,
+    /// Wall time already spent in `current_task`.
+    #[serde(default)]
+    pub current_task_elapsed_ms: u64,
+    /// Estimated total duration of `current_task`, when bounded/known.
+    #[serde(default)]
+    pub current_task_estimated_total_ms: Option<u64>,
+    /// Stable identifier for the next planned backend task.
+    #[serde(default)]
+    pub next_task: Option<String>,
+    /// Estimated duration of `next_task`, independent of the current task countdown.
+    #[serde(default)]
+    pub next_task_estimated_duration_ms: Option<u64>,
 }
 
 /// One benchmark run's measured metrics (stock or tuned).
@@ -643,6 +692,10 @@ pub struct SafeLoopStatus {
     /// The exact attributed candidate when available; absent coordinates are intentionally unknown.
     #[serde(default)]
     pub pending_forge_incident: Option<ForgeIncident>,
+    /// Effective durable Forge condemnation events (newest bounded tail). Unlike `blacklist`, this
+    /// includes the append-only rigid/quarantine ledger that survives operational resets.
+    #[serde(default)]
+    pub condemnations: Vec<CondemnationEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -731,6 +784,12 @@ mod tests {
     }
 
     #[test]
+    fn resume_power_sweep_request_is_additive_unit_method() {
+        let req = parse_request(r#"{"method":"ResumePowerSweep"}"#).unwrap();
+        assert!(matches!(req, IpcRequest::ResumePowerSweep));
+    }
+
+    #[test]
     fn power_sweep_point_target_clock_roundtrips() {
         let p = PowerSweepPoint {
             target_clock_mhz: Some(1830),
@@ -794,6 +853,38 @@ mod tests {
     }
 
     #[test]
+    fn forge_resume_and_task_progress_fields_roundtrip() {
+        let compatibility = ForgeResumeCompatibility {
+            program_version: "0.1.0".into(),
+            build_revision: "abc123".into(),
+            gpu_key: "nvml:GPU-a".into(),
+            adapter_name: "NVIDIA test".into(),
+            driver_name: "NVIDIA".into(),
+            driver_info: "32.0.15.7000".into(),
+        };
+        let progress = PowerSweepProgress {
+            phase: "paused".into(),
+            resume_compatibility: Some(compatibility.clone()),
+            resume_available: true,
+            current_task: Some("apply_qualification".into()),
+            current_task_elapsed_ms: 12_000,
+            current_task_estimated_total_ms: Some(300_000),
+            next_task: Some("final_stock_reset".into()),
+            next_task_estimated_duration_ms: Some(5_000),
+            ..Default::default()
+        };
+        let back: PowerSweepProgress =
+            serde_json::from_str(&serde_json::to_string(&progress).unwrap()).unwrap();
+        assert_eq!(back.resume_compatibility, Some(compatibility));
+        assert!(back.resume_available);
+        assert_eq!(back.current_task.as_deref(), Some("apply_qualification"));
+        assert_eq!(back.current_task_elapsed_ms, 12_000);
+        assert_eq!(back.current_task_estimated_total_ms, Some(300_000));
+        assert_eq!(back.next_task.as_deref(), Some("final_stock_reset"));
+        assert_eq!(back.next_task_estimated_duration_ms, Some(5_000));
+    }
+
+    #[test]
     fn legacy_power_sweep_progress_json_defaults_is_undervolt_false() {
         // A payload produced before the F2 pivot has no `is_undervolt` key → defaults false, so the
         // Apply gate falls through to the unchanged legacy F1 apply behavior (backward-compatible).
@@ -816,6 +907,25 @@ mod tests {
         assert_eq!(p.clock_table_ceiling_mhz, None);
         assert_eq!(p.preheat_converged, None);
         assert_eq!(p.preheat_temperature_c, None);
+        assert!(p.resume_compatibility.is_none());
+        assert!(!p.resume_available);
+        assert!(p.resume_block_reason.is_none());
+        assert!(p.current_task.is_none());
+        assert_eq!(p.current_task_elapsed_ms, 0);
+        assert_eq!(p.current_task_estimated_total_ms, None);
+        assert!(p.next_task.is_none());
+        assert_eq!(p.next_task_estimated_duration_ms, None);
         assert_eq!(p.stock_clock_mhz, 1800);
+    }
+
+    #[test]
+    fn legacy_safe_loop_status_defaults_condemnations_empty() {
+        let legacy = r#"{
+            "state":"idle", "safe_mode":false, "consecutive_crashes":0,
+            "crash_threshold":3, "boot_flag_armed":false, "last_validated":null,
+            "blacklist":[], "recent_crashes":[]
+        }"#;
+        let status: SafeLoopStatus = serde_json::from_str(legacy).unwrap();
+        assert!(status.condemnations.is_empty());
     }
 }

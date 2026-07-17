@@ -1,11 +1,55 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. Current state is the 2026-07-16 condemnation-ledger + vertical-repair
+How to pick this up cold. Current state is the 2026-07-16 qualification-v18 + profile-aware closure
 build below. Older dated sections remain as history; where they claim that BoostEdge residence was a
 proven field cause, or that a detached 3 s canary timeout predicted a roughly 2 s watchdog, later
 sections supersede them. Apply still requests 12 mV above the learned boundary, snaps upward to a
 physical VF bin and must pass the complete exact-Apply gate before publication.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## START-HERE (2026-07-16d) — items 1/2 implemented: complete vertical closure + v18 gate
+
+- Exact-Apply repair has no arbitrary attempt budget. A physically classified reset-clean failure
+  excludes the exact bin and closes every viable higher real bin at the same clock until a physical,
+  profile or publication-power boundary is proven. The condemnation view reloads before every
+  decision; inconclusive/coverage/orchestration outcomes stop fail-closed without blacklist or
+  inferred voltage repair. Only an actual exact-Apply `SilentError` is persisted as that quarantine
+  kind; `Unstable`/`ClockDrop` may steer the current run but are not mislabeled in the durable ledger.
+- The 94%-of-board-cap publication ceiling remains unchanged. Profile ceilings add electrical
+  differentiation: Godforge may use the full physical domain under that common ceiling; Brokkr's
+  remains at least one real voltage bin below Godforge; Deep Calm remains one bin below the lowest
+  stronger profile. When Godforge exhausts a clock, it fast-drops one real clock while carrying the
+  exhausted voltage, then requires fresh p99 calibration and the complete gate.
+- Qualification contract v18 replaces the lobby-first Texture sequence with Texture v9,
+  `TextureRop` immediately after the opening and again before later coverage. Endurance remains one
+  continuous 20-minute proof but front-loads TextureRop, composite game load and cap-slam rejection.
+  DX11 and standalone TransitionShock are no longer mandatory/current-run stages; their legacy
+  evidence and code paths remain readable. Exact Apply is now 5 min Texture v9 + 20 min Endurance =
+  25 min per unique pair, with earlier rejection possible inside either dwell.
+- **Next physical action:** use a new Clean Run on this build. Verify same-clock climbs, Godforge
+  fast-drop, profile voltage hierarchy, v18 workload labels and 25-minute passing-pair ladder. The
+  94% off-cap ceiling and all TDR/Safe Loop/reset protections remain active.
+
+## START-HERE (2026-07-16c) — resumable manual pause + operator-facing Forge UX
+
+- `StopPowerSweep` is now a cooperative manual pause: UI first shows `stopping`; the checkpoint is
+  marked `paused` only after completed evidence is durable and stock reset is confirmed. Resume is
+  the explicit additive `ResumePowerSweep` method. A normal Start is always a new run, and a
+  TDR/panic/Sentinel/Reset interruption is never promoted to a resumable manual pause.
+- Resume fails closed unless program version/build revision, GPU identity/adapter and driver
+  name/details match exactly. It retains the same run ID and reuses only reset-clean evidence from
+  that same run; a cancelled/incomplete candidate is retried while completed bins are skipped.
+  Elapsed time stays cumulative across sessions.
+- Forge progress now publishes structured current/next task IDs and durations. The three home
+  themes render current work, live elapsed/countdown, next work, total elapsed and finish estimate;
+  these timers keep ticking locally between long backend dwell callbacks.
+- Sentinel shows both the effective durable condemnation ledger and operational Safe Loop blacklist.
+  The live log has bilingual red/white/green presentation tones only; safety logic never parses them.
+- Main telemetry now shows VRAM clock with capacity/usage, NVAPI core mV and fan duty from all
+  NVML-exposed fans (`nvidia-smi` fallback). Missing fan/voltage remains `None`; real `0%` is shown.
+  Responsive grids/wrapping and minimum 40 px profile actions cover narrow-window layouts.
+- **Superseded audit:** the item-1/2 deficiencies identified here are implemented by the newer
+  2026-07-16d section above. Keep this paragraph only as the rationale for contract v18.
 
 ## START-HERE (2026-07-16b) — Forge learning modes; NEXT VALIDATION MUST USE CLEAN RUN
 

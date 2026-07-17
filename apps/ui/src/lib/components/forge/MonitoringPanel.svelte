@@ -14,13 +14,13 @@
     return Math.min(100, Math.max(6, Math.round((n / max) * 100)));
   }
 
-  // Fan speed has no backing sensor field anywhere — rendered as N/A, never fabricated.
   const tiles = $derived([
     { key: "core", label: "GPU Clock", accent: "gold", value: gpu?.core_clock_mhz, unit: "MHz", digits: 0, bars: sparks?.core ?? [] },
-    { key: "mem", label: "Mem Clock", accent: "blue", value: gpu?.memory_clock_mhz, unit: "MHz", digits: 0, bars: sparks?.mem ?? [] },
+    { key: "mem", label: "VRAM Speed", accent: "blue", value: gpu?.memory_clock_mhz, unit: "MHz", digits: 0, bars: sparks?.mem ?? [], secondary: gpu?.vram_total_mb != null ? `${(Number(gpu.vram_total_mb) / 1024).toFixed(1)} GB total` : "Capacity unavailable" },
     { key: "temp", label: "Temperature", accent: "red", value: gpu?.temperature_c, unit: "°C", digits: 0, bars: sparks?.temp ?? [] },
     { key: "power", label: "Power", accent: "copper", value: gpu?.power_w, unit: "W", digits: 0, bars: sparks?.power ?? [] },
-    { key: "fan", label: "Fan Speed", accent: "teal", value: null, unit: "%", digits: 0, bars: [], na: true },
+    { key: "voltage", label: "Core Voltage", accent: "copper", value: gpu?.voltage_mv, unit: "mV", digits: 0, bars: sparks?.voltage ?? [], secondary: gpu?.voltage_mv == null ? "Sensor not exposed" : null },
+    { key: "fan", label: "Fan Speed", accent: "teal", value: gpu?.fan_speed_pct, unit: "%", digits: 0, bars: sparks?.fan ?? [], secondary: gpu?.fan_speed_pct == null ? "Sensor not exposed" : "Average duty" },
     { key: "usage", label: "GPU Usage", accent: "green", value: gpu?.utilization_pct, unit: "%", digits: 1, bars: sparks?.usage ?? [] },
   ]);
 </script>
@@ -38,12 +38,13 @@
           <span class="tile-label">{tile.label}</span>
         </div>
         <div class="tile-value">
-          {#if tile.na || fixed(tile.value, tile.digits) == null}
-            <strong class="na">N/A</strong>
+          {#if fixed(tile.value, tile.digits) == null}
+            <strong class="na">Not exposed</strong>
           {:else}
             <strong>{fixed(tile.value, tile.digits)}</strong><span class="unit">{tile.unit}</span>
           {/if}
         </div>
+        {#if tile.secondary}<small class="tile-secondary">{tile.secondary}</small>{/if}
         <div class="spark" aria-hidden="true">
           {#each tile.bars as v}
             <span class="bar" style={`height:${barHeight(v, tile.bars)}%`}></span>
@@ -87,7 +88,7 @@
   }
   .mon-grid {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
     gap: 0.6rem;
   }
   .mon-tile {
@@ -156,6 +157,13 @@
   .tile-value strong.na {
     color: var(--forge-dim);
     font-size: 0.95rem;
+  }
+  .tile-secondary {
+    min-height: 1rem;
+    color: var(--forge-dim);
+    font-size: 0.6rem;
+    line-height: 1.25;
+    overflow-wrap: anywhere;
   }
   .tile-value .unit {
     font-size: 0.62rem;

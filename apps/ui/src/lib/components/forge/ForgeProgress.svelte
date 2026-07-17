@@ -1,21 +1,40 @@
 <script>
-  import { Activity, CircleCheck, Gauge, Square, Zap } from "@lucide/svelte";
+  import { Activity, ArrowRight, CircleCheck, Gauge, Play, Square, Timer, Zap } from "@lucide/svelte";
   import StatusBadge from "./StatusBadge.svelte";
 
   let {
     powerSweep = null,
     powerRunning = false,
     safeLoop = null,
+    forgeMode = "standard",
     onStopPower,
+    onStartPower,
+    onRecoverContinue,
+    onResumePower,
   } = $props();
+
+  let now = $state(Date.now());
+  let observedPhase = $state(null);
+  let phaseStartedAt = $state(Date.now());
+  let observedTask = $state(null);
+  let taskReportedElapsedMs = $state(0);
+  let taskObservedAt = $state(Date.now());
+  let observedElapsedRaw = $state(null);
+  let observedRemainingRaw = $state(null);
+  let observedTimingRunning = $state(false);
+  let timingElapsedBase = $state(null);
+  let timingRemainingBase = $state(null);
+  let timingObservedAt = $state(Date.now());
 
   const points = $derived(powerSweep?.points ?? []);
   const isUndervolt = $derived(Boolean(powerSweep?.is_undervolt));
   const profilesQualified = $derived(!isUndervolt || Boolean(powerSweep?.profiles_qualified));
   const isInterrupted = $derived(powerSweep?.phase === "interrupted");
+  const isPaused = $derived(powerSweep?.phase === "paused");
   const isStopping = $derived(powerSweep?.phase === "stopping");
   const phase = $derived.by(() => {
     if (isInterrupted) return "Interrupted";
+    if (isPaused) return "Paused safely";
     return powerSweep?.phase && powerSweep.phase !== "idle" ? powerSweep.phase : "Not running";
   });
   const hasRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
@@ -26,8 +45,18 @@
   });
   const completedSteps = $derived(Number(powerSweep?.completed_steps ?? 0));
   const totalSteps = $derived(Number(powerSweep?.total_steps_estimate ?? 0));
-  const elapsedMs = $derived(validDuration(powerSweep?.elapsed_ms));
-  const estimatedRemainingMs = $derived(validDuration(powerSweep?.estimated_remaining_ms));
+  const reportedElapsedMs = $derived(validDuration(powerSweep?.elapsed_ms));
+  const reportedRemainingMs = $derived(validDuration(powerSweep?.estimated_remaining_ms));
+  const elapsedMs = $derived(
+    timingElapsedBase == null
+      ? null
+      : timingElapsedBase + (powerRunning ? Math.max(0, now - timingObservedAt) : 0),
+  );
+  const estimatedRemainingMs = $derived(
+    timingRemainingBase == null
+      ? null
+      : Math.max(0, timingRemainingBase - (powerRunning ? Math.max(0, now - timingObservedAt) : 0)),
+  );
   const estimatedTotalMs = $derived.by(() => {
     if (estimatedRemainingMs == null) return elapsedMs;
     return (elapsedMs ?? 0) + estimatedRemainingMs;
@@ -66,6 +95,46 @@
     if (!totalSteps) return 0;
     return Math.min(100, Math.max(0, (completedSteps / totalSteps) * 100));
   });
+  const averageStepMs = $derived.by(() => {
+    if (!completedSteps || elapsedMs == null) return null;
+    return Math.max(1000, elapsedMs / completedSteps);
+  });
+  const currentTaskElapsedMs = $derived(validDuration(powerSweep?.current_task_elapsed_ms));
+  const currentTaskEstimatedTotalMs = $derived(validDuration(powerSweep?.current_task_estimated_total_ms));
+  const phaseElapsedMs = $derived(
+    powerRunning
+      ? powerSweep?.current_task
+        ? taskReportedElapsedMs + Math.max(0, now - taskObservedAt)
+        : Math.max(0, now - phaseStartedAt)
+      : null,
+  );
+  const currentTaskRemainingMs = $derived.by(() => {
+    if (!powerRunning || phaseElapsedMs == null) return null;
+    if (currentTaskEstimatedTotalMs != null) {
+      return Math.max(0, currentTaskEstimatedTotalMs - phaseElapsedMs);
+    }
+    if (averageStepMs == null || !["power", "descend", "calibrate", "apply-qualify"].includes(powerSweep?.phase)) return null;
+    return Math.max(0, averageStepMs - phaseElapsedMs);
+  });
+  const currentTaskLabel = $derived(taskLabel(powerSweep?.current_task) ?? estimateStage.label);
+  const nextTaskInfo = $derived.by(() => {
+    if (powerSweep?.next_task) {
+      return {
+        label: taskLabel(powerSweep.next_task),
+        durationMs: validDuration(powerSweep?.next_task_estimated_duration_ms),
+      };
+    }
+    return nextTaskEstimate(powerSweep?.phase, averageStepMs);
+  });
+  const estimatedFinish = $derived.by(() => {
+    if (!powerRunning || estimatedRemainingMs == null) return null;
+    return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(
+      new Date(now + estimatedRemainingMs),
+    );
+  });
+  const canContinueSaved = $derived.by(() => {
+    return Boolean(!powerRunning && isPaused && powerSweep?.resume_available);
+  });
   const latestMessage = $derived.by(() => {
     if (powerSweep?.note) return powerSweep.note;
     if (latestLogLine) return latestLogLine;
@@ -73,11 +142,16 @@
     if (hasRun) return "The latest core VF forge run is available for review.";
     return "No core VF forge run is active yet. Start Forge GPU when you are ready to let Nidavellir learn this card.";
   });
-  const title = $derived(isInterrupted ? "Forge Interrupted" : powerRunning ? "Forge in Progress" : "Forge Progress");
+  const title = $derived(isInterrupted ? "Forge Interrupted" : isPaused ? "Forge Paused" : powerRunning ? "Forge in Progress" : "Forge Progress");
   const intro = $derived.by(() => {
     if (powerRunning) return "Nidavellir is learning this GPU's stable core curve.";
     if (isInterrupted) {
       return "The previous core VF forge did not finish cleanly. Recover & continue can resume from saved learning after clearing recovery.";
+    }
+    if (isPaused) {
+      return powerSweep?.resume_available
+        ? "The GPU is back at stock and the compatible checkpoint is ready to resume explicitly."
+        : "The GPU is back at stock, but Core refused resume compatibility for this checkpoint.";
     }
     if (hasRun && (powerSweep?.godforge || powerSweep?.brokkrs || powerSweep?.deep_calm) && !profilesQualified) {
       return "The latest Fast result is provisional. Standard or Long qualification is required before Apply.";
@@ -94,6 +168,11 @@
   );
   const nextStep = $derived.by(() => {
     if (isInterrupted) return "Next: recover and continue with saved Forge learning, or use Full reset only to start from zero.";
+    if (isPaused) {
+      return powerSweep?.resume_available
+        ? "Next: resume this exact checkpoint when you are ready."
+        : `Resume unavailable: ${powerSweep?.resume_block_reason ?? "Core did not provide a compatibility verdict."}`;
+    }
     if (!powerRunning && profileRows.length && !profilesQualified) {
       return "Next: run Standard or Long to qualify these boundaries and unlock Apply.";
     }
@@ -197,6 +276,52 @@
     }
   }
 
+  function nextTaskEstimate(currentPhase, stepMs) {
+    const estimatedStep = stepMs == null ? null : Math.max(1000, stepMs);
+    switch (currentPhase) {
+      case "preheat":
+        return { label: "Find the sustainable maximum clock", durationMs: null };
+      case "power":
+        return { label: "Map the physical voltage frontier", durationMs: estimatedStep };
+      case "descend":
+        return { label: "Test the next hardware-derived candidate", durationMs: estimatedStep };
+      case "calibrate":
+        return { label: "Synthesize the three profile goals", durationMs: 90_000 };
+      case "synthesize":
+        return { label: "Qualify the exact Apply pairs", durationMs: estimatedStep };
+      case "apply-qualify":
+        return { label: "Publish the qualified profiles", durationMs: 60_000 };
+      case "stopping":
+        return { label: "Save learning and confirm stock reset", durationMs: null };
+      default:
+        return { label: "Prepare the next Forge stage", durationMs: null };
+    }
+  }
+
+  function taskLabel(task) {
+    if (!task) return null;
+    const labels = {
+      prepare_stock: "Prepare and verify stock state",
+      stock_preheat: "Normalize stock temperature and clock",
+      capture_goldens: "Capture stock render references",
+      frontier_descent: "Map the physical clock and voltage frontier",
+      power_calibration: "Calibrate exact Apply-pair power",
+      profile_synthesis: "Synthesize the three profile goals",
+      apply_calibration: "Calibrate exact Apply pairs",
+      synthesize_profiles: "Synthesize profile goals",
+      apply_qualification: "Qualify exact Apply pairs",
+      publish_profiles: "Publish qualified profiles",
+      final_stock_reset: "Restore and verify stock state",
+      final_reset: "Restore and verify stock state",
+    };
+    return labels[task] ?? String(task).replaceAll("_", " ");
+  }
+
+  function continueSavedRun() {
+    if (!canContinueSaved) return;
+    onResumePower?.();
+  }
+
   function profilePower(point) {
     const p99 = Number(point?.power_p99_w);
     if (Number.isFinite(p99) && p99 > 0) return p99;
@@ -226,6 +351,44 @@
     const seconds = totalSeconds % 60;
     return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
   }
+
+  $effect(() => {
+    const current = powerSweep?.phase ?? "idle";
+    if (current !== observedPhase) {
+      observedPhase = current;
+      phaseStartedAt = Date.now();
+    }
+  });
+
+  $effect(() => {
+    const current = powerSweep?.current_task ?? null;
+    const reported = currentTaskElapsedMs ?? 0;
+    if (current !== observedTask || reported > taskReportedElapsedMs) {
+      observedTask = current;
+      taskReportedElapsedMs = reported;
+      taskObservedAt = Date.now();
+    }
+  });
+
+  $effect(() => {
+    if (
+      reportedElapsedMs !== observedElapsedRaw ||
+      reportedRemainingMs !== observedRemainingRaw ||
+      powerRunning !== observedTimingRunning
+    ) {
+      observedElapsedRaw = reportedElapsedMs;
+      observedRemainingRaw = reportedRemainingMs;
+      observedTimingRunning = powerRunning;
+      timingElapsedBase = reportedElapsedMs;
+      timingRemainingBase = reportedRemainingMs;
+      timingObservedAt = Date.now();
+    }
+  });
+
+  $effect(() => {
+    const interval = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(interval);
+  });
 
   function targetLabel(point) {
     if (!point) return "Not available";
@@ -296,13 +459,18 @@
           compact
         />
       {/if}
-      <span class="run-state" class:live={powerRunning} class:interrupted={isInterrupted}>
-        {isStopping ? "Stopping" : powerRunning ? "Running" : isInterrupted ? "Interrupted" : hasRun ? "Stopped" : "Idle"}
+      <span class="run-state" class:live={powerRunning} class:interrupted={isInterrupted} class:paused={isPaused}>
+        {isStopping ? "Stopping" : powerRunning ? "Running" : isInterrupted ? "Interrupted" : isPaused ? "Paused" : hasRun ? "Stopped" : "Idle"}
       </span>
       {#if powerRunning}
         <button class="btn stop" onclick={onStopPower} disabled={isStopping}>
           <Square size={14} strokeWidth={1.9} />
           <span>{isStopping ? "Stopping…" : "Stop forging"}</span>
+        </button>
+      {:else if canContinueSaved}
+        <button class="btn continue" onclick={continueSavedRun}>
+          <Play size={14} strokeWidth={1.9} />
+          <span>Resume Forge</span>
         </button>
       {/if}
     </div>
@@ -351,11 +519,40 @@
       </div>
       <small>{estimateStage.detail}</small>
     </div>
+    {#if powerRunning}
+      <div class="task-timeline" aria-live="polite">
+        <article class="task-card current">
+          <span class="task-icon"><Timer size={18} strokeWidth={1.8} /></span>
+          <div>
+            <small>Now · running for {duration(phaseElapsedMs)}</small>
+            <strong>{currentTaskLabel}</strong>
+            <span>
+              {currentTaskRemainingMs == null
+                ? "Current task ETA is still learning from hardware samples."
+                : `≈ ${duration(currentTaskRemainingMs)} until the next task`}
+            </span>
+          </div>
+        </article>
+        <span class="task-arrow"><ArrowRight size={22} strokeWidth={1.6} /></span>
+        <article class="task-card next">
+          <span class="task-index">NEXT</span>
+          <div>
+            <small>
+              {currentTaskRemainingMs == null
+                ? "Starts after the current hardware task"
+                : `Starts in ≈ ${duration(currentTaskRemainingMs)}`}
+            </small>
+            <strong>{nextTaskInfo.label}</strong>
+            <span>{nextTaskInfo.durationMs == null ? "Duration pending live evidence" : `Expected duration ≈ ${duration(nextTaskInfo.durationMs)}`}</span>
+          </div>
+        </article>
+      </div>
+    {/if}
     <div class="timing-grid" aria-live="polite">
       <div class="timing-metric">
         <span>Remaining</span>
         <strong>{powerRunning && estimatedRemainingMs != null ? `≈ ${duration(estimatedRemainingMs)}` : "—"}</strong>
-        <small>Updates after each reported dwell.</small>
+        <small>{estimatedFinish ? `Estimated finish at ${estimatedFinish}.` : "Updates after each reported dwell."}</small>
       </div>
       <div class="timing-metric">
         <span>Estimated run total</span>
@@ -392,6 +589,11 @@
           : "No saved learning in this run"}
       </small>
     </div>
+    {#if isPaused && !powerSweep?.resume_available}
+      <p class="resume-contract-note" role="status">
+        Resume unavailable: {powerSweep?.resume_block_reason ?? "Core did not provide a build, hardware and driver compatibility verdict."}
+      </p>
+    {/if}
   </section>
 
   <div class="progress-grid">
@@ -551,6 +753,11 @@
     color: #f3b9bd;
     border-color: rgba(191, 97, 106, 0.45);
   }
+  .btn.continue {
+    border-color: rgba(126, 184, 78, 0.48);
+    background: rgba(92, 145, 54, 0.15);
+    color: #bce49a;
+  }
   .run-state {
     border: 1px solid var(--forge-line);
     border-radius: 999px;
@@ -683,6 +890,76 @@
     text-align: right;
     text-wrap: pretty;
   }
+  .run-state.paused {
+    border-color: rgba(126, 184, 78, 0.42);
+    background: rgba(92, 145, 54, 0.12);
+    color: #bce49a;
+  }
+  .task-timeline {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    align-items: stretch;
+    gap: 0.7rem;
+    margin-top: 0.55rem;
+  }
+  .task-card {
+    display: grid;
+    min-width: 0;
+    grid-template-columns: 42px minmax(0, 1fr);
+    align-items: center;
+    gap: 0.7rem;
+    min-height: 94px;
+    padding: 0.75rem;
+    background: rgba(5, 7, 11, 0.42);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.055);
+  }
+  .task-card.current {
+    background: rgba(214, 168, 93, 0.075);
+    box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.2);
+  }
+  .task-icon,
+  .task-index {
+    display: grid;
+    width: 42px;
+    min-height: 42px;
+    place-items: center;
+    color: var(--forge-gold);
+    background: rgba(214, 168, 93, 0.1);
+    box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.22);
+  }
+  .task-index {
+    color: var(--nord-dim);
+    font-size: 0.58rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+  }
+  .task-card > div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.24rem;
+  }
+  .task-card small {
+    color: var(--nord-dim);
+    font-size: 0.66rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .task-card strong {
+    color: var(--text);
+    font-size: 0.86rem;
+    font-weight: 650;
+    text-wrap: balance;
+  }
+  .task-card > div > span {
+    color: var(--muted);
+    font-size: 0.7rem;
+    line-height: 1.35;
+    text-wrap: pretty;
+  }
+  .task-arrow {
+    align-self: center;
+    color: var(--nord-dim);
+  }
   .timing-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -738,6 +1015,16 @@
   }
   .live-target small.saved {
     color: var(--forge-green);
+  }
+  .resume-contract-note {
+    margin: 0.6rem 0 0;
+    border-left: 2px solid var(--forge-gold);
+    padding: 0.5rem 0.65rem;
+    color: var(--muted);
+    background: rgba(214, 168, 93, 0.05);
+    font-size: 0.72rem;
+    line-height: 1.45;
+    text-wrap: pretty;
   }
   .label-with-icon {
     display: inline-flex;
@@ -852,8 +1139,13 @@
     .progress-grid,
     .pipeline-steps,
     .result-grid,
-    .timing-grid {
+    .timing-grid,
+    .task-timeline {
       grid-template-columns: 1fr;
+    }
+    .task-arrow {
+      justify-self: center;
+      transform: rotate(90deg);
     }
     .sweep-progress-head,
     .live-target,

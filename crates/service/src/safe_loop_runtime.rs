@@ -134,6 +134,14 @@ pub fn spawn_heartbeat(store: SafeLoopStore) {
 /// Build the read-only status snapshot for the UI.
 pub fn status_snapshot(store: &SafeLoopStore) -> SafeLoopStatus {
     let record = store.load_record();
+    let mut condemnations = nidavellir_core::condemnation::effective_condemnation_events(
+        &nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir()).load_all(),
+    );
+    const SENTINEL_CONDEMNATION_TAIL: usize = 100;
+    if condemnations.len() > SENTINEL_CONDEMNATION_TAIL {
+        let drop = condemnations.len() - SENTINEL_CONDEMNATION_TAIL;
+        condemnations.drain(0..drop);
+    }
     SafeLoopStatus {
         state: record.state,
         safe_mode: record.safe_mode,
@@ -145,6 +153,7 @@ pub fn status_snapshot(store: &SafeLoopStore) -> SafeLoopStatus {
         recent_crashes: record.crash_log,
         recovery_pending_ack: record.pending_forge_incident.is_some(),
         pending_forge_incident: record.pending_forge_incident,
+        condemnations,
     }
 }
 
@@ -206,6 +215,9 @@ fn read_last_bugcheck_message() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nidavellir_core::condemnation::{
+        CondemnationEvent, CondemnationLedger, CondemnationSeverity, KIND_REHABILITATED,
+    };
     use nidavellir_core::safe_loop::TuningPoint;
 
     #[test]
@@ -228,5 +240,59 @@ mod tests {
         assert!(!retain_boot_flag_until_reapply(
             &RecoveryAction::ApplyLastValidated { point }
         ));
+    }
+
+    #[test]
+    fn status_snapshot_exposes_only_recent_effective_condemnations() {
+        let base = std::env::temp_dir().join(format!(
+            "nidavellir-safe-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = SafeLoopStore::new(&base);
+        let ledger = CondemnationLedger::new(&base);
+        for index in 0..105u32 {
+            ledger
+                .append(&CondemnationEvent {
+                    timestamp: format!("2026-07-16T00:00:{:02}Z", index % 60),
+                    gpu_key: Some("gpu-test".into()),
+                    severity: CondemnationSeverity::Quarantine,
+                    kind: "apply-gate-silent-error".into(),
+                    target_mhz: 1700 + index,
+                    vf_bin_mv: 800 + index,
+                    run_id: Some("run-test".into()),
+                    qualification_contract_version: Some(17),
+                    note: None,
+                    rehabilitated: false,
+                })
+                .unwrap();
+        }
+        let first_visible = CondemnationEvent {
+            timestamp: "2026-07-16T01:00:00Z".into(),
+            gpu_key: Some("gpu-test".into()),
+            severity: CondemnationSeverity::Rigid,
+            kind: KIND_REHABILITATED.into(),
+            target_mhz: 1804,
+            vf_bin_mv: 904,
+            run_id: Some("run-test".into()),
+            qualification_contract_version: Some(17),
+            note: None,
+            rehabilitated: true,
+        };
+        ledger.append(&first_visible).unwrap();
+
+        let status = status_snapshot(&store);
+        assert_eq!(status.condemnations.len(), 100);
+        assert!(status.condemnations.iter().all(|event| !event.rehabilitated));
+        assert!(!status
+            .condemnations
+            .iter()
+            .any(|event| event.target_mhz == 1804 && event.vf_bin_mv == 904));
+        assert_eq!(status.condemnations.last().unwrap().target_mhz, 1803);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

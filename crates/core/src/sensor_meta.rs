@@ -7,6 +7,7 @@ pub enum SensorSource {
     Msr,
     Wmi,
     Nvml,
+    Nvapi,
     NvidiaSmi,
     #[default]
     Unknown,
@@ -19,6 +20,7 @@ impl SensorSource {
             Self::Msr => "msr",
             Self::Wmi => "wmi",
             Self::Nvml => "nvml",
+            Self::Nvapi => "nvapi",
             Self::NvidiaSmi => "nvidia_smi",
             Self::Unknown => "unknown",
         }

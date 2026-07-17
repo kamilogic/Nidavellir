@@ -8,7 +8,9 @@ use crate::sensor_meta::{SensorQuality, SensorSource};
 use crate::superio_profile::MotherboardRail;
 
 const WMIC_CACHE_TTL: Duration = Duration::from_secs(5);
-const GPU_CACHE_TTL: Duration = Duration::from_secs(30);
+// Dashboard/Forge poll live GPU cards once per second. A 30 s cache made clock,
+// voltage, fan and power look frozen even while the workload changed.
+const GPU_CACHE_TTL: Duration = Duration::from_secs(1);
 const RAM_VOLT_CACHE_TTL: Duration = Duration::from_secs(30);
 const CPU_VOLT_CACHE_TTL: Duration = Duration::from_secs(10);
 const WHEA_CACHE_TTL: Duration = Duration::from_secs(10);
@@ -63,7 +65,9 @@ pub struct GpuSensors {
     pub memory_clock_mhz: Option<u32>,
     pub max_core_clock_mhz: Option<u32>,
     pub max_memory_clock_mhz: Option<u32>,
+    pub fan_speed_pct: Option<u32>,
     pub voltage_mv: Option<u32>,
+    pub voltage_source: Option<String>,
     pub temperature_c: Option<f32>,
     pub power_w: Option<f32>,
     pub temperature_source: Option<String>,
@@ -134,11 +138,19 @@ impl SensorEngine {
             }
         };
 
+        let mut gpu = self.read_gpu_cached();
+        if let Some(primary) = gpu.first_mut() {
+            primary.voltage_mv = input.gpu_voltage_mv;
+            primary.voltage_source = input
+                .gpu_voltage_source
+                .map(|source| source.as_str().to_string());
+        }
+
         SensorReadings {
             motherboard,
             cpu: self.read_cpu(input),
             memory: self.read_memory(input),
-            gpu: self.read_gpu_cached(),
+            gpu,
             whea: self.read_whea_cached(),
         }
     }
@@ -381,7 +393,9 @@ fn read_gpu_sensors() -> Vec<GpuSensors> {
                 memory_clock_mhz: nv.memory_clock_mhz,
                 max_core_clock_mhz: None,
                 max_memory_clock_mhz: None,
+                fan_speed_pct: nv.fan_speed_pct,
                 voltage_mv: None,
+                voltage_source: None,
                 temperature_c: nv.temperature_c,
                 power_w: nv.power_w,
                 temperature_source: nv.temperature_c.map(|_| SensorSource::Nvml.as_str().to_string()),
@@ -423,6 +437,9 @@ fn merge_gpu_smi(dst: &mut GpuSensors, smi: &GpuSensors) {
     if dst.memory_clock_mhz.is_none() {
         dst.memory_clock_mhz = smi.memory_clock_mhz;
     }
+    if dst.fan_speed_pct.is_none() {
+        dst.fan_speed_pct = smi.fan_speed_pct;
+    }
     dst.max_core_clock_mhz = smi.max_core_clock_mhz.or(dst.max_core_clock_mhz);
     dst.max_memory_clock_mhz = smi.max_memory_clock_mhz.or(dst.max_memory_clock_mhz);
 }
@@ -430,7 +447,7 @@ fn merge_gpu_smi(dst: &mut GpuSensors, smi: &GpuSensors) {
 fn read_gpu_sensors_nvidia_smi() -> Option<Vec<GpuSensors>> {
     let output = std::process::Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,utilization.gpu,memory.used,memory.total,clocks.current.graphics,clocks.current.memory,clocks.max.graphics,clocks.max.memory,power.draw",
+            "--query-gpu=name,utilization.gpu,memory.used,memory.total,clocks.current.graphics,clocks.current.memory,clocks.max.graphics,clocks.max.memory,power.draw,fan.speed",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -450,6 +467,7 @@ fn read_gpu_sensors_nvidia_smi() -> Option<Vec<GpuSensors>> {
             continue;
         }
         let power_w = parts.get(8).and_then(|s| parse_power_w(s));
+        let fan_speed_pct = parts.get(9).and_then(|s| parse_percentage(s));
         out.push(GpuSensors {
             name,
             utilization_pct: parts[1].parse::<f64>().ok(),
@@ -459,7 +477,9 @@ fn read_gpu_sensors_nvidia_smi() -> Option<Vec<GpuSensors>> {
             memory_clock_mhz: parts[5].parse::<u32>().ok(),
             max_core_clock_mhz: parts[6].parse::<u32>().ok(),
             max_memory_clock_mhz: parts[7].parse::<u32>().ok(),
+            fan_speed_pct,
             voltage_mv: None,
+            voltage_source: None,
             temperature_c: None,
             power_w,
             temperature_source: None,
@@ -479,6 +499,14 @@ fn parse_power_w(s: &str) -> Option<f32> {
         return None;
     }
     t.parse::<f32>().ok().filter(|&v| v >= 0.0)
+}
+
+fn parse_percentage(s: &str) -> Option<u32> {
+    let value = s.trim().trim_end_matches('%').trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("N/A") || value.eq_ignore_ascii_case("[N/A]") {
+        return None;
+    }
+    value.parse::<u32>().ok().filter(|value| *value <= 100)
 }
 
 fn read_gpu_sensors_wmi() -> Vec<GpuSensors> {
@@ -530,7 +558,9 @@ fn read_gpu_sensors_wmi() -> Vec<GpuSensors> {
             memory_clock_mhz: None,
             max_core_clock_mhz: None,
             max_memory_clock_mhz: None,
+            fan_speed_pct: None,
             voltage_mv: None,
+            voltage_source: None,
             temperature_c: None,
             power_w: None,
             temperature_source: None,
@@ -567,5 +597,19 @@ fn check_whea_errors() -> WheaInfo {
             last_error: None,
             events: vec![],
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_percentage;
+
+    #[test]
+    fn percentage_parser_preserves_unavailable_instead_of_fabricating_zero() {
+        assert_eq!(parse_percentage("37"), Some(37));
+        assert_eq!(parse_percentage("37 %"), Some(37));
+        assert_eq!(parse_percentage("N/A"), None);
+        assert_eq!(parse_percentage("[N/A]"), None);
+        assert_eq!(parse_percentage("101"), None);
     }
 }

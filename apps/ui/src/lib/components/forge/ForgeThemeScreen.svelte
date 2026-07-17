@@ -20,6 +20,7 @@
     Zap,
   } from "@lucide/svelte";
   import ForgeSettingsPage from "./ForgeSettingsPage.svelte";
+  import ForgeProgress from "./ForgeProgress.svelte";
   import TelemetrySpark from "./TelemetrySpark.svelte";
   import commandGpu from "../../assets/themes/command-gpu.png";
   import commandMark from "../../assets/themes/nidavellir-mark.png";
@@ -47,6 +48,7 @@
     onStartPower,
     onRecoverContinue,
     onStopPower,
+    onResumePower,
     onApplyPower,
     onReportProfileUnstable,
     onFullReset,
@@ -97,6 +99,9 @@
   const profilesQualified = $derived(
     Boolean(profilesReady && (!isUndervolt || powerSweep?.profiles_qualified)),
   );
+  const hasForgeRun = $derived(Boolean(powerSweep && powerSweep.phase !== "idle"));
+  const forgePaused = $derived(powerSweep?.phase === "paused");
+  const resumeAvailable = $derived(Boolean(forgePaused && powerSweep?.resume_available));
   const state = $derived.by(() => {
     if (powerRunning) return "FORGING";
     if (profilesReady && profileMeta.some((profile) => appliedMatches(profile))) return "FORGED";
@@ -136,7 +141,9 @@
   const power = $derived(finite(gpu?.power_w));
   const clock = $derived(finite(gpu?.core_clock_mhz));
   const memory = $derived(finite(gpu?.memory_clock_mhz));
-  const fan = $derived(null);
+  const vramTotal = $derived(finite(gpu?.vram_total_mb));
+  const voltage = $derived(finite(gpu?.voltage_mv));
+  const fan = $derived(finite(gpu?.fan_speed_pct));
   const usage = $derived(finite(gpu?.utilization_pct));
 
   function values(key) {
@@ -146,6 +153,12 @@
 
   function display(value, digits = 0) {
     return value == null ? "—" : Number(value).toFixed(digits);
+  }
+
+  function vramCapacity(value) {
+    if (value == null) return "Capacity unavailable";
+    const gigabytes = value / 1024;
+    return `${gigabytes >= 10 ? gigabytes.toFixed(0) : gigabytes.toFixed(1)} GB total`;
   }
 
   function pointFor(key) {
@@ -226,6 +239,10 @@
 
   function runForge() {
     if (powerRunning) return;
+    if (forgePaused) {
+      if (resumeAvailable) onResumePower?.();
+      return;
+    }
     if (recoveryPending) {
       onRecoverContinue?.(forgeMode);
       return;
@@ -352,9 +369,9 @@
           <p>{state === "FORGED" ? "Ready for daily use." : state === "FORGING" ? "Building safe profiles now." : "Ready to begin a supervised forge."}</p>
         </div>
         <div class="command-cta">
-          <button class="plate-button" onclick={runForge} disabled={powerRunning}>
+          <button class="plate-button" onclick={runForge} disabled={powerRunning || (forgePaused && !resumeAvailable)}>
             <img src={copperPlate} alt="" />
-            <span>{powerRunning ? "Forging…" : recoveryPending ? "Review & Continue" : "Forge GPU"}</span>
+            <span>{powerRunning ? "Forging…" : resumeAvailable ? "Resume Forge" : forgePaused ? "Resume unavailable" : recoveryPending ? "Review & Continue" : "Forge GPU"}</span>
           </button>
           {#if profilesReady}
             <span class="refine">Profiles forged from measured hardware data <ShieldCheck size={23} /></span>
@@ -362,12 +379,27 @@
         </div>
       </section>
 
+      {#if hasForgeRun}
+        <ForgeProgress
+          {powerSweep}
+          {powerRunning}
+          {safeLoop}
+          {forgeMode}
+          {onStopPower}
+          {onStartPower}
+          {onRecoverContinue}
+          {onResumePower}
+        />
+      {/if}
+
       <section class="command-telemetry" aria-label="Live GPU telemetry">
         {#each [
           { key: "temp", label: "Temperature", value: temperature, unit: "°C" },
           { key: "power", label: "Power", value: power, unit: "W" },
           { key: "core", label: "Clock", value: clock, unit: "MHz" },
-          { key: "fan", label: "Fan", value: fan, unit: "%" },
+          { key: "mem", label: "VRAM", value: memory, unit: "MHz", hint: vramCapacity(vramTotal) },
+          { key: "voltage", label: "Voltage", value: voltage, unit: "mV", hint: voltage == null ? "Sensor not exposed" : "Live core voltage" },
+          { key: "fan", label: "Fan", value: fan, unit: "%", hint: fan == null ? "Sensor not exposed" : "Average duty" },
           { key: "usage", label: "Utilization", value: usage, unit: "%" },
         ] as metric}
           <article class="command-metric">
@@ -376,10 +408,12 @@
               {:else if metric.key === "power"}<Zap size={29} />
               {:else if metric.key === "core"}<Gauge size={29} />
               {:else if metric.key === "fan"}<Fan size={29} />
+              {:else if metric.key === "voltage"}<Activity size={29} />
               {:else}<Cpu size={29} />{/if}
               <span>{metric.label}</span>
             </div>
             <div class="metric-reading"><strong>{display(metric.value)}</strong><span>{metric.unit}</span></div>
+            {#if metric.hint}<small>{metric.hint}</small>{/if}
             <TelemetrySpark values={values(metric.key)} color="#80bd31" fill="rgba(128, 189, 49, 0.08)" height={48} />
           </article>
         {/each}
@@ -458,6 +492,7 @@
             <div class="gauge-side left">
               <div><span>Temperature</span><strong>{display(temperature)}</strong><small>°C</small><TelemetrySpark values={values("temp")} color="#627d90" fill="rgba(98, 125, 144, 0.04)" height={30} /></div>
               <div><span>Power</span><strong>{display(power)}</strong><small>W</small><TelemetrySpark values={values("power")} color="#627d90" fill="rgba(98, 125, 144, 0.04)" height={30} /></div>
+              <div><span>Fan</span><strong>{display(fan)}</strong><small>{fan == null ? "Not exposed" : "%"}</small><TelemetrySpark values={values("fan")} color="#7a9748" fill="rgba(122, 151, 72, 0.04)" height={30} /></div>
             </div>
             <div class="gauge-bezel">
               <img src={instrumentGauge} alt="Thermal and power gauge" />
@@ -465,9 +500,24 @@
             </div>
             <div class="gauge-side right">
               <div><span>Clock</span><strong>{display(clock)}</strong><small>MHz</small><TelemetrySpark values={values("core")} color="#627d90" fill="rgba(98, 125, 144, 0.04)" height={30} /></div>
+              <div><span>VRAM</span><strong>{display(memory)}</strong><small>MHz · {vramCapacity(vramTotal)}</small><TelemetrySpark values={values("mem")} color="#627d90" fill="rgba(98, 125, 144, 0.04)" height={30} /></div>
+              <div><span>Voltage</span><strong>{display(voltage)}</strong><small>{voltage == null ? "Not exposed" : "mV"}</small><TelemetrySpark values={values("voltage")} color="#627d90" fill="rgba(98, 125, 144, 0.04)" height={30} /></div>
               <div><span>Utilization</span><strong>{display(usage)}</strong><small>%</small><TelemetrySpark values={values("usage")} color="#7a9748" fill="rgba(122, 151, 72, 0.04)" height={30} /></div>
             </div>
           </section>
+
+          {#if hasForgeRun}
+            <ForgeProgress
+              {powerSweep}
+              {powerRunning}
+              {safeLoop}
+              {forgeMode}
+              {onStopPower}
+              {onStartPower}
+              {onRecoverContinue}
+              {onResumePower}
+            />
+          {/if}
 
           <section class="recommended-panel">
             <span class="instrument-kicker">{profilesReady ? "FORGED PROFILES" : "PROFILE OVERVIEW"}</span>
@@ -506,10 +556,10 @@
 
         <aside class="instrument-action-panel">
           <span class="panel-kicker">PRIMARY ACTION</span>
-          <button class="instrument-forge" onclick={runForge} disabled={powerRunning}><Anvil size={42} /><strong>{powerRunning ? "FORGING…" : recoveryPending ? "REVIEW & CONTINUE" : "FORGE GPU"}</strong></button>
+          <button class="instrument-forge" onclick={runForge} disabled={powerRunning || (forgePaused && !resumeAvailable)}><Anvil size={42} /><strong>{powerRunning ? "FORGING…" : resumeAvailable ? "RESUME FORGE" : forgePaused ? "RESUME UNAVAILABLE" : recoveryPending ? "REVIEW & CONTINUE" : "FORGE GPU"}</strong></button>
           <div class="mode-block">
             <label for="instrument-mode">MODE</label>
-            <select id="instrument-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning}>
+            <select id="instrument-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>
               <option value="fast">Fast — preview only</option>
               <option value="standard">Standard — recommended</option>
               <option value="long">Long — strongest confidence</option>
@@ -553,10 +603,25 @@
         <h2>{gpuName}</h2>
         <p class:pending={!safeLoopKnown} class:review={safeLoopKnown && !protectedState}><i></i> {safeLoopKnown ? (protectedState ? "Protected by Safe Loop" : "Safe Loop needs review") : "Safe Loop status unavailable"}</p>
         <div class="workshop-actions">
-          <button class="workshop-forge" onclick={runForge} disabled={powerRunning}><Anvil size={25} />{powerRunning ? "Forging…" : recoveryPending ? "Review & Continue" : "Forge GPU"}</button>
-          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning}><option value="fast">Fast · Preview only</option><option value="standard">Standard · Recommended</option><option value="long">Long · Strongest confidence</option><option value="clean">Clean run · Experimental</option></select><ChevronDown size={20} /></label>
+          <button class="workshop-forge" onclick={runForge} disabled={powerRunning || (forgePaused && !resumeAvailable)}><Anvil size={25} />{powerRunning ? "Forging…" : resumeAvailable ? "Resume Forge" : forgePaused ? "Resume unavailable" : recoveryPending ? "Review & Continue" : "Forge GPU"}</button>
+          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}><option value="fast">Fast · Preview only</option><option value="standard">Standard · Recommended</option><option value="long">Long · Strongest confidence</option><option value="clean">Clean run · Experimental</option></select><ChevronDown size={20} /></label>
         </div>
       </section>
+
+      {#if hasForgeRun}
+        <div class="workshop-progress-wrap">
+          <ForgeProgress
+            {powerSweep}
+            {powerRunning}
+            {safeLoop}
+            {forgeMode}
+            {onStopPower}
+            {onStartPower}
+            {onRecoverContinue}
+            {onResumePower}
+          />
+        </div>
+      {/if}
 
       <section class="workshop-profile" class:ready={profilesReady}>
         <div class="workshop-current"><span>Current profile</span><div><span class="workshop-profile-icon"><Hammer size={33} /></span><strong>{activeName}</strong></div><small><i></i>{activeKey ? "Applied" : "Stock"}</small></div>
@@ -594,12 +659,14 @@
           { key: "temp", label: "Temperature", value: temperature, unit: "°C" },
           { key: "power", label: "Power", value: power, unit: "W" },
           { key: "core", label: "Clock", value: clock, unit: "MHz" },
-          { key: "mem", label: "Memory", value: memory, unit: "MHz" },
-          { key: "fan", label: "Fans", value: null, unit: "RPM" },
+          { key: "mem", label: "VRAM", value: memory, unit: "MHz", hint: vramCapacity(vramTotal) },
+          { key: "voltage", label: "Voltage", value: voltage, unit: "mV", hint: voltage == null ? "Not exposed" : null },
+          { key: "fan", label: "Fans", value: fan, unit: "%", hint: fan == null ? "Not exposed" : null },
+          { key: "usage", label: "Utilization", value: usage, unit: "%" },
         ] as metric}
           <article>
-            <div>{#if metric.key === "temp"}<Thermometer size={24} />{:else if metric.key === "power"}<Zap size={24} />{:else if metric.key === "core"}<Gauge size={24} />{:else if metric.key === "mem"}<Cpu size={24} />{:else}<Fan size={24} />{/if}<span>{metric.label}<strong>{display(metric.value)} <small>{metric.unit}</small></strong></span></div>
-            <TelemetrySpark values={values(metric.key === "mem" ? "mem" : metric.key)} color="#87aada" fill="rgba(135, 170, 218, 0.04)" height={43} />
+            <div>{#if metric.key === "temp"}<Thermometer size={24} />{:else if metric.key === "power"}<Zap size={24} />{:else if metric.key === "core"}<Gauge size={24} />{:else if metric.key === "mem"}<Cpu size={24} />{:else if metric.key === "voltage"}<Activity size={24} />{:else if metric.key === "fan"}<Fan size={24} />{:else}<CircleGauge size={24} />{/if}<span>{metric.label}<strong>{display(metric.value)} <small>{metric.unit}</small></strong>{#if metric.hint}<em>{metric.hint}</em>{/if}</span></div>
+            <TelemetrySpark values={values(metric.key)} color="#87aada" fill="rgba(135, 170, 218, 0.04)" height={43} />
           </article>
         {/each}
         <button class="workshop-advanced" onclick={() => navigate("advanced")}><ChevronRight size={23} /><span><strong>Advanced</strong><small>Logs, Sentinel and Game Trace</small></span></button>
@@ -995,7 +1062,7 @@
   /* Command Deck */
   .command-header {
     display: grid;
-    grid-template-columns: 285px minmax(520px, 1fr) 320px;
+    grid-template-columns: max-content minmax(220px, 1fr) minmax(230px, 320px);
     align-items: center;
     height: 102px;
     border-bottom: 1px solid rgba(164, 171, 177, 0.35);
@@ -1010,6 +1077,7 @@
 
   .command-brand {
     display: flex;
+    min-width: 0;
     height: 100%;
     align-items: center;
     gap: 12px;
@@ -1018,6 +1086,7 @@
     font-size: 24px;
     font-weight: 650;
     letter-spacing: 0.17em;
+    white-space: nowrap;
   }
 
   .command-brand img {
@@ -1028,6 +1097,7 @@
 
   .command-nav {
     display: flex;
+    min-width: 0;
     height: 100%;
     align-items: stretch;
     gap: 14px;
@@ -1106,7 +1176,7 @@
     display: flex;
     flex-direction: column;
     gap: 20px;
-    padding: 28px 36px 44px;
+    padding: 28px clamp(20px, 2.35vw, 36px) 44px;
   }
 
   .command-page {
@@ -1116,7 +1186,7 @@
 
   .command-hero {
     display: grid;
-    grid-template-columns: 410px minmax(450px, 1fr) 420px;
+    grid-template-columns: minmax(300px, 410px) minmax(330px, 1fr) minmax(300px, 420px);
     align-items: center;
     min-height: 276px;
   }
@@ -1255,20 +1325,23 @@
 
   .command-telemetry {
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    min-height: 210px;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 1px;
+    min-height: 0;
     border: 1px solid #62696e;
-    background: rgba(8, 11, 12, 0.36);
+    background: #555c61;
   }
 
   .command-metric {
     position: relative;
     min-width: 0;
-    padding: 23px 34px 16px;
+    min-height: 188px;
+    padding: 23px clamp(18px, 1.5vw, 28px) 16px;
+    background: rgba(8, 11, 12, 0.94);
   }
 
   .command-metric + .command-metric {
-    border-left: 1px solid #555c61;
+    border-left: 0;
   }
 
   .metric-title {
@@ -1283,20 +1356,22 @@
 
   .metric-reading {
     display: flex;
+    min-width: 0;
     align-items: baseline;
-    gap: 10px;
-    margin: 8px 0 10px 36px;
+    gap: clamp(6px, 0.65vw, 10px);
+    margin: 8px 0 10px clamp(0px, 2.5vw, 36px);
   }
 
   .metric-reading strong {
     color: #eceeed;
-    font-size: 45px;
+    font-size: clamp(38px, 3.1vw, 45px);
     font-weight: 500;
     line-height: 1;
     font-variant-numeric: tabular-nums;
   }
 
   .metric-reading span {
+    flex: 0 0 auto;
     color: #b4b7b9;
     font-size: 17px;
   }
@@ -1306,6 +1381,8 @@
     margin-top: 2px;
     color: #93989d;
     text-align: right;
+    min-height: 1.25rem;
+    overflow-wrap: anywhere;
   }
 
   .section-label {
@@ -1329,7 +1406,7 @@
 
   .command-profile {
     display: grid;
-    grid-template-columns: 125px 420px 380px 1fr 112px;
+    grid-template-columns: minmax(86px, 125px) minmax(250px, 1.1fr) minmax(300px, 1fr) minmax(135px, 0.7fr) minmax(92px, 112px);
     align-items: center;
     min-height: 80px;
     border: 1px solid #485158;
@@ -1474,12 +1551,13 @@
   }
 
   .field-failure {
-    min-height: 0 !important;
+    min-height: 40px !important;
     margin-top: 0 !important;
     border: 0 !important;
+    padding: 0 6px !important;
     background: transparent !important;
     color: #9b9189 !important;
-    font-size: 10px !important;
+    font-size: 11px !important;
     letter-spacing: 0.03em;
     text-decoration: underline;
     text-underline-offset: 3px;
@@ -1632,6 +1710,13 @@
     padding: 19px 0 0;
   }
 
+  .instrument-main-column :global(.forge-all),
+  .command-body :global(.forge-all) {
+    min-width: 0;
+    border-radius: 0;
+    box-shadow: inset 0 0 0 1px var(--forge-line);
+  }
+
   .instrument-intro h1 {
     margin: 10px 0 15px;
     color: #d9dad8;
@@ -1770,7 +1855,10 @@
   .gauge-side small {
     margin-top: 8px;
     color: #cacbc8;
-    font-size: 18px;
+    max-width: 16ch;
+    font-size: 14px;
+    line-height: 1.3;
+    text-align: center;
     transform: translateY(10px);
   }
 
@@ -2320,7 +2408,7 @@
 
   .workshop-telemetry {
     display: grid;
-    grid-template-columns: repeat(5, 1fr) 220px;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
     min-height: 197px;
     align-items: center;
     padding: 0;
@@ -2329,15 +2417,34 @@
   .workshop-telemetry article {
     min-width: 0;
     border-right: 1px solid #444747;
-    padding: 0 28px;
+    min-height: 132px;
+    padding: 24px 28px;
   }
 
-  .workshop-telemetry article:first-child { padding-left: 63px; }
+  .workshop-telemetry article:first-child { padding-left: 40px; }
 
   .workshop-telemetry article > div { display: flex; align-items: center; gap: 18px; color: #d2b592; }
   .workshop-telemetry article > div > span { display: flex; flex-direction: column; gap: 4px; color: #bebfbd; font-size: 14px; }
   .workshop-telemetry article strong { color: #eeece8; font-size: 23px; font-weight: 500; font-variant-numeric: tabular-nums; }
   .workshop-telemetry article strong small { color: #bbb; font-size: 15px; font-weight: 400; }
+  .workshop-telemetry article em {
+    max-width: 18ch;
+    color: #858b89;
+    font-size: 11px;
+    font-style: normal;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+
+  .workshop-progress-wrap {
+    border-bottom: 1px solid #373a3a;
+    padding: 24px 40px;
+  }
+
+  .workshop-progress-wrap :global(.forge-all) {
+    border-radius: 0;
+    box-shadow: inset 0 0 0 1px #373a3a;
+  }
 
   .workshop-advanced {
     display: flex;
@@ -2370,6 +2477,18 @@
   .workshop-footer :global(svg) { color: #71b866; }
   .workshop-footer.pending :global(svg) { color: #777f7c; }
 
+  @media (max-width: 1440px) {
+    .command-hero { grid-template-columns: minmax(300px, 390px) minmax(360px, 1fr); }
+    .command-cta { grid-column: 1 / -1; flex-direction: row; justify-content: center; }
+    .command-profile { grid-template-columns: 90px minmax(240px, 1fr) minmax(290px, 1.2fr) minmax(130px, 0.65fr) 96px; }
+  }
+
+  @media (min-width: 981px) and (max-width: 1599px) {
+    .command-telemetry { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+    .command-metric { grid-column: span 3; }
+    .command-metric:nth-last-child(-n + 3) { grid-column: span 4; }
+  }
+
   @media (max-width: 1380px) {
     .instrument-content { grid-template-columns: 1fr; }
     .instrument-action-panel { grid-row: 2; }
@@ -2377,16 +2496,20 @@
   }
 
   @media (max-width: 1180px) {
-    .command-header { grid-template-columns: 250px 1fr 240px; }
+    .command-header { grid-template-columns: 280px minmax(190px, 1fr) 240px; }
     .command-nav { gap: 2px; }
     .command-nav button { min-width: auto; padding-inline: 10px; }
-    .command-hero { grid-template-columns: 330px 1fr; }
-    .command-cta { grid-column: 1 / -1; flex-direction: row; justify-content: center; }
-    .command-telemetry { grid-template-columns: repeat(3, 1fr); }
-    .command-metric:nth-child(4) { border-left: 0; }
+    .command-hero { grid-template-columns: minmax(280px, 330px) 1fr; }
     .command-profile { grid-template-columns: 90px 1fr 1.4fr 1fr 55px; }
     .workshop-profile { grid-template-columns: 280px repeat(2, 1fr); gap: 24px 0; padding-block: 32px; }
     .workshop-telemetry { grid-template-columns: repeat(3, 1fr); gap: 28px 0; padding-block: 28px; }
+  }
+
+  @media (min-width: 561px) and (max-width: 980px) {
+    .command-telemetry { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .command-metric,
+    .command-metric:nth-last-child(-n + 3) { grid-column: auto; }
+    .command-metric:last-child { grid-column: 1 / -1; }
   }
 
   @media (max-width: 820px) {
@@ -2417,7 +2540,6 @@
     .command-gpu-wrap { height: 220px; }
     .command-identity { padding: 0; }
     .command-telemetry { grid-template-columns: 1fr 1fr; }
-    .command-metric:nth-child(odd) { border-left: 0; }
     .command-profile { grid-template-columns: 70px 1fr 50px; }
     .profile-result { display: none; }
     .command-profile:not(.preview) .profile-icon { grid-row: 1 / span 2; }
@@ -2445,6 +2567,34 @@
     .workshop-current { grid-column: 1 / -1; border-right: 0; }
     .workshop-content.diagnostics-view { padding: 22px 18px 36px; }
     .workshop-telemetry { grid-template-columns: 1fr 1fr; }
+  }
+
+  @media (max-width: 560px) {
+    .command-body { padding-inline: 12px; }
+    .command-brand span { font-size: 17px; }
+    .command-hero { min-height: 0; }
+    .command-identity h1 { font-size: 34px; }
+    .state-status { width: 100%; grid-template-columns: 1fr 1fr; }
+    .state-status > div + div { padding-left: 20px; }
+    .state-status strong { font-size: 30px; }
+    .plate-button { width: min(100%, 320px); }
+    .command-telemetry { grid-template-columns: 1fr; }
+    .command-metric,
+    .command-metric:nth-last-child(-n + 3),
+    .command-metric:last-child { grid-column: auto; }
+    .profile-measurements { grid-template-columns: 1fr; }
+    .command-profile:not(.preview) .profile-measurements { grid-column: 2 / 4; }
+    .gauge-side { grid-template-columns: 1fr; }
+    .gauge-side > div { min-height: 170px; border-right: 0; border-bottom: 1px solid #5b605d; }
+    .gauge-side.right > div:first-child { border-left: 0; }
+    .workshop-actions { width: 100%; flex-direction: column; gap: 14px; }
+    .workshop-forge,
+    .workshop-actions label { width: min(100%, 355px); }
+    .workshop-profile { grid-template-columns: 1fr; }
+    .workshop-current { grid-column: 1; }
+    .workshop-telemetry { grid-template-columns: 1fr; }
+    .workshop-progress-wrap { padding-inline: 16px; }
+    .workshop-footer { align-items: flex-start; flex-direction: column; gap: 10px; padding-block: 18px; }
   }
 
   @media (prefers-reduced-motion: reduce) {

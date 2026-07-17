@@ -32,7 +32,7 @@
   let fullResetFeedback = $state(null);
   // Live GPU telemetry (ReadSensors) + rolling sparkline buffers for the monitoring panel.
   let sensors = $state(null);
-  let sparks = $state({ core: [], mem: [], temp: [], power: [], usage: [] });
+  let sparks = $state({ core: [], mem: [], temp: [], power: [], fan: [], voltage: [], usage: [] });
   const SPARK_CAP = 20;
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
@@ -227,6 +227,11 @@
     };
     await call("StopPowerSweep", setPower);
   };
+  const resumePower = async () => {
+    if (powerSweep?.running || powerSweep?.phase !== "paused" || !powerSweep?.resume_available) return;
+    await call("ResumePowerSweep", setPower);
+    await refresh(true);
+  };
   const POWER_APPLY = {
     godforge: "ApplyPowerGodforge",
     brokkrs: "ApplyPowerBrokkrs",
@@ -345,6 +350,8 @@
         mem: pushSpark(sparks.mem, g.memory_clock_mhz),
         temp: pushSpark(sparks.temp, g.temperature_c),
         power: pushSpark(sparks.power, g.power_w),
+        fan: pushSpark(sparks.fan, g.fan_speed_pct),
+        voltage: pushSpark(sparks.voltage, g.voltage_mv),
         usage: pushSpark(sparks.usage, g.utilization_pct),
       };
     } catch {
@@ -405,6 +412,7 @@
     onStartPower={startPower}
     onRecoverContinue={recoverAndStartPower}
     onStopPower={stopPower}
+    onResumePower={resumePower}
     onApplyPower={applyPower}
     onReportProfileUnstable={reportProfileUnstable}
     onFullReset={fullResetTuning}
@@ -421,6 +429,7 @@
       {exportMsg}
       {exportFailed}
       {sentinel}
+      {safeLoop}
       {sentinelState}
       {sentinelSummary}
       {gameTrace}

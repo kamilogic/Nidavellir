@@ -174,6 +174,26 @@ pub fn condemned_pairs(events: &[CondemnationEvent], gpu_key: &str) -> Condemned
     out
 }
 
+/// Effective ledger events for read-only audit/UI surfaces. Rehabilitation entries are never
+/// exposed as active condemnations, and a later rehabilitation cancels every earlier event at the
+/// same exact GPU/pair. Ordering remains append order so callers can retain the newest bounded tail.
+pub fn effective_condemnation_events(events: &[CondemnationEvent]) -> Vec<CondemnationEvent> {
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| !event.rehabilitated)
+        .filter(|(index, event)| {
+            !events[index + 1..].iter().any(|later| {
+                later.rehabilitated
+                    && later.target_mhz == event.target_mhz
+                    && later.vf_bin_mv == event.vf_bin_mv
+                    && later.gpu_key == event.gpu_key
+            })
+        })
+        .map(|(_, event)| event.clone())
+        .collect()
+}
+
 /// Monotone V/F floor envelope over condemned (clock, mv) pairs — the same math as the field
 /// floor: running-max condemned voltage by clock, ceil-interpolated between condemned clocks
 /// (conservative chord above the convex true boundary), held flat beyond the highest clock.
@@ -322,6 +342,17 @@ mod tests {
         ];
         let pairs = condemned_pairs(&events, "gpu-a");
         assert_eq!(pairs.rigid, vec![(1920, 918)]);
+    }
+
+    #[test]
+    fn effective_events_hide_rehabilitated_pairs_and_rehabilitation_records() {
+        let old = event(CondemnationSeverity::Rigid, 1845, 856, Some(17));
+        let kept = event(CondemnationSeverity::Quarantine, 1890, 900, Some(17));
+        let mut rehab = old.clone();
+        rehab.rehabilitated = true;
+        rehab.kind = KIND_REHABILITATED.into();
+        let effective = effective_condemnation_events(&[old, kept.clone(), rehab]);
+        assert_eq!(effective, vec![kept]);
     }
 
     #[test]

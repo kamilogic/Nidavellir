@@ -16,10 +16,17 @@
     sentinel parity, durable Needs Attention incidents with explicit acknowledgement, run-scoped
     export and content-addressed dirty build identity. Real-use profile failures can be marked from
     their hardware-derived card and become durable local blacklist evidence.
+  - **Manual Forge pause + operator UX (2026-07-16)** — explicit exact-compatible resume of the same
+    run, cumulative timing, structured current/next task progress, Sentinel condemnation/blacklist
+    views, semantic live-log tones, responsive Forge layouts and live VRAM/mV/fan telemetry.
+  - **Qualification v18 + profile-aware closure (2026-07-16)** — same-clock repair closes the real
+    voltage domain without an attempt budget, profile hierarchy and Godforge fast-drop preserve
+    distinct roles, Texture v9 is TextureRop-first, Endurance rejects aggressively before completing
+    its continuous thermal proof, and the mandatory exact gate is reduced from 38 to 25 min/pair.
 
 ## Now — Product model (see product.md)
 Reframed around 3 profiles forged from a clock×power frontier. Phases:
-- **Current F2 frontier (2026-07-15)** — code-complete: Forge now normalizes stock
+- **Current F2 frontier (2026-07-16)** — code-complete: Forge now normalizes stock
   deterministically before reading the live domain. **Ctable** (sane physical-table ceiling/count),
   **Cboost** (post-preheat observed boost) and **Cmax** (first sustainable clock proved by discovery)
   are distinct facts. Preheat requires two converged usable 10 s windows and fails closed before any
@@ -30,14 +37,16 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   checked reset and boot-flag clear. Qualification is persisted before discovery so resume cannot see
   a positive discovery without its same-curve rejection evidence. A positive observation becomes
   reusable only after cleanup is proven. Numeric p99 classification has hysteresis: NearCap ≥99%,
-  OffCap ≤98%, and the middle band retries or ends inconclusive. Qualification contract v17 records
+  OffCap ≤98%, and the middle band retries or ends inconclusive. Qualification contract v18 records
   complete build/workload/graphics/golden provenance; older positives remain readable but are
   ineligible. MixedGame now records BoostEdge + TextureRop + PowerRender in every frame/submit;
   BoostEdge/MixedGame checksum reduction is sparse GPU-side and every sampled mismatch accumulates.
-  The exact-Apply closure now adds a native offscreen DX11 stock-golden gate between Texture and the
-  longer stages: Texture 5 min, DX11 5 min, TransitionShock 8 min and Endurance 20 min per unique pair.
-  It selects the NVIDIA adapter explicitly, records its LUID/provenance, and bounds GPU completion
-  polling below the Windows watchdog regime. The additive ForgeProgress preheat/Ctable/Cboost fields
+  Exact Apply now runs Texture v9 for 5 minutes followed by one continuous, aggressively ordered
+  20-minute Endurance per unique pair. DX11 and standalone TransitionShock remain legacy-readable but
+  left the mandatory/current path after never rejecting a collected candidate. Physical gate failures
+  close every viable higher same-clock bin under the unchanged 94%-of-cap publication ceiling and a
+  profile-specific voltage hierarchy; Godforge can fast-drop one real clock at carried voltage after
+  exhausting a clock. The additive ForgeProgress preheat/Ctable/Cboost fields
   expose this domain without parsing logs. The explicit F2 Apply path and legacy F1 remain intact.
   The first post-reset Standard hardware cycle completed across a resumed two-run sequence and
   published `1890@893`, `1845@862` and `1740@800`. Endurance rejected stochastic `1905@900` and
@@ -45,9 +54,9 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   operator returned to a Windows login after a reported TDR/reboot; no observation or sentinel event
   attributed the active point before checkpoint resume. Restart reconciliation is now implemented;
   the operator also confirmed `1845@862` repeatedly unstable in real use. **Next evidence/safety
-  gate:** deploy this build, mark every confirmed profile unstable from its card, then perform a clean
-  Forge evaluation of qualification v17. No final-gate duration was reduced; the new DX11 stage must
-  first demonstrate field discrimination without false positives on safe controls.
+  gate:** deploy this build and perform a new Clean Run evaluation of qualification v18. Confirm
+  same-clock closure, profile voltage hierarchy, Godforge fast-drop and known-unstable rejection;
+  compile/unit tests alone do not establish silicon specificity.
 - **F1 — Profile model**: 3-profile synthesis (Godforge=clock / Brokkr's=R / Deep
   Calm=MHz/W) + V2 confidence gate.
   - **F1a (DONE)** — pure `synthesize_forge_profiles` + unit tests. Not yet wired.
@@ -74,6 +83,10 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   **V3** (confidence-maturing trials) folds into F1b/F4.
 
 ## Near-term
+- **Hardware-validate v18:** run a new Clean Run against known unstable and safe controls. Verify
+  TextureRop-first early rejection, the complete continuous Endurance proof, same-clock vertical
+  closure, profile voltage ceilings and Godforge fast-drop. Keep the 94% publication ceiling unless
+  hardware evidence supports a separate decision.
 - **Hardware verification of P0:** deploy the rebuilt service, exercise a controlled interrupted run,
   and verify Needs Attention/acknowledgement plus run-scoped export without inducing a TDR on purpose.
 - **Godforge** as a real OC profile (currently the max-voltage stock point).
@@ -82,8 +95,8 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
 - **Safe-Loop → knowledge integration**: on a boot-flag-detected reboot, fold the
   crash offset (with `Reboot` severity) into `gpu_knowledge.json` automatically
   (today only in-sweep SilentError/TDR auto-record).
-- **Physical qualifier calibration**: compare 1845 MHz @ 862 mV with known-safe bins under the new
-  DX11 gate before considering any shortening of Texture/DX11/TransitionShock/Endurance.
+- **Physical qualifier calibration**: compare 1845 MHz @ 862 mV and other confirmed unstable pairs
+  with known-safe bins under Texture v9 + Endurance before any further duration reduction.
 
 ## Deferred (per project design)
 - AMD path (ADLX) — currently NVIDIA/NVAPI only.

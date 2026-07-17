@@ -81,7 +81,10 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// v17 (2026-07-15): exact Apply additionally requires a native offscreen Direct3D 11 golden gate
 /// on the selected NVIDIA adapter. This covers a graphics API/driver path absent from wgpu's
 /// Vulkan/DX12 backends; pre-v17 positives did not exercise it and cannot unlock Apply.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 17;
+/// v18 (2026-07-16): Texture becomes TextureRop-first v9 and Endurance front-loads its aggressive
+/// rejection tier. DX11 and TransitionShock leave the mandatory gate because neither rejected a
+/// candidate in the collected runs; current deployability is exact-Apply Texture v9 + Endurance.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 18;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -161,7 +164,7 @@ pub enum F2QualificationVerdict {
 }
 
 /// Strength of the qualification evidence. Older strengths remain readable for compatibility;
-/// FSGL4 is the current three-pattern v7 qualifier required for Apply.
+/// FSGL4 is the current provenance-complete qualifier strength required for Apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum F2QualificationStrength {
@@ -189,14 +192,11 @@ pub enum F2QualificationPattern {
     /// completeness gates or forcing a contract-version bump; publishing is gated on run_id-scoped
     /// endurance evidence instead ([`point_has_current_endurance_qualification`]).
     Endurance,
-    /// v15 candidate-only transition shock: true-idle → heavy-slam cycles reproducing the
-    /// game/benchmark-LAUNCH transition (P-state exit + boost VF ramp + VRM load step) behind the
-    /// observed in-game BusReset TDR cascade. Same policy as Endurance: exact-Apply only, NOT in
-    /// [`REQUIRED_QUALIFICATION_PATTERNS`], no contract bump; publishing requires run_id-scoped
-    /// evidence of BOTH shock and endurance ([`point_has_current_endurance_qualification`]).
+    /// Legacy v15 candidate-only transition shock. Contract v18 no longer executes or requires it,
+    /// but the variant remains so persisted evidence is backward-readable.
     TransitionShock,
-    /// v17 candidate-only native Direct3D 11 render/integrity gate. It runs only at exact Apply,
-    /// after the binding Texture detector and before the longer shock/endurance gates.
+    /// Legacy v17 candidate-only native Direct3D 11 render/integrity gate. Contract v18 no longer
+    /// executes or requires it, but the variant remains so persisted evidence is backward-readable.
     Dx11Game,
 }
 
@@ -1109,8 +1109,9 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
 }
 
 /// True when the CURRENT run's candidate-only stress gate validated cleanly at this exact
-/// `(target_mhz, apply_mv)` pair on this GPU — requires the v17 native DX11 gate, the v15
-/// TransitionShock (idle→slam launch-transition cycles), and the v14 Endurance soak.
+/// `(target_mhz, apply_mv)` pair on this GPU — v18 requires the continuous Endurance soak after the
+/// required exact-Apply Texture v9 pattern. DX11 and TransitionShock remain readable legacy evidence
+/// but no longer gate publication because they never rejected a collected candidate.
 /// These gates only TIGHTEN Apply — they are not part of [`REQUIRED_QUALIFICATION_PATTERNS`] and
 /// never touch the frontier descent. They still share the current qualification contract and full
 /// reproducibility/cleanup requirements; the publish gate is also run_id-scoped. Fail closed:
@@ -1122,11 +1123,7 @@ pub fn point_has_current_endurance_qualification(
     apply_mv: u32,
     gpu_key: &str,
 ) -> bool {
-    [
-        F2QualificationPattern::Dx11Game,
-        F2QualificationPattern::TransitionShock,
-        F2QualificationPattern::Endurance,
-    ]
+    [F2QualificationPattern::Endurance]
         .iter()
         .all(|required| {
             obs.iter().any(|o| {
@@ -2061,14 +2058,20 @@ mod tests {
             o.gpu_key = Some("RTX 4070".into());
             o
         };
-        // All candidate-only gates clean in THIS run at the exact pair → publishes.
-        let both = [
-            pass("R1", F2QualificationPattern::Dx11Game, F2ObsOutcome::Validated),
-            pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated),
-            pass("R1", F2QualificationPattern::Endurance, F2ObsOutcome::Validated),
-        ];
-        assert!(point_has_current_endurance_qualification(&both, "R1", 1935, 956, "RTX 4070"));
-        let mut missing_provenance = both.clone();
+        // The current run's continuous Endurance gate at the exact pair is sufficient in v18.
+        let endurance = [pass(
+            "R1",
+            F2QualificationPattern::Endurance,
+            F2ObsOutcome::Validated,
+        )];
+        assert!(point_has_current_endurance_qualification(
+            &endurance,
+            "R1",
+            1935,
+            956,
+            "RTX 4070"
+        ));
+        let mut missing_provenance = endurance.clone();
         missing_provenance[0].evidence_provenance = None;
         assert!(!point_has_current_endurance_qualification(
             &missing_provenance,
@@ -2078,15 +2081,18 @@ mod tests {
             "RTX 4070"
         ));
         // Run-scoped: the same evidence never publishes a different run.
-        assert!(!point_has_current_endurance_qualification(&both, "R2", 1935, 956, "RTX 4070"));
-        // Endurance alone is NOT enough (v15: the launch-transition shock is also required)…
-        let endurance_only = [pass("R1", F2QualificationPattern::Endurance, F2ObsOutcome::Validated)];
-        assert!(!point_has_current_endurance_qualification(&endurance_only, "R1", 1935, 956, "RTX 4070"));
-        // …and shock alone is not enough either.
+        assert!(!point_has_current_endurance_qualification(
+            &endurance,
+            "R2",
+            1935,
+            956,
+            "RTX 4070"
+        ));
+        // Removed legacy gates cannot publish a v18 point by themselves.
         let shock_only =
             [pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated)];
         assert!(!point_has_current_endurance_qualification(&shock_only, "R1", 1935, 956, "RTX 4070"));
-        // Fail closed: a complete 3-pattern Apply set WITHOUT the stress gates is not publishable.
+        // Fail closed: Texture qualification without the continuous Endurance gate is not publishable.
         let mut no_gate =
             apply_qualification_pass(obs(1935, 956, F2ObsOutcome::Validated), F2QualificationPattern::Texture);
         no_gate.run_id = "R1".into();
@@ -2095,12 +2101,7 @@ mod tests {
         // A non-validated endurance dwell (silent error mid-soak) rejects the point.
         let mut failed = pass("R1", F2QualificationPattern::Endurance, F2ObsOutcome::SilentError);
         failed.silent_error = true;
-        let with_failed_endurance =
-            [
-                pass("R1", F2QualificationPattern::Dx11Game, F2ObsOutcome::Validated),
-                pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated),
-                failed,
-            ];
+        let with_failed_endurance = [failed];
         assert!(!point_has_current_endurance_qualification(&with_failed_endurance, "R1", 1935, 956, "RTX 4070"));
     }
 

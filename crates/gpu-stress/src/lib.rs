@@ -137,7 +137,7 @@ pub struct RenderGoldens {
     pub dx11: Dx11Golden,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Dx11Golden {
     pub checksum: u32,
     pub adapter_luid: i64,
@@ -277,14 +277,12 @@ pub enum VfQualifierPattern {
     V8Texture,
     V8Transitions,
     V8Memory,
-    /// v14 candidate-only endurance soak: one CONTINUOUS mixed dwell (MixedGame + FrameCadence +
-    /// the graceful TextureRop silent-error detector) that scales to fill a single ~15-min dwell.
-    /// Run ONLY at the exact Apply pair, after the required 3-pattern set.
+    /// Candidate-only endurance soak: one CONTINUOUS mixed dwell whose v18 plan front-loads its
+    /// aggressive rejection tier and then completes the full ~20-minute thermal proof.
+    /// Run only at the exact Apply pair, after the required Texture v9 pattern.
     Endurance,
-    /// v15 candidate-only transition shock: true-idle → heavy-slam cycles (BoostEntry) with the
-    /// graceful TextureRop detector between rounds. Targets the game/benchmark-LAUNCH transition
-    /// (P-state exit + VF ramp + VRM load step) behind the observed in-game BusReset TDR cascade.
-    /// Run ONLY at the exact Apply pair, before the Endurance soak (fail cheap first).
+    /// Legacy v15 candidate-only transition shock. Contract v18 no longer schedules it in the
+    /// mandatory exact-Apply gate, but the pattern remains for persisted evidence compatibility.
     TransitionShock,
 }
 
@@ -297,7 +295,9 @@ impl VfQualifierPattern {
             Self::Fsgl3A => "fsgl3-a",
             Self::Fsgl3B => "fsgl3-b",
             Self::V8HighFps => "v8-high-fps",
-            Self::V8Texture => "v8-texture",
+            // The internal variant name remains for source compatibility; qualification contract
+            // v18 gives it the v9 workload/provenance below.
+            Self::V8Texture => "v9-texture",
             Self::V8Transitions => "v8-transitions",
             Self::V8Memory => "v8-memory",
             Self::Endurance => "endurance",
@@ -362,7 +362,7 @@ pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'stati
         VfQualifierPattern::Fsgl3A => "f2q-mix3-rotating-final-sparse16-r1/fsgl3-a",
         VfQualifierPattern::Fsgl3B => "f2q-mix3-rotating-final-sparse16-r1/fsgl3-b",
         VfQualifierPattern::V8HighFps => "f2q-mix3-rotating-final-sparse16-r1/v8-high-fps",
-        VfQualifierPattern::V8Texture => "f2q-mix3-rotating-final-sparse16-r1/v8-texture",
+        VfQualifierPattern::V8Texture => "f2q-texture-rop-first-r1/v9-texture",
         VfQualifierPattern::V8Transitions => {
             "f2q-mix3-rotating-final-sparse16-r1/v8-transitions"
         }
@@ -582,30 +582,24 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 6),
     ];
-    // Severity ladder: graceful silent-error detectors (L2 TextureRop, cadence) run FIRST; the
-    // hang-prone memory detectors (VramPressure, TextureStream) run LAST — a bad bin usually
-    // dies cheaply by wrong-pixel checksum long before anything TDR-prone executes.
-    // v18 introduced LOBBY-FIRST after the initial 2026-07-13 trace interpretation. Later comparison
-    // showed that essentially the same external residence/power envelope survived in the lobby and
-    // failed only in a match, so the trace did not isolate residence as the cause. Keep this long
-    // BoostEdge block as high-FPS/cadence coverage, then exercise TextureRop, mixed and memory paths;
-    // qualification v16 fingerprints the complete composition instead of claiming one causal model.
+    // v9 Texture (qualification contract v18): the empirically binding, golden-checked TextureRop
+    // detector is first and owns most of the opening tier. The old lobby-first plan spent ~45% of a
+    // 60 s descent dwell on BoostEdge before reaching the detector that actually rejected candidates.
+    // A marginal bin can now fail during the first TextureRop block (roughly 6-30 s depending on the
+    // requested dwell), while a pass still crosses cadence, mixed load, VRAM and streaming coverage.
     const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 12] = [
-        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 3),
-        // Sustained isolated lobby-like block FIRST (~44% of the dwell): exercises anchor-bin
-        // residency with a golden + frame-time degradation gate. This is coverage for one plausible
-        // failure class, not proof that the field TDR was caused by residency alone.
-        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 42),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
-        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 5),
-        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 4),
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 2),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 34),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 12),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 18),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 7),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
         (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 3),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 3),
-        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 5),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 8),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 6),
         (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 4),
-        (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 5),
-        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 3),
+        (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 4),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 2),
     ];
     const V8_TRANSITIONS: [(VfQualifierPhase, VfWorkload, u64); 20] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
@@ -671,43 +665,32 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
     // gave (which never rejected a candidate as an isolated pass) but under continuous worst load —
     // stronger, so the required Transitions/Memory patterns can be dropped (contract v14).
     const ENDURANCE: [(VfQualifierPhase, VfWorkload, u64); 23] = [
-        // Warm-up ramp into load.
-        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 3),
-        // Sustained max-power saturation block (the reset-between 5-min patterns never reach this heat).
+        // v18 rejection tier: start with the two loads that bound real failures, with a golden
+        // TextureRop check between electrical shocks. A bad finalist is rejected before the long
+        // thermal-soak half; a passing finalist still completes the full continuous 20-minute dwell.
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 2),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
+        (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 12),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 8),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 8),
+        // Continuous saturation and thermal accumulation remain the proof tier.
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 14),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
-        // Cap-slam #1: heavy burst ↔ idle release, oscillating the VRM at high (already-hot) state.
-        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
-        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
-        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
-        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
-        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
-        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
-        // v16.1 composite: heavy render + near-full VRAM-resident gather SIMULTANEOUSLY (real game
-        // load: compute + texture + memory controller on the shared rail at once). Golden-checked.
-        (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 14),
-        // v16.2 LOBBY-LIKE REGIME: sustained BoostEdge — hundreds of LIGHT frames
-        // per second riding the TOP of the boost curve, i.e. continuous residency AT the anchor bin
-        // + kHz-scale VRM ripple. This is the OW-lobby/high-FPS regime that killed 1815@843/862 and
-        // 1890@900/918 in real use while every heavy pattern passed: heavy loads sit power-bound
-        // BELOW the anchor; only light frames pin the anchor itself. Golden-checked (goldens.boost).
-        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 12),
-        // Fine droop transients + game-realistic mixed load.
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 10),
         (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 8),
         (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 10),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
-        // Second saturation + cap-slam pass — heat is at its peak now, the worst point for a marginal Vmin.
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 12),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
-        // Second composite pass at peak heat.
         (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 12),
-        // Second lobby pass at peak heat — anchor-bin residency when the silicon is at its worst.
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 10),
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 6),
-        // Cool-down close.
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 3),
     ];
     // v15 candidate-only transition shock: idle→slam cycles reproduce the game/benchmark-LAUNCH
@@ -3858,7 +3841,8 @@ mod tests {
         let texture = vf_qualifier_workload_fingerprint(VfQualifierPattern::V8Texture);
         let endurance = vf_qualifier_workload_fingerprint(VfQualifierPattern::Endurance);
         assert_ne!(texture, endurance);
-        assert!(texture.contains("mix3-rotating-final-sparse16-r1"));
+        assert_eq!(texture, "f2q-texture-rop-first-r1/v9-texture");
+        assert!(endurance.contains("mix3-rotating-final-sparse16-r1"));
     }
 
     #[test]
@@ -3949,7 +3933,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_patterns_preserve_duration_and_bias_distinct_failure_modes() {
+    fn v9_texture_and_legacy_v8_patterns_preserve_duration_and_bias_failure_modes() {
         let high_fps = vf_qualifier_plan(60_000, VfQualifierPattern::V8HighFps);
         let texture = vf_qualifier_plan(60_000, VfQualifierPattern::V8Texture);
         let transitions = vf_qualifier_plan(60_000, VfQualifierPattern::V8Transitions);
@@ -4012,7 +3996,7 @@ mod tests {
                 >= 5
         );
         assert_eq!(VfQualifierPattern::V8HighFps.label(), "v8-high-fps");
-        assert_eq!(VfQualifierPattern::V8Texture.label(), "v8-texture");
+        assert_eq!(VfQualifierPattern::V8Texture.label(), "v9-texture");
         assert_eq!(VfQualifierPattern::V8Transitions.label(), "v8-transitions");
         assert_eq!(VfQualifierPattern::V8Memory.label(), "v8-memory");
         // v11: Texture and Memory also carry the banded TextureStream phase (severity-last).
@@ -4032,6 +4016,21 @@ mod tests {
                 .unwrap();
             assert!(stream > last_texrop, "TextureStream must run after graceful detectors");
         }
+        assert_eq!(
+            texture.get(1).map(|segment| segment.workload),
+            Some(VfWorkload::TextureRop),
+            "Texture v9 must enter the binding detector immediately after the opening"
+        );
+        assert!(
+            texture
+                .iter()
+                .take(4)
+                .filter(|segment| segment.workload == VfWorkload::TextureRop)
+                .map(|segment| segment.duration_ms)
+                .sum::<u64>()
+                >= 30_000,
+            "at least half of a 60 s descent dwell must exercise TextureRop before later coverage"
+        );
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::Fsgl1), 8);
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::Fsgl3A), 8);
         for phase in [
@@ -4078,6 +4077,17 @@ mod tests {
                 "endurance must exercise {workload:?}"
             );
         }
+        assert_eq!(
+            plan.get(1).map(|segment| segment.workload),
+            Some(VfWorkload::TextureRop),
+            "Endurance v18 must front-load its graceful rejection detector"
+        );
+        assert!(
+            plan.iter()
+                .take(9)
+                .any(|segment| segment.workload == VfWorkload::CompositeGameLoad),
+            "the rejection tier must reach composite game load before the long thermal proof"
+        );
         // Sustained max-power dominates — this is a worst-case soak, harsher than a game's average
         // load (which MixedGame represents), not a single-detector burst.
         assert!(

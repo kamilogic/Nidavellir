@@ -18,6 +18,7 @@
     exportMsg = "",
     exportFailed = false,
     sentinel = null,
+    safeLoop = null,
     sentinelState = "No events",
     sentinelSummary = "No automatic recovery action recorded.",
     gameTrace = null,
@@ -32,6 +33,15 @@
   } = $props();
 
   let activeTab = $state("log");
+  const blacklist = $derived(safeLoop?.blacklist ?? []);
+  const condemnations = $derived.by(() =>
+    [...(safeLoop?.condemnations ?? [])].sort((a, b) => {
+      const rehabilitationOrder = Number(Boolean(a?.rehabilitated)) - Number(Boolean(b?.rehabilitated));
+      if (rehabilitationOrder) return rehabilitationOrder;
+      return String(b?.timestamp ?? "").localeCompare(String(a?.timestamp ?? ""));
+    }),
+  );
+  const activeCondemnations = $derived(condemnations.filter((event) => !event?.rehabilitated).length);
 
   const tabs = $derived([
     {
@@ -43,7 +53,9 @@
     {
       id: "sentinel",
       label: "Sentinel",
-      detail: sentinelState,
+      detail: activeCondemnations || blacklist.length
+        ? `${activeCondemnations + blacklist.length} safety records`
+        : sentinelState,
       icon: ShieldCheck,
     },
     {
@@ -80,6 +92,32 @@
     if (value.startsWith("parado")) return value.replace("parado", "Stopped").replace("amostras", "samples");
     if (value.startsWith("erro:")) return value.replace("erro:", "Error:");
     return value;
+  }
+
+  function blacklistAxes(region) {
+    const axes = region?.center?.axes ?? {};
+    const labels = {
+      gpu_freq_mhz: ["Clock", "MHz"],
+      gpu_vf_bin_mv: ["VF bin", "mV"],
+      gpu_offset_mhz: ["Offset", "MHz"],
+      gpu_mem_offset_mhz: ["Memory offset", "MHz"],
+    };
+    return Object.entries(axes).map(([key, value]) => {
+      const [label, unit] = labels[key] ?? [key.replaceAll("_", " "), ""];
+      return `${label} ${value}${unit ? ` ${unit}` : ""}`;
+    });
+  }
+
+  function condemnationPoint(event) {
+    if (event?.target_mhz == null && event?.vf_bin_mv == null) return "Unattributed hardware event";
+    const clock = event?.target_mhz == null ? "unknown clock" : `${event.target_mhz} MHz`;
+    const voltage = event?.vf_bin_mv == null ? "unknown VF bin" : `${event.vf_bin_mv} mV`;
+    return `${clock} @ ${voltage}`;
+  }
+
+  function condemnationReason(event) {
+    const kind = String(event?.kind ?? "stability evidence").replaceAll("-", " ").replaceAll("_", " ");
+    return event?.note ? `${kind} · ${event.note}` : kind;
   }
 </script>
 
@@ -182,6 +220,62 @@
           <dd>{sentinel?.ts ?? "—"}</dd>
         </div>
       </dl>
+
+      <section class="condemnation-log" aria-labelledby="condemnation-log-title">
+        <div class="blacklist-heading">
+          <div>
+            <span class="panel-kicker">Condemnation ledger</span>
+            <h4 id="condemnation-log-title">Rejected hardware points</h4>
+          </div>
+          <span class:active={activeCondemnations > 0}>{activeCondemnations}</span>
+        </div>
+        {#if condemnations.length}
+          <ol>
+            {#each condemnations as event, index}
+              <li class:rehabilitated={event?.rehabilitated}>
+                <span class="blacklist-index">{String(index + 1).padStart(2, "0")}</span>
+                <div>
+                  <div class="ledger-title">
+                    <strong>{condemnationPoint(event)}</strong>
+                    <span class={`severity ${event?.severity ?? "unknown"}`}>{event?.severity ?? "recorded"}</span>
+                    {#if event?.rehabilitated}<span class="rehabilitated-label">Rehabilitated</span>{/if}
+                  </div>
+                  <small>{condemnationReason(event)}</small>
+                  <small class="ledger-meta">{event?.timestamp ?? "Timestamp unavailable"}{event?.run_id ? ` · run ${event.run_id}` : ""}</small>
+                </div>
+              </li>
+            {/each}
+          </ol>
+        {:else}
+          <p class="blacklist-empty">No condemnation events have been published for this hardware.</p>
+        {/if}
+      </section>
+
+      <section class="blacklist-log" aria-labelledby="blacklist-log-title">
+        <div class="blacklist-heading">
+          <div>
+            <span class="panel-kicker">Durable hardware evidence</span>
+            <h4 id="blacklist-log-title">Blacklisted regions</h4>
+          </div>
+          <span class:active={blacklist.length > 0}>{blacklist.length}</span>
+        </div>
+        {#if blacklist.length}
+          <ol>
+            {#each blacklist as region, index}
+              {@const axes = blacklistAxes(region)}
+              <li>
+                <span class="blacklist-index">{String(index + 1).padStart(2, "0")}</span>
+                <div>
+                  <strong>{axes.length ? axes.join(" · ") : "Hardware-local tuning region"}</strong>
+                  <small>Safety radius ±{region?.radius ?? "—"} hardware step{region?.radius === 1 ? "" : "s"}</small>
+                </div>
+              </li>
+            {/each}
+          </ol>
+        {:else}
+          <p class="blacklist-empty">No tuning regions are currently blacklisted for this hardware.</p>
+        {/if}
+      </section>
 
       <p class="panel-footnote">
         Sentinel is automatic and has no manual switch here. This panel reports events; it does not change GPU tuning.
@@ -596,6 +690,154 @@
     color: var(--diag-text);
     font-size: 0.9rem;
     line-height: 1.5;
+  }
+
+  .blacklist-log,
+  .condemnation-log {
+    margin-top: 1.25rem;
+    border-top: 1px solid var(--forge-line);
+    border-bottom: 1px solid var(--forge-line);
+    padding: 1.05rem 0;
+  }
+
+  .blacklist-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .blacklist-heading h4 {
+    margin: 0.2rem 0 0;
+    color: var(--diag-text);
+    font-size: 1rem;
+    font-weight: 600;
+  }
+
+  .blacklist-heading > span {
+    display: grid;
+    min-width: 40px;
+    min-height: 40px;
+    place-items: center;
+    color: var(--diag-dim);
+    background: color-mix(in srgb, var(--forge-panel) 72%, transparent);
+    font-variant-numeric: tabular-nums;
+    box-shadow: 0 0 0 1px var(--forge-line);
+  }
+
+  .blacklist-heading > span.active {
+    color: var(--diag-danger);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--diag-danger) 45%, transparent);
+  }
+
+  .blacklist-log ol,
+  .condemnation-log ol {
+    display: grid;
+    max-height: 280px;
+    gap: 1px;
+    margin: 1rem 0 0;
+    padding: 0;
+    overflow-y: auto;
+    list-style: none;
+    background: var(--forge-line);
+  }
+
+  .blacklist-log li,
+  .condemnation-log li {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr);
+    align-items: center;
+    gap: 0.85rem;
+    min-height: 58px;
+    padding: 0.65rem 0.85rem;
+    background: color-mix(in srgb, var(--forge-void) 96%, transparent);
+  }
+
+  .blacklist-index {
+    color: var(--diag-danger);
+    font: 0.72rem/1 "Cascadia Code", "Consolas", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .blacklist-log li > div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .condemnation-log {
+    margin-top: 1.25rem;
+  }
+
+  .condemnation-log li > div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .condemnation-log li.rehabilitated {
+    opacity: 0.58;
+  }
+
+  .ledger-title {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .severity,
+  .rehabilitated-label {
+    padding: 0.18rem 0.38rem;
+    color: #e4b184;
+    background: rgba(197, 138, 81, 0.12);
+    font-size: 0.58rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    box-shadow: inset 0 0 0 1px rgba(197, 138, 81, 0.3);
+  }
+
+  .severity.rigid,
+  .severity.critical,
+  .severity.hard {
+    color: #ef9a8c;
+    background: rgba(215, 120, 104, 0.12);
+    box-shadow: inset 0 0 0 1px rgba(215, 120, 104, 0.34);
+  }
+
+  .rehabilitated-label {
+    color: #8fc8a3;
+    background: rgba(83, 183, 122, 0.1);
+    box-shadow: inset 0 0 0 1px rgba(83, 183, 122, 0.28);
+  }
+
+  .ledger-meta {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.82;
+    overflow-wrap: anywhere;
+  }
+
+  .blacklist-log strong,
+  .condemnation-log strong {
+    color: #e2d8d4;
+    font-size: 0.82rem;
+    font-weight: 550;
+    overflow-wrap: anywhere;
+  }
+
+  .blacklist-log small,
+  .condemnation-log small,
+  .blacklist-empty {
+    color: var(--diag-dim);
+    font-size: 0.74rem;
+  }
+
+  .blacklist-empty {
+    margin-top: 0.9rem;
   }
 
   .trace-switch {

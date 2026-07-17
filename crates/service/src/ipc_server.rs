@@ -297,7 +297,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             guard.mem_sweep.stop();
             guard.forge_all.stop();
             guard.benchmark.stop();
-            guard.power_sweep.stop();
+            guard.power_sweep.abort();
             let msg = match crate::gpu_apply::reset(&guard.safe_store) {
                 Ok(()) => {
                     guard.power_sweep.recover_after_reset(
@@ -318,7 +318,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             guard.mem_sweep.stop();
             guard.forge_all.stop();
             guard.benchmark.stop();
-            guard.power_sweep.stop();
+            guard.power_sweep.abort();
             let msg = match crate::gpu_apply::reset(&guard.safe_store) {
                 Ok(()) => {
                     let mut problems: Vec<String> = Vec::new();
@@ -433,6 +433,13 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             guard.power_sweep.stop();
             IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
         }
+        IpcRequest::ResumePowerSweep => {
+            let store = guard.safe_store.clone();
+            match guard.power_sweep.resume(store) {
+                Ok(progress) => IpcResponse::success(ResponseData::PowerSweep(progress)),
+                Err(e) => IpcResponse::failure(format!("Forge resume refused: {e}")),
+            }
+        }
         IpcRequest::GetPowerSweepProgress => {
             IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
         }
@@ -534,6 +541,7 @@ fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
             | IpcRequest::StartPowerSweepClean
             | IpcRequest::StartPowerSweepFast
             | IpcRequest::StartPowerSweepLong
+            | IpcRequest::ResumePowerSweep
             | IpcRequest::ApplyPowerGodforge
             | IpcRequest::ApplyPowerBrokkrs
             | IpcRequest::ApplyPowerDeepCalm
@@ -848,6 +856,7 @@ mod tests {
             IpcRequest::StartPowerSweepClean,
             IpcRequest::StartPowerSweepFast,
             IpcRequest::StartPowerSweepLong,
+            IpcRequest::ResumePowerSweep,
             IpcRequest::ApplyPowerGodforge,
             IpcRequest::ApplyPowerBrokkrs,
             IpcRequest::ApplyPowerDeepCalm,

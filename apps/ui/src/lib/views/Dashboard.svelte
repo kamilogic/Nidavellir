@@ -19,6 +19,15 @@
     return Number.isFinite(n) ? n.toFixed(digits) : null;
   }
 
+  function vramCapacity(gpu) {
+    if (gpu?.vram_total_mb == null) return "Capacity unavailable";
+    const totalGb = Number(gpu.vram_total_mb) / 1024;
+    const total = `${totalGb >= 10 ? totalGb.toFixed(0) : totalGb.toFixed(1)} GB total`;
+    if (gpu.vram_used_mb == null) return total;
+    const usedGb = Number(gpu.vram_used_mb) / 1024;
+    return `${usedGb.toFixed(1)} GB used · ${total}`;
+  }
+
   async function refresh() {
     try {
       const [s, d] = await Promise.all([
@@ -76,23 +85,22 @@
               </div>
               <div>
                 <span>Core clock</span>
-                <strong>{gpu.core_clock_mhz ? `${gpu.core_clock_mhz} MHz` : "N/A"}</strong>
+                <strong>{gpu.core_clock_mhz != null ? `${gpu.core_clock_mhz} MHz` : "N/A"}</strong>
+              </div>
+              <div class="priority-metric">
+                <span>VRAM speed</span>
+                <strong>{gpu.memory_clock_mhz != null ? `${gpu.memory_clock_mhz} MHz` : "N/A"}</strong>
+                <small>{vramCapacity(gpu)}</small>
               </div>
               <div>
-                <span>Memory clock</span>
-                <strong>{gpu.memory_clock_mhz ? `${gpu.memory_clock_mhz} MHz` : "N/A"}</strong>
+                <span>Core voltage</span>
+                <strong>{gpu.voltage_mv != null ? `${gpu.voltage_mv} mV` : "Not exposed"}</strong>
+                {#if gpu.voltage_source}<small>{gpu.voltage_source}</small>{/if}
               </div>
               <div>
-                <span>VRAM</span>
-                <strong>
-                  {#if gpu.vram_used_mb != null && gpu.vram_total_mb != null}
-                    {gpu.vram_used_mb} / {gpu.vram_total_mb} MB
-                  {:else if gpu.vram_total_mb != null}
-                    {gpu.vram_total_mb} MB
-                  {:else}
-                    N/A
-                  {/if}
-                </strong>
+                <span>Fan duty</span>
+                <strong>{gpu.fan_speed_pct != null ? `${gpu.fan_speed_pct}%` : "Not exposed"}</strong>
+                <small>{gpu.fan_speed_pct != null ? "Average reported fan duty" : "Driver/card returned no fan sensor"}</small>
               </div>
             </div>
             {#if gpu.temperature_source || gpu.power_source}
@@ -264,6 +272,23 @@
     font-size: 0.86rem;
     font-variant-numeric: tabular-nums;
     overflow-wrap: anywhere;
+  }
+  .metric-grid small {
+    display: block;
+    min-height: 1.1rem;
+    margin-top: 0.28rem;
+    color: var(--nord-dim);
+    font-size: 0.68rem;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+  .metric-grid .priority-metric {
+    background: color-mix(in srgb, var(--forge-panel-raised) 72%, rgba(5, 7, 11, 0.24));
+    box-shadow: inset 0 0 0 1px rgba(214, 168, 93, 0.18);
+  }
+  .metric-grid .priority-metric strong {
+    color: var(--forge-gold);
+    font-size: 1rem;
   }
   .sub {
     margin: 0.3rem 0 0;

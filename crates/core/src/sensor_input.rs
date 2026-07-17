@@ -13,6 +13,10 @@ pub struct SensorInput {
     pub dram_mv: Option<u32>,
     pub dram_source: Option<SensorSource>,
     pub dram_quality: SensorQuality,
+    /// Read-only live GPU voltage supplied by the service's NVAPI layer. Core
+    /// cannot query NVAPI directly without reversing the crate dependency.
+    pub gpu_voltage_mv: Option<u32>,
+    pub gpu_voltage_source: Option<SensorSource>,
     pub superio: Option<ResolvedSuperIo>,
 }
 
@@ -33,6 +37,8 @@ impl SensorInput {
             dram_mv: None,
             dram_source: None,
             dram_quality: SensorQuality::Unavailable,
+            gpu_voltage_mv: None,
+            gpu_voltage_source: None,
             superio: None,
         };
 

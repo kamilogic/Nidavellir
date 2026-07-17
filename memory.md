@@ -8,6 +8,36 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-16d) — profile-aware vertical closure + qualification contract v18
+- Exact-Apply physical failures now close every viable higher same-clock bin; the arbitrary
+  two-repair budget is gone. The durable condemnation view refreshes for every decision.
+  Inconclusive/coverage failures remain incomplete without blacklist or voltage inference, and only
+  an actual SilentError is persisted under the exact-Apply silent-error quarantine kind.
+- The conservative 94%-of-cap publication ceiling is retained. Godforge can climb the physical
+  voltage domain under that ceiling; Brokkr's stays one real bin below Godforge and Deep Calm one bin
+  below the lowest stronger profile. Exhausted Godforge clocks fast-drop to the next real clock at
+  the carried voltage, then receive fresh power calibration and the full gate.
+- Qualification v18 is TextureRop-first Texture v9 plus a continuous 20-minute Endurance whose
+  aggressive rejection tier runs first. Mandatory DX11 and standalone TransitionShock were removed,
+  including DX11 golden capture; legacy evidence remains readable. A clean passing exact pair now
+  costs 25 minutes of dwell instead of 38, while failures may reject earlier.
+- Software validation passed (`gpu-stress` 16, core 102, service 403). Hardware validation is still
+  pending and must be a new Clean Run; no Apply/Forge/hardware write was executed for this change.
+
+## Latest (2026-07-16c) — manual pause/resume and complete operator-facing Forge status
+- Manual Stop reaches `paused` only after stock reset and checkpoint persistence. Explicit
+  `ResumePowerSweep` requires the exact program build, GPU/adapter and driver; it keeps the same
+  run ID, reuses only compatible completed evidence from that run, retries incomplete work and keeps
+  elapsed time cumulative. Ordinary Start and TDR/recovery paths never auto-resume.
+- Structured current/next backend tasks drive a novice-facing timeline with live task/total timers
+  and ETAs. Sentinel displays effective condemnations plus the separate operational blacklist; log
+  red/white/green tone remains presentation-only.
+- Live UI telemetry now includes VRAM clock/capacity/usage, NVAPI core voltage and averaged NVML fan
+  duty (`nvidia-smi` fallback), preserving valid 0% and unavailable `None`. All three themes and the
+  dashboard received responsive/wrapping refinements.
+- The item-1/2 review recorded here is superseded by qualification v18 above; it remains historical
+  rationale rather than current behavior.
+
 ## Latest (2026-07-16b) — modos de aprendizado: clean run experimental vs produção
 - `StartPowerSweepClean` (IPC additivo) / modo UI "Clean run · Experimental": busca 100% orgânica
   para avaliar versões do algoritmo — arquiva observações/forge_state em `forge-archive/<run_id>/`,

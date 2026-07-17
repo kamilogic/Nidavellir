@@ -13,6 +13,10 @@ pub struct NvmlGpuReading {
     pub vram_total_mb: Option<u64>,
     pub core_clock_mhz: Option<u32>,
     pub memory_clock_mhz: Option<u32>,
+    /// Current fan duty reported by NVML, averaged across every exposed fan.
+    /// `None` means the driver/card does not expose fan telemetry (for example,
+    /// passively cooled devices); it is never replaced with a fabricated zero.
+    pub fan_speed_pct: Option<u32>,
     pub temperature_c: Option<f32>,
     pub power_w: Option<f32>,
     /// Enforced power limit (W) — the cap the card throttles against.
@@ -176,6 +180,15 @@ pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
         let memory_clock_mhz = device
             .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Memory)
             .ok();
+        let fan_speed_pct = device.num_fans().ok().and_then(|fan_count| {
+            let speeds = (0..fan_count)
+                .filter_map(|fan_index| device.fan_speed(fan_index).ok())
+                .collect::<Vec<_>>();
+            (!speeds.is_empty()).then(|| {
+                speeds.iter().copied().map(u64::from).sum::<u64>()
+                    .div_ceil(speeds.len() as u64) as u32
+            })
+        });
         let temperature_c = device
             .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
             .ok()
@@ -202,6 +215,7 @@ pub fn read_nvidia_gpus_nvml() -> Vec<NvmlGpuReading> {
             vram_total_mb,
             core_clock_mhz,
             memory_clock_mhz,
+            fan_speed_pct,
             temperature_c,
             power_w,
             power_limit_w,

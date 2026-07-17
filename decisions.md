@@ -2,6 +2,31 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Close every viable same-clock bin; v18 uses binding tests first (2026-07-16)
+- **Problem:** the first vertical-repair patch stopped after two attempts, used one undifferentiated
+  voltage policy for all profiles, read a stale condemnation snapshot and could persist non-Silent
+  outcomes under the silent-error ledger kind. Meanwhile the 38-minute exact gate spent five minutes
+  in DX11 and eight in standalone TransitionShock even though collected runs showed TextureRop and
+  continuous Endurance as the actual rejectors.
+- **Vertical-closure decision:** no attempt-count cap. A reset-clean physical `SilentError`,
+  `Unstable` or `ClockDrop` may climb to the next viable real bin at the same clock; an inconclusive,
+  coverage or orchestration result stops incomplete without blacklist or inferred repair. Reload
+  condemnation state at each decision. Persist the exact-Apply silent quarantine only for a real
+  `SilentError`; never encode a different outcome under that name.
+- **Profile decision:** retain the common 94%-of-cap publication ceiling. Godforge may climb to the
+  physical limit under it. Brokkr's voltage ceiling is one real bin below Godforge; Deep Calm is one
+  bin below the lowest stronger profile. At an exhausted Godforge clock, carry that voltage to the
+  next lower real clock, calibrate exact power and require the full gate; a Godforge-only selection
+  override prevents the efficiency tie-break from discarding that candidate.
+- **Qualification decision:** contract v18 makes Texture v9 TextureRop-first and front-loads the
+  aggressive TextureRop/composite/cap-slam tier inside the still-continuous 20-minute Endurance.
+  Current exact Apply requires Texture v9 5 min + Endurance 20 min. DX11/TransitionShock cease to be
+  mandatory and DX11 golden capture leaves the active startup path; their persisted evidence remains
+  backward-readable. This reduces a fully passing pair from 38 to 25 dwell minutes without reducing
+  the continuous thermal proof.
+- **Hardware gate:** compile/unit tests prove orchestration and workload composition, not silicon
+  specificity. The next evidence must come from a new Clean Run with old learning excluded.
+
 ## Resynthesis must score the conservative post-gate p99 (2026-07-17)
 - **Bug proven by the 2026-07-17 run**: selection scored candidates with the calm PowerRender
   calibration p99 while publication printed the conservative post-gate basis. Deep Calm was
@@ -21,6 +46,21 @@ Durable technical decisions and their rationale. Newest first.
   bug. Follow-up that eliminates the walk (with P2/v9): measure a texture-class p99 at every
   exact Apply bin during the existing calibration gap-fill (~65 s × ~12 bins once per run), so
   every candidate carries a gate-representative selection basis before the first synthesis.
+
+## Manual Forge pause is explicit, exact-compatible and evidence-preserving (2026-07-16)
+- **Problem:** the old Stop was terminal and restart recovery could appear to continue despite not
+  proving whether the program, driver or GPU still matched the saved evidence. A TDR interruption is
+  materially different from an operator-requested pause.
+- **Decision:** Stop is cooperative and becomes `paused` only after a confirmed stock reset and
+  durable checkpoint. Resume has its own IPC method and requires exact package/build, GPU/adapter and
+  driver identity. It keeps the same run ID, reuses only compatible reset-clean observations from
+  that run and retries the interrupted candidate. Start always means new run; TDR, panic, Sentinel
+  cancellation and Reset remain non-resumable recovery paths.
+- **UX contract:** current/next task IDs and durations are structured backend data. The frontend may
+  locally advance clocks between backend callbacks, but it must not infer work or safety state from
+  log prose. Semantic live-log colors are therefore presentation-only.
+- **Telemetry contract:** unavailable fan/voltage stays `None`; zero fan duty is real data. VRAM
+  speed is primary and capacity/usage secondary. Sensor/UI changes never alter Forge evidence.
 
 ## Forge learning modes: experimental clean run vs production persistence (2026-07-16)
 - **Why**: during algorithm development every version must be evaluated on a fully ORGANIC search —

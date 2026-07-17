@@ -131,14 +131,14 @@ const F2_ADAPTIVE_MAX_STRIDE_BINS: usize = 4;
 #[cfg(windows)]
 const F2_ADAPTIVE_MAX_VOLTAGE_DROP_MV: u32 = 25;
 
-/// Relative sustained-clock margin allowed between equivalent v8 qualification passes. A
+/// Relative sustained-clock margin allowed between equivalent Texture v9 qualification passes. A
 /// candidate whose heavy-phase p5 falls farther than this below the median of prior stable
 /// candidates at the same target/pattern has reached the voltage-margin cliff even if it did not
 /// crash. This is policy, not a hardware limit.
 #[cfg(windows)]
 const MARGIN_DROP_TOL_MHZ: u32 = 30;
 
-/// Number of additional attempts after an inconclusive v8 qualification dwell. Coverage
+/// Number of additional attempts after an inconclusive Texture v9 qualification dwell. Coverage
 /// ambiguity is not instability: retry the same physical point, then skip only this clock.
 #[cfg(windows)]
 const INCONCLUSIVE_RETRY_BUDGET: usize = 2;
@@ -155,16 +155,6 @@ const F2_STANDARD_DWELL_MS: u64 = 15_000;
 /// thermal saturation the reset-between 5-min patterns never reach.
 #[cfg(windows)]
 pub(crate) const F2_ENDURANCE_QUALIFICATION_DWELL_MS: u64 = 1_200_000;
-
-/// v15 candidate-only transition shock (~8 min): true-idle → heavy-slam cycles at the exact Apply
-/// point, reproducing the game/benchmark-LAUNCH transition behind the observed in-game BusReset TDR
-/// cascade. Runs BEFORE the Endurance soak — a launch-fragile point fails in ~8 min instead of
-/// wasting the 20-min soak.
-#[cfg(windows)]
-pub(crate) const F2_TRANSITION_SHOCK_DWELL_MS: u64 = 480_000;
-/// Native Direct3D 11 exact-Apply gate. Five minutes matches the binding Texture gate while the
-/// fail-cheap ordering keeps it ahead of the 8/20-minute candidate-only gates.
-pub(crate) const F2_DX11_QUALIFICATION_DWELL_MS: u64 = 300_000;
 
 /// Residual offset (kHz) at or below which a post-reset readback counts as "cleared". F2 must NEVER
 /// leave a positive offset applied; a larger residual makes the confirmed path treat the reset as
@@ -1685,6 +1675,22 @@ fn resume_f2_candidates(
     resume_below
 }
 
+fn f2_prior_observation_is_resume_eligible(
+    observation_run_id: &str,
+    current_run_id: &str,
+    resume_current_run: bool,
+) -> bool {
+    !resume_current_run || observation_run_id == current_run_id
+}
+
+fn f2_refresh_discovery_for_qualification(
+    qualification_passes: usize,
+    final_gate_passes: usize,
+    resume_current_run: bool,
+) -> bool {
+    !resume_current_run && (qualification_passes > 0 || final_gate_passes > 0)
+}
+
 fn f2_observation_matches_current_candidate(
     candidates: &[AnchoredPositiveOffsetPlan],
     anchor_mv: u32,
@@ -3010,7 +3016,7 @@ impl F2Ops for RealF2Ops<'_> {
                         .expect("qualification purpose has a pattern"),
                     purpose
                         .render_goldens()
-                        .expect("v8 qualification purpose has stock goldens"),
+                        .expect("qualification purpose has stock goldens"),
                     self.cancel,
                 )
             }
@@ -4274,7 +4280,7 @@ pub(crate) struct F2ClockDiscoveryProgress {
 
 /// Result of filling one missing exact-Apply-bin PowerRender measurement after the qualified
 /// frontier is complete. This step never promotes stability; it only contributes current-contract
-/// power telemetry. The distinct exact-Apply v8 gate runs after synthesis.
+/// power telemetry. The distinct exact-Apply v18 gate runs after synthesis.
 #[cfg(windows)]
 pub(crate) struct F2PowerCalibrationSummary {
     pub confirmed: bool,
@@ -4285,7 +4291,7 @@ pub(crate) struct F2PowerCalibrationSummary {
     pub logs: Vec<String>,
 }
 
-/// Result of the long v8 three-pattern gate at the exact post-margin Apply pair selected for a profile.
+/// Result of the v18 Texture-first + Endurance gate at the exact post-margin Apply pair.
 /// A reset-clean rejection is local to this candidate and lets synthesis choose another point; hard
 /// device/reset/write failures still abort the Forge.
 #[cfg(windows)]
@@ -4564,7 +4570,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: None,
                 line: format!(
-                    "v8 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
+                    "v9 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
                     qualification_pattern_label(pattern),
                     pass_index,
                     patterns.len(),
@@ -4596,7 +4602,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                         report.dwell = Some(F2DwellOutcome::ClockDrop);
                         report.validated = false;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV v8 {}: colapso de margem p5={current_p5} MHz (baseline {:?} MHz, tolerância {} MHz)",
+                            "{target_mhz} MHz @ {} mV v9 {}: colapso de margem p5={current_p5} MHz (baseline {:?} MHz, tolerância {} MHz)",
                             candidate.anchor.voltage_mv,
                             qualification_pattern_label(pattern),
                             median_u32(margin_history.values(pattern)),
@@ -4608,7 +4614,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                 }
             }
             logs.push(format!(
-                "{target_mhz} MHz @ {} mV v8 {} {}/{}: {:?}",
+                "{target_mhz} MHz @ {} mV v9 {} {}/{}: {:?}",
                 candidate.anchor.voltage_mv,
                 qualification_pattern_label(pattern),
                 pass_index,
@@ -4628,7 +4634,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: None,
                 line: format!(
-                    "{target_mhz} MHz @ {} mV · v8 {} {}/{} → {:?} · aguardando cleanup",
+                    "{target_mhz} MHz @ {} mV · v9 {} {}/{} → {:?} · aguardando cleanup",
                     candidate.anchor.voltage_mv,
                     qualification_pattern_label(pattern),
                     pass_index,
@@ -4652,7 +4658,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                     if qualification_should_retry_inconclusive(inconclusive_retries) {
                         inconclusive_retries += 1;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV v8 {} inconclusivo; retentativa {}/{} com dwell ampliado",
+                            "{target_mhz} MHz @ {} mV v9 {} inconclusivo; retentativa {}/{} com dwell ampliado",
                             candidate.anchor.voltage_mv,
                             qualification_pattern_label(pattern),
                             inconclusive_retries,
@@ -4822,7 +4828,7 @@ fn gate_anchored_candidate_fsgl3(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: None,
                 line: format!(
-                    "v8 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
+                    "v9 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
                     qualification_pattern_label(pattern),
                     pass_index,
                     patterns.len(),
@@ -4839,7 +4845,7 @@ fn gate_anchored_candidate_fsgl3(
                 inconclusive_retries as u32,
             );
             logs.push(format!(
-                "{target_mhz} MHz @ {} mV v8 {} {}/{}: {:?}",
+                "{target_mhz} MHz @ {} mV v9 {} {}/{}: {:?}",
                 candidate.anchor.voltage_mv,
                 qualification_pattern_label(pattern),
                 pass_index,
@@ -4867,7 +4873,7 @@ fn gate_anchored_candidate_fsgl3(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: Some(format!("{:?}", report.outcome)),
                 line: format!(
-                    "{target_mhz} MHz @ {} mV · v8 {} {}/{} → {:?} · aprendizado salvo",
+                    "{target_mhz} MHz @ {} mV · v9 {} {}/{} → {:?} · aprendizado salvo",
                     candidate.anchor.voltage_mv,
                     qualification_pattern_label(pattern),
                     pass_index,
@@ -4884,7 +4890,7 @@ fn gate_anchored_candidate_fsgl3(
                             clean_passes_after_inconclusive,
                         ) {
                             logs.push(format!(
-                                "{target_mhz} MHz @ {} mV v8 {}: dívida inconclusiva preservada; exigindo mais um passe limpo consecutivo",
+                                "{target_mhz} MHz @ {} mV v9 {}: dívida inconclusiva preservada; exigindo mais um passe limpo consecutivo",
                                 candidate.anchor.voltage_mv,
                                 qualification_pattern_label(pattern)
                             ));
@@ -4913,7 +4919,7 @@ fn gate_anchored_candidate_fsgl3(
                         inconclusive_retries += 1;
                         clean_passes_after_inconclusive = 0;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV v8 {} inconclusivo; {}",
+                            "{target_mhz} MHz @ {} mV v9 {} inconclusivo; {}",
                             candidate.anchor.voltage_mv,
                             qualification_pattern_label(pattern),
                             if exact_apply {
@@ -4930,36 +4936,19 @@ fn gate_anchored_candidate_fsgl3(
             }
         }
     }
-    // v14/v15 candidate-only STRESS gates at the EXACT Apply point, run ONLY at exact-Apply — the
-    // frontier descent (exact_apply=false) never pays them. IN ORDER (fail cheap first):
-    //   1. DX11 (~5 min): native Direct3D 11 offscreen render + stock checksum on the same NVIDIA
-    //      adapter, covering a driver/API path absent from the wgpu Vulkan/DX12 battery.
-    //   2. TransitionShock (~8 min): true-idle → heavy-slam cycles reproducing the game/benchmark
-    //      LAUNCH transition (P-state exit + boost VF ramp + VRM load step) behind the observed
-    //      in-game BusReset TDR cascade; the slam wall-time check fails Unstable at the pre-hang
-    //      precursor, long before the ~2 s driver watchdog.
-    //   3. Endurance (~20 min): one CONTINUOUS worst-realistic soak (sustained max-power +
-    //      cap-slam + droop + mixed), no mid-soak reset, so thermal saturation truly accumulates.
+    // v18 candidate-only Endurance at the EXACT Apply point. Texture v9 already ran first as the
+    // required pattern; DX11 and TransitionShock were removed from the mandatory path after never
+    // rejecting a collected candidate. Endurance remains one continuous ~20-minute transaction,
+    // now with its aggressive TextureRop/composite/cap-slam rejection tier at the front and the
+    // complete thermal-saturation proof behind it.
     // Non-Validated ⇒ the exact point is rejected (fail closed). Each pass keeps the same
     // arm→apply→verify→dwell→reset motor + NVML clock ceiling + cooperative Stop.
     if exact_apply {
-        for (pattern, dwell_ms, kind) in [
-            (
-                F2QualificationPattern::Dx11Game,
-                F2_DX11_QUALIFICATION_DWELL_MS,
-                "render nativo Direct3D 11",
-            ),
-            (
-                F2QualificationPattern::TransitionShock,
-                F2_TRANSITION_SHOCK_DWELL_MS,
-                "shock idle→slam",
-            ),
-            (
-                F2QualificationPattern::Endurance,
-                F2_ENDURANCE_QUALIFICATION_DWELL_MS,
-                "soak contínuo",
-            ),
-        ] {
+        let (pattern, dwell_ms, kind) = (
+            F2QualificationPattern::Endurance,
+            F2_ENDURANCE_QUALIFICATION_DWELL_MS,
+            "soak contínuo agressivo",
+        );
             let label = qualification_pattern_label(pattern);
             if stop.load(Ordering::SeqCst) {
                 return F2QualificationOutcome::Cancelled;
@@ -4990,7 +4979,7 @@ fn gate_anchored_candidate_fsgl3(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: None,
                 line: format!(
-                    "v8 {label}: {target_mhz} MHz @ {} mV — {kind} ({} min)…",
+                    "v9 {label}: {target_mhz} MHz @ {} mV — {kind} ({} min)…",
                     candidate.anchor.voltage_mv,
                     dwell_ms / 60_000
                 ),
@@ -5004,7 +4993,7 @@ fn gate_anchored_candidate_fsgl3(
                 0,
             );
             logs.push(format!(
-                "{target_mhz} MHz @ {} mV v8 {label} ({kind} {} min): {:?}",
+                "{target_mhz} MHz @ {} mV v9 {label} ({kind} {} min): {:?}",
                 candidate.anchor.voltage_mv,
                 dwell_ms / 60_000,
                 report.outcome
@@ -5030,7 +5019,7 @@ fn gate_anchored_candidate_fsgl3(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: Some(format!("{:?}", report.outcome)),
                 line: format!(
-                    "{target_mhz} MHz @ {} mV · v8 {label} → {:?} · aprendizado salvo",
+                    "{target_mhz} MHz @ {} mV · v9 {label} → {:?} · aprendizado salvo",
                     candidate.anchor.voltage_mv, report.outcome
                 ),
             });
@@ -5056,7 +5045,6 @@ fn gate_anchored_candidate_fsgl3(
                     ))
                 }
             }
-        }
     }
     F2QualificationOutcome::Qualified
 }
@@ -5526,6 +5514,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     run_id: &str,
     gpu_key: &str,
     ledger_run_scoped: bool,
+    resume_current_run: bool,
     sane: &[(usize, u32, u32)],
     limits: &PositiveOffsetLimits,
     target_mhz: u32,
@@ -5566,6 +5555,11 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     let compatible_prior: Vec<_> = prior
         .into_iter()
         .filter(|observation| {
+            f2_prior_observation_is_resume_eligible(
+                &observation.run_id,
+                run_id,
+                resume_current_run,
+            ) &&
             f2_observation_matches_current_candidate(
                 &unpruned_descent.candidates,
                 observation.anchor_mv,
@@ -5613,7 +5607,11 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     // Standard/Long must not qualify a boundary that exists only because a previous run accepted it.
     // Prior positives may guide Fast/resume, but qualification modes must rediscover the boundary with
     // the current PowerRender discovery contract before the FailureSeekingGameLoop is allowed to run.
-    let refresh_discovery_for_qualification = qualification_passes > 0 || final_gate_passes > 0;
+    let refresh_discovery_for_qualification = f2_refresh_discovery_for_qualification(
+        qualification_passes,
+        final_gate_passes,
+        resume_current_run,
+    );
     let resume_good_mv = if refresh_discovery_for_qualification {
         None
     } else {
@@ -5628,6 +5626,11 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         logs.push(format!(
             "{target_mhz} MHz: Standard/Long exige redescoberta fresca; ponto antigo {:?} mV não será qualificado diretamente",
             prior_good_mv
+        ));
+    }
+    if resume_current_run && prior_good_mv.is_some() {
+        logs.push(format!(
+            "{target_mhz} MHz: Resume explícito reutiliza apenas evidência reset-clean compatível desta mesma run; candidato cancelado/incompleto continua pendente"
         ));
     }
     // Resume below the deepest reset-clean point already observed on this exact GPU. A known
@@ -5760,8 +5763,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     }
 
     // Qualification evidence context, separate from the Discovery `ctx` used by PowerRender.
-    // The v8 three-pattern set is the default per-candidate qualifier during descent. The optional final gate is kept
-    // dormant for now and shares the same boundary shape.
+    // Texture v9 is the default per-candidate qualifier during descent. The optional final gate is
+    // kept dormant here and shares the same boundary shape.
     let mut qual_ctx = ctx.clone();
     qual_ctx.evidence_kind = nidavellir_core::f2_observation::F2EvidenceKind::Qualification;
     qual_ctx.discovery_contract_version = None;
@@ -7530,7 +7533,7 @@ mod tests {
                             F2QualificationPattern::A => "fsgl3-a",
                             F2QualificationPattern::B => "fsgl3-b",
                             F2QualificationPattern::HighFps => "v8-high-fps",
-                            F2QualificationPattern::Texture => "v8-texture",
+                            F2QualificationPattern::Texture => "v9-texture",
                             F2QualificationPattern::Transitions => "v8-transitions",
                             F2QualificationPattern::Memory => "v8-memory",
                             F2QualificationPattern::Endurance => "endurance",
@@ -7803,6 +7806,27 @@ mod tests {
         );
         resume_f2_candidates(&mut candidates, Some(900), Some(850), None);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn explicit_resume_reuses_only_same_run_and_does_not_force_standard_rediscovery() {
+        assert!(f2_prior_observation_is_resume_eligible(
+            "run-current",
+            "run-current",
+            true
+        ));
+        assert!(!f2_prior_observation_is_resume_eligible(
+            "run-old",
+            "run-current",
+            true
+        ));
+        assert!(
+            f2_prior_observation_is_resume_eligible("run-old", "run-current", false),
+            "normal Start keeps the existing cross-run guidance behavior"
+        );
+        assert!(!f2_refresh_discovery_for_qualification(1, 0, true));
+        assert!(!f2_refresh_discovery_for_qualification(1, 1, true));
+        assert!(f2_refresh_discovery_for_qualification(1, 0, false));
     }
 
     #[test]
