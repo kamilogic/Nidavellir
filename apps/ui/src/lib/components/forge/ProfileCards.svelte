@@ -91,7 +91,7 @@
 
   function applyQualification(point) {
     if (!point?.apply_qualified) return null;
-    return `Exact Apply qualified · FSGL3 v${point.apply_qualification_version ?? "current"}`;
+    return `Exact Apply qualified · contract v${point.apply_qualification_version ?? "current"}`;
   }
 
   function measuredVoltage(point) {

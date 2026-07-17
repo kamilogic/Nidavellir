@@ -12,6 +12,10 @@
   - Brokkr's = best MHz/W, off-cap; 3-tier failure classes; supported-GPU docs.
   - **V1 continuous per-GPU stability knowledge** (severity frontier, per-point
     stats, data-driven margin — no fixed MHz).
+  - **P0 restart/accounting closure (2026-07-15)** — run/candidate checkpoints, installed-service
+    sentinel parity, durable Needs Attention incidents with explicit acknowledgement, run-scoped
+    export and content-addressed dirty build identity. Real-use profile failures can be marked from
+    their hardware-derived card and become durable local blacklist evidence.
 
 ## Now — Product model (see product.md)
 Reframed around 3 profiles forged from a clock×power frontier. Phases:
@@ -26,21 +30,24 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   checked reset and boot-flag clear. Qualification is persisted before discovery so resume cannot see
   a positive discovery without its same-curve rejection evidence. A positive observation becomes
   reusable only after cleanup is proven. Numeric p99 classification has hysteresis: NearCap ≥99%,
-  OffCap ≤98%, and the middle band retries or ends inconclusive. Qualification contract v16 records
+  OffCap ≤98%, and the middle band retries or ends inconclusive. Qualification contract v17 records
   complete build/workload/graphics/golden provenance; older positives remain readable but are
   ineligible. MixedGame now records BoostEdge + TextureRop + PowerRender in every frame/submit;
   BoostEdge/MixedGame checksum reduction is sparse GPU-side and every sampled mismatch accumulates.
-  The exact-Apply closure is deliberately unchanged: Texture 5 min, TransitionShock 8 min and
-  Endurance 20 min per unique selected pair. The additive ForgeProgress preheat/Ctable/Cboost fields
+  The exact-Apply closure now adds a native offscreen DX11 stock-golden gate between Texture and the
+  longer stages: Texture 5 min, DX11 5 min, TransitionShock 8 min and Endurance 20 min per unique pair.
+  It selects the NVIDIA adapter explicitly, records its LUID/provenance, and bounds GPU completion
+  polling below the Windows watchdog regime. The additive ForgeProgress preheat/Ctable/Cboost fields
   expose this domain without parsing logs. The explicit F2 Apply path and legacy F1 remain intact.
   The first post-reset Standard hardware cycle completed across a resumed two-run sequence and
   published `1890@893`, `1845@862` and `1740@800`. Endurance rejected stochastic `1905@900` and
   `1860@868`, but the known field discriminator `1845@862` still passed. During unattended descent the
   operator returned to a Windows login after a reported TDR/reboot; no observation or sentinel event
-  attributed the active point before checkpoint resume. **Next evidence/safety gates:** supervised
-  in-game A/B of `1845@862`, plus P0 restart reconciliation that persists the active intent, enters
-  Needs Attention and requires acknowledgement instead of silently resuming. DX11 and any reduction
-  of the exact-Apply gate remain deferred until field discrimination is demonstrated.
+  attributed the active point before checkpoint resume. Restart reconciliation is now implemented;
+  the operator also confirmed `1845@862` repeatedly unstable in real use. **Next evidence/safety
+  gate:** deploy this build, mark every confirmed profile unstable from its card, then perform a clean
+  Forge evaluation of qualification v17. No final-gate duration was reduced; the new DX11 stage must
+  first demonstrate field discrimination without false positives on safe controls.
 - **F1 — Profile model**: 3-profile synthesis (Godforge=clock / Brokkr's=R / Deep
   Calm=MHz/W) + V2 confidence gate.
   - **F1a (DONE)** — pure `synthesize_forge_profiles` + unit tests. Not yet wired.
@@ -67,19 +74,16 @@ Reframed around 3 profiles forged from a clock×power frontier. Phases:
   **V3** (confidence-maturing trials) folds into F1b/F4.
 
 ## Near-term
-- **P0 unaccounted-restart safety:** bind checkpoints to a boot/run epoch and active candidate; on an
-  unexplained restart, reconcile durable crash evidence, block automatic continuation in Needs
-  Attention, and require explicit operator acknowledgement.
-- **P0 evidence/export identity:** give dirty builds a content identity (or reject reuse), and export
-  the current run separately from historical observation rows plus reconciled runtime incidents.
+- **Hardware verification of P0:** deploy the rebuilt service, exercise a controlled interrupted run,
+  and verify Needs Attention/acknowledgement plus run-scoped export without inducing a TDR on purpose.
 - **Godforge** as a real OC profile (currently the max-voltage stock point).
 - **In-game apply test** of Brokkr's via the VF ceiling (user present) — the final
   consistency verdict.
 - **Safe-Loop → knowledge integration**: on a boot-flag-detected reboot, fold the
   crash offset (with `Reboot` severity) into `gpu_knowledge.json` automatically
   (today only in-sweep SilentError/TDR auto-record).
-- **Physical qualifier calibration**: compare 1845 MHz @ 862 mV with known-safe bins before adding
-  DX11 or shortening Texture 5 min + TransitionShock 8 min + Endurance 20 min.
+- **Physical qualifier calibration**: compare 1845 MHz @ 862 mV with known-safe bins under the new
+  DX11 gate before considering any shortening of Texture/DX11/TransitionShock/Endurance.
 
 ## Deferred (per project design)
 - AMD path (ADLX) — currently NVIDIA/NVAPI only.

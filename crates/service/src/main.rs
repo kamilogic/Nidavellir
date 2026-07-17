@@ -356,6 +356,8 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parachute first: recover from any prior crash before doing anything else.
     let safe_store = SafeLoopStore::system();
+    #[cfg(windows)]
+    gpu_power_sweep::reconcile_interrupted_forge(&safe_store);
     safe_loop_runtime::run_startup_recovery(&safe_store);
     safe_loop_runtime::spawn_heartbeat(safe_store.clone());
     // Re-apply the persisted GPU profile (volatile offsets) unless a prior

@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::capability::CapabilityReport;
 use crate::detector::HardwareInfo;
 use crate::gpu_sweep::{GpuSweepProgress, StabilityResult, SweepPhase, VfPoint};
-use crate::safe_loop::{BlacklistRegion, CrashClass, SafeLoopState, TuningPoint};
+use crate::safe_loop::{BlacklistRegion, CrashClass, ForgeIncident, SafeLoopState, TuningPoint};
 use crate::sensors::SensorReadings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +16,9 @@ pub enum IpcRequest {
     GetCapabilityReport,
     GetDriverStatus,
     GetSafeLoopStatus,
+    /// Explicitly acknowledge the pending Forge restart/runtime incident. This releases only the
+    /// acknowledgement latch; durable blacklist and incident history remain.
+    AcknowledgeForgeIncident,
     GetGpuCurve,
     StartGpuValidation,
     GetGpuValidation,
@@ -45,6 +48,14 @@ pub enum IpcRequest {
     StopBenchmark,
     GetBenchmarkProgress,
     StartPowerSweep,
+    /// EXPERIMENTAL clean-run variant of `StartPowerSweep` (development): the same Standard dwell
+    /// policy, but the search is fully ORGANIC — pre-run observations/frontier and `forge_state`
+    /// are archived under `forge-archive/<run_id>/`, prior GPU V/F blacklist regions are stripped
+    /// from `safe_loop.json` (snapshotted first) and the durable condemnation ledger is read
+    /// run-scoped only. Failures produced DURING the run still block and steer repairs; sentinel,
+    /// startup recovery and Safe Mode stay fully active. Additive — production learning keeps the
+    /// existing requests.
+    StartPowerSweepClean,
     /// Fast-evidence variant of `StartPowerSweep`: the same complete F2 frontier with shorter dwell
     /// validation at every tested point. Additive — `StartPowerSweep` keeps its behavior.
     StartPowerSweepFast,
@@ -56,6 +67,11 @@ pub enum IpcRequest {
     ApplyPowerGodforge,
     ApplyPowerBrokkrs,
     ApplyPowerDeepCalm,
+    /// Operator-confirmed real-use failures for one of the currently forged profiles. Each route
+    /// resolves its exact hardware-derived point from the persisted profile set before blacklisting.
+    ReportPowerGodforgeUnstable,
+    ReportPowerBrokkrsUnstable,
+    ReportPowerDeepCalmUnstable,
     /// Write a rich, human-readable log of the latest/current F2 forge run — run metadata, contract
     /// versions, the published profiles, the frontier summary, the live progress log, and every
     /// recorded dwell (clock/voltage/power/temp/outcome/pattern) — to a timestamped file under the
@@ -97,6 +113,12 @@ pub struct ForgeLogExport {
     pub bytes: u64,
     /// Number of dwell observations included.
     pub observation_count: usize,
+    /// Run IDs included in the scoped human + JSONL export.
+    #[serde(default)]
+    pub run_ids: Vec<String>,
+    /// Reconciled runtime/operator incidents included in the human log.
+    #[serde(default)]
+    pub incident_count: usize,
     /// One-line human summary (for a toast / status line).
     pub note: String,
 }
@@ -290,6 +312,17 @@ pub struct PowerSweepProgress {
     /// final 90%-of-Cmax floor become exact only as the frontier is learned.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Learning policy of this run (additive, 2026-07-17): `"clean_run"` (experimental organic
+    /// search) or `"persistent"` (production). `None` on legacy payloads. Lets the UI and the run
+    /// export prove which policy actually executed — the live log tail alone cannot.
+    #[serde(default)]
+    pub learning: Option<String>,
+    /// Current run identity. Positive evidence and exports are scoped to this ID.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Ordered run IDs that form one interrupted/resumed Forge sequence.
+    #[serde(default)]
+    pub run_sequence: Vec<String>,
     #[serde(default)]
     pub current_clock_mhz: Option<u32>,
     #[serde(default)]
@@ -604,6 +637,12 @@ pub struct SafeLoopStatus {
     pub last_validated: Option<TuningPoint>,
     pub blacklist: Vec<BlacklistRegion>,
     pub recent_crashes: Vec<CrashClass>,
+    /// True when Forge/Apply must remain blocked until explicit operator acknowledgement.
+    #[serde(default)]
+    pub recovery_pending_ack: bool,
+    /// The exact attributed candidate when available; absent coordinates are intentionally unknown.
+    #[serde(default)]
+    pub pending_forge_incident: Option<ForgeIncident>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

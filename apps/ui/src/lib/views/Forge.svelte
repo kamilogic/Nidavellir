@@ -37,7 +37,6 @@
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
   let hardwareLoaded = $state(false);
-  let autoResumeAttempted = $state(false);
   let refreshInFlight = false;
   let lastSlowRefreshAt = 0;
 
@@ -75,9 +74,6 @@
         lastSlowRefreshAt = now;
       }
       error = null;
-      if (powerSweep?.phase === "interrupted" && !powerSweep?.running && !autoResumeAttempted) {
-        void autoRecoverInterruptedPower();
-      }
     } catch (e) {
       error = String(e);
     } finally {
@@ -166,43 +162,30 @@
     fast: "StartPowerSweepFast",
     standard: "StartPowerSweep",
     long: "StartPowerSweepLong",
+    clean: "StartPowerSweepClean",
   };
   const selectForgeMode = (mode) => {
     forgeMode = mode;
   };
-  const startPower = (mode = forgeMode) =>
-    call(POWER_START[mode] ?? POWER_START.standard, setPower);
-  const restoredForgeMode = () => {
-    const mode = String(powerSweep?.mode ?? "").toLowerCase();
-    if (mode === "fast" || mode === "rápida") return "fast";
-    if (mode === "long" || mode === "longa") return "long";
-    return "standard";
-  };
-  const autoRecoverInterruptedPower = async () => {
-    autoResumeAttempted = true;
-    const mode = restoredForgeMode();
-    forgeMode = mode;
-    verification = null;
-    try {
-      const reset = await serviceCall("ResetGpuTuning");
-      setApplied(reset);
-      const started = await serviceCall(POWER_START[mode]);
-      setPower(started);
-      error = null;
-    } catch (e) {
-      error = `Automatic Forge recovery failed: ${String(e)}`;
-    }
+  const startPower = (mode = forgeMode) => {
+    if (safeLoop?.recovery_pending_ack) return recoverAndStartPower(mode);
+    return call(POWER_START[mode] ?? POWER_START.standard, setPower);
   };
   const recoverAndStartPower = async (mode = forgeMode) => {
+    const incident = safeLoop?.pending_forge_incident;
+    const point = incident?.target_mhz && incident?.anchor_mv
+      ? ` Candidate context: ${incident.target_mhz} MHz at ${incident.anchor_mv} mV VF bin.`
+      : " No candidate will be inferred because the interrupted point was not attributable.";
     const confirmed = globalThis.confirm?.(
-      "Continue Forge from saved learning? Nidavellir will reset the GPU to stock, clear recovery, preserve learned observations, then start the selected Forge mode.",
+      `Review the interrupted Forge and continue from saved learning? Nidavellir will reset the GPU to stock, acknowledge the incident, preserve the blacklist/observations, then start the selected mode.${point}`,
     ) ?? true;
     if (!confirmed) return;
-    autoResumeAttempted = true;
     verification = null;
     try {
       const reset = await serviceCall("ResetGpuTuning");
       setApplied(reset);
+      const acknowledged = await serviceCall("AcknowledgeForgeIncident");
+      safeLoop = acknowledged?.data?.type === "SafeLoop" ? acknowledged.data : safeLoop;
       const started = await serviceCall(POWER_START[mode] ?? POWER_START.standard);
       setPower(started);
       error = null;
@@ -210,6 +193,29 @@
     } catch (e) {
       error = String(e);
       await refresh();
+    }
+  };
+  const REPORT_UNSTABLE = {
+    godforge: "ReportPowerGodforgeUnstable",
+    brokkrs: "ReportPowerBrokkrsUnstable",
+    deep_calm: "ReportPowerDeepCalmUnstable",
+  };
+  const reportProfileUnstable = async (key) => {
+    const point = powerSweep?.[key];
+    if (!point) return;
+    const target = point.target_clock_mhz ?? point.clock_mhz;
+    const anchor = point.vf_table_voltage_mv ?? point.boundary_voltage_mv ?? point.voltage_mv;
+    const confirmed = globalThis.confirm?.(
+      `Confirm repeated real-use instability at ${target} MHz · ${anchor} mV VF bin? This records a durable, hardware-local blacklist point and invalidates the current profile set.`,
+    ) ?? true;
+    if (!confirmed) return;
+    try {
+      const response = await serviceCall(REPORT_UNSTABLE[key]);
+      setPower(response);
+      await refresh(true);
+      error = null;
+    } catch (e) {
+      error = String(e);
     }
   };
   const stopPower = async () => {
@@ -397,8 +403,10 @@
     {onThemeChange}
     onForgeModeChange={selectForgeMode}
     onStartPower={startPower}
+    onRecoverContinue={recoverAndStartPower}
     onStopPower={stopPower}
     onApplyPower={applyPower}
+    onReportProfileUnstable={reportProfileUnstable}
     onFullReset={fullResetTuning}
     onDismissFullResetFeedback={() => (fullResetFeedback = null)}
     {activeView}

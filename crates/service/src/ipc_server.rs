@@ -188,6 +188,14 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             let status = crate::safe_loop_runtime::status_snapshot(&guard.safe_store);
             IpcResponse::success(ResponseData::SafeLoop(status))
         }
+        IpcRequest::AcknowledgeForgeIncident => {
+            match crate::safe_loop_runtime::acknowledge_forge_incident(&guard.safe_store) {
+                Ok(_) => IpcResponse::success(ResponseData::SafeLoop(
+                    crate::safe_loop_runtime::status_snapshot(&guard.safe_store),
+                )),
+                Err(e) => IpcResponse::failure(e),
+            }
+        }
         IpcRequest::GetGpuCurve => {
             IpcResponse::success(ResponseData::GpuCurve(crate::gpu_real::read_curve_snapshot()))
         }
@@ -292,23 +300,10 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             guard.power_sweep.stop();
             let msg = match crate::gpu_apply::reset(&guard.safe_store) {
                 Ok(()) => {
-                    let cleanup_error = crate::gpu_power_sweep::clear_persisted_forge_state().err();
-                    let recovery_note = cleanup_error.as_ref().map_or_else(
-                        || {
-                            "Reset geral concluído; Safe Loop desarmado, checkpoint da Forge limpo e nova execução liberada."
-                                .to_string()
-                        },
-                        |e| {
-                            format!(
-                                "Reset manual concluído; GPU em stock e Safe Loop desarmado, mas o checkpoint da Forge não pôde ser removido: {e}"
-                            )
-                        },
+                    guard.power_sweep.recover_after_reset(
+                        "Reset concluído; GPU em stock e Safe Loop desarmado. O checkpoint e a sequência da Forge foram preservados.",
                     );
-                    guard.power_sweep.recover_after_reset(recovery_note);
-                    cleanup_error.map_or_else(
-                        || "Reset all to stock".to_string(),
-                        |e| format!("Reset to stock; {e}"),
-                    )
+                    "Reset to stock; Forge checkpoint preserved".to_string()
                 }
                 Err(e) => format!("Reset failed: {e}"),
             };
@@ -343,7 +338,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                     // the learned state — wipe it too so a full reset leaves nothing inconsistent with
                     // the now-empty blacklist.
                     problems.extend(crate::tdr_sentinel::reset_sentinel_state());
-                    guard.power_sweep.recover_after_reset(
+                    guard.power_sweep.forget_after_full_reset(
                         "Reset completo concluído; GPU em stock, Safe Loop desarmado e todo o aprendizado apagado.",
                     );
                     if problems.is_empty() {
@@ -401,7 +396,15 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             if guard.power_sweep.start(store) {
                 IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
             } else {
-                IpcResponse::failure("Power sweep already running")
+                IpcResponse::failure(power_sweep_start_failure(&guard.safe_store))
+            }
+        }
+        IpcRequest::StartPowerSweepClean => {
+            let store = guard.safe_store.clone();
+            if guard.power_sweep.start_clean_run(store) {
+                IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
+            } else {
+                IpcResponse::failure(power_sweep_start_failure(&guard.safe_store))
             }
         }
         IpcRequest::StartPowerSweepFast => {
@@ -412,7 +415,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             {
                 IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
             } else {
-                IpcResponse::failure("Power sweep already running")
+                IpcResponse::failure(power_sweep_start_failure(&guard.safe_store))
             }
         }
         IpcRequest::StartPowerSweepLong => {
@@ -423,7 +426,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             {
                 IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
             } else {
-                IpcResponse::failure("Power sweep already running")
+                IpcResponse::failure(power_sweep_start_failure(&guard.safe_store))
             }
         }
         IpcRequest::StopPowerSweep => {
@@ -444,6 +447,22 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::ApplyPowerDeepCalm => {
             let prog = guard.power_sweep.progress();
             apply_forge_profile(&guard.safe_store, &prog, prog.deep_calm, "Deep Calm")
+        }
+        IpcRequest::ReportPowerGodforgeUnstable
+        | IpcRequest::ReportPowerBrokkrsUnstable
+        | IpcRequest::ReportPowerDeepCalmUnstable => {
+            let key = match request {
+                IpcRequest::ReportPowerGodforgeUnstable => "godforge",
+                IpcRequest::ReportPowerBrokkrsUnstable => "brokkrs",
+                _ => "deep_calm",
+            };
+            match guard
+                .power_sweep
+                .report_profile_unstable(&guard.safe_store, key)
+            {
+                Ok(progress) => IpcResponse::success(ResponseData::PowerSweep(progress)),
+                Err(e) => IpcResponse::failure(e),
+            }
         }
         IpcRequest::GetSentinelStatus => {
             let status = std::fs::read_to_string(
@@ -476,6 +495,14 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
     }
 }
 
+fn power_sweep_start_failure(store: &nidavellir_core::safe_loop::SafeLoopStore) -> String {
+    if store.load_record().pending_forge_incident.is_some() {
+        "Forge recovery requires explicit operator acknowledgement before continuation".into()
+    } else {
+        "Power sweep already running".into()
+    }
+}
+
 fn gpu_operation_running(state: &AppState) -> bool {
     state.gpu_validation.status().running
         || !matches!(
@@ -504,6 +531,7 @@ fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
             | IpcRequest::StartForgeAll
             | IpcRequest::StartBenchmark
             | IpcRequest::StartPowerSweep
+            | IpcRequest::StartPowerSweepClean
             | IpcRequest::StartPowerSweepFast
             | IpcRequest::StartPowerSweepLong
             | IpcRequest::ApplyPowerGodforge
@@ -523,13 +551,39 @@ fn apply_forge_profile(
     pt: Option<nidavellir_core::ipc::PowerSweepPoint>,
     label: &str,
 ) -> IpcResponse {
+    let record = store.load_record();
+    if record.pending_forge_incident.is_some() {
+        return IpcResponse::failure(
+            "Forge recovery requires explicit operator acknowledgement before Apply",
+        );
+    }
     if prog.is_undervolt {
         if !prog.profiles_qualified {
             return IpcResponse::failure(
                 "F2 profiles are provisional — run Standard or Long qualification before Apply",
             );
         }
-        apply_undervolt_profile(store, pt, label)
+        if let Some(point) = pt {
+            let (target_mhz, anchor_mv) = undervolt_apply_params(&point);
+            #[cfg(windows)]
+            let ledger_condemned = nidavellir_core::condemnation::CondemnationLedger::new(
+                store.base_dir(),
+            )
+            .condemned_pairs(&crate::gpu_power_sweep::current_gpu_key())
+            .refuses(target_mhz, anchor_mv);
+            #[cfg(not(windows))]
+            let ledger_condemned = false;
+            if crate::gpu_undervolt::field_pair_blacklisted(&record, target_mhz, anchor_mv)
+                || ledger_condemned
+            {
+                return IpcResponse::failure(
+                    "F2 profile is condemned by durable real-use evidence on this GPU — run Forge again",
+                );
+            }
+            apply_undervolt_profile(store, Some(point), label)
+        } else {
+            apply_undervolt_profile(store, None, label)
+        }
     } else {
         apply_power_profile(store, pt, label)
     }
@@ -791,6 +845,7 @@ mod tests {
             IpcRequest::StartForgeAll,
             IpcRequest::StartBenchmark,
             IpcRequest::StartPowerSweep,
+            IpcRequest::StartPowerSweepClean,
             IpcRequest::StartPowerSweepFast,
             IpcRequest::StartPowerSweepLong,
             IpcRequest::ApplyPowerGodforge,

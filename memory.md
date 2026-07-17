@@ -8,6 +8,45 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-16b) — modos de aprendizado: clean run experimental vs produção
+- `StartPowerSweepClean` (IPC additivo) / modo UI "Clean run · Experimental": busca 100% orgânica
+  para avaliar versões do algoritmo — arquiva observações/forge_state em `forge-archive/<run_id>/`,
+  faz snapshot e remove regiões GPU V/F do `safe_loop.json` (Safe Mode/crashes/incidentes intactos)
+  e lê o ledger durável só no escopo da run. Escritas no ledger global nunca param; falhas da
+  própria run continuam bloqueando e orientando o reparo vertical. Produção = comportamento P0.
+- A PRÓXIMA validação de hardware deve usar o modo clean run (obrigatório durante desenvolvimento).
+
+## 2026-07-16 — condemnation ledger (P0) + vertical Apply repair (P1) implemented
+- Root causes fixed: gate failures no longer kill the clock (vertical repair climbs +1/+2 real VF
+  bins under the 94%-of-cap publication ceiling, budget 2/clock/run, full gate always re-runs), and
+  hard failures now live in the append-only `condemnation_ledger.jsonl` that survives every reset
+  (the 07-15 manual reset had wiped 1890@900's Endurance failure; it then passed a single ladder).
+- Severity model: Rigid (TDR/crash/device-lost — at-or-below refused, manual rehab only) vs
+  Quarantine (exact-Apply SilentError — strictly-below refused; re-attempt of the exact pair needs
+  double full-gate proof, or a single pass under a stronger contract). Floor = safe_loop ∪ ledger
+  at every confirmed preflight/descent/restore/Apply path. Dominance pre-gate: only gate-APPROVED
+  points can veto a candidate before its ladder.
+- Ledger seeded from run-log history (2 rigid: 1920@918 field TDR, 1845@856 CandidateCrash;
+  10 quarantine pairs incl. 1890@900, 1905@893/900/906, 1920@912, 1875@875/881, 1860@868).
+- Validation run pending (see handoff). Deferred: Godforge fast-drop (needs per-profile selection
+  overrides), Texture v9 + Endurance front-load + DX11/TransitionShock removal (P2, contract v18).
+
+## 2026-07-15 — durable restart incidents and field-failure feedback implemented
+- Startup parity is closed: both installed-service and console paths reconcile a persisted running
+  Forge and start the Event Log TDR sentinel. The reconciliation runs before normal Safe Loop startup
+  recovery, so an armed exact candidate is not lost; unknown candidates stay unknown.
+- `PowerSweepProgress` persists a run identity/sequence and active candidate throughout execution.
+  Reconciled incidents survive reboot in `safe_loop.json`, force `needs_attention`, keep Start/Apply/
+  boot-reapply at stock, and require explicit acknowledgement. The UI never auto-resumes them.
+- Normal reset preserves the interrupted checkpoint and all durable learning. Full reset remains the
+  deliberate clean-algorithm-evaluation path and removes checkpoint, blacklist and incident history.
+- A profile card can be marked unstable after confirmed real use. The service derives the exact pair
+  from the current profile, adds durable local blacklist evidence and invalidates the profile set;
+  source policy contains no per-GPU blacklist constants. The operator confirmed `1845@862` repeatedly
+  unstable in this session.
+- Forge export is scoped to the ordered current run sequence and includes incidents. Dirty builds now
+  carry a source-content suffix rather than the ambiguous plain `-dirty` identity.
+
 ## Latest (2026-07-15) — evidence-integrity rebuild + first HW cycle; restart attribution is P0
 - The post-reset Standard hardware cycle spans two run IDs (127 observations, then 59 after resume).
   The resumed run completed in 175.1 min and published `1890@893`, `1845@862` and `1740@800` with
@@ -54,12 +93,14 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 - Sentinel canary execution is owned synchronously by its dedicated thread; the false 3 s
   "pre-hang before a 2 s watchdog" claim and detached worker were removed. Canary/Event Log recovery
   ownership is atomically deduplicated. Its TextureRop reference remains execution-local, so it is an
-  auxiliary consistency detector, not a stock-golden or game-correctness oracle. Exact-Apply Texture
-  + TransitionShock + Endurance remains the deployability barrier.
+  auxiliary consistency detector, not a stock-golden or game-correctness oracle.
+- Qualification v17 adds a native offscreen Direct3D 11 gate only at exact Apply. Its checksum golden
+  is captured at stock on the explicitly selected NVIDIA adapter; candidate runs must match the same
+  adapter LUID and pass bounded completion/readback checks. The deployability order is now Texture
+  5 min + DX11 5 min + TransitionShock 8 min + Endurance 20 min. No duration was shortened.
 - `1845 MHz @ 862 mV` remains historical field evidence for this GPU, but the intentional full reset
   removed the old blacklist before evaluating the new method. The clean learning cycle re-published
-  that exact pair, which keeps DX11/workload coverage and any final-gate change blocked on an
-  attributable in-game A/B rather than treating the synthetic pass as proof of safety.
+  that exact pair, which makes it the primary v17 DX11 discriminator against known-safe controls.
 
 ## Latest (2026-07-06, late) — v12: regime lift replaces reconciliation exclusion (code-complete)
 - v11 run data: detect-before-TDR worked (zero TDRs, texture-rop silent errors as graceful killer,

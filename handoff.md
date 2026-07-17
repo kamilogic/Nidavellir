@@ -1,13 +1,104 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. Current state is the 2026-07-15 qualification-integrity rebuild below.
-Older dated sections remain as history; where they claim that BoostEdge residence was a proven field
-cause, or that a detached 3 s canary timeout predicted a roughly 2 s watchdog, this section supersedes
-them. Apply still requests 12 mV above the learned boundary, snaps upward to a physical VF bin and
-must pass the complete exact-Apply gate before publication.
+How to pick this up cold. Current state is the 2026-07-16 condemnation-ledger + vertical-repair
+build below. Older dated sections remain as history; where they claim that BoostEdge residence was a
+proven field cause, or that a detached 3 s canary timeout predicted a roughly 2 s watchdog, later
+sections supersede them. Apply still requests 12 mV above the learned boundary, snaps upward to a
+physical VF bin and must pass the complete exact-Apply gate before publication.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
-## START-HERE (2026-07-15) — contract v16 + first hardware cycle; unaccounted TDR/reboot found
+## START-HERE (2026-07-16b) — Forge learning modes; NEXT VALIDATION MUST USE CLEAN RUN
+
+- **Two learning modes** (`ForgeLearning` in `gpu_power_sweep.rs`): `Persistent` (production, the
+  P0 ledger/floor behavior below) and `CleanRun` (experimental) via the additive IPC
+  `StartPowerSweepClean` / UI Forge mode "Clean run · Experimental".
+- **Clean run = organic search**: at start it archives `f2_observations.jsonl` + `forge_state.json`
+  into `forge-archive/<run_id>/`, snapshots `safe_loop.json` and strips its GPU V/F blacklist
+  regions (Safe Mode, crash counters, incidents, non-GPU entries preserved), carries over no
+  run-sequence/points/profiles, and reads the condemnation ledger RUN-SCOPED. Ledger WRITES stay
+  global (production truth never lost); the run's own failures still block and steer vertical
+  repair. At the end the observations are copied into the archive; the next clean run is organic
+  again. Sentinel/startup recovery/TDR protections unchanged.
+- **Guaranteed absent in a clean run**: "dwells redundantes pulados", "fronteira prevista … por
+  fronteira v4 anterior", "retomando fronteira já delimitada", and any `BlacklistedBoundary` from
+  pre-run evidence (during-run failures may still produce one — intended).
+- **Validation-run checklist (CLEAN RUN, mandatory)**: (1) start via the "Clean run" mode and
+  confirm the "CLEAN RUN experimental" log lines + archive folder; (2) descent shows NO reuse/
+  prediction messages; (3) a gate failure climbs the SAME clock (+1/+2 bins) instead of dropping
+  it; (4) repairs respect the 188 W publication ceiling; (5) failures of THIS run refuse re-descent
+  below them (`BlacklistedBoundary` with current run_id only); (6) global
+  `condemnation_ledger.jsonl` gained the run's quarantines/crashes afterwards.
+
+## 2026-07-16 — P0 condemnation ledger + P1 vertical Apply repair (validation run pending)
+
+- **New durable store**: `%ProgramData%\Nidavellir\condemnation_ledger.jsonl` — append-only memory
+  of hard failures (`crates/core/src/condemnation.rs`). NO reset path may touch it
+  (`clear_all_learning` documents the invariant); wire format pinned by a unit test. Seeded from
+  run-log history on 2026-07-16 (2 rigid + 10 quarantine pairs).
+- **Refusal is now the UNION** of the safe-loop field floor and the ledger: confirmed preflights
+  (`run_confirmed_f2_apply_qualification` / `_power_calibration` / `_clock_discovery`), the descent
+  BlacklistedBoundary check, CLI probes, `load_forge_state` profile restore and the IPC Apply guard.
+  Rigid refuses at-or-below its floor; Quarantine refuses strictly-below and demands TWO full-gate
+  passes to publish the exact pair (single pass under a STRONGER contract also re-proves).
+- **Vertical repair in the exact-Apply loop** (`gpu_power_sweep.rs`): a gate failure quarantines the
+  bin in the ledger, excludes it + regime dependents, then inserts a same-clock candidate +1 bin
+  (SilentError) / +2 bins (TDR/device-lost), skipping condemned bins, under the PUBLICATION ceiling
+  (94% of cap) with the worst honest power measurement (PowerRender calibration fills unmeasured
+  bins). Budget 2 repairs/clock/run. Dominance pre-gate: only gate-APPROVED points skip a
+  candidate's ladder. Pure helpers + tests: `f2_plan_vertical_repair`, `f2_repair_bin_above`,
+  `repair_step_bins`, `measured_power_at_pair`, `f2_approved_dominator`.
+- **Next run validates** (no workload/contract changes were made): condemnations survive; descent
+  stops above ledger floors; a gate failure climbs the same clock instead of dropping it; repairs
+  respect 188 W (94% × 200 W); no clock is discarded while a viable bin remains. Expected on this
+  rig: 1905 exhausts almost immediately by power (906 already ≈189 W), Godforge converges around
+  1890@906+/1875@887+ instead of sinking toward 1740.
+- **Deferred**: Godforge fast-drop (needs per-profile selection overrides — Godforge's lowest-power
+  tie-break defeats a lifted same-clock candidate); P2 = Texture v9 (texture-rop-dominated),
+  Endurance front-load, DX11/TransitionShock removal, contract v18.
+
+## 2026-07-15 — restart/accounting P0 implemented; field failures are operator-owned
+
+- Installed-service and console startup now run the same TDR sentinel and interrupted-Forge
+  reconciliation. A persisted running checkpoint becomes a durable Forge incident before startup
+  recovery can consume its boot flag. An exact armed candidate is blacklisted; without an exact
+  candidate the incident remains explicitly unattributed.
+- Forge checkpoints now persist `run_id`, ordered `run_sequence`, active clock/voltage and progress
+  before the first candidate and after every progress callback. A reconciled incident enters
+  `needs_attention`; Start, Apply and boot reapply remain at stock until the operator explicitly
+  acknowledges it. The UI no longer performs Reset+Start automatically.
+- The ordinary recovery reset preserves the interrupted checkpoint, run sequence, blacklist and
+  observations. Only `ResetGpuTuningFull` forgets them. Export filters observations to the current
+  run sequence, writes a scoped companion JSONL and includes durable runtime/operator incidents.
+- Forged cards expose **Mark unstable**. This resolves the currently forged hardware-derived pair,
+  records a durable three-axis blacklist and operator field-failure incident, and invalidates the
+  profile set. No GPU-specific clock or voltage is hard-coded in source.
+- Operator confirmation in this session upgrades the previously documented `1845@862` failure from
+  historical suspicion to repeated real-use evidence. It must be marked through the new action in
+  the rebuilt app before the next clean Forge evaluation; any other confirmed profile must be marked
+  individually from its own card.
+- Dirty build identity is now `HEAD-dirty-<content hash>` over the relevant source tree, so distinct
+  local patches no longer share provenance.
+- Validation: `cargo check --workspace`, core 89/89, service 386/386, gpu-nvapi 40/40,
+  gpu-stress 16/16, driver-pawnio 2/2, frontend production build and `git diff --check` pass. The
+  monolithic workspace-test/clippy path still hits the known Tauri sidecar `Access denied` build
+  limitation; strict Clippy also reports pre-existing warnings outside this scope. No hardware write,
+  Apply or Forge was performed by this implementation session.
+
+## START-HERE (2026-07-15) — contract v17 DX11 gate + restart-safe Forge
+
+- Qualification v17 is code-complete: exact Apply now runs Texture 5 min → native DX11 5 min →
+  TransitionShock 8 min → Endurance 20 min. DX11 captures its golden at stock, explicitly selects
+  the NVIDIA DXGI adapter, requires the same LUID for candidate evidence, and uses bounded completion
+  polling plus deterministic readback checks. Existing gate durations were not reduced.
+- This change intentionally leaves the per-bin descent hardware-derived and unchanged. A DX11
+  rejection applies only to the exact candidate pair; synthesis moves to the next higher physical
+  voltage bin through the existing reset-clean rejection path. Old v16 positives are readable but
+  cannot unlock Apply.
+- Next physical action: deploy, keep prior blacklist learning cleared for this evaluation, and run a
+  clean supervised Standard Forge. Compare whether the known field-failed `1845@862` is rejected while
+  safe controls pass; do not infer success from compile/tests alone.
+
+## PRIOR CHECKPOINT (2026-07-15) — contract v16 + first hardware cycle; unaccounted TDR/reboot found
 
 ### Hardware checkpoint and operator-reported TDR
 - A Standard cycle after the intentional full reset produced two run IDs: the first persisted 127
@@ -65,16 +156,16 @@ Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
    recovery nets, with an atomic cross-layer claim preventing duplicate reset/reapply. Its TextureRop
    reference is still local to that execution: useful for stochastic divergence, but not a stock-golden
    oracle and never a substitute for the exact-Apply gate.
-7. **Deployability unchanged** — exact-Apply Texture, TransitionShock and Endurance remain mandatory.
-   DX11 and shorter final gates are explicitly evidence-gated, not part of this patch.
+7. **Deployability at this checkpoint** — exact-Apply Texture, TransitionShock and Endurance were
+   mandatory. The newer v17 section above supersedes this with the approved additive DX11 gate.
 
 ### Next physical gate
 Preserve this checkpoint, then run a supervised in-game trace of the newly published `1845@862`
 profile against stock/the same known scene. A repeated field failure confirms a synthetic false
 negative and should drive workload/API coverage plus the P0 restart reconciliation; survival across
 repeated comparable sessions requires checking driver/workload drift before changing policy. Do not
-reduce Texture/TransitionShock/Endurance or promote a DX11 renderer until that discriminator is
-demonstrated and recorded with attributable v16 provenance.
+reduce Texture/TransitionShock/Endurance until the v17 DX11 discriminator is demonstrated with
+attributable provenance.
 
 ## START-HERE (2026-07-12) — pipeline completo forja↔sentinela FECHADO; próximo = re-forge de validação
 Tudo commitado+pushado até `202689f`. Estado consolidado da sessão 2026-07-10→12 (a mais produtiva

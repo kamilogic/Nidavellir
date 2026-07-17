@@ -78,7 +78,10 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// sparse GPU-side, and every dwell records the exact workload/build/adapter/golden provenance that
 /// produced it. Positive evidence additionally requires confirmed stock reset and boot-flag cleanup.
 /// Pre-v16 positives describe a different workload and cannot unlock Apply.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 16;
+/// v17 (2026-07-15): exact Apply additionally requires a native offscreen Direct3D 11 golden gate
+/// on the selected NVIDIA adapter. This covers a graphics API/driver path absent from wgpu's
+/// Vulkan/DX12 backends; pre-v17 positives did not exercise it and cannot unlock Apply.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 17;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -192,6 +195,9 @@ pub enum F2QualificationPattern {
     /// [`REQUIRED_QUALIFICATION_PATTERNS`], no contract bump; publishing requires run_id-scoped
     /// evidence of BOTH shock and endurance ([`point_has_current_endurance_qualification`]).
     TransitionShock,
+    /// v17 candidate-only native Direct3D 11 render/integrity gate. It runs only at exact Apply,
+    /// after the binding Texture detector and before the longer shock/endurance gates.
+    Dx11Game,
 }
 
 /// The complete pattern set the current qualification contract requires at a boundary and at the
@@ -1103,8 +1109,8 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
 }
 
 /// True when the CURRENT run's candidate-only stress gate validated cleanly at this exact
-/// `(target_mhz, apply_mv)` pair on this GPU — requires BOTH the v15 TransitionShock (idle→slam
-/// launch-transition cycles) AND the v14 Endurance soak (continuous worst-realistic ~20 min).
+/// `(target_mhz, apply_mv)` pair on this GPU — requires the v17 native DX11 gate, the v15
+/// TransitionShock (idle→slam launch-transition cycles), and the v14 Endurance soak.
 /// These gates only TIGHTEN Apply — they are not part of [`REQUIRED_QUALIFICATION_PATTERNS`] and
 /// never touch the frontier descent. They still share the current qualification contract and full
 /// reproducibility/cleanup requirements; the publish gate is also run_id-scoped. Fail closed:
@@ -1116,7 +1122,11 @@ pub fn point_has_current_endurance_qualification(
     apply_mv: u32,
     gpu_key: &str,
 ) -> bool {
-    [F2QualificationPattern::TransitionShock, F2QualificationPattern::Endurance]
+    [
+        F2QualificationPattern::Dx11Game,
+        F2QualificationPattern::TransitionShock,
+        F2QualificationPattern::Endurance,
+    ]
         .iter()
         .all(|required| {
             obs.iter().any(|o| {
@@ -1381,6 +1391,7 @@ mod tests {
                 F2QualificationPattern::Memory => 4,
                 F2QualificationPattern::Endurance => 5,
                 F2QualificationPattern::TransitionShock => 6,
+                F2QualificationPattern::Dx11Game => 7,
             },
             verdict: F2QualificationVerdict::Pass,
             phases_completed: 8,
@@ -2050,8 +2061,9 @@ mod tests {
             o.gpu_key = Some("RTX 4070".into());
             o
         };
-        // BOTH gates clean in THIS run at the exact pair → publishes.
+        // All candidate-only gates clean in THIS run at the exact pair → publishes.
         let both = [
+            pass("R1", F2QualificationPattern::Dx11Game, F2ObsOutcome::Validated),
             pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated),
             pass("R1", F2QualificationPattern::Endurance, F2ObsOutcome::Validated),
         ];
@@ -2084,7 +2096,11 @@ mod tests {
         let mut failed = pass("R1", F2QualificationPattern::Endurance, F2ObsOutcome::SilentError);
         failed.silent_error = true;
         let with_failed_endurance =
-            [pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated), failed];
+            [
+                pass("R1", F2QualificationPattern::Dx11Game, F2ObsOutcome::Validated),
+                pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated),
+                failed,
+            ];
         assert!(!point_has_current_endurance_qualification(&with_failed_endurance, "R1", 1935, 956, "RTX 4070"));
     }
 

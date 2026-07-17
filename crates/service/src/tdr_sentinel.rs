@@ -168,6 +168,16 @@ pub fn startup_reconcile(store: &SafeLoopStore) -> bool {
     ]);
     rec.blacklist.push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
     let _ = store.save_record(&rec);
+    crate::gpu_undervolt::append_condemnation(
+        store.base_dir(),
+        nidavellir_core::condemnation::CondemnationSeverity::Rigid,
+        nidavellir_core::condemnation::KIND_FIELD_TDR,
+        Some(crate::gpu_power_sweep::current_gpu_key()),
+        applied.target_mhz,
+        applied.anchor_mv,
+        None,
+        "TDR/wedge while the service was down with the profile applied; boot stays stock".into(),
+    );
     crate::gpu_apply::sentinel_clear_applied();
     append_sentinel_log(&format!(
         "\"event\":\"boot-reconcile\",\"action\":\"stock\",\"target_mhz\":{},\"failed_mv\":{}",
@@ -325,6 +335,16 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
             if let Err(e) = store.save_record(&rec) {
                 warn!("sentinel: blacklist persist failed: {e}");
             }
+            crate::gpu_undervolt::append_condemnation(
+                store.base_dir(),
+                nidavellir_core::condemnation::CondemnationSeverity::Rigid,
+                nidavellir_core::condemnation::KIND_FIELD_TDR,
+                Some(crate::gpu_power_sweep::current_gpu_key()),
+                target_mhz,
+                failed_mv,
+                None,
+                format!("in-game {kind}; sentinel auto-fallback to {new_anchor_mv} mV"),
+            );
             // 3. Preserve-identity fallback: same clock, higher bin — through the FULL guarded
             //    apply path (audit #1: arms the Safe Loop boot flag around the autonomous write +
             //    8 s survival window, so a bumped point that cold-hangs is NOT re-applied on boot;
@@ -381,6 +401,16 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
             ]);
             rec.blacklist.push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
             let _ = store.save_record(&rec);
+            crate::gpu_undervolt::append_condemnation(
+                store.base_dir(),
+                nidavellir_core::condemnation::CondemnationSeverity::Rigid,
+                nidavellir_core::condemnation::KIND_FIELD_TDR,
+                Some(crate::gpu_power_sweep::current_gpu_key()),
+                target_mhz,
+                failed_anchor_mv,
+                None,
+                format!("{kind} after a prior bump this session; ladder exhausted, stock"),
+            );
             crate::gpu_apply::sentinel_clear_applied();
             append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"stock\",\"reason\":\"ladder-exhausted\""));
             write_sentinel_status(&format!(
@@ -418,15 +448,21 @@ pub fn spawn(store: SafeLoopStore) {
                 }
                 let is_historical = newest.len() >= 19 && newest[..19] < start_floor[..];
                 persist_baseline(&newest);
-                last_handled = Some(newest);
+                last_handled = Some(newest.clone());
                 if is_historical {
                     continue;
                 }
-                // Audit #2: never act while a forge run owns the GPU (the per-step boot flag has
-                // inter-step windows a forge-induced 153 can land in).
+                // Never mutate hardware while Forge owns it. Hand the event to the run owner: it
+                // persists attribution when the boot flag is armed, otherwise records an explicitly
+                // unattributed incident, then requests a cooperative stop.
                 if crate::gpu_power_sweep::FORGE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-                    info!("sentinel: TDR event during an active forge run — forge owns recovery");
-                    append_sentinel_log("\"event\":\"tdr\",\"action\":\"forge-active-skip\"");
+                    let recorded = crate::gpu_power_sweep::record_active_forge_tdr(&store, &newest);
+                    info!(
+                        "sentinel: TDR event during active Forge — incident recorded={recorded}, cooperative stop requested"
+                    );
+                    append_sentinel_log(
+                        "\"event\":\"tdr\",\"action\":\"forge-stop-requested\"",
+                    );
                     continue;
                 }
                 let n = bumps.load(std::sync::atomic::Ordering::SeqCst);

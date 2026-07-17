@@ -162,6 +162,9 @@ pub(crate) const F2_ENDURANCE_QUALIFICATION_DWELL_MS: u64 = 1_200_000;
 /// wasting the 20-min soak.
 #[cfg(windows)]
 pub(crate) const F2_TRANSITION_SHOCK_DWELL_MS: u64 = 480_000;
+/// Native Direct3D 11 exact-Apply gate. Five minutes matches the binding Texture gate while the
+/// fail-cheap ordering keeps it ahead of the 8/20-minute candidate-only gates.
+pub(crate) const F2_DX11_QUALIFICATION_DWELL_MS: u64 = 300_000;
 
 /// Residual offset (kHz) at or below which a post-reset readback counts as "cleared". F2 must NEVER
 /// leave a positive offset applied; a larger residual makes the confirmed path treat the reset as
@@ -2130,7 +2133,7 @@ fn f2_intent(target_mhz: u32, cand: &PositiveOffsetPlan) -> TuningPoint {
 /// (no field evidence) or when the blacklist has no GPU V/F entries. Entirely data-driven —
 /// no GPU-specific constants; the same record that condemned 1815@862 in the field is what
 /// rejects a dominated 1845@863 here, for any card.
-fn field_vf_floor_mv(record: &SafeLoopRecord, clock_mhz: i64) -> Option<i64> {
+pub(crate) fn field_vf_floor_mv(record: &SafeLoopRecord, clock_mhz: i64) -> Option<i64> {
     let mut pts: Vec<(i64, i64)> = record
         .blacklist
         .iter()
@@ -2171,6 +2174,75 @@ fn field_vf_floor_mv(record: &SafeLoopRecord, clock_mhz: i64) -> Option<i64> {
     Some(floor)
 }
 
+/// Profile-level version of the field guard. A real-use failure learned after Forge completion must
+/// invalidate a restored/applied pair even though its synthetic qualification was previously clean.
+pub(crate) fn field_pair_blacklisted(
+    record: &SafeLoopRecord,
+    target_mhz: u32,
+    anchor_mv: u32,
+) -> bool {
+    let intent = TuningPoint::from_axes([
+        ("gpu_freq_mhz", target_mhz as i64),
+        ("gpu_vf_bin_mv", anchor_mv as i64),
+    ]);
+    record.is_blacklisted(&intent)
+        || field_vf_floor_mv(record, target_mhz as i64)
+            .is_some_and(|floor_mv| i64::from(anchor_mv) <= floor_mv)
+}
+
+/// Refusal reason from the DURABLE condemnation ledger — the union companion to the operational
+/// field guard above. `safe_loop.json` is legitimately replaced by resets; the ledger is not
+/// (the 2026-07-15 reset wiped the 1890@900 Endurance failure and the pair passed a single
+/// ladder the next day). Every confirmed hardware-write preflight must consult BOTH sources.
+/// The message deliberately contains "blacklisted" so the forge's existing stop-reason handling
+/// (boundary knowledge → exclude + resynthesize, never hard-abort) applies unchanged.
+pub(crate) fn ledger_refusal(
+    condemned: &nidavellir_core::condemnation::CondemnedPairs,
+    target_mhz: u32,
+    anchor_mv: u32,
+) -> Option<String> {
+    condemned.refuses(target_mhz, anchor_mv).then(|| {
+        format!(
+            "the candidate {target_mhz} MHz @ {anchor_mv} mV VF is blacklisted by the durable \
+             condemnation ledger (rigid/quarantine floor)"
+        )
+    })
+}
+
+/// Append a durable condemnation (best-effort — recovery paths never block on ledger IO). Stamps
+/// the current qualification contract so a Quarantine entry can later be re-proved by a single
+/// pass under a strictly STRONGER contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_condemnation(
+    base: &std::path::Path,
+    severity: nidavellir_core::condemnation::CondemnationSeverity,
+    kind: &str,
+    gpu_key: Option<String>,
+    target_mhz: u32,
+    vf_bin_mv: u32,
+    run_id: Option<String>,
+    note: String,
+) {
+    use nidavellir_core::condemnation::{CondemnationEvent, CondemnationLedger};
+    let event = CondemnationEvent {
+        timestamp: nidavellir_core::f2_observation::now_rfc3339(),
+        gpu_key,
+        severity,
+        kind: kind.to_string(),
+        target_mhz,
+        vf_bin_mv,
+        run_id,
+        qualification_contract_version: Some(
+            nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
+        ),
+        note: Some(note),
+        rehabilitated: false,
+    };
+    if let Err(e) = CondemnationLedger::new(base).append(&event) {
+        warn!("condemnation ledger append failed (non-blocking): {e}");
+    }
+}
+
 /// Conservative field-evidence match: refuse if the 3-axis F2 intent OR the 2-axis (freq, vf_bin)
 /// point (matching build-frontier's region keys) falls in a blacklisted region, OR the candidate
 /// sits at/below the monotonic field voltage floor ([`field_vf_floor_mv`]) — a point dominated by
@@ -2179,14 +2251,8 @@ fn field_vf_floor_mv(record: &SafeLoopRecord, clock_mhz: i64) -> Option<i64> {
 fn candidate_blacklisted(record: &SafeLoopRecord, target_mhz: u32, cand: &PositiveOffsetPlan,
 ) -> bool {
     let f2 = f2_intent(target_mhz, cand);
-    let f1_like = TuningPoint::from_axes([
-        ("gpu_freq_mhz", target_mhz as i64),
-        ("gpu_vf_bin_mv", cand.voltage_mv as i64),
-    ]);
     record.is_blacklisted(&f2)
-        || record.is_blacklisted(&f1_like)
-        || field_vf_floor_mv(record, target_mhz as i64)
-            .is_some_and(|floor| (cand.voltage_mv as i64) <= floor)
+        || field_pair_blacklisted(record, target_mhz, cand.voltage_mv)
 }
 
 /// Pure confirmed-mode preflight. Returns `Some(reason)` to REFUSE (fail closed) before any
@@ -2521,6 +2587,8 @@ impl F2StressPurpose {
             | F2StressPurpose::ApplyQualification(F2QualificationPattern::TransitionShock, _) => {
                 Some(VfQualifierPattern::TransitionShock)
             }
+            F2StressPurpose::V8Qualification(F2QualificationPattern::Dx11Game, _)
+            | F2StressPurpose::ApplyQualification(F2QualificationPattern::Dx11Game, _) => None,
         }
     }
 
@@ -2924,6 +2992,15 @@ impl F2Ops for RealF2Ops<'_> {
                     self.cancel,
                 )
             }
+            F2StressPurpose::V8Qualification(F2QualificationPattern::Dx11Game, goldens)
+            | F2StressPurpose::ApplyQualification(F2QualificationPattern::Dx11Game, goldens) => {
+                crate::gpu_power_sweep::single_dx11_qualifier_dwell_with_cancel(
+                    self.dwell_ms,
+                    self.target_mhz,
+                    goldens.dx11,
+                    self.cancel,
+                )
+            }
             purpose => {
                 crate::gpu_power_sweep::single_qualifier_dwell_with_cancel(
                     self.dwell_ms,
@@ -3282,7 +3359,17 @@ pub fn run_undervolt_probe(store: &SafeLoopStore, confirm: bool, args: Undervolt
             candidate.as_ref(),
             &limits,
             focus_target,
-        ) {
+        )
+        .or_else(|| {
+            candidate.as_ref().and_then(|c| {
+                ledger_refusal(
+                    &nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir())
+                        .condemned_pairs(&crate::gpu_power_sweep::current_gpu_key()),
+                    focus_target,
+                    c.voltage_mv,
+                )
+            })
+        }) {
             Some(reason) => {
                 println!(
                     "undervolt-probe: --confirm REFUSED — {reason}. No Safe Loop arm, no apply, no \
@@ -3395,7 +3482,17 @@ fn run_anchored_undervolt_probe(
             candidate.as_ref(),
             limits,
             focus_target,
-        ) {
+        )
+        .or_else(|| {
+            candidate.as_ref().and_then(|c| {
+                ledger_refusal(
+                    &nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir())
+                        .condemned_pairs(&crate::gpu_power_sweep::current_gpu_key()),
+                    focus_target,
+                    c.voltage_mv,
+                )
+            })
+        }) {
             Some(reason) => {
                 println!(
                     "undervolt-probe: --confirm REFUSED — {reason}. No Safe Loop arm, no apply, no \
@@ -4312,7 +4409,9 @@ impl F2QualificationMarginHistory {
             F2QualificationPattern::Transitions => &self.transitions,
             F2QualificationPattern::Memory => &self.memory,
             // ponytail: the candidate-only gates never feed the descent margin history.
-            F2QualificationPattern::Endurance | F2QualificationPattern::TransitionShock => &[],
+            F2QualificationPattern::Endurance
+            | F2QualificationPattern::TransitionShock
+            | F2QualificationPattern::Dx11Game => &[],
         }
     }
 
@@ -4325,7 +4424,9 @@ impl F2QualificationMarginHistory {
             F2QualificationPattern::Transitions => self.transitions.push(p5_mhz),
             F2QualificationPattern::Memory => self.memory.push(p5_mhz),
             // ponytail: the candidate-only gates never feed the descent margin history.
-            F2QualificationPattern::Endurance | F2QualificationPattern::TransitionShock => {}
+            F2QualificationPattern::Endurance
+            | F2QualificationPattern::TransitionShock
+            | F2QualificationPattern::Dx11Game => {}
         }
     }
 }
@@ -4631,6 +4732,7 @@ fn qualification_pattern_label(pattern: F2QualificationPattern) -> &'static str 
         F2QualificationPattern::Memory => "Memory",
         F2QualificationPattern::Endurance => "Endurance",
         F2QualificationPattern::TransitionShock => "TransitionShock",
+        F2QualificationPattern::Dx11Game => "DX11",
     }
 }
 
@@ -4830,16 +4932,23 @@ fn gate_anchored_candidate_fsgl3(
     }
     // v14/v15 candidate-only STRESS gates at the EXACT Apply point, run ONLY at exact-Apply — the
     // frontier descent (exact_apply=false) never pays them. IN ORDER (fail cheap first):
-    //   1. TransitionShock (~8 min): true-idle → heavy-slam cycles reproducing the game/benchmark
+    //   1. DX11 (~5 min): native Direct3D 11 offscreen render + stock checksum on the same NVIDIA
+    //      adapter, covering a driver/API path absent from the wgpu Vulkan/DX12 battery.
+    //   2. TransitionShock (~8 min): true-idle → heavy-slam cycles reproducing the game/benchmark
     //      LAUNCH transition (P-state exit + boost VF ramp + VRM load step) behind the observed
     //      in-game BusReset TDR cascade; the slam wall-time check fails Unstable at the pre-hang
     //      precursor, long before the ~2 s driver watchdog.
-    //   2. Endurance (~20 min): one CONTINUOUS worst-realistic soak (sustained max-power +
+    //   3. Endurance (~20 min): one CONTINUOUS worst-realistic soak (sustained max-power +
     //      cap-slam + droop + mixed), no mid-soak reset, so thermal saturation truly accumulates.
     // Non-Validated ⇒ the exact point is rejected (fail closed). Each pass keeps the same
     // arm→apply→verify→dwell→reset motor + NVML clock ceiling + cooperative Stop.
     if exact_apply {
         for (pattern, dwell_ms, kind) in [
+            (
+                F2QualificationPattern::Dx11Game,
+                F2_DX11_QUALIFICATION_DWELL_MS,
+                "render nativo Direct3D 11",
+            ),
             (
                 F2QualificationPattern::TransitionShock,
                 F2_TRANSITION_SHOCK_DWELL_MS,
@@ -4962,6 +5071,7 @@ pub(crate) fn run_confirmed_f2_apply_qualification(
     obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
     run_id: &str,
     gpu_key: &str,
+    ledger_run_scoped: bool,
     sane: &[(usize, u32, u32)],
     limits: &PositiveOffsetLimits,
     target_mhz: u32,
@@ -5010,6 +5120,12 @@ pub(crate) fn run_confirmed_f2_apply_qualification(
             }
         }
     };
+    let ledger = nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir());
+    let condemned = if ledger_run_scoped {
+        nidavellir_core::condemnation::condemned_pairs_for_run(&ledger.load_all(), gpu_key, run_id)
+    } else {
+        ledger.condemned_pairs(gpu_key)
+    };
     if let Some(reason) = confirmed_f2_refusal(
         &store.load_record(),
         store.is_boot_flag_armed(),
@@ -5017,7 +5133,9 @@ pub(crate) fn run_confirmed_f2_apply_qualification(
         Some(&candidate.anchor),
         limits,
         target_mhz,
-    ) {
+    )
+    .or_else(|| ledger_refusal(&condemned, target_mhz, candidate.anchor.voltage_mv))
+    {
         return F2ApplyQualificationSummary {
             qualified: false,
             executed_steps: 0,
@@ -5117,6 +5235,7 @@ pub(crate) fn run_confirmed_f2_power_calibration(
     obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
     run_id: &str,
     gpu_key: &str,
+    ledger_run_scoped: bool,
     sane: &[(usize, u32, u32)],
     limits: &PositiveOffsetLimits,
     target_mhz: u32,
@@ -5163,6 +5282,12 @@ pub(crate) fn run_confirmed_f2_power_calibration(
             }
         }
     };
+    let ledger = nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir());
+    let condemned = if ledger_run_scoped {
+        nidavellir_core::condemnation::condemned_pairs_for_run(&ledger.load_all(), gpu_key, run_id)
+    } else {
+        ledger.condemned_pairs(gpu_key)
+    };
     if let Some(reason) = confirmed_f2_refusal(
         &store.load_record(),
         store.is_boot_flag_armed(),
@@ -5170,7 +5295,9 @@ pub(crate) fn run_confirmed_f2_power_calibration(
         Some(&candidate.anchor),
         limits,
         target_mhz,
-    ) {
+    )
+    .or_else(|| ledger_refusal(&condemned, target_mhz, candidate.anchor.voltage_mv))
+    {
         return F2PowerCalibrationSummary {
             confirmed: false,
             executed_steps: 0,
@@ -5398,6 +5525,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     obs_store: &nidavellir_core::f2_observation::F2ObservationStore,
     run_id: &str,
     gpu_key: &str,
+    ledger_run_scoped: bool,
     sane: &[(usize, u32, u32)],
     limits: &PositiveOffsetLimits,
     target_mhz: u32,
@@ -5413,6 +5541,13 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     on_progress: &mut dyn FnMut(F2ClockDiscoveryProgress),
 ) -> F2ClockDiscoverySummary {
     use std::sync::atomic::Ordering;
+
+    let ledger = nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir());
+    let condemned = if ledger_run_scoped {
+        nidavellir_core::condemnation::condemned_pairs_for_run(&ledger.load_all(), gpu_key, run_id)
+    } else {
+        ledger.condemned_pairs(gpu_key)
+    };
 
     use nidavellir_core::f2_observation::{
         first_bad_for_target, is_current_discovery_evidence, is_current_qualification_pass,
@@ -5673,7 +5808,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
             &store.load_record(),
             target_mhz,
             &descent.candidates[i].anchor,
-        ) {
+        ) || condemned.refuses(target_mhz, descent.candidates[i].anchor.voltage_mv)
+        {
             completed = true;
             stop_reason = "BlacklistedBoundary".into();
             logs.push(format!(
@@ -6618,7 +6754,17 @@ fn run_manual_prior_undervolt_probe(
             candidate.as_ref(),
             &manual_limits,
             focus_target,
-        ) {
+        )
+        .or_else(|| {
+            candidate.as_ref().and_then(|c| {
+                ledger_refusal(
+                    &nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir())
+                        .condemned_pairs(&crate::gpu_power_sweep::current_gpu_key()),
+                    focus_target,
+                    c.voltage_mv,
+                )
+            })
+        }) {
             Some(reason) => {
                 println!(
                     "undervolt-probe: --confirm REFUSED — {reason}. No Safe Loop arm, no apply, no \
@@ -6686,6 +6832,14 @@ mod tests {
 
     fn os(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()
+    }
+
+    fn dx11_golden() -> nidavellir_gpu_stress::Dx11Golden {
+        nidavellir_gpu_stress::Dx11Golden {
+            checksum: 7,
+            adapter_luid: 8,
+            frame_reference_us: 9,
+        }
     }
 
     // (index, voltage_mv, base_freq_mhz): boost-top bin at 1062/1755; lower bins below the target.
@@ -7205,6 +7359,7 @@ mod tests {
                         stream: 6,
                         stream_frame_reference_ms: 20,
                         boost_frame_reference_us: 30,
+                        dx11: dx11_golden(),
                     },
                 )
             ),
@@ -7283,6 +7438,7 @@ mod tests {
                         stream: 6,
                         stream_frame_reference_ms: 20,
                         boost_frame_reference_us: 30,
+                        dx11: dx11_golden(),
                     },
                 ),
             ),
@@ -7312,6 +7468,7 @@ mod tests {
                         stream: 6,
                         stream_frame_reference_ms: 20,
                         boost_frame_reference_us: 30,
+                        dx11: dx11_golden(),
                     },
                 ),
             ),
@@ -7337,6 +7494,7 @@ mod tests {
                         stream: 6,
                         stream_frame_reference_ms: 20,
                         boost_frame_reference_us: 30,
+                        dx11: dx11_golden(),
                     },
                 ),
             ),
@@ -7377,6 +7535,7 @@ mod tests {
                             F2QualificationPattern::Memory => "v8-memory",
                             F2QualificationPattern::Endurance => "endurance",
                             F2QualificationPattern::TransitionShock => "transition-shock",
+                            F2QualificationPattern::Dx11Game => "native-dx11",
                         }
                         .to_string(),
                         duration_ms: 1_000,
@@ -7483,6 +7642,7 @@ mod tests {
             stream: 66,
             stream_frame_reference_ms: 20,
             boost_frame_reference_us: 30,
+            dx11: dx11_golden(),
         };
         let purpose = F2StressPurpose::V8Qualification(
             F2QualificationPattern::Transitions,
@@ -8145,6 +8305,7 @@ mod tests {
             stream: 0,
             stream_frame_reference_ms: 0,
             boost_frame_reference_us: 0,
+            dx11: dx11_golden(),
         }
     }
 

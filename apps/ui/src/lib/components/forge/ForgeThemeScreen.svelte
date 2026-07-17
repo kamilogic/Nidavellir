@@ -45,8 +45,10 @@
     onThemeChange,
     onForgeModeChange,
     onStartPower,
+    onRecoverContinue,
     onStopPower,
     onApplyPower,
+    onReportProfileUnstable,
     onFullReset,
     onDismissFullResetFeedback,
     onViewChange,
@@ -106,13 +108,18 @@
   });
   const activeName = $derived(profileMeta.find((item) => item.key === activeKey)?.name ?? "Stock");
   const safeLoopKnown = $derived(Boolean(safeLoop));
+  const recoveryPending = $derived(Boolean(safeLoop?.recovery_pending_ack));
   const protectedState = $derived(
     Boolean(safeLoopKnown && !(safeLoop?.safe_mode || safeLoop?.state === "unstable")),
   );
-  const protectionLabel = $derived(!safeLoopKnown ? "Awaiting" : protectedState ? "Protected" : "Review");
+  const protectionLabel = $derived(
+    !safeLoopKnown ? "Awaiting" : recoveryPending ? "Needs Attention" : protectedState ? "Protected" : "Review",
+  );
   const protectionMessage = $derived(
     !safeLoopKnown
       ? "Waiting for Safe Loop status."
+      : recoveryPending
+        ? (safeLoop?.pending_forge_incident?.message ?? "Interrupted Forge requires acknowledgement before continuing.")
       : protectedState
         ? "Your GPU is monitored and ready."
         : "Safe Loop needs your attention.",
@@ -219,7 +226,16 @@
 
   function runForge() {
     if (powerRunning) return;
+    if (recoveryPending) {
+      onRecoverContinue?.(forgeMode);
+      return;
+    }
     onStartPower?.(forgeMode);
+  }
+
+  function reportProfile(profile) {
+    if (powerRunning || !pointFor(profile.key)) return;
+    onReportProfileUnstable?.(profile.key);
   }
 
   function selectMode(event) {
@@ -338,7 +354,7 @@
         <div class="command-cta">
           <button class="plate-button" onclick={runForge} disabled={powerRunning}>
             <img src={copperPlate} alt="" />
-            <span>{powerRunning ? "Forging…" : "Forge GPU"}</span>
+            <span>{powerRunning ? "Forging…" : recoveryPending ? "Review & Continue" : "Forge GPU"}</span>
           </button>
           {#if profilesReady}
             <span class="refine">Profiles forged from measured hardware data <ShieldCheck size={23} /></span>
@@ -394,9 +410,12 @@
                 <strong>{profileActive(profile.key) ? "Applied" : canApply(profile.key) ? "Ready" : "Measured"}</strong>
                 <span>{profilesQualified ? "Qualified profile" : "Qualification pending"}</span>
               </div>
-              <button class="profile-select" class:selected={profileActive(profile.key)} onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)} aria-label={`Apply ${profile.name}`}>
-                {#if profileActive(profile.key)}<ShieldCheck size={24} />{:else}<ChevronRight size={22} />{/if}
-              </button>
+              <div class="profile-actions">
+                <button class="profile-select" class:selected={profileActive(profile.key)} onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)} aria-label={`Apply ${profile.name}`}>
+                  {#if profileActive(profile.key)}<ShieldCheck size={24} />{:else}<ChevronRight size={22} />{/if}
+                </button>
+                <button class="field-failure" onclick={() => reportProfile(profile)} disabled={powerRunning || !point}>Mark unstable</button>
+              </div>
             {:else}
               <div class="profile-await"><strong>Available after Forge</strong><span>Generated from this GPU’s measured behavior.</span></div>
             {/if}
@@ -473,6 +492,7 @@
                     <button onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)}>
                       {profileActive(profile.key) ? "APPLIED" : canApply(profile.key) ? "APPLY" : "MEASURED"}
                     </button>
+                    <button class="field-failure" onclick={() => reportProfile(profile)} disabled={powerRunning || !point}>MARK UNSTABLE</button>
                   {:else}
                     <p>{profile.summary}</p>
                     <small class="profile-availability">Available after Forge completes.</small>
@@ -486,13 +506,14 @@
 
         <aside class="instrument-action-panel">
           <span class="panel-kicker">PRIMARY ACTION</span>
-          <button class="instrument-forge" onclick={runForge} disabled={powerRunning}><Anvil size={42} /><strong>{powerRunning ? "FORGING…" : "FORGE GPU"}</strong></button>
+          <button class="instrument-forge" onclick={runForge} disabled={powerRunning}><Anvil size={42} /><strong>{powerRunning ? "FORGING…" : recoveryPending ? "REVIEW & CONTINUE" : "FORGE GPU"}</strong></button>
           <div class="mode-block">
             <label for="instrument-mode">MODE</label>
             <select id="instrument-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning}>
               <option value="fast">Fast — preview only</option>
               <option value="standard">Standard — recommended</option>
               <option value="long">Long — strongest confidence</option>
+              <option value="clean">Clean run — experimental (organic)</option>
             </select>
             <p>Builds safe profiles while you use your PC.</p>
             <small>Learns your GPU, tests limits safely and creates personalized profiles.</small>
@@ -532,8 +553,8 @@
         <h2>{gpuName}</h2>
         <p class:pending={!safeLoopKnown} class:review={safeLoopKnown && !protectedState}><i></i> {safeLoopKnown ? (protectedState ? "Protected by Safe Loop" : "Safe Loop needs review") : "Safe Loop status unavailable"}</p>
         <div class="workshop-actions">
-          <button class="workshop-forge" onclick={runForge} disabled={powerRunning}><Anvil size={25} />{powerRunning ? "Forging…" : "Forge GPU"}</button>
-          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning}><option value="fast">Fast · Preview only</option><option value="standard">Standard · Recommended</option><option value="long">Long · Strongest confidence</option></select><ChevronDown size={20} /></label>
+          <button class="workshop-forge" onclick={runForge} disabled={powerRunning}><Anvil size={25} />{powerRunning ? "Forging…" : recoveryPending ? "Review & Continue" : "Forge GPU"}</button>
+          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning}><option value="fast">Fast · Preview only</option><option value="standard">Standard · Recommended</option><option value="long">Long · Strongest confidence</option><option value="clean">Clean run · Experimental</option></select><ChevronDown size={20} /></label>
         </div>
       </section>
 
@@ -557,6 +578,7 @@
               <button onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)}>
                 {profileActive(profile.key) ? "Applied" : canApply(profile.key) ? "Apply" : "Measured"}
               </button>
+              <button class="field-failure" onclick={() => reportProfile(profile)} disabled={powerRunning || !point}>Mark unstable</button>
             {:else}
               <p>{profile.summary}</p>
               <small class="profile-availability">Available after Forge completes.</small>
@@ -1307,7 +1329,7 @@
 
   .command-profile {
     display: grid;
-    grid-template-columns: 125px 420px 380px 1fr 72px;
+    grid-template-columns: 125px 420px 380px 1fr 112px;
     align-items: center;
     min-height: 80px;
     border: 1px solid #485158;
@@ -1442,6 +1464,31 @@
 
   .profile-select.selected {
     border-color: #83bd31;
+  }
+
+  .profile-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .field-failure {
+    min-height: 0 !important;
+    margin-top: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+    color: #9b9189 !important;
+    font-size: 10px !important;
+    letter-spacing: 0.03em;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+  }
+
+  .field-failure:disabled {
+    cursor: default;
+    opacity: 0.45;
   }
 
   .command-advanced,
@@ -2376,7 +2423,7 @@
     .command-profile:not(.preview) .profile-icon { grid-row: 1 / span 2; }
     .command-profile:not(.preview) .profile-copy { grid-column: 2; grid-row: 1; padding-block: 14px; }
     .command-profile:not(.preview) .profile-measurements { grid-column: 2 / 4; grid-row: 2; padding: 0 18px 14px 24px; }
-    .command-profile:not(.preview) .profile-select { grid-column: 3; grid-row: 1; justify-self: center; }
+    .command-profile:not(.preview) .profile-actions { grid-column: 3; grid-row: 1; justify-self: center; }
     .command-profile.preview { grid-template-columns: 70px 1fr; }
     .command-profile.preview .profile-await { grid-column: 2; padding: 0 18px 15px 24px; }
     .instrument-frame { grid-template-columns: 1fr; }

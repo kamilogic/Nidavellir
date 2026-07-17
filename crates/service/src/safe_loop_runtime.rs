@@ -70,6 +70,12 @@ pub fn run_startup_recovery(store: &SafeLoopStore) -> SafeLoopRecord {
         RecoveryAction::ApplyLastValidated { point } => {
             info!("Safe Loop: clean boot, reapplying last validated profile {point:?}");
         }
+        RecoveryAction::AwaitOperatorAcknowledgement { incident } => {
+            warn!(
+                "Safe Loop: Forge incident {} requires operator acknowledgement; staying at stock",
+                incident.id
+            );
+        }
         RecoveryAction::BlacklistAndRecede {
             crashed,
             recede_to,
@@ -137,7 +143,21 @@ pub fn status_snapshot(store: &SafeLoopStore) -> SafeLoopStatus {
         last_validated: record.last_validated,
         blacklist: record.blacklist,
         recent_crashes: record.crash_log,
+        recovery_pending_ack: record.pending_forge_incident.is_some(),
+        pending_forge_incident: record.pending_forge_incident,
     }
+}
+
+/// Explicitly release the pending Forge incident latch while preserving blacklist and history.
+pub fn acknowledge_forge_incident(store: &SafeLoopStore) -> Result<bool, String> {
+    let mut record = store.load_record();
+    let acknowledged = record.acknowledge_forge_incident().is_some();
+    if acknowledged {
+        store
+            .save_record(&record)
+            .map_err(|e| format!("persist Forge incident acknowledgement: {e}"))?;
+    }
+    Ok(acknowledged)
 }
 
 /// Read the most recent BSOD bugcheck from the Windows System event log and

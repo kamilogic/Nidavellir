@@ -188,6 +188,14 @@
       title: "10 s discovery + 3 × 120 s qualification",
       description: "Traverses the same full frontier, then runs three independent two-minute passes per selected boundary for the strongest initial confidence.",
     },
+    {
+      id: "clean",
+      label: "Clean run",
+      summaryLabel: "Clean",
+      meta: "experimental",
+      title: "Organic search — no historical memory",
+      description: "Standard dwells, but the search starts from zero: pre-run learning is archived away and only failures from this run steer it. Sentinel and Safe Loop protections stay fully active. For algorithm evaluation during development.",
+    },
   ];
   const selectedMode = $derived(forgeModes.find((mode) => mode.id === forgeMode) ?? forgeModes[1]);
 

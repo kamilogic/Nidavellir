@@ -2292,6 +2292,7 @@ dependencies = [
  "nidavellir-gpu-nvapi",
  "pollster",
  "wgpu",
+ "windows 0.58.0",
 ]
 
 [[package]]

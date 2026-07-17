@@ -164,6 +164,68 @@ pub enum CrashClass {
     Unknown,
 }
 
+/// Durable source of a Forge incident that requires operator-visible accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeIncidentKind {
+    /// A persisted candidate boot flag survived the restart, so the exact point is attributable.
+    CandidateCrash,
+    /// A running Forge checkpoint survived without a candidate boot flag. Do not invent a point.
+    UnaccountedRestart,
+    /// The operator reported that a forged profile failed under real use on this GPU.
+    OperatorFieldFailure,
+    /// The live worker failed internally without completing its terminal checkpoint.
+    RuntimeFailure,
+}
+
+/// Reboot-surviving Forge incident. It is stored with Safe Loop state so UI, recovery and export all
+/// observe the same acknowledgement contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeIncident {
+    pub id: String,
+    pub kind: ForgeIncidentKind,
+    pub detected_at: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub gpu_key: Option<String>,
+    #[serde(default)]
+    pub target_mhz: Option<u32>,
+    #[serde(default)]
+    pub anchor_mv: Option<u32>,
+    pub message: String,
+    #[serde(default)]
+    pub acknowledged: bool,
+}
+
+impl ForgeIncident {
+    pub fn new(
+        kind: ForgeIncidentKind,
+        run_id: Option<String>,
+        gpu_key: Option<String>,
+        target_mhz: Option<u32>,
+        anchor_mv: Option<u32>,
+        message: impl Into<String>,
+    ) -> Self {
+        let detected_at = chrono::Utc::now().to_rfc3339();
+        let id = format!(
+            "forge-incident-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        Self {
+            id,
+            kind,
+            detected_at,
+            run_id,
+            gpu_key,
+            target_mhz,
+            anchor_mv,
+            message: message.into(),
+            acknowledged: false,
+        }
+    }
+}
+
 /// Classify a Windows bugcheck (stop) code.
 pub fn classify_bugcheck(code: u64) -> CrashClass {
     match code {
@@ -209,6 +271,12 @@ pub struct SafeLoopRecord {
     pub safe_mode: bool,
     /// Most recent crash classifications, newest last (capped).
     pub crash_log: Vec<CrashClass>,
+    /// Incident currently blocking automatic Forge continuation / profile Apply.
+    #[serde(default)]
+    pub pending_forge_incident: Option<ForgeIncident>,
+    /// Durable incident history, newest last (capped by the mutation helpers).
+    #[serde(default)]
+    pub forge_incidents: Vec<ForgeIncident>,
 }
 
 impl Default for SafeLoopRecord {
@@ -220,6 +288,8 @@ impl Default for SafeLoopRecord {
             blacklist: Vec::new(),
             safe_mode: false,
             crash_log: Vec::new(),
+            pending_forge_incident: None,
+            forge_incidents: Vec::new(),
         }
     }
 }
@@ -253,7 +323,45 @@ impl SafeLoopRecord {
     pub fn clear_recovery_latch(&mut self) {
         self.safe_mode = false;
         self.consecutive_crashes = 0;
-        self.state = SafeLoopState::Idle;
+        self.state = if self.pending_forge_incident.is_some() {
+            SafeLoopState::Unstable
+        } else {
+            SafeLoopState::Idle
+        };
+    }
+
+    /// Persist an incident once and latch Needs Attention until the operator acknowledges it.
+    pub fn record_forge_incident(&mut self, incident: ForgeIncident) -> bool {
+        let duplicate = self
+            .forge_incidents
+            .iter()
+            .any(|known| known.id == incident.id || (known.run_id.is_some() && known.run_id == incident.run_id));
+        if duplicate {
+            return false;
+        }
+        self.pending_forge_incident = Some(incident.clone());
+        push_capped(&mut self.forge_incidents, incident, 64);
+        if !self.safe_mode {
+            self.state = SafeLoopState::Unstable;
+        }
+        true
+    }
+
+    /// Release only the incident acknowledgement latch. Blacklist and incident history stay durable.
+    pub fn acknowledge_forge_incident(&mut self) -> Option<ForgeIncident> {
+        let mut incident = self.pending_forge_incident.take()?;
+        incident.acknowledged = true;
+        if let Some(stored) = self
+            .forge_incidents
+            .iter_mut()
+            .find(|stored| stored.id == incident.id)
+        {
+            stored.acknowledged = true;
+        }
+        if !self.safe_mode {
+            self.state = SafeLoopState::Idle;
+        }
+        Some(incident)
     }
 }
 
@@ -285,6 +393,9 @@ pub enum RecoveryAction {
     Idle,
     /// Boot-flag clear; reapply the last known-good profile.
     ApplyLastValidated { point: TuningPoint },
+    /// A previous Forge execution ended without a terminal checkpoint. Stay at stock and wait for
+    /// an explicit operator acknowledgement; never silently resume or reapply.
+    AwaitOperatorAcknowledgement { incident: ForgeIncident },
     /// Boot-flag armed: blacklist the crash region and recede to known-good.
     BlacklistAndRecede {
         crashed: TuningPoint,
@@ -342,6 +453,8 @@ pub fn decide_recovery(
                 RecoveryAction::RemainSafeMode {
                     stock: TuningPoint::stock(),
                 }
+            } else if let Some(incident) = record.pending_forge_incident.clone() {
+                RecoveryAction::AwaitOperatorAcknowledgement { incident }
             } else if let Some(point) = record.last_validated.clone() {
                 RecoveryAction::ApplyLastValidated { point }
             } else {
@@ -362,6 +475,10 @@ pub fn apply_recovery(record: &mut SafeLoopRecord, action: &RecoveryAction) -> T
         RecoveryAction::ApplyLastValidated { point } => {
             record.state = SafeLoopState::Validated;
             point.clone()
+        }
+        RecoveryAction::AwaitOperatorAcknowledgement { .. } => {
+            record.state = SafeLoopState::Unstable;
+            TuningPoint::stock()
         }
         RecoveryAction::BlacklistAndRecede {
             crashed,
@@ -800,6 +917,66 @@ mod tests {
         assert_eq!(rec.last_validated, Some(good));
         assert_eq!(rec.blacklist.len(), 1);
         assert_eq!(rec.crash_log, vec![CrashClass::OcInstability]);
+    }
+
+    #[test]
+    fn pending_forge_incident_requires_acknowledgement_and_stays_at_stock() {
+        let mut rec = SafeLoopRecord::default();
+        rec.mark_validated(TuningPoint::from_axes([("gpu_freq_mhz", 1800)]));
+        let incident = ForgeIncident::new(
+            ForgeIncidentKind::UnaccountedRestart,
+            Some("run-1".into()),
+            Some("gpu-1".into()),
+            None,
+            None,
+            "Forge restarted without an attributable candidate",
+        );
+        assert!(rec.record_forge_incident(incident.clone()));
+
+        let action = decide_recovery(None, CrashClass::Unknown, &rec);
+        assert_eq!(
+            action,
+            RecoveryAction::AwaitOperatorAcknowledgement {
+                incident: incident.clone()
+            }
+        );
+        assert!(apply_recovery(&mut rec, &action).is_stock());
+        assert_eq!(rec.state, SafeLoopState::Unstable);
+
+        rec.clear_recovery_latch();
+        assert_eq!(rec.state, SafeLoopState::Unstable);
+        assert_eq!(rec.pending_forge_incident, Some(incident));
+    }
+
+    #[test]
+    fn acknowledging_incident_preserves_durable_history() {
+        let mut rec = SafeLoopRecord::default();
+        let incident = ForgeIncident::new(
+            ForgeIncidentKind::OperatorFieldFailure,
+            None,
+            Some("gpu-1".into()),
+            Some(1845),
+            Some(862),
+            "Confirmed under real use",
+        );
+        assert!(rec.record_forge_incident(incident.clone()));
+        assert!(!rec.record_forge_incident(incident.clone()));
+
+        let acknowledged = rec.acknowledge_forge_incident().unwrap();
+        assert!(acknowledged.acknowledged);
+        assert!(rec.pending_forge_incident.is_none());
+        assert_eq!(rec.forge_incidents.len(), 1);
+        assert!(rec.forge_incidents[0].acknowledged);
+    }
+
+    #[test]
+    fn legacy_record_defaults_forge_incident_fields() {
+        let rec: SafeLoopRecord = serde_json::from_str(
+            r#"{"state":"idle","consecutive_crashes":0,"last_validated":null,"blacklist":[],"safe_mode":false,"crash_log":[]}"#,
+        )
+        .unwrap();
+        assert!(rec.pending_forge_incident.is_none());
+        assert!(rec.forge_incidents.is_empty());
     }
 
     #[test]

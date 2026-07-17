@@ -54,7 +54,7 @@ is load-only.
 
 The live F2 Forge asks two separate questions: homogeneous `PowerRender` characterizes power and
 the voltage boundary; the failure-seeking qualifier tries to reject a point before it can become a
-deployable profile. The current contracts are discovery v5 and qualification **v16**.
+deployable profile. The current contracts are discovery v5 and qualification **v17**.
 
 **Deterministic stock normalization and clock domain.** Before any candidate write, Forge resets to
 stock and runs up to six 10 s preheat windows. It requires two consecutive usable windows with no
@@ -90,10 +90,10 @@ the compatibility fallback. The ambiguous band receives bounded exact-candidate 
 ambiguity stays inconclusive and cannot define the frontier. `ClockDrop` classification remains
 exclusive to homogeneous `PowerRender`, not the qualifier's light/heavy mix.
 
-**Qualification v16 provenance and integrity.** Every current dwell records the service build
+**Qualification v17 provenance and integrity.** Every current dwell records the service build
 version/revision, semantic workload fingerprint, actual selected wgpu backend, adapter and driver
 identity/details, checksum method, and the stock-golden capture configuration/values. Older JSONL
-lines remain readable, but pre-v16 positive evidence cannot unlock Apply. Current positive discovery,
+lines remain readable, but pre-v17 positive evidence cannot unlock Apply. Current positive discovery,
 frontier qualification and exact-Apply qualification additionally require proven transaction cleanup.
 
 `MixedGame` is now genuinely interleaved: every frame records BoostEdge, TextureRop and PowerRender
@@ -113,16 +113,19 @@ whose measured p95 reaches a higher electrical regime must use that regime's mea
 and current qualification; no power or voltage is interpolated.
 
 **Exact-Apply stability closure.** Standard/Long remain provisional until every unique selected
-`(target, Apply VF bin)` completes, in order, **Texture for 5 minutes**, **TransitionShock for
-8 minutes**, and **Endurance for 20 minutes**. Adding voltage can expose a higher sustained boost
+`(target, Apply VF bin)` completes, in order, **Texture for 5 minutes**, **native Direct3D 11 for
+5 minutes**, **TransitionShock for 8 minutes**, and **Endurance for 20 minutes**. The DX11 stage
+renders offscreen on an explicitly selected NVIDIA DXGI adapter, compares periodic readbacks with a
+stock-session golden, requires the same adapter LUID, and bounds completion polling at 750 ms. Adding
+voltage can expose a higher sustained boost
 regime, so this gate is not inherited from the lower boundary. A reset-clean rejection removes the
 candidate and triggers re-synthesis; inconclusive evidence remains debt; hard recovery failures abort.
 The published profile power remains the conservative maximum confirmed across homogeneous
 PowerRender calibration and the approved exact-Apply dwells.
 
 The field-failed **1845 MHz @ 862 mV** point is the calibration discriminator for the next physical
-A/B against known-safe bins. **DX11 coverage is not implemented and the final gate is not shortened**
-until that A/B shows that the proposed change distinguishes the failed point without losing safe-bin
+A/B against known-safe bins. **DX11 coverage is now implemented, but the final gate is not shortened**
+until that A/B shows that the added stage distinguishes the failed point without losing safe-bin
 specificity. The long Endurance stage remains necessary because the latest field failure appeared
 well after the shorter Texture and TransitionShock stages had passed.
 
@@ -221,13 +224,24 @@ Pascal and newer**:
 The program **detects this at runtime** (`vf_curve_supported()`), so the UI always
 reflects what your exact GPU + driver actually allow rather than a static list.
 
-## Apply & persist
+## Apply, persist & report field failure
 
 GPU offsets are **volatile** (lost on reboot/driver reload). "Apply" writes the
 profile (lock voltage + clock offset / memory offset) **and persists it**; the
 Core Service **re-applies it on every boot** — gated by the Safe Loop: if the
-boot-flag is still armed (last apply crashed) or Safe Mode is active, it is **not**
+boot-flag is still armed (last apply crashed), Safe Mode is active, or a Forge incident awaits
+operator acknowledgement, it is **not**
 re-applied. "Reset to stock" clears it.
+
+If a forged profile repeatedly fails under real use, **Mark unstable** resolves that profile's exact
+hardware-derived clock/voltage pair, records durable local failure evidence and invalidates the
+published set. The coordinates are not product constants. A normal recovery reset preserves this
+learning; the explicit full reset removes it when evaluating a new Forge method from zero.
+
+An interrupted run never resumes silently. A surviving running checkpoint enters **Needs Attention**,
+keeps the GPU at stock and requires explicit acknowledgement. When the active boot flag identifies an
+exact candidate, only that candidate is blacklisted; otherwise the incident is retained as
+unattributed rather than guessing from adjacent observations.
 
 ## Honest limits
 
@@ -236,6 +250,25 @@ re-applied. "Reset to stock" clears it.
   applies margin — **final confirmation is a real game/benchmark session.**
 - Finding the absolute OC ceiling (Godforge) inherently risks a TDR/black screen;
   the Safe Loop makes it recoverable. For safety, prefer undervolt + moderate OC.
+
+## Condemnation ledger + vertical Apply repair (2026-07-16)
+
+- **`condemnation_ledger.jsonl`** (append-only, per-GPU, `crates/core/src/condemnation.rs`) holds
+  hard failures across every reset: **Rigid** (field TDR, machine crash with a candidate armed,
+  device-lost, operator report — the pair and everything at-or-below it at the same clock is
+  refused; only a manual `rehabilitated` append lifts it) and **Quarantine** (Texture/Endurance
+  SilentError at exact-Apply — strictly-below refused; the exact pair may be re-attempted but
+  publishing needs two independent full-gate passes, or one pass under a stronger contract).
+  Descent 60 s boundary failures stay in `safe_loop.json` (operational). Every confirmed hardware
+  preflight, the descent boundary check, profile restore and the IPC Apply guard consult the UNION
+  of the field floor and the ledger.
+- **Vertical repair**: a failed exact-Apply pair condemns the *bin*, not the clock. The same clock
+  climbs the real VF curve (+1 bin on SilentError, +2 on TDR/device-lost, skipping condemned bins),
+  bounded by the publication power ceiling (94% of the cap, using the worst honest measurement at
+  the bin — PowerRender calibration fills unmeasured bins) and a budget of 2 repairs per clock per
+  run. The repaired pair always re-runs the full gate; descent evidence only orients power/order.
+  A candidate is skipped without a ladder only when an already gate-approved point dominates it
+  (≥ sustained clock, ≤ selection power).
 
 ## Next steps (deferred)
 

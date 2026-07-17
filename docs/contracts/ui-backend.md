@@ -6,15 +6,35 @@
 
 
 
-\## Current F2 reference (2026-07-15): contract v16, Candidate Transaction and stock domain
+\## 2026-07-16 (additive): `StartPowerSweepClean` — experimental organic clean run
+
+\- **New IPC method** (unit method, no params, same request/response shape as `StartPowerSweep`):
+  `StartPowerSweepClean`. Wire: `{"method":"StartPowerSweepClean"}`. Response, progress
+  (`GetPowerSweepProgress`), stop (`StopPowerSweep`) and apply methods are all UNCHANGED.
+\- **Semantics**: Standard dwell policy, but a fully ORGANIC search for algorithm evaluation during
+  development. At start the backend archives `f2_observations.jsonl` + `forge_state.json` under
+  `forge-archive/<run_id>/`, snapshots `safe_loop.json` and strips its GPU V/F blacklist regions,
+  and reads the durable condemnation ledger RUN-SCOPED (only this run's failures). Failures during
+  the run still block and steer vertical repair; ledger writes keep flowing to the global file.
+  Sentinel, startup recovery and Safe Mode are unaffected. At the end the run's observations are
+  copied into the same archive folder; the next clean run starts organic again.
+\- **UI**: the Forge mode selector gains a fourth option `clean` ("Clean run · Experimental") →
+  `StartPowerSweepClean`. Existing modes and mappings unchanged.
+\- **New additive field (2026-07-17)**: `PowerSweepProgress.learning: Option<String>` —
+  `"clean_run"` or `"persistent"` (`None` on legacy payloads). Printed in the run-log export
+  header (`learning :`); the clean-run pre-flight also writes
+  `forge-archive/<run_id>/clean-run-manifest.txt` as log-independent proof of the mode. Added
+  after the 2026-07-17 run proved the live-log tail cannot evidence which policy executed.
+
+\## Current F2 reference (2026-07-15): contract v17, native DX11 gate and Candidate Transaction
 
 This section is the normative current behavior and supersedes the dated v4/v6/v7 runtime descriptions
 below where they conflict. Historical notes remain in place to explain payload evolution. No IPC method
 or existing field was removed.
 
-\- **Evidence contract v16.** Every current F2 dwell persists `evidence_provenance` with the service
+\- **Evidence contract v17.** Every current F2 dwell persists `evidence_provenance` with the service
   build version/revision, semantic workload fingerprint, actual selected render backend, adapter name,
-  driver name/details, checksum method and stock-golden configuration/values. Pre-v16 positive evidence
+  driver name/details, checksum method and stock-golden configuration/values. Pre-v17 positive evidence
   remains readable but cannot unlock Apply. Positive discovery, frontier qualification and exact-Apply
   qualification additionally require `reset_to_stock_ok == true` and `boot_flag_cleared == true`.
 
@@ -41,10 +61,10 @@ or existing field was removed.
   `checksum_count` reports the checks actually executed. The UI must not describe this as 100% frame
   checksum coverage.
 
-\- **Exact Apply is unchanged.** Every unique selected `(target, Apply VF bin)` still requires Texture
-  5 min, TransitionShock 8 min and Endurance 20 min. DX11 coverage and any shorter final gate are
-  explicitly deferred until physical A/B of the field-failed 1845 MHz @ 862 mV point against known-safe
-  bins proves that the alternative discriminates both populations.
+\- **Exact Apply adds native DX11.** Every unique selected `(target, Apply VF bin)` requires Texture
+  5 min, native offscreen DX11 5 min, TransitionShock 8 min and Endurance 20 min. DX11 captures a stock
+  golden on an explicitly selected NVIDIA adapter, records/matches its LUID, performs periodic readback
+  integrity checks and fails inconclusive when coverage cannot be proved. No existing dwell was shortened.
 
 \- **Additive/defaulted `PowerSweepProgress` fields:**
   - `observed_boost_clock_mhz: Option<u32>` — Cboost observed after deterministic stock preheat.
@@ -1236,6 +1256,32 @@ copy.
   from duplicated tuning constants.
 
 
+
+\## Backend ↔ Frontend (2026-07-15): Forge incident acknowledgement and field feedback
+
+All changes are additive/defaulted. The frontend must use structured fields and must never resume an
+interrupted Forge merely because the persisted phase is `interrupted`.
+
+\- New unit request `AcknowledgeForgeIncident` releases only the acknowledgement latch. It returns the
+  normal `SafeLoop` response; blacklist and incident history remain durable.
+
+\- `SafeLoopStatus` adds `recovery_pending_ack: bool` and
+  `pending_forge_incident: Option<ForgeIncident>`. When pending, Start and Apply are blocked and the
+  primary action must be presented as review/continue rather than automatic recovery.
+
+\- `PowerSweepProgress` adds `run_id: Option<String>` and ordered `run_sequence: Vec<String>`. Both
+  default empty for old checkpoints. `needs_attention` is an explicit non-running phase.
+
+\- New unit requests `ReportPowerGodforgeUnstable`, `ReportPowerBrokkrsUnstable` and
+  `ReportPowerDeepCalmUnstable` resolve the chosen point from the current backend profile set. They
+  add durable real-use evidence and invalidate qualification; the frontend sends no clock/voltage.
+
+\- `ForgeLogExport` adds `run_ids: Vec<String>` and `incident_count: usize`. The human log and its
+  companion JSONL are scoped to that sequence. Legacy checkpoints without run identity remain
+  exportable but are labeled as legacy/global rather than presented as a clean current-run result.
+
+\- `ResetGpuTuning` resets hardware and releases the Safe Mode latch but preserves an interrupted
+  Forge checkpoint and its run identity. `ResetGpuTuningFull` remains the explicit destructive path.
 
 (No other active backend → frontend requests)
 

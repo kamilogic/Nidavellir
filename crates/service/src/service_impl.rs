@@ -45,9 +45,14 @@ pub fn run_service() -> windows_service::Result<()> {
     // Parachute first: the service boots before login, so it reads the
     // boot-flag and recovers from any prior crash before touching hardware.
     let safe_store = nidavellir_core::safe_loop::SafeLoopStore::system();
+    crate::gpu_power_sweep::reconcile_interrupted_forge(&safe_store);
     crate::safe_loop_runtime::run_startup_recovery(&safe_store);
     crate::safe_loop_runtime::spawn_heartbeat(safe_store.clone());
+    // The installed Windows service is the product runtime. It must own the same boot and live TDR
+    // reconciliation as console mode before any persisted profile can be reapplied.
+    crate::tdr_sentinel::startup_reconcile(&safe_store);
     crate::gpu_apply::reapply_on_boot(&safe_store);
+    crate::tdr_sentinel::spawn(safe_store.clone());
 
     let hw = nidavellir_core::detect_hardware();
     let state = Arc::new(Mutex::new(AppState {

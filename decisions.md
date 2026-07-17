@@ -2,11 +2,98 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Resynthesis must score the conservative post-gate p99 (2026-07-17)
+- **Bug proven by the 2026-07-17 run**: selection scored candidates with the calm PowerRender
+  calibration p99 while publication printed the conservative post-gate basis. Deep Calm was
+  selected as 1740@812 at 157 W (11.1 MHz/W); the gate measured 188 W (Texture 300 s p99 =
+  Endurance peak); only `max_power_w` (off-cap basis) was raised, so every resynthesis kept
+  scoring 157 W and published a dominated "efficiency" profile — Godforge-class worst-case power
+  (188 vs 185 W) for 135 MHz less clock.
+- **Decision**: when an exact-Apply gate passes, raise the classified point's `power_p99_w` (and
+  `perf_per_watt`) to `current_apply_qualification_p99_at_anchor` — the SAME basis publication
+  uses — before the next resynthesis. Selection, dominance pre-gate and publication now see one
+  honest number. Strictly conservative: only ever raises. Regression test:
+  `resynthesis_scores_post_gate_conservative_p99_not_calm_calibration`.
+- **Known consequence (accepted)**: unqualified candidates still carry the optimistic calm
+  calibration, so the efficiency slots may walk down through a few optimistic candidates (one
+  38-min gate each) before settling on the honest best — bounded by the 90%/95% clock floors.
+  On this card Deep Calm may legitimately converge to Brokkr's point: that is measurement, not a
+  bug. Follow-up that eliminates the walk (with P2/v9): measure a texture-class p99 at every
+  exact Apply bin during the existing calibration gap-fill (~65 s × ~12 bins once per run), so
+  every candidate carries a gate-representative selection basis before the first synthesis.
+
+## Forge learning modes: experimental clean run vs production persistence (2026-07-16)
+- **Why**: during algorithm development every version must be evaluated on a fully ORGANIC search —
+  pre-classified pairs, historical seeds and prior condemnations contaminate the comparison. The
+  durable ledger stays right for the product; it is wrong as an experiment input.
+- **Decision**: two modes. `ForgeLearning::Persistent` (production) keeps the P0 behavior. The new
+  `ForgeLearning::CleanRun` (IPC `StartPowerSweepClean`, UI mode "Clean run · Experimental") starts
+  organic: `f2_observations.jsonl` + `forge_state.json` archived to `forge-archive/<run_id>/`,
+  `safe_loop.json` snapshotted and its GPU V/F blacklist regions stripped (Safe Mode, crash
+  counters, incidents and non-GPU entries preserved), no run-sequence/profile carryover, and the
+  condemnation ledger read RUN-SCOPED (only events with the current `run_id`).
+- **Key invariant**: ledger WRITES never stop — TDR/crash/gate failures during a clean run still
+  append to the global ledger (production truth is never lost) and, carrying the current run_id,
+  still block and steer vertical repair WITHIN the run. Reads are what the mode scopes.
+- **By construction a clean run cannot emit**: "dwells redundantes pulados", "fronteira prevista
+  por fronteira v4 anterior", "retomando fronteira já delimitada" (all require prior observations,
+  archived away) or a `BlacklistedBoundary` from pre-run evidence (record stripped + ledger
+  run-scoped). During-run failures may still produce `BlacklistedBoundary` — intended.
+- Results are archived at run end but never auto-imported by the next clean run; sentinel,
+  startup recovery and TDR protections remain fully active in both modes. Development validation
+  runs MUST use clean run mode until the algorithm stabilizes.
+
+## Condemnation ledger + vertical Apply repair (P0+P1, 2026-07-16)
+- **Problem proven by the 2026-07-14/16 runs**: (a) a gate failure at the margin pair excluded the
+  whole clock — the 07-14 run sank 1920→1740 through six ~38-min Endurance failures without ever
+  trying the validated bins above each failure; (b) durable failure knowledge lived only in
+  `safe_loop.json`, which a manual reset wiped on 07-15 — 1890@900 (Endurance fail 07-10) was
+  re-attempted on 07-16 and PASSED a single ladder, one interruption away from publication.
+- **P0 — `condemnation_ledger.jsonl`** (`crates/core/src/condemnation.rs`): append-only, per-GPU,
+  survives every reset path (`clear_all_learning` explicitly excludes it; wire format pinned by
+  test). Severities: **Rigid** (field TDR, CandidateCrash, device-lost, operator report — refuses
+  `anchor <= floor`, manual rehabilitation only via an appended `rehabilitated` entry) and
+  **Quarantine** (Texture/Endurance SilentError at exact-Apply — refuses strictly below; the exact
+  pair stays attemptable but publishing needs TWO independent full-gate passes, or one pass under a
+  strictly stronger contract). Descent 60 s failures stay operational (not ledgered). The floor is
+  the UNION of the safe-loop field floor and the ledger (`ledger_refusal`), consulted by every
+  confirmed preflight, the descent boundary check, profile restore and IPC Apply.
+- **P1 — vertical repair** (`f2_plan_vertical_repair`): a gate failure condemns the BIN, not the
+  clock. The same clock climbs the real VF curve (+1 bin on SilentError, +2 on TDR/device-lost,
+  skipping condemned bins), admitted only under the PUBLICATION ceiling (`off_cap_ceiling_w`, 94%
+  of cap — not the 98–99% discovery bound) using the worst honest measurement at the bin (confirmed
+  p99 + peaks; unmeasured bins get a PowerRender calibration first). Budget:
+  `MAX_APPLY_REPAIRS_PER_CLOCK = 2` per run — a budget, not a physical truth. Repaired pairs ALWAYS
+  re-run the full exact-Apply gate: descent evidence orients power/order only.
+- **Dominance pre-gate**: a candidate is skipped without spending the 25–40 min ladder only when an
+  already gate-APPROVED point dominates it (≥ sustained clock, ≤ selection power); descent-only
+  evidence never vetoes. Unknown candidate power fails open toward qualifying.
+- **Deferred**: Godforge fast-drop (next clock born at the highest off-cap bin). Godforge's
+  tie-break is lowest-power, so a lifted same-clock candidate always loses selection — doing this
+  properly needs per-profile candidate overrides in synthesis; it must not ride along with the
+  P0+P1 validation run. Texture v9 / Endurance reorder / gate removals are P2 (contract v18).
+
+## Forge restart incidents require acknowledgement; field failures come from the local profile (2026-07-15)
+- **Restart contract**: a running checkpoint surviving startup is evidence of an incomplete Forge.
+  Reconcile it before Safe Loop consumes the boot flag. Attribute and blacklist only an exact armed
+  candidate; otherwise record an explicitly unattributed incident and never infer a neighboring point.
+- **Recovery contract**: stay at stock and block Forge Start, Apply and boot reapply until explicit
+  operator acknowledgement. Resetting hardware is not acknowledgement, and the UI must not auto-start.
+  The ordinary reset preserves the checkpoint and learning; full reset is the intentional clean-test
+  operation that forgets them.
+- **Field contract**: a user-confirmed real-use profile failure is stronger than a synthetic pass.
+  Resolve the exact current profile pair at runtime, persist its local blacklist/incident evidence and
+  invalidate the profile set. Never hard-code a GPU's known-bad coordinates in source.
+- **Ownership**: the active Forge worker owns GPU mutation. A live sentinel event records the incident
+  and requests cooperative stop; it does not race the worker with a second reset.
+- **Evidence identity**: export only the ordered run sequence associated with the checkpoint and its
+  incidents. Dirty builds are identified by a content hash in addition to HEAD.
+
 ## Qualification evidence is reproducible; Ctable, Cboost and Cmax are separate (2026-07-15)
 - **Corrected premise**: the field trace did not isolate sustained BoostEdge/bin residence as the
   cause of the game TDR. Equivalent external telemetry survived in the lobby. Treat workload and
   driver-path composition as the missing variable; do not encode the old causal claim in policy.
-- **Evidence contract**: qualification v16 stores build revision/dirty state, workload fingerprint,
+- **Evidence contract**: qualification v17 stores build revision/dirty state, workload fingerprint,
   actual render backend, adapter/driver, checksum method and golden configuration. Current positive
   discovery, boundary and exact-Apply evidence requires both confirmed stock reset and boot-flag
   cleanup. Compatibility means old lines remain readable, not eligible.
@@ -30,10 +117,12 @@ Durable technical decisions and their rationale. Newest first.
   recovery ownership so one episode cannot trigger two concurrent GPU mutations. Its TextureRop
   baseline remains execution-local, so the canary detects returned stochastic/self-consistency
   failures but is not represented as a stock-known-answer or game-correctness oracle.
-- **Safety trade-off**: exact-Apply Texture + TransitionShock + Endurance stays mandatory. A native
-  DX11 qualifier and shorter final soak remain deferred until A/B calibration separates known-bad
-  `1845@862` from safe controls with acceptable false positives. No source policy hard-codes that GPU
-  point; it remains local field evidence in Safe Loop.
+- **DX11 exact-Apply gate**: after Texture, run a native offscreen Direct3D 11 render for 5 min before
+  TransitionShock and Endurance. Capture a deterministic stock checksum first, select an NVIDIA DXGI
+  adapter explicitly, require the same adapter LUID at the candidate, poll GPU completion with a
+  750 ms bound, and treat missing/ambiguous coverage as inconclusive. This expands driver/API coverage
+  without changing descent or shortening any existing gate. `1845@862` remains local field evidence,
+  never a source-coded blacklist coordinate.
 
 ## v13: absolute NVML max-clock ceiling for every F2 dwell AND Apply (2026-07-06)
 - **Problem**: the anchored plateau caps are per-point offsets relative to the base V/F curve, which

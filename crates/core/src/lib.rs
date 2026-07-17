@@ -1,4 +1,5 @@
 pub mod capability;
+pub mod condemnation;
 pub mod detector;
 pub mod f2_observation;
 pub mod fingerprint;

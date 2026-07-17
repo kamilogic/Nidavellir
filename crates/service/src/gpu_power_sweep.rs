@@ -18,7 +18,7 @@
 //! Windows-only (NVAPI/NVML).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(windows)]
 use nidavellir_core::f2_observation::{
@@ -85,6 +85,166 @@ fn f2_next_bin_above(sane_curve: &[(usize, u32, u32)], mv: u32) -> Option<u32> {
         .map(|&(_, bin_mv, _)| bin_mv)
         .filter(|&bin_mv| bin_mv > mv)
         .min()
+}
+
+/// Vertical-repair budget: gate failures at the SAME clock beyond this many repairs exhaust the
+/// clock for THIS run (a budget, not a physical truth — the next run may climb further).
+#[cfg(windows)]
+const MAX_APPLY_REPAIRS_PER_CLOCK: u32 = 2;
+
+/// Vertical-repair severity step (2026-07-16): a graceful SilentError overshoots the true
+/// boundary by little (+1 physical bin); a hard TDR/device-lost/crash means the pair sits far
+/// below it (+2 bins). Pure.
+#[cfg(windows)]
+fn repair_step_bins(stop_reason: &str) -> usize {
+    let lower = stop_reason.to_ascii_lowercase();
+    if ["tdr", "device", "crash", "wedge"].iter().any(|h| lower.contains(h)) {
+        2
+    } else {
+        1
+    }
+}
+
+/// The `step`-th real sane-curve bin strictly above `failed_mv`, or `None` when the curve tops
+/// out first. Pure.
+#[cfg(windows)]
+fn f2_repair_bin_above(
+    sane_curve: &[(usize, u32, u32)],
+    failed_mv: u32,
+    step: usize,
+) -> Option<u32> {
+    let mut bins: Vec<u32> =
+        sane_curve.iter().map(|&(_, mv, _)| mv).filter(|&mv| mv > failed_mv).collect();
+    bins.sort_unstable();
+    bins.dedup();
+    bins.get(step.saturating_sub(1)).copied()
+}
+
+/// Worst measured power (W) at the exact (target, anchor) pair for this GPU — the MAX over every
+/// confirmed p99 and recorded peak in the observation log. PowerRender alone underestimates the
+/// gate's real draw (Texture qualification peaked 30-40 W above the PowerRender p99 at low clocks
+/// in the 2026-07-16 run), so the repair power-guard uses the worst honest measurement available.
+/// `None` = the pair was never measured.
+#[cfg(windows)]
+fn measured_power_at_pair(
+    observations: &[nidavellir_core::f2_observation::F2Observation],
+    gpu_key: &str,
+    target_mhz: u32,
+    anchor_mv: u32,
+) -> Option<f32> {
+    observations
+        .iter()
+        .filter(|o| {
+            o.gpu_key.as_deref() == Some(gpu_key)
+                && o.target_mhz == target_mhz
+                && o.anchor_mv == anchor_mv
+        })
+        .flat_map(|o| {
+            o.power_p99_w
+                .filter(|_| o.power_p99_confirmed)
+                .into_iter()
+                .chain(o.max_watts.map(|w| w as f32))
+        })
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .fold(None, |acc: Option<f32>, w| Some(acc.map_or(w, |a| a.max(w))))
+}
+
+/// Plan the vertical repair for a failed exact-Apply pair (2026-07-16): the SAME clock climbs the
+/// real VF curve instead of dying. Returns `Ok((next_mv, measured_power_guard))` — the repair bin
+/// (severity-stepped above the failure, then climbed past any field/ledger-condemned bins) plus
+/// the worst measured power at that bin when one exists (`None` ⇒ the caller must calibrate before
+/// admitting it). Returns `Err(reason)` when the clock is exhausted THIS run: repair budget spent,
+/// no real bin remains, every bin above is condemned, or the PUBLICATION power ceiling
+/// (`off_cap_ceiling_w`, NOT the discovery cap) is already exceeded by the best lower bound.
+/// Pure over its inputs — no hardware, unit-tested.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn f2_plan_vertical_repair(
+    sane_curve: &[(usize, u32, u32)],
+    record: &nidavellir_core::safe_loop::SafeLoopRecord,
+    condemned: &nidavellir_core::condemnation::CondemnedPairs,
+    observations: &[nidavellir_core::f2_observation::F2Observation],
+    gpu_key: &str,
+    target_mhz: u32,
+    failed_mv: u32,
+    stop_reason: &str,
+    power_limit_w: f32,
+    attempts_so_far: u32,
+) -> Result<(u32, Option<f32>), String> {
+    if attempts_so_far >= MAX_APPLY_REPAIRS_PER_CLOCK {
+        return Err(format!(
+            "orçamento de reparo esgotado ({attempts_so_far}/{MAX_APPLY_REPAIRS_PER_CLOCK} nesta run)"
+        ));
+    }
+    let step = repair_step_bins(stop_reason);
+    let mut next_mv = f2_repair_bin_above(sane_curve, failed_mv, step)
+        .ok_or_else(|| format!("nenhum bin físico real acima de {failed_mv} mV"))?;
+    // Climb past bins physics already condemned (field floor / durable ledger) — attempting them
+    // would only be refused at the preflight.
+    while crate::gpu_undervolt::field_pair_blacklisted(record, target_mhz, next_mv)
+        || condemned.refuses(target_mhz, next_mv)
+    {
+        next_mv = f2_next_bin_above(sane_curve, next_mv).ok_or_else(|| {
+            format!("todos os bins acima de {failed_mv} mV estão condenados por falhas reais")
+        })?;
+    }
+    // Publication power ceiling: power is monotone in voltage at a fixed clock, so the worst
+    // measurement at the failed bin is a LOWER bound for the repair bin. Guard on the max of
+    // both; an unmeasured repair bin is admitted as `None` for the caller to calibrate.
+    let measured_at_next = measured_power_at_pair(observations, gpu_key, target_mhz, next_mv);
+    if power_limit_w > 0.0 {
+        let ceiling = off_cap_ceiling_w(power_limit_w);
+        let lower_bound = measured_at_next
+            .into_iter()
+            .chain(measured_power_at_pair(observations, gpu_key, target_mhz, failed_mv))
+            .fold(0.0_f32, f32::max);
+        if lower_bound > ceiling {
+            return Err(format!(
+                "potência medida {lower_bound:.0} W já excede o teto de publicação {ceiling:.0} W"
+            ));
+        }
+    }
+    Ok((next_mv, measured_at_next))
+}
+
+/// An already gate-APPROVED point (full exact-Apply under the current contract) that dominates
+/// `candidate`: sustained clock ≥ AND selection power ≤, different Apply pair. Approval is
+/// required so mere 60 s descent evidence can never veto a candidate before its gate (agreed
+/// 2026-07-16). Unknown candidate power (≤ 0) is never dominated — fail open toward qualifying.
+/// Pure.
+#[cfg(windows)]
+fn f2_approved_dominator(
+    candidate: &PowerSweepPoint,
+    classified: &[(PowerSweepPoint, f64)],
+) -> Option<(u32, u32)> {
+    let sustained = |p: &PowerSweepPoint| p.p5_clock_mhz.unwrap_or(p.clock_mhz);
+    let selection_power = |p: &PowerSweepPoint| {
+        if p.boundary_voltage_mv.is_some() {
+            p.power_p99_w.unwrap_or(0.0)
+        } else {
+            p.power_w
+        }
+    };
+    let cand_key = f2_apply_key(candidate)?;
+    let cand_power = selection_power(candidate);
+    if cand_power <= 0.0 {
+        return None;
+    }
+    classified
+        .iter()
+        .map(|(p, _)| p)
+        .filter(|p| {
+            p.apply_qualified
+                && p.apply_qualification_version
+                    == Some(nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION)
+                && f2_apply_key(p).is_some_and(|k| k != cand_key)
+        })
+        .find(|p| {
+            sustained(p) >= sustained(candidate)
+                && selection_power(p) > 0.0
+                && selection_power(p) <= cand_power
+        })
+        .and_then(|p| f2_apply_key(p))
 }
 /// Initial telemetry threshold for a missing-valid-NVML-sample stall. Leva 1 records the signal only;
 /// proactive reset remains disabled until the hardware gate proves the signal has acceptable
@@ -236,6 +396,23 @@ pub enum PowerSweepMode {
     Long,
 }
 
+/// How a forge run relates to accumulated learning (2026-07-16).
+///
+/// - `Persistent` (production): the P0 behavior — durable condemnation ledger, cross-run field
+///   floor, warm-start predictions and dwell reuse from `f2_observations.jsonl`.
+/// - `CleanRun` (experimental, development): a fully ORGANIC search for comparing algorithm
+///   versions. Pre-run observations and `forge_state.json` are archived away, prior GPU V/F
+///   blacklist regions are stripped from `safe_loop.json` (snapshotted first) and the durable
+///   ledger is read RUN-SCOPED only. Failures produced DURING the run still block and steer
+///   repairs; ledger WRITES still go to the global file so production never loses hard-failure
+///   truth. Sentinel, startup recovery, Safe Mode and TDR protections stay fully active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForgeLearning {
+    #[default]
+    Persistent,
+    CleanRun,
+}
+
 impl PowerSweepMode {
     fn id(self) -> &'static str {
         match self {
@@ -356,6 +533,61 @@ impl Default for PowerSweepHandle {
     }
 }
 
+fn record_operator_field_failure(
+    record: &mut nidavellir_core::safe_loop::SafeLoopRecord,
+    point: &PowerSweepPoint,
+    run_id: Option<String>,
+    gpu_key: String,
+) -> (u32, u32) {
+    use nidavellir_core::safe_loop::{
+        BlacklistRegion, ForgeIncident, ForgeIncidentKind, SafeLoopState, TuningPoint,
+        DEFAULT_BLACKLIST_RADIUS,
+    };
+
+    let target_mhz = point.target_clock_mhz.unwrap_or(point.clock_mhz);
+    let anchor_mv = point
+        .vf_table_voltage_mv
+        .or(point.boundary_voltage_mv)
+        .unwrap_or(point.voltage_mv);
+    let intent = TuningPoint::from_axes([
+        ("gpu_freq_mhz", i64::from(target_mhz)),
+        ("gpu_offset_mhz", i64::from(point.offset_mhz)),
+        ("gpu_vf_bin_mv", i64::from(anchor_mv)),
+    ]);
+    if !record.is_blacklisted(&intent) {
+        record
+            .blacklist
+            .push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
+    }
+    let duplicate_incident = record.forge_incidents.iter().any(|incident| {
+        incident.kind == ForgeIncidentKind::OperatorFieldFailure
+            && incident.gpu_key.as_deref() == Some(gpu_key.as_str())
+            && incident.target_mhz == Some(target_mhz)
+            && incident.anchor_mv == Some(anchor_mv)
+    });
+    if !duplicate_incident {
+        let mut incident = ForgeIncident::new(
+            ForgeIncidentKind::OperatorFieldFailure,
+            run_id,
+            Some(gpu_key),
+            Some(target_mhz),
+            Some(anchor_mv),
+            format!(
+                "Operator confirmed repeated real-use instability for {target_mhz} MHz at {anchor_mv} mV VF bin"
+            ),
+        );
+        incident.acknowledged = true;
+        if record.forge_incidents.len() >= 64 {
+            record.forge_incidents.remove(0);
+        }
+        record.forge_incidents.push(incident);
+    }
+    if !record.safe_mode {
+        record.state = SafeLoopState::Unstable;
+    }
+    (target_mhz, anchor_mv)
+}
+
 impl PowerSweepHandle {
     pub fn progress(&self) -> PowerSweepProgress {
         self.progress.lock().map(|p| p.clone()).unwrap_or_else(|_| idle())
@@ -378,15 +610,95 @@ impl PowerSweepHandle {
         self.running.store(false, Ordering::SeqCst);
         if let Ok(mut prog) = self.progress.lock() {
             let note = note.into();
+            if matches!(prog.phase.as_str(), "needs_attention" | "interrupted") {
+                prog.running = false;
+                prog.phase = "interrupted".into();
+                prog.profiles_qualified = false;
+                prog.note = Some(note.clone());
+                prog.log.push(note);
+                return;
+            }
             let mut reset = idle();
             reset.note = Some(note.clone());
             reset.log.push(note);
             *prog = reset;
         }
     }
+    /// Full-reset path: remove the visible checkpoint as well as durable learning.
+    pub fn forget_after_full_reset(&self, note: impl Into<String>) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
+        if let Ok(mut prog) = self.progress.lock() {
+            let note = note.into();
+            let mut reset = idle();
+            reset.note = Some(note.clone());
+            reset.log.push(note);
+            *prog = reset;
+        }
+    }
+    /// Convert an operator-confirmed real-use failure into durable, hardware-derived field evidence.
+    /// The point is resolved from the current forged profile; callers cannot inject arbitrary values.
+    pub fn report_profile_unstable(
+        &self,
+        store: &SafeLoopStore,
+        profile_key: &str,
+    ) -> Result<PowerSweepProgress, String> {
+        let mut prog = self
+            .progress
+            .lock()
+            .map_err(|_| "Forge progress lock poisoned".to_string())?;
+        if prog.running {
+            return Err("cannot report a field failure while Forge is running".into());
+        }
+        let point = match profile_key {
+            "godforge" => prog.godforge,
+            "brokkrs" => prog.brokkrs,
+            "deep_calm" => prog.deep_calm,
+            _ => return Err(format!("unknown Forge profile '{profile_key}'")),
+        }
+        .ok_or_else(|| format!("Forge profile '{profile_key}' is unavailable"))?;
+        let mut record = store.load_record();
+        let gpu_key = current_gpu_key();
+        let (target_mhz, anchor_mv) = record_operator_field_failure(
+            &mut record,
+            &point,
+            prog.run_id.clone(),
+            gpu_key.clone(),
+        );
+        crate::gpu_undervolt::append_condemnation(
+            store.base_dir(),
+            nidavellir_core::condemnation::CondemnationSeverity::Rigid,
+            "operator-field-failure",
+            Some(gpu_key.clone()),
+            target_mhz,
+            anchor_mv,
+            prog.run_id.clone(),
+            "Operator confirmed repeated real-use instability".into(),
+        );
+        store
+            .save_record(&record)
+            .map_err(|e| format!("persist field instability: {e}"))?;
+
+        prog.profiles_qualified = false;
+        prog.phase = "field_rejected".into();
+        prog.note = Some(format!(
+            "Perfil {target_mhz} MHz target · {anchor_mv} mV VF condenado por falha repetida em uso real; conhecimento preservado para a próxima Forge."
+        ));
+        prog.log.push(format!(
+            "FIELD: {target_mhz} MHz @ {anchor_mv} mV confirmado instável pelo operador; perfil bloqueado e ponto salvo na blacklist durável."
+        ));
+        save_forge_state(&gpu_key, &prog);
+        Ok(prog.clone())
+    }
     /// Start the live F2 forge in `Standard` mode (the plain `StartPowerSweep` IPC).
     pub fn start(&self, store: SafeLoopStore) -> bool {
         self.start_with_mode(store, PowerSweepMode::Standard)
+    }
+
+    /// Start an EXPERIMENTAL clean run (`StartPowerSweepClean`): Standard dwell policy with a
+    /// fully organic search — no historical memory influences discovery (see [`ForgeLearning`]).
+    pub fn start_clean_run(&self, store: SafeLoopStore) -> bool {
+        self.start_with_options(store, PowerSweepMode::Standard, ForgeLearning::CleanRun)
     }
 }
 
@@ -394,12 +706,51 @@ impl PowerSweepHandle {
 /// fallback can never race a forge run (audit #2 — the boot flag alone has inter-step windows).
 pub(crate) static FORGE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static ACTIVE_FORGE_STOP: OnceLock<Mutex<Option<Weak<AtomicBool>>>> = OnceLock::new();
+
+fn active_forge_stop_slot() -> &'static Mutex<Option<Weak<AtomicBool>>> {
+    ACTIVE_FORGE_STOP.get_or_init(|| Mutex::new(None))
+}
+
+fn register_active_forge_stop(stop: &Arc<AtomicBool>) {
+    if let Ok(mut slot) = active_forge_stop_slot().lock() {
+        *slot = Some(Arc::downgrade(stop));
+    }
+}
+
+fn clear_active_forge_stop() {
+    if let Ok(mut slot) = active_forge_stop_slot().lock() {
+        *slot = None;
+    }
+}
+
+fn request_active_forge_stop() {
+    if let Ok(slot) = active_forge_stop_slot().lock() {
+        if let Some(stop) = slot.as_ref().and_then(Weak::upgrade) {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+}
 
 impl PowerSweepHandle {
     /// Start the live multi-clock forge in a specific button `mode` (Fast / Standard / Long). All
     /// modes run the same complete physical frontier and fail-closed motor; only dwell duration and
     /// independent validation count vary.
     pub fn start_with_mode(&self, store: SafeLoopStore, mode: PowerSweepMode) -> bool {
+        self.start_with_options(store, mode, ForgeLearning::Persistent)
+    }
+
+    /// Full-option start: button `mode` (dwell policy) × [`ForgeLearning`] (memory policy).
+    pub fn start_with_options(
+        &self,
+        store: SafeLoopStore,
+        mode: PowerSweepMode,
+        learning: ForgeLearning,
+    ) -> bool {
+        if store.load_record().pending_forge_incident.is_some() {
+            warn!("F2 power sweep refused: interrupted Forge incident requires acknowledgement");
+            return false;
+        }
         if self.running.swap(true, Ordering::SeqCst) {
             return false;
         }
@@ -408,6 +759,7 @@ impl PowerSweepHandle {
         // re-apply while a forge run owns the GPU (the per-step boot flag has clear inter-step
         // windows a forge-induced TDR event can land in).
         FORGE_ACTIVE.store(true, Ordering::SeqCst);
+        register_active_forge_stop(&self.stop);
         let progress = Arc::clone(&self.progress);
         let stop = Arc::clone(&self.stop);
         let running = Arc::clone(&self.running);
@@ -417,14 +769,15 @@ impl PowerSweepHandle {
             // intact (Phase 3 decides its fate) but is no longer routed here.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 #[cfg(windows)]
-                measure_multiclock_undervolt_forge(&progress, &stop, &store, mode);
+                measure_multiclock_undervolt_forge(&progress, &stop, &store, mode, learning);
                 #[cfg(not(windows))]
                 {
-                    let _ = (&progress, &stop, &store, mode);
+                    let _ = (&progress, &stop, &store, mode, learning);
                 }
             }));
             if result.is_err() {
                 warn!("F2 power sweep worker panicked; marking Forge idle after fail-closed interruption");
+                let mut incident_progress = None;
                 if let Ok(mut prog) = progress.lock() {
                     prog.running = false;
                     prog.phase = "interrupted".into();
@@ -438,10 +791,17 @@ impl PowerSweepHandle {
                         "Forge interrompido por falha interna/TDR; reset manual recomendado antes de continuar."
                             .into(),
                     );
+                    save_forge_state(&current_gpu_key(), &prog);
+                    incident_progress = Some(prog.clone());
+                }
+                if let Some(prog) = incident_progress.as_ref() {
+                    #[cfg(windows)]
+                    record_runtime_forge_incident(&store, prog);
                 }
             }
             running.store(false, Ordering::SeqCst);
             FORGE_ACTIVE.store(false, Ordering::SeqCst);
+            clear_active_forge_stop();
         });
         true
     }
@@ -458,6 +818,93 @@ impl PowerSweepHandle {
 // not alter the IPC `PowerSweepProgress` type (the wrapper is service-internal).
 // ---------------------------------------------------------------------------
 
+/// Remove every GPU V/F blacklist region from the record (clean-run start). Operational descent
+/// knowledge and prior field entries stop influencing the organic search; rigid history remains
+/// durable in the condemnation ledger, and Safe Mode / crash counters / incidents / non-GPU
+/// entries are untouched. Pure + unit-tested.
+fn strip_gpu_vf_blacklist(record: &mut nidavellir_core::safe_loop::SafeLoopRecord) -> usize {
+    let before = record.blacklist.len();
+    record.blacklist.retain(|region| !region.center.axes.contains_key("gpu_freq_mhz"));
+    before - record.blacklist.len()
+}
+
+/// EXPERIMENTAL clean-run pre-flight: archive every pre-run learning input under
+/// `forge-archive/<run_id>/` so the search starts ORGANIC, then strip prior GPU V/F blacklist
+/// regions from `safe_loop.json` (snapshotted first). Best-effort per file; every action is
+/// logged into the run. The durable condemnation ledger is NEVER touched — clean runs ignore it
+/// by READING run-scoped, and writes keep flowing to it so production never loses hard failures.
+#[cfg(windows)]
+fn archive_pre_clean_run(store: &SafeLoopStore, run_id: &str) -> Vec<String> {
+    let base = store.base_dir().to_path_buf();
+    let archive = base.join("forge-archive").join(run_id);
+    let mut lines = vec![format!(
+        "CLEAN RUN experimental: busca 100% orgânica — memória pré-run arquivada em forge-archive\\{run_id}; ledger durável lido apenas no escopo desta run."
+    )];
+    if let Err(e) = std::fs::create_dir_all(&archive) {
+        lines.push(format!(
+            "CLEAN RUN: falha ao criar a pasta de arquivo ({e}) — arquivos pré-run permanecem no lugar."
+        ));
+        return lines;
+    }
+    for name in [nidavellir_core::f2_observation::F2_OBSERVATIONS_FILE, "forge_state.json"] {
+        let from = base.join(name);
+        if !from.exists() {
+            continue;
+        }
+        match std::fs::rename(&from, archive.join(format!("pre-{name}"))) {
+            Ok(()) => lines.push(format!("CLEAN RUN: {name} arquivado (pré-run).")),
+            Err(e) => lines.push(format!("CLEAN RUN: falha ao arquivar {name} ({e}).")),
+        }
+    }
+    let _ = std::fs::copy(store.record_path(), archive.join("pre-safe_loop.json"));
+    let mut record = store.load_record();
+    let removed = strip_gpu_vf_blacklist(&mut record);
+    if removed > 0 {
+        match store.save_record(&record) {
+            Ok(()) => lines.push(format!(
+                "CLEAN RUN: {removed} região(ões) GPU V/F removida(s) do blacklist operacional (snapshot em pre-safe_loop.json); Safe Mode, contadores de crash e incidentes preservados."
+            )),
+            Err(e) => lines.push(format!(
+                "CLEAN RUN: falha ao gravar safe_loop sem o blacklist antigo ({e})."
+            )),
+        }
+    } else {
+        lines.push("CLEAN RUN: blacklist operacional já não continha regiões GPU V/F.".into());
+    }
+    // Audit manifest: proves the clean-run pre-flight ran (and what it did) independently of the
+    // live log, whose bounded tail loses the run's opening lines on long runs.
+    let _ = std::fs::write(
+        archive.join("clean-run-manifest.txt"),
+        format!(
+            "run_id: {run_id}\nstarted: {}\n{}\n",
+            nidavellir_core::f2_observation::now_rfc3339(),
+            lines.join("\n")
+        ),
+    );
+    lines
+}
+
+/// Clean-run finalization: COPY the run's observations into the archive. The live file stays for
+/// UI/export; the NEXT clean run archives-and-clears it at start, so no clean run ever imports a
+/// prior one automatically (a production run started afterwards may inherit this organic
+/// evidence — that is real learning, by design).
+#[cfg(windows)]
+fn archive_clean_run_results(store: &SafeLoopStore, run_id: &str) -> Option<String> {
+    let base = store.base_dir().to_path_buf();
+    let from = base.join(nidavellir_core::f2_observation::F2_OBSERVATIONS_FILE);
+    if !from.exists() {
+        return None;
+    }
+    let archive = base.join("forge-archive").join(run_id);
+    let _ = std::fs::create_dir_all(&archive);
+    match std::fs::copy(&from, archive.join("run-f2_observations.jsonl")) {
+        Ok(_) => Some(format!(
+            "CLEAN RUN: observações desta run copiadas para forge-archive\\{run_id}; a próxima clean run começará orgânica novamente."
+        )),
+        Err(e) => Some(format!("CLEAN RUN: falha ao arquivar observações finais ({e}).")),
+    }
+}
+
 /// Bump when the persisted shape changes incompatibly; older files are ignored.
 const FORGE_STATE_SCHEMA: u32 = 1;
 /// Keep only the last N log lines in the snapshot (the live log can be long).
@@ -468,7 +915,7 @@ const FORGE_LIVE_LOG_TAIL: usize = 240;
 
 /// On-disk wrapper around a completed `PowerSweepProgress`, tagged with the GPU
 /// it was forged on and a schema version for forward-compatible rejection.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ForgeStateFile {
     schema_version: u32,
     gpu_key: String,
@@ -584,10 +1031,216 @@ fn save_forge_state(gpu_key: &str, prog: &PowerSweepProgress) {
     }
 }
 
+fn f2_profile_set_has_field_failure(
+    record: &nidavellir_core::safe_loop::SafeLoopRecord,
+    condemned: &nidavellir_core::condemnation::CondemnedPairs,
+    profiles: &[Option<PowerSweepPoint>],
+) -> bool {
+    profiles.iter().flatten().any(|point| {
+        let target_mhz = point.target_clock_mhz.unwrap_or(point.clock_mhz);
+        let anchor_mv = point
+            .vf_table_voltage_mv
+            .or(point.boundary_voltage_mv)
+            .unwrap_or(point.voltage_mv);
+        crate::gpu_undervolt::field_pair_blacklisted(record, target_mhz, anchor_mv)
+            || condemned.refuses(target_mhz, anchor_mv)
+    })
+}
+
+#[cfg(windows)]
+fn record_runtime_forge_incident(store: &SafeLoopStore, prog: &PowerSweepProgress) {
+    use nidavellir_core::safe_loop::{ForgeIncident, ForgeIncidentKind};
+
+    let mut record = store.load_record();
+    let incident = ForgeIncident::new(
+        ForgeIncidentKind::RuntimeFailure,
+        prog.run_id.clone(),
+        Some(current_gpu_key()),
+        prog.current_clock_mhz,
+        prog.current_voltage_mv,
+        "Forge worker failed before writing a terminal checkpoint; explicit acknowledgement required",
+    );
+    if record.record_forge_incident(incident) {
+        if let Err(e) = store.save_record(&record) {
+            warn!("failed to persist runtime Forge incident: {e}");
+        }
+    }
+}
+
+/// Reconcile a run whose durable checkpoint still said `running=true` when the service starts.
+/// This runs before Safe Loop consumes the boot flag, so an exact armed candidate is retained when
+/// available. Missing coordinates remain explicitly unattributed.
+#[cfg(windows)]
+pub fn reconcile_interrupted_forge(store: &SafeLoopStore) -> bool {
+    use nidavellir_core::safe_loop::{
+        ForgeIncident, ForgeIncidentKind, SUPERVISED_F2_FORGE_PHASE,
+    };
+
+    let Ok(json) = std::fs::read_to_string(forge_state_path()) else {
+        return false;
+    };
+    let Ok(mut file) = serde_json::from_str::<ForgeStateFile>(json.trim_start_matches('\u{feff}'))
+    else {
+        return false;
+    };
+    if file.schema_version != FORGE_STATE_SCHEMA || !file.progress.running {
+        return false;
+    }
+
+    let boot_flag = store.read_boot_flag();
+    let clean_shutdown = store.is_clean_shutdown_present();
+    let from_flag = |axis: &str| {
+        boot_flag
+            .as_ref()
+            .and_then(|flag| flag.intent.axes.get(axis))
+            .and_then(|value| u32::try_from(*value).ok())
+    };
+    let exact_candidate_crash = boot_flag
+        .as_ref()
+        .is_some_and(|flag| flag.phase == SUPERVISED_F2_FORGE_PHASE)
+        && !clean_shutdown;
+    let target_mhz = exact_candidate_crash.then(|| from_flag("gpu_freq_mhz")).flatten();
+    let anchor_mv = exact_candidate_crash.then(|| from_flag("gpu_vf_bin_mv")).flatten();
+    let kind = if exact_candidate_crash {
+        ForgeIncidentKind::CandidateCrash
+    } else {
+        ForgeIncidentKind::UnaccountedRestart
+    };
+    let message = if exact_candidate_crash {
+        match (target_mhz, anchor_mv) {
+            (Some(target), Some(anchor)) => format!(
+                "Forge restart reconciled while {target} MHz at {anchor} mV VF bin was armed; startup recovery owns blacklist attribution"
+            ),
+            _ => "Forge restart reconciled with an armed candidate, but its coordinates were incomplete"
+                .into(),
+        }
+    } else if clean_shutdown {
+        "Forge was interrupted by a graceful service/OS shutdown; operator acknowledgement is required before continuation"
+            .into()
+    } else {
+        "Forge ended without a terminal checkpoint or armed candidate; do not infer a failed point"
+            .into()
+    };
+
+    let mut record = store.load_record();
+    let incident = ForgeIncident::new(
+        kind,
+        file.progress.run_id.clone(),
+        Some(file.gpu_key.clone()),
+        target_mhz,
+        anchor_mv,
+        message.clone(),
+    );
+    let recorded = record.record_forge_incident(incident);
+    if recorded {
+        if let Err(e) = store.save_record(&record) {
+            warn!("failed to persist reconciled Forge incident: {e}");
+        }
+    }
+
+    file.progress.running = false;
+    file.progress.phase = "needs_attention".into();
+    file.progress.profiles_qualified = false;
+    file.progress.estimated_remaining_ms = None;
+    file.progress.estimated_total_upper_ms = None;
+    file.progress.note = Some(format!(
+        "Execução anterior interrompida: {message}. Revise e reconheça o incidente antes de continuar."
+    ));
+    save_forge_state(&file.gpu_key, &file.progress);
+    recorded
+}
+
+/// Event-Log handoff while Forge is still alive. The sentinel never resets hardware concurrently;
+/// it records the incident/blacklist evidence and requests the owning worker's cooperative stop.
+#[cfg(windows)]
+pub(crate) fn record_active_forge_tdr(store: &SafeLoopStore, event_timestamp: &str) -> bool {
+    use nidavellir_core::safe_loop::{
+        BlacklistRegion, ForgeIncident, ForgeIncidentKind, DEFAULT_BLACKLIST_RADIUS,
+        SUPERVISED_F2_FORGE_PHASE,
+    };
+
+    if !FORGE_ACTIVE.load(Ordering::SeqCst) {
+        return false;
+    }
+    request_active_forge_stop();
+
+    let file = std::fs::read_to_string(forge_state_path())
+        .ok()
+        .and_then(|json| {
+            serde_json::from_str::<ForgeStateFile>(json.trim_start_matches('\u{feff}')).ok()
+        });
+    let boot_flag = store.read_boot_flag();
+    let forge_boot_flag = boot_flag
+        .as_ref()
+        .filter(|flag| flag.phase == SUPERVISED_F2_FORGE_PHASE);
+    let from_flag = |axis: &str| {
+        forge_boot_flag
+            .and_then(|flag| flag.intent.axes.get(axis))
+            .and_then(|value| u32::try_from(*value).ok())
+    };
+    let target_mhz = from_flag("gpu_freq_mhz");
+    let anchor_mv = from_flag("gpu_vf_bin_mv");
+    let run_id = file.as_ref().and_then(|file| file.progress.run_id.clone());
+    let gpu_key = file
+        .as_ref()
+        .map(|file| file.gpu_key.clone())
+        .or_else(|| Some(current_gpu_key()));
+
+    let mut record = store.load_record();
+    if let Some(flag) = forge_boot_flag {
+        if !record.is_blacklisted(&flag.intent) {
+            record.blacklist.push(BlacklistRegion::around(
+                flag.intent.clone(),
+                DEFAULT_BLACKLIST_RADIUS,
+            ));
+        }
+        if let (Some(target), Some(anchor)) = (target_mhz, anchor_mv) {
+            crate::gpu_undervolt::append_condemnation(
+                store.base_dir(),
+                nidavellir_core::condemnation::CondemnationSeverity::Rigid,
+                nidavellir_core::condemnation::KIND_CANDIDATE_CRASH,
+                gpu_key.clone(),
+                target,
+                anchor,
+                run_id.clone(),
+                format!("Windows TDR at {event_timestamp} while the Forge candidate was armed"),
+            );
+        }
+    }
+    let kind = if forge_boot_flag.is_some() {
+        ForgeIncidentKind::CandidateCrash
+    } else {
+        ForgeIncidentKind::RuntimeFailure
+    };
+    let message = if forge_boot_flag.is_some() {
+        format!(
+            "Windows reported a TDR at {event_timestamp} while the persisted Forge candidate was armed; the exact intent was blacklisted"
+        )
+    } else {
+        format!(
+            "Windows reported a TDR at {event_timestamp} during Forge, outside an attributable candidate window; no point was inferred"
+        )
+    };
+    let recorded = record.record_forge_incident(ForgeIncident::new(
+        kind,
+        run_id,
+        gpu_key,
+        target_mhz,
+        anchor_mv,
+        message,
+    ));
+    if recorded {
+        if let Err(e) = store.save_record(&record) {
+            warn!("failed to persist active Forge TDR incident: {e}");
+        }
+    }
+    recorded
+}
+
 /// Write a rich, human-readable log of the current/last F2 forge run to a timestamped file under the
 /// data dir: run metadata, contract versions, published profiles, frontier summary, the live progress
-/// log, and EVERY recorded dwell (clock/voltage/power/temp/outcome/pattern). Read-only — reads the
-/// persisted observation store + the live progress; touches no hardware. Cross-platform (pure fs).
+/// log, reconciled incidents, and only the dwells belonging to this run/resume sequence. Read-only —
+/// reads persisted evidence + the live progress; touches no hardware. Cross-platform (pure fs).
 pub fn export_forge_log(
     prog: &PowerSweepProgress,
 ) -> Result<nidavellir_core::ipc::ForgeLogExport, String> {
@@ -597,7 +1250,35 @@ pub fn export_forge_log(
     let data_dir = nidavellir_core::safe_loop::default_data_dir();
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
     let generated = nidavellir_core::f2_observation::now_rfc3339();
-    let observations = F2ObservationStore::system().load_all();
+    let all_observations = F2ObservationStore::system().load_all();
+    let mut run_ids = prog.run_sequence.clone();
+    if run_ids.is_empty() {
+        run_ids.extend(prog.run_id.clone());
+    }
+    let mut seen_run_ids = std::collections::HashSet::new();
+    run_ids.retain(|run_id| seen_run_ids.insert(run_id.clone()));
+    let observations: Vec<_> = if run_ids.is_empty() {
+        // Legacy checkpoints did not persist a run identity. Keep them exportable, but label the
+        // scope honestly instead of claiming the full store is one run.
+        all_observations
+    } else {
+        all_observations
+            .into_iter()
+            .filter(|observation| run_ids.iter().any(|run_id| run_id == &observation.run_id))
+            .collect()
+    };
+    let incidents: Vec<_> = nidavellir_core::safe_loop::SafeLoopStore::system()
+        .load_record()
+        .forge_incidents
+        .into_iter()
+        .filter(|incident| {
+            run_ids.is_empty()
+                || incident
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|run_id| run_ids.iter().any(|known| known == run_id))
+        })
+        .collect();
 
     let fmt_profile = |label: &str, p: &Option<PowerSweepPoint>| -> String {
         match p {
@@ -620,9 +1301,21 @@ pub fn export_forge_log(
     out.push_str("===============================================================\n");
     out.push_str(&format!("generated    : {generated}\n"));
     out.push_str(&format!(
+        "run scope    : {}\n",
+        if run_ids.is_empty() {
+            "legacy checkpoint (run identity unavailable)".into()
+        } else {
+            run_ids.join(" -> ")
+        }
+    ));
+    out.push_str(&format!(
         "contracts    : discovery v{F2_DISCOVERY_CONTRACT_VERSION} - qualification v{F2_QUALIFICATION_CONTRACT_VERSION}\n"
     ));
     out.push_str(&format!("mode         : {}\n", prog.mode.as_deref().unwrap_or("-")));
+    out.push_str(&format!(
+        "learning     : {}\n",
+        prog.learning.as_deref().unwrap_or("persistent (legacy)")
+    ));
     out.push_str(&format!("phase        : {}\n", prog.phase));
     out.push_str(&format!("profiles_ok  : {}\n", prog.profiles_qualified));
     out.push_str(&format!("power cap    : {:.0} W\n", prog.power_limit_w));
@@ -640,6 +1333,30 @@ pub fn export_forge_log(
     out.push_str(&fmt_profile("Godforge", &prog.godforge));
     out.push_str(&fmt_profile("Brokkr's Best", &prog.brokkrs));
     out.push_str(&fmt_profile("Deep Calm", &prog.deep_calm));
+
+    out.push_str(&format!(
+        "\n-- Reconciled incidents ({} event(s)) --------------------------\n",
+        incidents.len()
+    ));
+    if incidents.is_empty() {
+        out.push_str("none recorded for this run scope\n");
+    } else {
+        for incident in &incidents {
+            let point = match (incident.target_mhz, incident.anchor_mv) {
+                (Some(target), Some(anchor)) => format!("{target}@{anchor}"),
+                _ => "unattributed".into(),
+            };
+            out.push_str(&format!(
+                "{} | {:?} | run {} | {} | acknowledged={} | {}\n",
+                incident.detected_at,
+                incident.kind,
+                incident.run_id.as_deref().unwrap_or("-"),
+                point,
+                incident.acknowledged,
+                incident.message
+            ));
+        }
+    }
 
     out.push_str("\n-- Live progress log -------------------------------------------\n");
     for line in &prog.log {
@@ -685,16 +1402,28 @@ pub fn export_forge_log(
     let path = data_dir.join(format!("nidavellir-forge-log-{stamp}.txt"));
     std::fs::write(&path, &out).map_err(|e| format!("write log: {e}"))?;
     let bytes = out.len() as u64;
-    let raw = data_dir.join(nidavellir_core::f2_observation::F2_OBSERVATIONS_FILE);
+    let raw = data_dir.join(format!("nidavellir-forge-observations-{stamp}.jsonl"));
+    let mut raw_jsonl = String::new();
+    for observation in &observations {
+        let line = serde_json::to_string(observation)
+            .map_err(|e| format!("serialize scoped observation: {e}"))?;
+        raw_jsonl.push_str(&line);
+        raw_jsonl.push('\n');
+    }
+    std::fs::write(&raw, raw_jsonl).map_err(|e| format!("write scoped observations: {e}"))?;
 
     Ok(nidavellir_core::ipc::ForgeLogExport {
         path: path.display().to_string(),
         raw_observations_path: raw.display().to_string(),
         bytes,
         observation_count: observations.len(),
+        run_ids: run_ids.clone(),
+        incident_count: incidents.len(),
         note: format!(
-            "Log salvo: {} dwell(s), {:.0} KB",
+            "Log salvo: {} run(s), {} dwell(s), {} incidente(s), {:.0} KB",
+            run_ids.len(),
             observations.len(),
+            incidents.len(),
             bytes as f64 / 1024.0
         ),
     })
@@ -718,6 +1447,29 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
     match decode_forge_state(&json, gpu_key) {
         ForgeStateLoad::Loaded(prog) => {
             let mut prog = *prog;
+            let safe_record = nidavellir_core::safe_loop::SafeLoopStore::system().load_record();
+            let condemned =
+                nidavellir_core::condemnation::CondemnationLedger::system().condemned_pairs(gpu_key);
+            let profiles = [prog.godforge, prog.brokkrs, prog.deep_calm];
+            if prog.is_undervolt
+                && prog.profiles_qualified
+                && f2_profile_set_has_field_failure(&safe_record, &condemned, &profiles)
+            {
+                prog.profiles_qualified = false;
+                prog.phase = "field_rejected".into();
+                prog.note = Some(
+                    "Um perfil restaurado foi condenado por evidência durável de uso real; execute Forge novamente para ressintetizar acima da fronteira de campo."
+                        .into(),
+                );
+            }
+            if safe_record.pending_forge_incident.is_some() {
+                prog.profiles_qualified = false;
+                prog.phase = "needs_attention".into();
+                prog.note = Some(
+                    "Uma execução Forge interrompida requer revisão e reconhecimento explícito antes de continuar."
+                        .into(),
+                );
+            }
             if prog.is_undervolt && prog.profiles_qualified {
                 let observations =
                     nidavellir_core::f2_observation::F2ObservationStore::system().load_all();
@@ -769,7 +1521,7 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
 }
 
 #[cfg(windows)]
-fn current_gpu_key() -> String {
+pub(crate) fn current_gpu_key() -> String {
     if let Some(gpu) = nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()
         .into_iter()
         .next()
@@ -1342,18 +2094,42 @@ fn worst_quality(a: DwellQuality, b: DwellQuality) -> DwellQuality {
 enum RenderStressPurpose {
     PowerCharacterization,
     VfQualification(VfQualifierPattern, RenderGoldens),
+    Dx11Qualification(nidavellir_gpu_stress::Dx11Golden),
+}
+
+#[cfg(windows)]
+enum RenderSession {
+    Wgpu(nidavellir_gpu_stress::GpuCtx),
+    Dx11(nidavellir_gpu_stress::Dx11Qualifier),
 }
 
 #[cfg(windows)]
 fn f2_evidence_provenance(
-    ctx: &nidavellir_gpu_stress::GpuCtx,
+    session: &RenderSession,
     purpose: RenderStressPurpose,
 ) -> F2EvidenceProvenance {
     fn present(value: String) -> Option<String> {
         (!value.trim().is_empty()).then_some(value)
     }
 
-    let adapter = ctx.adapter_identity();
+    let (adapter_name, render_backend, driver_name, driver_info) = match session {
+        RenderSession::Wgpu(ctx) => {
+            let adapter = ctx.adapter_identity();
+            (adapter.name, adapter.backend, adapter.driver, adapter.driver_info)
+        }
+        RenderSession::Dx11(ctx) => {
+            let adapter = ctx.adapter_identity();
+            (
+                adapter.name,
+                "dx11".into(),
+                "native-direct3d11".into(),
+                format!(
+                    "vendor={:04x};device={:04x};luid={}",
+                    adapter.vendor_id, adapter.device_id, adapter.adapter_luid
+                ),
+            )
+        }
+    };
     let (workload_fingerprint, checksum_method, golden_config) = match purpose {
         RenderStressPurpose::PowerCharacterization => (
             "power-characterization-v5/power-render".to_owned(),
@@ -1375,16 +2151,24 @@ fn f2_evidence_provenance(
                 goldens.boost_frame_reference_us,
             ),
         ),
+        RenderStressPurpose::Dx11Qualification(golden) => (
+            "dx11-game-v1/offscreen-rgba8-fullscreen-alu".to_owned(),
+            "stock-golden-fnv1a32/readback-every-24-frames".to_owned(),
+            format!(
+                "source=stock;capture_ms={V8_GOLDEN_SAMPLE_MS};checksum={};adapter_luid={};frame_reference_us={}",
+                golden.checksum, golden.adapter_luid, golden.frame_reference_us
+            ),
+        ),
     };
     let revision = env!("NIDAVELLIR_BUILD_REVISION");
     F2EvidenceProvenance {
         build_version: Some(env!("CARGO_PKG_VERSION").into()),
         build_revision: (revision != "unknown").then(|| revision.to_owned()),
         workload_fingerprint: Some(workload_fingerprint),
-        render_backend: present(adapter.backend),
-        adapter_name: present(adapter.name),
-        driver_name: present(adapter.driver),
-        driver_info: present(adapter.driver_info),
+        render_backend: present(render_backend),
+        adapter_name: present(adapter_name),
+        driver_name: present(driver_name),
+        driver_info: present(driver_info),
         checksum_method: Some(checksum_method),
         golden_config: Some(golden_config),
     }
@@ -1662,6 +2446,112 @@ fn qualification_coverage_from_run(
 }
 
 #[cfg(windows)]
+fn dx11_qualification_coverage_from_run(
+    result: StabilityResult,
+    report: Option<&nidavellir_gpu_stress::Dx11QualificationResult>,
+    samples: &[PhaseSample],
+    target_mhz: Option<u32>,
+) -> F2QualificationCoverage {
+    let phase_samples: Vec<_> = samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.4 == VfQualifierPhase::CompositeGameLoad.code())
+        .collect();
+    let clocks: Vec<u32> = phase_samples.iter().map(|sample| sample.0).collect();
+    let powers: Vec<f32> = phase_samples.iter().map(|sample| sample.1).collect();
+    let temperatures: Vec<f32> = phase_samples.iter().filter_map(|sample| sample.3).collect();
+    let target_residency_frac = target_mhz.and_then(|target| {
+        let floor = target.saturating_sub(F2_QUALIFIER_TARGET_TOL_MHZ);
+        (!clocks.is_empty()).then(|| {
+            clocks.iter().filter(|clock| **clock >= floor).count() as f32 / clocks.len() as f32
+        })
+    });
+    let checksum_count = report.map_or(0, |report| report.checks);
+    let (verdict, reason) = if let Some(reason) = report.and_then(|report| report.inconclusive_reason.clone()) {
+        (F2QualificationVerdict::Inconclusive, Some(reason))
+    } else if !result.is_stable() {
+        (F2QualificationVerdict::Fail, Some("dx11_workload_failed".into()))
+    } else if report.is_none() {
+        (F2QualificationVerdict::Inconclusive, Some("dx11_report_missing".into()))
+    } else if checksum_count == 0 {
+        (F2QualificationVerdict::Inconclusive, Some("checksum_coverage_low".into()))
+    } else if phase_samples.is_empty() {
+        (F2QualificationVerdict::Inconclusive, Some("telemetry_missing".into()))
+    } else if target_residency_frac.is_some_and(|fraction| fraction < 0.35) {
+        (F2QualificationVerdict::Inconclusive, Some("target_residency_low".into()))
+    } else {
+        (F2QualificationVerdict::Pass, None)
+    };
+    let coverage_status = match verdict {
+        F2QualificationVerdict::Pass => "pass",
+        F2QualificationVerdict::Fail => "fail",
+        F2QualificationVerdict::Inconclusive => "inconclusive",
+    };
+    let frame_count = report.map_or(0, |report| report.frames);
+    let duration_ms = report.map_or(0, |report| report.elapsed_ms);
+    F2QualificationCoverage {
+        strength: F2QualificationStrength::Fsgl4,
+        pattern: Some(F2QualificationPattern::Dx11Game),
+        pass_index: 0,
+        verdict,
+        phases_completed: u32::from(verdict == F2QualificationVerdict::Pass),
+        phases_expected: 1,
+        checksum_count,
+        sample_count: phase_samples.len().try_into().unwrap_or(u32::MAX),
+        compute_check_count: 0,
+        target_residency_frac,
+        heavy_light_power_delta_w: None,
+        failure_phase: (!result.is_stable()).then(|| "dx11-game".into()),
+        retry_count: 0,
+        reason,
+        phase_metrics: vec![F2QualificationPhaseMetric {
+            phase_name: "dx11-game".into(),
+            phase_pattern: "native-dx11".into(),
+            duration_ms,
+            frame_count,
+            checksum_count,
+            compute_check_count: 0,
+            clock_avg: (!clocks.is_empty())
+                .then(|| clocks.iter().map(|clock| *clock as f32).sum::<f32>() / clocks.len() as f32),
+            clock_p5: pct_u32(clocks.clone(), 0.05),
+            clock_p50: pct_u32(clocks.clone(), 0.50),
+            clock_p95: pct_u32(clocks, 0.95),
+            target_residency_pct: target_residency_frac.map(|fraction| fraction * 100.0),
+            power_avg: avg_f32(&powers),
+            power_p95: pct_f32(powers, 0.95),
+            power_capped_fraction: (!phase_samples.is_empty()).then(|| {
+                phase_samples.iter().filter(|sample| sample.2).count() as f32
+                    / phase_samples.len() as f32
+            }),
+            temperature_avg: avg_f32(&temperatures),
+            temperature_max: pct_f32(temperatures, 1.0),
+            coverage_status: coverage_status.into(),
+        }],
+    }
+}
+
+#[cfg(windows)]
+fn dx11_inconclusive_coverage(reason: String) -> F2QualificationCoverage {
+    F2QualificationCoverage {
+        strength: F2QualificationStrength::Fsgl4,
+        pattern: Some(F2QualificationPattern::Dx11Game),
+        pass_index: 0,
+        verdict: F2QualificationVerdict::Inconclusive,
+        phases_completed: 0,
+        phases_expected: 1,
+        checksum_count: 0,
+        sample_count: 0,
+        compute_check_count: 0,
+        target_residency_frac: None,
+        heavy_light_power_delta_w: None,
+        failure_phase: None,
+        retry_count: 0,
+        reason: Some(reason),
+        phase_metrics: Vec::new(),
+    }
+}
+
+#[cfg(windows)]
 fn load_and_measure(ms: u64) -> Measured {
     load_and_measure_for(
         ms,
@@ -1887,6 +2777,9 @@ fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
         stream: stream.0,
         stream_frame_reference_ms: stream.1,
         boost_frame_reference_us: boost.1,
+        dx11: nidavellir_gpu_stress::Dx11Qualifier::new()
+            .and_then(|ctx| ctx.capture_golden(V8_GOLDEN_SAMPLE_MS))
+            .map_err(|e| format!("DX11 golden: {e}"))?,
     })
 }
 
@@ -1904,11 +2797,24 @@ fn load_and_measure_for(
     // heavy render is issued on the SAME GpuCtx — so we create + drop a context per
     // dwell. The clock offset is applied via NVAPI on the hardware, independent of
     // the wgpu device, so a fresh context still measures the applied operating point.
-    let ctx = match nidavellir_gpu_stress::GpuCtx::new() {
-        Ok(c) => c,
+    let session = match purpose {
+        RenderStressPurpose::Dx11Qualification(_) => {
+            nidavellir_gpu_stress::Dx11Qualifier::new().map(RenderSession::Dx11)
+        }
+        _ => nidavellir_gpu_stress::GpuCtx::new().map(RenderSession::Wgpu),
+    };
+    let session = match session {
+        Ok(session) => session,
+        Err(error) if matches!(purpose, RenderStressPurpose::Dx11Qualification(_)) => {
+            let mut measured = Measured::degenerate(StabilityResult::Stable, 0);
+            measured.qualification_coverage = Some(dx11_inconclusive_coverage(format!(
+                "dx11_init_failed: {error}"
+            )));
+            return measured;
+        }
         Err(_) => return Measured::degenerate(StabilityResult::Crash, 0),
     };
-    let evidence_provenance = Some(f2_evidence_provenance(&ctx, purpose));
+    let evidence_provenance = Some(f2_evidence_provenance(&session, purpose));
     let sampler_stop = Arc::new(AtomicBool::new(false));
     // Collect raw samples in the sampler thread for precise stats (mean/max/std + the
     // richer min/p5/temperature stats). Tuple: (clock_mhz, power_w, capped, temp_c, qualifier_phase).
@@ -1942,7 +2848,7 @@ fn load_and_measure_for(
                     last_valid_sample = std::time::Instant::now();
                     // Discovery discards ramp-up for steady-state power. Qualification keeps the
                     // opening/transition samples because the phase changes are the workload.
-                    if matches!(purpose, RenderStressPurpose::VfQualification(_, _))
+                    if !matches!(purpose, RenderStressPurpose::PowerCharacterization)
                         || t0.elapsed().as_millis() >= RAMP_DISCARD_MS
                     {
                         if let Ok(mut v) = smp.lock() {
@@ -1995,34 +2901,43 @@ fn load_and_measure_for(
     // pin / voltage lock), so the card stays power-managed and throttles to fit the
     // cap instead of TDRing — measuring the real power-limited regime the undervolt
     // actually helps in.
-    let render = catch_unwind(AssertUnwindSafe(|| match purpose {
-        RenderStressPurpose::PowerCharacterization => match cancel {
-            Some(token) => ctx.run_render_stress_with_cancel(ms, token),
-            None => ctx.run_render_stress(ms),
-        },
-        RenderStressPurpose::VfQualification(pattern, goldens) => {
-            ctx.run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel(
+    let render = catch_unwind(AssertUnwindSafe(|| match (&session, purpose) {
+        (RenderSession::Wgpu(ctx), RenderStressPurpose::PowerCharacterization) => {
+            let run = match cancel {
+                Some(token) => ctx.run_render_stress_with_cancel(ms, token),
+                None => ctx.run_render_stress(ms),
+            };
+            (run.result, run.phase_reports, run.frames, run.fps, None)
+        }
+        (RenderSession::Wgpu(ctx), RenderStressPurpose::VfQualification(pattern, goldens)) => {
+            let run = ctx.run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel(
                 ms,
                 phase_state.as_ref(),
                 pattern,
                 Some(goldens),
                 cancel,
-            )
-        }
-    }));
-    let (res, phase_reports, render_frames, render_fps) = match render {
-        Ok(r) => {
-            if let Some(phase) = r.failure_phase {
+            );
+            if let Some(phase) = run.failure_phase {
                 warn!("VF qualifier failed during phase {}", phase.label());
             }
-            (
-                r.result,
-                r.phase_reports,
-                Some(r.frames),
-                (r.fps.is_finite() && r.fps >= 0.0).then_some(r.fps),
-            )
+            (run.result, run.phase_reports, run.frames, run.fps, None)
         }
-        Err(_) => (StabilityResult::Crash, Vec::new(), None, None),
+        (RenderSession::Dx11(ctx), RenderStressPurpose::Dx11Qualification(golden)) => {
+            phase_state.store(VfQualifierPhase::CompositeGameLoad.code(), Ordering::SeqCst);
+            let run = ctx.run_with_golden(ms, golden, cancel);
+            (run.result, Vec::new(), run.frames, run.fps, Some(run))
+        }
+        _ => unreachable!("render session must match its purpose"),
+    }));
+    let (res, phase_reports, render_frames, render_fps, dx11_report) = match render {
+        Ok((result, reports, frames, fps, dx11_report)) => (
+            result,
+            reports,
+            Some(frames),
+            (fps.is_finite() && fps >= 0.0).then_some(fps),
+            dx11_report,
+        ),
+        Err(_) => (StabilityResult::Crash, Vec::new(), None, None, None),
     };
     let cancelled = cancel.is_some_and(|token| token.load(Ordering::SeqCst));
     sampler_stop.store(true, Ordering::SeqCst);
@@ -2036,6 +2951,12 @@ fn load_and_measure_for(
         RenderStressPurpose::VfQualification(pattern, _) => {
             Some(qualification_coverage_from_run(res, &phase_reports, &v, target_mhz, pattern))
         }
+        RenderStressPurpose::Dx11Qualification(_) => Some(dx11_qualification_coverage_from_run(
+            res,
+            dx11_report.as_ref(),
+            &v,
+            target_mhz,
+        )),
         RenderStressPurpose::PowerCharacterization => None,
     };
     let volt_samples = volts.lock().map(|g| g.clone()).unwrap_or_default();
@@ -4597,6 +5518,22 @@ pub(crate) fn single_qualifier_dwell_with_cancel(
 }
 
 #[cfg(windows)]
+pub(crate) fn single_dx11_qualifier_dwell_with_cancel(
+    dwell_ms: u64,
+    target_mhz: u32,
+    golden: nidavellir_gpu_stress::Dx11Golden,
+    cancel: Option<&AtomicBool>,
+) -> SingleDwell {
+    let m = load_and_measure_for(
+        dwell_ms,
+        RenderStressPurpose::Dx11Qualification(golden),
+        Some(target_mhz),
+        cancel,
+    );
+    single_dwell_from_measured(m)
+}
+
+#[cfg(windows)]
 fn single_dwell_from_measured(m: Measured) -> SingleDwell {
     SingleDwell {
         cancelled: m.cancelled,
@@ -5764,6 +6701,7 @@ fn f2_apply_pair_dwell_ladder_ms() -> Vec<u64> {
         F2_APPLY_QUALIFICATION_DWELL_MS;
         nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len()
     ];
+    ladder.push(crate::gpu_undervolt::F2_DX11_QUALIFICATION_DWELL_MS);
     ladder.push(crate::gpu_undervolt::F2_TRANSITION_SHOCK_DWELL_MS);
     ladder.push(crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS);
     ladder
@@ -5782,7 +6720,7 @@ fn f2_apply_pair_upper_ms() -> u64 {
 #[cfg(windows)]
 fn f2_apply_upper_estimate_ms(pair_count: usize, policy: F2ForgeModePolicy) -> u64 {
     // Fast (no qualification) skips exact-Apply entirely. Otherwise every pair runs the COMPLETE
-    // gate ladder — the 3 required patterns + TransitionShock + Endurance — so the ETA reflects
+    // gate ladder — required patterns + native DX11 + TransitionShock + Endurance — so the ETA reflects
     // the real deployment gate, not just the 5-min patterns.
     if f2_required_qualification_passes(policy) == 0 {
         return 0;
@@ -5948,6 +6886,7 @@ fn measure_multiclock_undervolt_forge(
     stop: &Arc<AtomicBool>,
     store: &SafeLoopStore,
     mode: PowerSweepMode,
+    learning: ForgeLearning,
 ) {
     use std::collections::{HashMap, HashSet};
     use std::time::Instant;
@@ -5959,16 +6898,46 @@ fn measure_multiclock_undervolt_forge(
 
     let started = Instant::now();
     info!("F2 undervolt forge starting (anchored min-stable-voltage per clock) — mode {}", mode.label());
+    // Minted BEFORE any learning file is read: the clean-run archive step is keyed by the run id
+    // and must complete before anything (ETA, predictions, warm start) can observe pre-run
+    // evidence.
+    let run_id = new_run_id("f2-forge");
+    let organic_ledger = learning == ForgeLearning::CleanRun;
+    let clean_run_lines = if organic_ledger {
+        archive_pre_clean_run(store, &run_id)
+    } else {
+        Vec::new()
+    };
     let previous = progress.lock().map(|g| g.clone()).unwrap_or_default();
+    // A CLEAN run is organic end-to-end: no resumed run sequence and no carried points/profiles.
+    let mut resumed_run_sequence = if !organic_ledger && previous.phase == "interrupted" {
+        previous.run_sequence.clone()
+    } else {
+        Vec::new()
+    };
+    if !organic_ledger
+        && previous.phase == "interrupted"
+        && resumed_run_sequence.is_empty()
+        && previous.run_id.is_some()
+    {
+        if let Some(run_id) = previous.run_id.clone() {
+            resumed_run_sequence.push(run_id);
+        }
+    }
     let mut prog = idle();
-    // Keep the last completed profiles available while a new frontier is learned. A partial run may
-    // replace its live/checkpoint view, but must never erase a previously usable recommendation.
-    prog.points = previous.points;
-    prog.recommended = previous.recommended;
-    prog.godforge = previous.godforge;
-    prog.brokkrs = previous.brokkrs;
-    prog.deep_calm = previous.deep_calm;
-    prog.power_bound_collapse = previous.power_bound_collapse;
+    if !organic_ledger {
+        // Keep the last completed profiles available while a new frontier is learned. A partial run
+        // may replace its live/checkpoint view, but must never erase a previously usable
+        // recommendation.
+        prog.points = previous.points;
+        prog.recommended = previous.recommended;
+        prog.godforge = previous.godforge;
+        prog.brokkrs = previous.brokkrs;
+        prog.deep_calm = previous.deep_calm;
+        prog.power_bound_collapse = previous.power_bound_collapse;
+    }
+    prog.learning = Some(if organic_ledger { "clean_run" } else { "persistent" }.to_string());
+    prog.log.extend(clean_run_lines);
     // A new hardware run may discover evidence that invalidates an older boundary. Keep the prior
     // recommendations visible, but fail closed until this run finishes a complete qualification.
     prog.profiles_qualified = false;
@@ -6131,11 +7100,11 @@ fn measure_multiclock_undervolt_forge(
     let qualification_needs_goldens =
         mode_policy.qualification_passes > 0 || mode_policy.final_gate_passes > 0;
     let render_goldens = if qualification_needs_goldens {
-        prog.log.push("Qualificação v8: capturando golden stock para power/boost/texture-ROP/frame-cadence/geometry…".into());
+        prog.log.push("Qualificação v17: capturando goldens stock wgpu + Direct3D 11 no adaptador NVIDIA…".into());
         set(progress, prog.clone());
         match capture_fsgl3_render_goldens() {
             Ok(goldens) => {
-                prog.log.push("Qualificação v8: golden stock capturado; os quatro padrões podem começar.".into());
+                prog.log.push("Qualificação v17: goldens stock wgpu/DX11 capturados; descida e exact-Apply podem começar.".into());
                 set(progress, prog.clone());
                 Some(goldens)
             }
@@ -6144,10 +7113,10 @@ fn measure_multiclock_undervolt_forge(
                 prog.running = false;
                 prog.phase = "incomplete".into();
                 prog.note = Some(format!(
-                    "Forja F2 abortada antes da qualificação v8 — stock não produziu golden determinístico: {e}. GPU no stock, nada aplicado."
+                    "Forja F2 abortada antes da qualificação v17 — stock não produziu golden determinístico wgpu/DX11: {e}. GPU no stock, nada aplicado."
                 ));
                 set(progress, prog);
-                warn!("f2-forge: v8 golden capture failed: {e}");
+                warn!("f2-forge: v17 golden capture failed: {e}");
                 return;
             }
         }
@@ -6285,8 +7254,13 @@ fn measure_multiclock_undervolt_forge(
     warn!("f2-forge: CONFIRMED — supervised hardware run begins (anchored undervolt per clock; can TDR/reboot).");
 
     // ── Complete real-clock discovery. Cmax is the first target that actually sustains under load.
+    resumed_run_sequence.push(run_id.clone());
+    prog.run_id = Some(run_id.clone());
+    prog.run_sequence = resumed_run_sequence;
     let obs_store = F2ObservationStore::system();
-    let run_id = new_run_id("f2-forge");
+    // This is the run-wide crash marker. It is written before the first candidate and refreshed at
+    // every phase transition; a surviving `running=true` is reconciled on the next service start.
+    save_forge_state(&gpu_key, &prog);
     let power_limit = (cap > 0.0).then_some(cap);
     let mut cmax: Option<u32> = None;
     let mut forge_complete = false;
@@ -6392,9 +7366,7 @@ fn measure_multiclock_undervolt_forge(
                     Some(u64::from(remaining).saturating_mul(per_step_ms));
                 prog.log.push(event.line);
                 set(progress, prog.clone());
-                if event.outcome.is_some() {
-                    save_forge_state(&gpu_key, &prog);
-                }
+                save_forge_state(&gpu_key, &prog);
             };
         let attempted_start_mv = next_clock_start_mv;
         let mut summary = crate::gpu_undervolt::run_confirmed_f2_clock_discovery(
@@ -6402,6 +7374,7 @@ fn measure_multiclock_undervolt_forge(
             &obs_store,
             &run_id,
             &gpu_key,
+            organic_ledger,
             &f2_inputs.sane_base_curve,
             &f2_inputs.limits,
             target,
@@ -6435,6 +7408,7 @@ fn measure_multiclock_undervolt_forge(
                         &obs_store,
                         &run_id,
                         &gpu_key,
+                        organic_ledger,
                         &f2_inputs.sane_base_curve,
                         &f2_inputs.limits,
                         target,
@@ -6482,6 +7456,7 @@ fn measure_multiclock_undervolt_forge(
                 &obs_store,
                 &run_id,
                 &gpu_key,
+                organic_ledger,
                 &f2_inputs.sane_base_curve,
                 &f2_inputs.limits,
                 target,
@@ -6685,6 +7660,7 @@ fn measure_multiclock_undervolt_forge(
                 &obs_store,
                 &run_id,
                 &gpu_key,
+                organic_ledger,
                 &f2_inputs.sane_base_curve,
                 &f2_inputs.limits,
                 missing.target_mhz,
@@ -6786,6 +7762,28 @@ fn measure_multiclock_undervolt_forge(
                     }
                 }
             }
+            // P1 vertical repair (2026-07-16): a gate failure at the margin pair condemns the
+            // BIN (quarantined in the durable ledger), never the clock — the clock climbs the
+            // real VF curve, bounded per run by MAX_APPLY_REPAIRS_PER_CLOCK and by the
+            // PUBLICATION power ceiling. The condemned view is loaded once: this run only ever
+            // re-selects pairs it has not itself excluded.
+            let mut repair_attempts: std::collections::HashMap<u32, u32> =
+                std::collections::HashMap::new();
+            let condemned = {
+                let ledger = nidavellir_core::condemnation::CondemnationLedger::new(
+                    store.base_dir(),
+                );
+                if organic_ledger {
+                    // Clean run: only condemnations THIS run produced steer selection/repair.
+                    nidavellir_core::condemnation::condemned_pairs_for_run(
+                        &ledger.load_all(),
+                        &gpu_key,
+                        &run_id,
+                    )
+                } else {
+                    ledger.condemned_pairs(&gpu_key)
+                }
+            };
             let mut final_profiles = None;
             loop {
                 let eligible = classified
@@ -6882,13 +7880,47 @@ fn measure_multiclock_undervolt_forge(
                         continue;
                     }
 
+                    // Dominance pre-gate (2026-07-16): never spend a 25-40 min ladder on a
+                    // candidate an already gate-APPROVED point dominates (≥ sustained clock,
+                    // ≤ selection power). Approval means the full exact-Apply gate under the
+                    // current contract — 60 s descent evidence never vetoes a candidate.
+                    if let Some((dom_clock, dom_mv)) =
+                        f2_approved_dominator(&selected_point, &classified)
+                    {
+                        excluded_apply_pairs.insert(key);
+                        prog.log.push(format!(
+                            "FORGE: candidato {} MHz @ {} mV dominado por {} MHz @ {} mV já aprovado no gate — excluído sem gastar o gate. Ressintetizando.",
+                            key.0, key.1, dom_clock, dom_mv
+                        ));
+                        changed = true;
+                        break;
+                    }
+
+                    // Quarantine re-proof (2026-07-16): a pair the durable ledger quarantined
+                    // under the current-or-stronger contract needs TWO independent full-gate
+                    // passes before publishing — one stochastic pass proved insufficient
+                    // (1890@900 failed Endurance on 2026-07-10 and passed a single ladder on
+                    // 2026-07-16 after the operational blacklist was reset).
+                    let required_passes = condemned.required_apply_passes(
+                        key.0,
+                        key.1,
+                        nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
+                    );
+                    if required_passes > 1 {
+                        prog.log.push(format!(
+                            "FORGE: par {} MHz @ {} mV em quarentena (falha de gate anterior no ledger) — prova dupla exigida: {required_passes} passagens completas do gate.",
+                            key.0, key.1
+                        ));
+                    }
+
                     prog.phase = "apply-qualify".into();
                     prog.total_steps_estimate = prog.total_steps_estimate.saturating_add(
                         u32::try_from(f2_apply_pair_dwell_ladder_ms().len()).unwrap_or(u32::MAX),
                     );
                     prog.log.push(format!(
-                        "Qualificação Apply exato: {} MHz target @ {} mV VF — v8 Texture + Transitions + Memory (5 min cada) + TransitionShock ({} min) + Endurance ({} min).",
+                        "Qualificação Apply exato: {} MHz target @ {} mV VF — Texture (5 min) + DX11 nativo ({} min) + TransitionShock ({} min) + Endurance ({} min).",
                         key.0, key.1,
+                        crate::gpu_undervolt::F2_DX11_QUALIFICATION_DWELL_MS / 60_000,
                         crate::gpu_undervolt::F2_TRANSITION_SHOCK_DWELL_MS / 60_000,
                         crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS / 60_000
                     ));
@@ -6935,12 +7967,13 @@ fn measure_multiclock_undervolt_forge(
                                 save_forge_state(&gpu_key, &prog);
                             }
                         };
-                    let summary =
+                    let mut summary =
                         crate::gpu_undervolt::run_confirmed_f2_apply_qualification(
                             store,
                             &obs_store,
                             &run_id,
                             &gpu_key,
+                            organic_ledger,
                             &f2_inputs.sane_base_curve,
                             &f2_inputs.limits,
                             key.0,
@@ -6951,7 +7984,39 @@ fn measure_multiclock_undervolt_forge(
                             stop,
                             &mut on_apply_qualification_progress,
                         );
+                    // Quarantine re-proof: only a pair that PASSED pass 1 earns pass 2 — a
+                    // failure short-circuits into the normal failure handling below.
+                    let mut passes_done = 1u32;
+                    while summary.qualified && passes_done < required_passes {
+                        passes_done += 1;
+                        let mut next_pass =
+                            crate::gpu_undervolt::run_confirmed_f2_apply_qualification(
+                                store,
+                                &obs_store,
+                                &run_id,
+                                &gpu_key,
+                                organic_ledger,
+                                &f2_inputs.sane_base_curve,
+                                &f2_inputs.limits,
+                                key.0,
+                                key.1,
+                                selected_point.offset_mhz,
+                                F2_APPLY_QUALIFICATION_DWELL_MS,
+                                render_goldens,
+                                stop,
+                                &mut on_apply_qualification_progress,
+                            );
+                        next_pass.logs.splice(0..0, summary.logs.drain(..));
+                        next_pass.executed_steps += summary.executed_steps;
+                        summary = next_pass;
+                    }
                     prog.log.extend(summary.logs);
+                    if required_passes > 1 && summary.qualified {
+                        prog.log.push(format!(
+                            "FORGE: prova dupla concluída — {} MHz @ {} mV passou {passes_done} passagens completas do gate.",
+                            key.0, key.1
+                        ));
+                    }
                     prog.log.push(format!(
                         "Qualificação Apply exato {} MHz @ {} mV → {} ({} dwell(s)).",
                         key.0, key.1, summary.stop_reason, summary.executed_steps
@@ -7003,6 +8068,21 @@ fn measure_multiclock_undervolt_forge(
                                 key.1,
                                 &gpu_key,
                             );
+                        // Conservative post-gate SELECTION basis (2026-07-17): the same required-set
+                        // p99 that publication will print. The 2026-07-17 run selected Deep Calm
+                        // 1740@812 on the calm PowerRender 157 W, the gate measured 188 W, and only
+                        // the off-cap basis was raised — so every resynthesis kept scoring the point
+                        // at 157 W and published an "efficiency" profile drawing Godforge-class
+                        // worst-case power for 135 MHz less. Selection and publication must see the
+                        // SAME honest number.
+                        let apply_gate_p99 = nidavellir_core::f2_observation::
+                            current_apply_qualification_p99_at_anchor(
+                                &observations,
+                                &run_id,
+                                key.0,
+                                key.1,
+                                &gpu_key,
+                            );
                         for (point, _) in &mut classified {
                             if f2_apply_key(point) == Some(key) {
                                 point.p95_clock_mhz =
@@ -7014,6 +8094,19 @@ fn measure_multiclock_undervolt_forge(
                                             key.0, key.1, point.max_power_w, worst
                                         ));
                                         point.max_power_w = worst;
+                                    }
+                                }
+                                if let Some(gate_p99) = apply_gate_p99 {
+                                    let selection_p99 = point.power_p99_w.unwrap_or(0.0);
+                                    if gate_p99 > selection_p99 {
+                                        prog.log.push(format!(
+                                            "FORGE: p99 conservador pós-gate elevou a base de SELEÇÃO de {} MHz @ {} mV: {:.0} → {:.0} W; a ressíntese pontuará o valor honesto.",
+                                            key.0, key.1, selection_p99, gate_p99
+                                        ));
+                                        point.power_p99_w = Some(gate_p99);
+                                        point.perf_per_watt =
+                                            f64::from(point.p5_clock_mhz.unwrap_or(point.clock_mhz))
+                                                / f64::from(gate_p99);
                                     }
                                 }
                                 point.apply_qualified = true;
@@ -7053,34 +8146,171 @@ fn measure_multiclock_undervolt_forge(
                     // A BLACKLISTED Apply pair is BOUNDARY knowledge, not a safety emergency —
                     // same principle as the frontier BlacklistedBoundary fix. The sentinel's
                     // real-world failures (e.g. 1905@906 damned by a field TDR) land here when the
-                    // margin policy picks that exact pair: exclude it and RESYNTHESIZE so the
-                    // forge converges on a point real use has not condemned, instead of ending the
-                    // whole run "parcial" with zero profiles (2026-07-12 18:32 run).
-                    if summary.aborted && summary.stop_reason.contains("blacklisted") {
-                        excluded_apply_pairs.insert(key);
-                        prog.log.push(format!(
-                            "FORGE: par de Apply {} MHz @ {} mV está na blacklist (falha real anterior) — excluído; ressintetizando acima dele.",
-                            key.0, key.1
-                        ));
-                        changed = true;
-                        break;
-                    }
-                    if summary.aborted || summary.cancelled {
+                    // margin policy picks that exact pair. Both this refusal and a graceful gate
+                    // failure flow into the VERTICAL REPAIR below: the failed/refused BIN is
+                    // excluded, and the SAME clock climbs the real VF curve instead of dying
+                    // (2026-07-16 — the 2026-07-14 run sank 1920 → 1740 through six ~38-min
+                    // failures without ever trying the validated bins above each failure).
+                    let blacklist_refused =
+                        summary.aborted && summary.stop_reason.contains("blacklisted");
+                    if !blacklist_refused && (summary.aborted || summary.cancelled) {
                         forge_aborted |= summary.aborted;
                         terminal = true;
                         break;
                     }
-                    let dependent_keys =
-                        f2_regime_dependent_apply_keys(key, &classified);
-                    let inherited_count = dependent_keys
-                        .iter()
-                        .filter(|dependent| excluded_apply_pairs.insert(**dependent))
-                        .count();
-                    excluded_apply_pairs.insert(key);
-                    prog.log.push(format!(
-                        "FORGE: candidato {} MHz target @ {} mV VF excluído; {} ponto(s) que herdam o mesmo regime p5 também bloqueado(s). Ressintetizando.",
-                        key.0, key.1, inherited_count
-                    ));
+                    if blacklist_refused {
+                        excluded_apply_pairs.insert(key);
+                        prog.log.push(format!(
+                            "FORGE: par de Apply {} MHz @ {} mV recusado pela blacklist/ledger (falha real anterior) — bin excluído da seleção; reparo vertical tentará o próximo bin acima.",
+                            key.0, key.1
+                        ));
+                    } else {
+                        // Durable quarantine: the exact pair failed the full gate — remembered
+                        // across resets and contract bumps (rehabilitation is manual-only; a
+                        // future re-attempt of this exact pair needs the double-proof protocol).
+                        crate::gpu_undervolt::append_condemnation(
+                            store.base_dir(),
+                            nidavellir_core::condemnation::CondemnationSeverity::Quarantine,
+                            nidavellir_core::condemnation::KIND_APPLY_GATE_SILENT,
+                            Some(gpu_key.clone()),
+                            key.0,
+                            key.1,
+                            Some(run_id.clone()),
+                            summary.stop_reason.clone(),
+                        );
+                        let dependent_keys =
+                            f2_regime_dependent_apply_keys(key, &classified);
+                        let inherited_count = dependent_keys
+                            .iter()
+                            .filter(|dependent| excluded_apply_pairs.insert(**dependent))
+                            .count();
+                        excluded_apply_pairs.insert(key);
+                        prog.log.push(format!(
+                            "FORGE: candidato {} MHz target @ {} mV VF reprovado no gate — bin condenado (quarentena no ledger); {} ponto(s) que herdam o mesmo regime p5 também bloqueado(s).",
+                            key.0, key.1, inherited_count
+                        ));
+                    }
+                    // Vertical repair: same clock, next viable bin above (severity-stepped, past
+                    // condemned bins), admitted only under the PUBLICATION power ceiling and the
+                    // per-clock budget. Descent evidence orients power/order ONLY — the repaired
+                    // pair re-runs the FULL exact-Apply gate.
+                    let attempts = repair_attempts.get(&key.0).copied().unwrap_or(0);
+                    match f2_plan_vertical_repair(
+                        &f2_inputs.sane_base_curve,
+                        &store.load_record(),
+                        &condemned,
+                        &obs_store.load_all(),
+                        &gpu_key,
+                        key.0,
+                        key.1,
+                        &summary.stop_reason,
+                        prog.power_limit_w,
+                        attempts,
+                    ) {
+                        Err(reason) => {
+                            prog.log.push(format!(
+                                "FORGE: {} MHz esgotado nesta run — {reason}. Ressíntese continua nos clocks restantes.",
+                                key.0
+                            ));
+                        }
+                        Ok((next_mv, measured)) => {
+                            // An unmeasured repair bin gets an honest PowerRender p99 first —
+                            // synthesis and the off-cap gate need real power at the exact bin.
+                            let mut guard_power = measured;
+                            if guard_power.is_none() {
+                                prog.log.push(format!(
+                                    "Reparo vertical: calibrando p99 em {} MHz @ {next_mv} mV…",
+                                    key.0
+                                ));
+                                set(progress, prog.clone());
+                                let cal_power_limit =
+                                    (prog.power_limit_w > 0.0).then_some(prog.power_limit_w);
+                                let mut on_cal =
+                                    |event: crate::gpu_undervolt::F2ClockDiscoveryProgress| {
+                                        prog.log.push(event.line);
+                                        set(progress, prog.clone());
+                                    };
+                                let cal =
+                                    crate::gpu_undervolt::run_confirmed_f2_power_calibration(
+                                        store,
+                                        &obs_store,
+                                        &run_id,
+                                        &gpu_key,
+                                        organic_ledger,
+                                        &f2_inputs.sane_base_curve,
+                                        &f2_inputs.limits,
+                                        key.0,
+                                        next_mv,
+                                        selected_point.offset_mhz,
+                                        cal_power_limit,
+                                        mode_policy.discovery_dwell_ms,
+                                        stop,
+                                        &mut on_cal,
+                                    );
+                                prog.log.extend(cal.logs);
+                                retain_boot_flag |= cal.retain_boot_flag;
+                                if cal.aborted {
+                                    forge_aborted = true;
+                                    terminal = true;
+                                } else if cal.confirmed {
+                                    guard_power = measured_power_at_pair(
+                                        &obs_store.load_all(),
+                                        &gpu_key,
+                                        key.0,
+                                        next_mv,
+                                    );
+                                }
+                            }
+                            if terminal {
+                                break;
+                            }
+                            match guard_power {
+                                Some(p99)
+                                    if prog.power_limit_w <= 0.0
+                                        || p99 <= off_cap_ceiling_w(prog.power_limit_w) =>
+                                {
+                                    let confidence = classified
+                                        .iter()
+                                        .find(|(p, _)| f2_apply_key(p) == Some(key))
+                                        .map(|(_, c)| *c)
+                                        .unwrap_or(0.0);
+                                    let mut repaired = selected_point;
+                                    repaired.vf_table_voltage_mv = Some(next_mv);
+                                    repaired.apply_margin_mv = repaired
+                                        .boundary_voltage_mv
+                                        .map(|b| next_mv.saturating_sub(b));
+                                    repaired.power_p99_w = Some(p99);
+                                    repaired.max_power_w = repaired.max_power_w.max(p99);
+                                    repaired.apply_qualified = false;
+                                    repaired.apply_qualification_version = None;
+                                    repair_attempts.insert(key.0, attempts + 1);
+                                    classified.push((repaired, confidence));
+                                    prog.log.push(format!(
+                                        "FORGE: reparo vertical — {} MHz sobe {} → {next_mv} mV (tentativa {}/{MAX_APPLY_REPAIRS_PER_CLOCK}; p99 {p99:.0} W sob o teto de publicação). O novo par exige o gate completo.",
+                                        key.0,
+                                        key.1,
+                                        attempts + 1
+                                    ));
+                                }
+                                Some(p99) => {
+                                    prog.log.push(format!(
+                                        "FORGE: {} MHz esgotado — p99 medido {p99:.0} W em {next_mv} mV excede o teto de publicação {:.0} W.",
+                                        key.0,
+                                        off_cap_ceiling_w(prog.power_limit_w)
+                                    ));
+                                }
+                                None => {
+                                    prog.log.push(format!(
+                                        "FORGE: {} MHz esgotado — sem medição de potência confiável em {next_mv} mV.",
+                                        key.0
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if terminal {
+                        break;
+                    }
                     changed = true;
                     break;
                 }
@@ -7221,6 +8451,11 @@ fn measure_multiclock_undervolt_forge(
         prog.godforge.is_some(),
     )
     .into();
+    if organic_ledger {
+        if let Some(line) = archive_clean_run_results(store, &run_id) {
+            prog.log.push(line);
+        }
+    }
     // Every candidate is already durable in f2_observations.jsonl. Persist the UI checkpoint too so
     // a partial/failed run remains inspectable after a service restart. Previous completed profiles
     // stay attached until a newer complete frontier replaces them. NO auto-apply.
@@ -7266,7 +8501,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_after_reset_clears_visible_forge_state() {
+    fn recover_after_reset_preserves_interrupted_checkpoint_for_operator_review() {
         let handle = PowerSweepHandle::default();
         {
             let mut prog = handle.progress.lock().expect("progress lock");
@@ -7281,12 +8516,65 @@ mod tests {
         let restored = handle.progress();
 
         assert!(!restored.running);
-        assert_eq!(restored.phase, "idle");
-        assert!(restored.points.is_empty());
-        assert!(restored.godforge.is_none());
+        assert_eq!(restored.phase, "interrupted");
+        assert_eq!(restored.points.len(), 1);
+        assert!(restored.godforge.is_some());
         assert!(!restored.profiles_qualified);
         assert_eq!(restored.note.as_deref(), Some("reset complete"));
         assert_eq!(restored.log, vec!["reset complete".to_string()]);
+    }
+
+    #[test]
+    fn full_reset_forgets_visible_forge_state() {
+        let handle = PowerSweepHandle::default();
+        {
+            let mut prog = handle.progress.lock().expect("progress lock");
+            prog.phase = "interrupted".into();
+            prog.run_id = Some("run-1".into());
+            prog.run_sequence = vec!["run-1".into()];
+            prog.points = vec![PowerSweepPoint::default()];
+        }
+
+        handle.forget_after_full_reset("full reset complete");
+        let restored = handle.progress();
+        assert_eq!(restored.phase, "idle");
+        assert!(restored.run_id.is_none());
+        assert!(restored.run_sequence.is_empty());
+        assert!(restored.points.is_empty());
+    }
+
+    #[test]
+    fn operator_field_failure_is_hardware_derived_durable_and_idempotent() {
+        let mut record = nidavellir_core::safe_loop::SafeLoopRecord::default();
+        let point = PowerSweepPoint {
+            clock_mhz: 1840,
+            target_clock_mhz: Some(1845),
+            voltage_mv: 860,
+            vf_table_voltage_mv: Some(862),
+            offset_mhz: 45,
+            ..PowerSweepPoint::default()
+        };
+
+        assert_eq!(
+            record_operator_field_failure(
+                &mut record,
+                &point,
+                Some("run-1".into()),
+                "gpu-1".into(),
+            ),
+            (1845, 862)
+        );
+        record_operator_field_failure(
+            &mut record,
+            &point,
+            Some("run-1".into()),
+            "gpu-1".into(),
+        );
+
+        assert_eq!(record.blacklist.len(), 1);
+        assert_eq!(record.forge_incidents.len(), 1);
+        assert!(record.forge_incidents[0].acknowledged);
+        assert!(crate::gpu_undervolt::field_pair_blacklisted(&record, 1845, 862));
     }
 
     #[cfg(windows)]
@@ -7564,6 +8852,7 @@ mod tests {
                     F2QualificationPattern::Memory => 4,
                     F2QualificationPattern::Endurance => 5,
                     F2QualificationPattern::TransitionShock => 6,
+                    F2QualificationPattern::Dx11Game => 7,
                 },
                 verdict: F2QualificationVerdict::Pass,
                 phases_completed: 8,
@@ -7973,6 +9262,60 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn dx11_qualification_requires_integrity_telemetry_and_target_residency() {
+        let report = nidavellir_gpu_stress::Dx11QualificationResult {
+            result: StabilityResult::Stable,
+            frames: 240,
+            checks: 10,
+            fps: 120.0,
+            elapsed_ms: 2_000,
+            timed_out: false,
+            inconclusive_reason: None,
+        };
+        let samples = vec![
+            (1800, 170.0, false, Some(65.0), VfQualifierPhase::CompositeGameLoad.code(), false);
+            8
+        ];
+        let pass = dx11_qualification_coverage_from_run(
+            StabilityResult::Stable,
+            Some(&report),
+            &samples,
+            Some(1800),
+        );
+        assert_eq!(pass.verdict, F2QualificationVerdict::Pass);
+        assert_eq!(pass.pattern, Some(F2QualificationPattern::Dx11Game));
+        assert_eq!(pass.checksum_count, 10);
+        assert_eq!(pass.phase_metrics[0].phase_pattern, "native-dx11");
+
+        let no_telemetry = dx11_qualification_coverage_from_run(
+            StabilityResult::Stable,
+            Some(&report),
+            &[],
+            Some(1800),
+        );
+        assert_eq!(no_telemetry.verdict, F2QualificationVerdict::Inconclusive);
+
+        let wrong_result = dx11_qualification_coverage_from_run(
+            StabilityResult::SilentError,
+            Some(&report),
+            &samples,
+            Some(1800),
+        );
+        assert_eq!(wrong_result.verdict, F2QualificationVerdict::Fail);
+
+        let mut wrong_adapter = report;
+        wrong_adapter.inconclusive_reason = Some("adapter mismatch".into());
+        let wrong_adapter = dx11_qualification_coverage_from_run(
+            StabilityResult::Stable,
+            Some(&wrong_adapter),
+            &samples,
+            Some(1800),
+        );
+        assert_eq!(wrong_adapter.verdict, F2QualificationVerdict::Inconclusive);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn f2_uses_every_real_clock_bin_and_stops_below_90_percent_of_cmax() {
         let base_curve = vec![
             (0, 900, 1875),
@@ -8057,13 +9400,14 @@ mod tests {
 
         let standard = PowerSweepMode::Standard.f2_policy();
         // v14 single-detector: descent = 15s discovery + 1×65s (Texture only). Exact-Apply runs the
-        // gate ladder per pair: 1×305s Texture + 485s TransitionShock + 1205s composite Endurance.
+        // gate ladder per pair: 1×305s Texture + 305s native DX11 + 485s TransitionShock +
+        // 1205s composite Endurance.
         assert_eq!(f2_target_upper_estimate_ms(1, standard), 80_000);
         assert_eq!(f2_calibration_upper_estimate_ms(1, standard), 45_000);
-        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 1_995_000);
+        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 2_300_000);
         assert_eq!(
             f2_apply_upper_estimate_ms(F2_ESTIMATE_MAX_PROFILE_PAIRS, standard),
-            5_985_000
+            6_900_000
         );
 
         let fast = PowerSweepMode::Fast.f2_policy();
@@ -8071,15 +9415,16 @@ mod tests {
         assert_eq!(f2_apply_upper_estimate_ms(3, fast), 0);
 
         // The ETA and the gate can never desync: both read the SAME ladder helper (REQUIRED
-        // pattern(s) + TransitionShock + Endurance, each + overhead).
+        // pattern(s) + DX11 + TransitionShock + Endurance, each + overhead).
         assert_eq!(
             f2_apply_pair_dwell_ladder_ms().len(),
-            nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() + 2
+            nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() + 3
         );
         assert_eq!(
             f2_apply_upper_estimate_ms(1, standard),
             nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() as u64
                 * (F2_APPLY_QUALIFICATION_DWELL_MS + PROBE_OVERHEAD_MS)
+                + (crate::gpu_undervolt::F2_DX11_QUALIFICATION_DWELL_MS + PROBE_OVERHEAD_MS)
                 + (crate::gpu_undervolt::F2_TRANSITION_SHOCK_DWELL_MS + PROBE_OVERHEAD_MS)
                 + (crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS + PROBE_OVERHEAD_MS)
         );
@@ -10759,6 +12104,8 @@ mod tests {
         let mut prog = idle();
         prog.phase = "descend".into();
         prog.running = true; // a running snapshot must restore as NOT running
+        prog.run_id = Some("run-current".into());
+        prog.run_sequence = vec!["run-original".into(), "run-current".into()];
         prog.learned_points = 7;
         prog.stock_clock_mhz = 1786;
         prog.observed_boost_clock_mhz = Some(1950);
@@ -10775,6 +12122,8 @@ mod tests {
             ForgeStateLoad::Loaded(p) => {
                 assert!(!p.running, "restored progress must never be running");
                 assert_eq!(p.phase, "interrupted");
+                assert_eq!(p.run_id.as_deref(), Some("run-current"));
+                assert_eq!(p.run_sequence, vec!["run-original", "run-current"]);
                 assert_eq!(p.learned_points, 7);
                 assert!(p.note.as_deref().unwrap_or_default().contains("7 dwell"));
                 assert_eq!(p.points.len(), 2);
@@ -10823,6 +12172,8 @@ mod tests {
         let object = value.as_object_mut().expect("object");
         for field in [
             "mode",
+            "run_id",
+            "run_sequence",
             "current_clock_mhz",
             "current_voltage_mv",
             "completed_steps",
@@ -10848,6 +12199,8 @@ mod tests {
         }
         let restored: PowerSweepProgress = serde_json::from_value(value).expect("legacy decode");
         assert_eq!(restored.completed_steps, 0);
+        assert!(restored.run_id.is_none());
+        assert!(restored.run_sequence.is_empty());
         assert_eq!(restored.total_steps_estimate, 0);
         assert_eq!(restored.estimated_total_upper_ms, None);
         assert_eq!(restored.cmax_clock_mhz, None);
@@ -10916,5 +12269,249 @@ mod tests {
             }
             other => panic!("expected Loaded, got {other:?}"),
         }
+    }
+
+    // ── P1 vertical repair (2026-07-16) ─────────────────────────────────────────────────────────
+
+    #[cfg(windows)]
+    fn power_obs(
+        target_mhz: u32,
+        anchor_mv: u32,
+        p99: Option<f32>,
+        confirmed: bool,
+        peak: Option<u32>,
+        gpu: &str,
+    ) -> F2Observation {
+        use nidavellir_core::f2_observation::{
+            F2EvidenceKind, F2ObsDwell, F2ObsMode, F2ObsOutcome, F2ObsVerifier,
+        };
+        F2Observation {
+            run_id: "repair-test".into(),
+            timestamp: "2026-07-16T00:00:00Z".into(),
+            gpu_key: Some(gpu.into()),
+            evidence_kind: F2EvidenceKind::Discovery,
+            discovery_contract_version: None,
+            qualification_contract_version: None,
+            qualification_coverage: None,
+            evidence_provenance: None,
+            mode: F2ObsMode::LadderSweep,
+            target_mhz,
+            requested_start_mv: None,
+            anchor_mv,
+            base_mhz: target_mhz.saturating_sub(15),
+            offset_mhz: 15,
+            positive_offset_cap_mhz: 90,
+            higher_bins_capped: 0,
+            max_flatten_mhz: 0,
+            lower_bins_elastic: 0,
+            verifier_result: F2ObsVerifier::RaiseVerified,
+            dwell_result: F2ObsDwell::ClockDrop,
+            avg_clock_mhz: Some(target_mhz),
+            sustained_clock_mhz: Some(target_mhz),
+            sustained_upper_clock_mhz: Some(target_mhz),
+            watts: peak,
+            max_watts: peak,
+            power_p99_w: p99,
+            power_p99_confirmed: confirmed,
+            power_p99_attempts: 1,
+            measured_voltage_min_mv: None,
+            measured_voltage_avg_mv: None,
+            measured_voltage_max_mv: None,
+            measured_voltage_sample_count: 0,
+            render_frames: None,
+            render_fps: None,
+            power_capped_frac: None,
+            max_temp_c: None,
+            thermal_throttled: false,
+            dwell_duration_ms: None,
+            sample_count: None,
+            silent_error: false,
+            device_lost: false,
+            unstable: false,
+            clock_drop: false,
+            tdr_or_crash: false,
+            reset_to_stock_attempted: true,
+            reset_to_stock_ok: true,
+            boot_flag_cleared: true,
+            blacklisted: false,
+            outcome: F2ObsOutcome::PowerBoundClockDrop,
+            confidence: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn clean_run_strip_removes_only_gpu_vf_regions() {
+        use nidavellir_core::safe_loop::{BlacklistRegion, SafeLoopRecord, TuningPoint};
+        let mut record = SafeLoopRecord::default();
+        record.safe_mode = true;
+        record.consecutive_crashes = 2;
+        record.blacklist.push(BlacklistRegion::around(
+            TuningPoint::from_axes([("gpu_freq_mhz", 1890), ("gpu_vf_bin_mv", 900)]),
+            1,
+        ));
+        record.blacklist.push(BlacklistRegion::around(TuningPoint::from_axes([("vcore", -80)]), 1));
+        assert_eq!(strip_gpu_vf_blacklist(&mut record), 1);
+        // Non-GPU learning and the safety latches survive a clean-run strip.
+        assert_eq!(record.blacklist.len(), 1);
+        assert!(record.safe_mode);
+        assert_eq!(record.consecutive_crashes, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repair_step_is_severity_based() {
+        assert_eq!(repair_step_bins("ExactApplyRejected: Endurance SilentError (3 dwell(s))"), 1);
+        assert_eq!(repair_step_bins("dwell TDR/crash"), 2);
+        assert_eq!(repair_step_bins("DeviceLost during qualification"), 2);
+        assert_eq!(repair_step_bins("the candidate intent is blacklisted"), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repair_bin_above_steps_real_bins_and_tops_out() {
+        let curve = [(0usize, 887u32, 1890u32), (1, 893, 1895), (2, 900, 1900), (3, 906, 1905)];
+        assert_eq!(f2_repair_bin_above(&curve, 893, 1), Some(900));
+        assert_eq!(f2_repair_bin_above(&curve, 893, 2), Some(906));
+        assert_eq!(f2_repair_bin_above(&curve, 906, 1), None);
+        assert_eq!(f2_repair_bin_above(&curve, 900, 2), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_power_takes_worst_honest_measurement_at_exact_pair() {
+        let a = power_obs(1890, 906, Some(183.0), true, Some(185), "G");
+        let unconfirmed = power_obs(1890, 906, Some(999.0), false, None, "G");
+        let other_pair = power_obs(1890, 912, Some(500.0), true, Some(500), "G");
+        let other_gpu = power_obs(1890, 906, Some(500.0), true, Some(500), "H");
+        let obs = [a, unconfirmed, other_pair, other_gpu];
+        assert_eq!(measured_power_at_pair(&obs, "G", 1890, 906), Some(185.0));
+        assert_eq!(measured_power_at_pair(&obs, "G", 1905, 906), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vertical_repair_climbs_past_condemned_bins_and_respects_budget_and_ceiling() {
+        use nidavellir_core::condemnation::{
+            condemned_pairs, CondemnationEvent, CondemnationSeverity, CondemnedPairs,
+        };
+        let curve = [(0usize, 900u32, 1890u32), (1, 906, 1895), (2, 912, 1900), (3, 918, 1905)];
+        let record = nidavellir_core::safe_loop::SafeLoopRecord::default();
+        let clean = CondemnedPairs::default();
+        // Repair budget spent → the clock is exhausted for this run.
+        assert!(f2_plan_vertical_repair(
+            &curve, &record, &clean, &[], "G", 1890, 900, "SilentError", 200.0,
+            MAX_APPLY_REPAIRS_PER_CLOCK,
+        )
+        .is_err());
+        // SilentError climbs exactly +1 real bin; unmeasured → the caller must calibrate.
+        assert_eq!(
+            f2_plan_vertical_repair(
+                &curve, &record, &clean, &[], "G", 1890, 900, "SilentError", 200.0, 0,
+            ),
+            Ok((906, None))
+        );
+        // A rigid condemnation at 906 pushes the repair past it, to 912.
+        let events = [CondemnationEvent {
+            timestamp: "t".into(),
+            gpu_key: Some("G".into()),
+            severity: CondemnationSeverity::Rigid,
+            kind: "field-tdr".into(),
+            target_mhz: 1890,
+            vf_bin_mv: 906,
+            run_id: None,
+            qualification_contract_version: Some(17),
+            note: None,
+            rehabilitated: false,
+        }];
+        let condemned = condemned_pairs(&events, "G");
+        let (mv, _) = f2_plan_vertical_repair(
+            &curve, &record, &condemned, &[], "G", 1890, 900, "SilentError", 200.0, 0,
+        )
+        .unwrap();
+        assert_eq!(mv, 912);
+        // Power monotonicity: the FAILED bin already measured above the publication ceiling
+        // (94% of 200 W = 188 W) → every higher bin exceeds it too → exhausted, zero dwells.
+        let hot = power_obs(1890, 900, Some(190.0), true, Some(191), "G");
+        let err = f2_plan_vertical_repair(
+            &curve, &record, &clean, std::slice::from_ref(&hot), "G", 1890, 900, "SilentError",
+            200.0, 0,
+        )
+        .unwrap_err();
+        assert!(err.contains("teto de publicação"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resynthesis_scores_post_gate_conservative_p99_not_calm_calibration() {
+        // 2026-07-17 clean-run regression: Deep Calm selected 1740@812 on the calm PowerRender
+        // calibration (157 W); the gate then measured 188 W (Texture 300 s p99) but only the
+        // off-cap basis was raised, so every resynthesis kept scoring 157 W and published an
+        // "efficiency" profile drawing Godforge-class worst-case power for 135 MHz less. With
+        // the selection basis raised to the post-gate conservative p99, the dominated point
+        // must lose the efficiency slot to the honest best-MHz/W point.
+        let mk = |target: u32, mv: u32, p99: f32| PowerSweepPoint {
+            clock_mhz: target,
+            p5_clock_mhz: Some(target),
+            target_clock_mhz: Some(target),
+            boundary_voltage_mv: Some(mv.saturating_sub(12)),
+            vf_table_voltage_mv: Some(mv),
+            power_p99_w: Some(p99),
+            max_power_w: p99,
+            power_w: p99,
+            ..Default::default()
+        };
+        let optimistic = vec![
+            (mk(1875, 900, 185.0), 0.95),
+            (mk(1845, 875, 177.0), 0.95),
+            (mk(1740, 812, 157.0), 0.95),
+        ];
+        let profiles =
+            synthesize_forge_profiles_capped(&optimistic, &ForgePolicy::balanced(), 200.0);
+        assert_eq!(
+            profiles.deep_calm.and_then(|p| f2_apply_key(&p)),
+            Some((1740, 812)),
+            "the calm calibration keeps the trap point attractive (the bug's precondition)"
+        );
+        let honest = vec![
+            (mk(1875, 900, 185.0), 0.95),
+            (mk(1845, 875, 177.0), 0.95),
+            (mk(1740, 812, 188.0), 0.95), // selection basis raised to the post-gate p99
+        ];
+        let profiles = synthesize_forge_profiles_capped(&honest, &ForgePolicy::balanced(), 200.0);
+        assert_eq!(
+            profiles.deep_calm.and_then(|p| f2_apply_key(&p)),
+            Some((1845, 875)),
+            "the honest post-gate p99 must move Deep Calm off the dominated point"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dominance_pre_gate_requires_full_apply_approval() {
+        let mk = |target: u32, mv: u32, p99: f32, qualified: bool| PowerSweepPoint {
+            clock_mhz: target,
+            p5_clock_mhz: Some(target),
+            target_clock_mhz: Some(target),
+            boundary_voltage_mv: Some(mv.saturating_sub(12)),
+            vf_table_voltage_mv: Some(mv),
+            power_p99_w: Some(p99),
+            apply_qualified: qualified,
+            apply_qualification_version: qualified.then_some(
+                nidavellir_core::f2_observation::F2_QUALIFICATION_CONTRACT_VERSION,
+            ),
+            ..Default::default()
+        };
+        let candidate = mk(1875, 887, 180.0, false);
+        // A dominating point that only has descent evidence (NOT gate-approved) never vetoes.
+        let unapproved = vec![(mk(1890, 900, 178.0, false), 0.9), (candidate, 0.9)];
+        assert_eq!(f2_approved_dominator(&candidate, &unapproved), None);
+        // The same dominator, gate-approved under the current contract → veto with its pair.
+        let approved = vec![(mk(1890, 900, 178.0, true), 0.9), (candidate, 0.9)];
+        assert_eq!(f2_approved_dominator(&candidate, &approved), Some((1890, 900)));
+        // Unknown candidate power can never be dominated — fail open toward qualifying.
+        let mut unknown = candidate;
+        unknown.power_p99_w = None;
+        assert_eq!(f2_approved_dominator(&unknown, &approved), None);
     }
 }

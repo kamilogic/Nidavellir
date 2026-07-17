@@ -70,6 +70,11 @@ pub(crate) fn sentinel_clear_applied() {
 ///
 /// Deliberately does NOT touch `gpu_applied.json`, the boot-flag, `safe_loop.json`, or
 /// `forge_state.json`; those are handled by [`reset`] / the caller so each concern stays explicit.
+///
+/// SAFETY INVARIANT: `condemnation_ledger.jsonl` must NEVER be added here (or to any other reset
+/// path). It is the append-only memory of real hard failures; the 2026-07-15 manual reset wiped
+/// the 1890@900 Endurance condemnation with `safe_loop.json` and the pair was re-attempted the
+/// next day. Only an explicit manual rehabilitation entry may lift a condemnation.
 pub fn clear_all_learning() -> Vec<String> {
     let base = default_data_dir();
     let targets = [
@@ -318,7 +323,8 @@ pub fn reset(_store: &SafeLoopStore) -> Result<(), String> {
 }
 
 /// Re-apply the persisted profile at service startup. Skips if the Safe Loop
-/// boot-flag is armed (last apply crashed) or Safe Mode is active.
+/// boot-flag is armed (last apply crashed), Safe Mode is active, or an interrupted Forge still
+/// requires explicit operator acknowledgement.
 #[cfg(windows)]
 pub fn reapply_on_boot(store: &SafeLoopStore) {
     // v13 (audit N1): the NVML clock ceiling is driver-resident and would survive a service
@@ -333,8 +339,13 @@ pub fn reapply_on_boot(store: &SafeLoopStore) {
         }
         return;
     }
-    if store.load_record().safe_mode {
+    let record = store.load_record();
+    if record.safe_mode {
         warn!("GPU apply-on-boot: Safe Mode active — not re-applying");
+        return;
+    }
+    if record.pending_forge_incident.is_some() {
+        warn!("GPU apply-on-boot: Forge incident requires acknowledgement — staying at stock");
         return;
     }
     let Some(ap) = load_applied() else {

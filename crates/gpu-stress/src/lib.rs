@@ -17,6 +17,11 @@ use std::sync::Arc;
 use nidavellir_core::gpu_sweep::StabilityResult;
 use wgpu::util::DeviceExt;
 
+#[cfg(windows)]
+mod dx11;
+#[cfg(windows)]
+pub use dx11::Dx11Qualifier;
+
 const C1: u32 = 1664525;
 const C2: u32 = 1013904223;
 const HASH1: u32 = 2654435761;
@@ -127,6 +132,37 @@ pub struct RenderGoldens {
     /// the checksum back on the CPU every frame (slower than the dwell's sparse GPU-side checksum),
     /// so the degradation gate errs permissive, never strict.
     pub boost_frame_reference_us: u32,
+    /// Stock native-DX11 checksum and adapter identity. Captured before any candidate write so the
+    /// exact-Apply DX11 gate compares the same physical NVIDIA adapter against its own reference.
+    pub dx11: Dx11Golden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dx11Golden {
+    pub checksum: u32,
+    pub adapter_luid: i64,
+    pub frame_reference_us: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dx11AdapterIdentity {
+    pub name: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub adapter_luid: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Dx11QualificationResult {
+    pub result: StabilityResult,
+    pub frames: u64,
+    pub checks: u32,
+    pub fps: f64,
+    pub elapsed_ms: u64,
+    pub timed_out: bool,
+    /// Environment/identity refusal that must be treated as inconclusive, never as silicon
+    /// instability (for example, a stock golden captured on a different adapter LUID).
+    pub inconclusive_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
