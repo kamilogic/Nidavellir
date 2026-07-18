@@ -8,6 +8,40 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-18) — Texture Hop v10, bounded Standard and explicit Long
+- Qualification contract v19 replaces Texture v9 with Texture Hop v10. TextureRop now performs
+  denser dependent sampling and is exercised immediately through irregular multi-period load
+  transitions; all workload fingerprints moved to `f2q-texhop-v10-r1`, so pre-v19 positives cannot
+  unlock Apply.
+- Standard now uses 30 s frontier qualification and 2 min Texture Hop + 5 min Endurance per exact
+  pair. A 59-minute active-work watchdog reserves the final minute for reset/checkpoint, preserves
+  completed learning and blocks every incomplete profile. Only explicitly selected Long may exceed
+  one hour; it retains 60 s frontier + 5 min Texture Hop + 20 min Endurance.
+- Fast no longer exists as a user-facing or provisional mode. Its old IPC variant remains only as a
+  compatibility alias to Standard. The main forge-themed Command Deck now exposes the Standard/Long
+  selector beside Forge GPU; a Full-Reset-armed Clean Run uses the Standard budget.
+- Software validation passed (`gpu-stress` 16, core 102, service 404, UI production build). The
+  decisive hardware gate is still pending: a clean Standard run must reject the known-bad
+  `1800@869` neighborhood and converge toward the repeatedly trusted `1800@875` boundary in at most
+  one hour. Those numbers are this GPU's regression oracle, not global blacklist/default values.
+
+## Latest (2026-07-17) — organic reset handoff, full-gate power and clean Forge UX
+- A successful Full Reset now arms a one-shot `clean` in the UI, so the next Forge starts
+  organically without the operator having to remember the mode; the selector returns to Standard
+  after that run completes. Active observations/profiles/Sentinel history are
+  cleared; hardware-derived durable condemnations remain stored but are ignored as pre-run input by
+  the run-scoped Clean Run ledger.
+- Exact Apply now performs an energy-envelope screen after Texture v9. If p99/peak already exceeds
+  the common 94%-of-cap publication ceiling, Endurance is skipped and the pair is removed only from
+  this run's selection — no blacklist, condemnation or fake stability repair. Eligible pairs still
+  require the complete Texture + Endurance proof.
+- Selection/publication now use the worst p99 from the complete Texture + Endurance gate. The final
+  converged stock window publishes `stock_power_p99_w`, enabling per-GPU efficiency-vs-stock in the
+  profile UI. The progress panel is progress-only; profiles are responsive disclosures with concise
+  target, voltage, maximum power and efficiency metrics.
+- Workload composition remains contract v18. It is already TextureRop-first and adversarial
+  Endurance-first; do not tighten weights speculatively before the required new hardware Clean Run.
+
 ## Latest (2026-07-16d) — profile-aware vertical closure + qualification contract v18
 - Exact-Apply physical failures now close every viable higher same-clock bin; the arbitrary
   two-repair budget is gone. The durable condemnation view refreshes for every decision.

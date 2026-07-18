@@ -149,7 +149,7 @@
       return "Nidavellir has detected your NVIDIA GPU. The current Forge GPU action runs the implemented core VF forge and profile generation path.";
     }
     if (hasProfiles && !profilesQualified && !applied?.core) {
-      return "Fast found provisional profile points. Run Standard or Long to qualify their sustained stability before Apply is unlocked.";
+      return "The previous run ended without the complete proof. Run Standard again or choose Long explicitly; Apply stays locked until qualification is complete.";
     }
     if (hasProfiles && !applied?.core) {
       return "Nidavellir has generated profiles. Choose one below, or refine the core VF profiles by running the forge again.";
@@ -165,28 +165,20 @@
   const firstRunSteps = ["Safe Loop check", "Multi-clock discovery", "Stability confidence", "Profile creation"];
   const forgeModes = [
     {
-      id: "fast",
-      label: "Fast",
-      summaryLabel: "Fast",
-      meta: "≈20–30m fresh",
-      title: "10 s discovery · preview only",
-      description: "Traverses the full physical frontier with short 10-second dwells. It discovers provisional points quickly, but Apply stays locked until Standard or Long qualifies them.",
-    },
-    {
       id: "standard",
       label: "Standard",
       summaryLabel: "Std",
-      meta: "≈55–75m fresh",
-      title: "10 s discovery + 2 × 60 s qualification",
-      description: "Traverses the same full frontier, then requires two independent 60-second reset/reapply passes at every selected boundary. Learned GPUs usually resume faster.",
+      meta: "up to 1 hour",
+      title: "Bounded Texture Hop qualification",
+      description: "Runs the aggressive Texture Hop detector and compact Endurance proof. At one hour it stops safely and keeps incomplete profiles locked.",
     },
     {
       id: "long",
       label: "Long",
       summaryLabel: "Long",
-      meta: "≈90–120m fresh",
-      title: "10 s discovery + 3 × 120 s qualification",
-      description: "Traverses the same full frontier, then runs three independent two-minute passes per selected boundary for the strongest initial confidence.",
+      meta: "may exceed 1 hour",
+      title: "Exhaustive qualification",
+      description: "Keeps the full five-minute Texture Hop and twenty-minute thermal Endurance proof. This is the only mode allowed to run beyond one hour.",
     },
     {
       id: "clean",
@@ -194,10 +186,10 @@
       summaryLabel: "Clean",
       meta: "experimental",
       title: "Organic search — no historical memory",
-      description: "Standard dwells, but the search starts from zero: pre-run learning is archived away and only failures from this run steer it. Sentinel and Safe Loop protections stay fully active. For algorithm evaluation during development.",
+      description: "Uses the Standard one-hour budget, but starts organically: pre-run learning is archived and only failures from this run steer it. Sentinel and Safe Loop remain active.",
     },
   ];
-  const selectedMode = $derived(forgeModes.find((mode) => mode.id === forgeMode) ?? forgeModes[1]);
+  const selectedMode = $derived(forgeModes.find((mode) => mode.id === forgeMode) ?? forgeModes[0]);
 
   function selectMode(mode) {
     if (powerRunning) return;

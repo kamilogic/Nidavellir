@@ -5,6 +5,62 @@
 > surface (methods + payload shapes). Keep it current when the IPC changes.
 
 
+\## 2026-07-18 (current): qualification v19, bounded Standard and explicit Long
+
+\- **Texture Hop v10 is the early hardware discriminator.** The current TextureRop shader performs
+  denser dependent texture work (64 rounds with four dependent samples per round), while the
+  workload alternates it through short 2/3/5/7-frame bursts and non-uniform gaps. The plan enters
+  TextureRop immediately, returns to it repeatedly around power/composite transitions and remains
+  stock-golden checked. The semantic workload fingerprint is `f2q-texhop-v10-r1`; positive evidence
+  from pre-v19 contracts cannot unlock Apply.
+\- **Standard is strict and bounded.** Frontier candidates receive 30 s of Texture Hop v10. Each
+  unique exact-Apply pair that remains publishable must then pass 120 s of Texture Hop plus 300 s of
+  Endurance. A watchdog stops new GPU work after 59 active minutes, reserving the final minute for
+  reset/checkpoint. Reaching that ceiling is fail-closed: learning is preserved, incomplete profiles
+  remain blocked and the run is not resumable as Standard.
+\- **Long is the only explicitly unbounded mode.** Long retains 60 s frontier qualification plus
+  300 s Texture Hop and 1200 s Endurance per exact pair. It has no one-hour watchdog and therefore
+  must be selected explicitly by the operator.
+\- **Fast is retired as a product mode.** It is absent from every current selector and has no
+  provisional publication path. `StartPowerSweepFast` remains only as a deprecated mixed-version
+  wire alias and executes the Standard policy; it never restores the former Fast semantics.
+\- **Primary Forge selector.** The main forge-themed Command Deck exposes Standard and Long beside
+  the Forge action. After Full Reset, its one-shot Clean option is shown as using the Standard time
+  budget. The instrument/workshop selectors use the same set and meaning.
+
+
+\## 2026-07-17 (additive): organic reset handoff, honest full-gate power and simplified Forge UX
+
+\- **Full Reset arms the experiment:** after a successful `ResetGpuTuningFull`, the frontend selects
+  `clean`, so the next Forge request is `StartPowerSweepClean` without requiring the operator to
+  remember the mode change. This automatic arm is one-shot: after that Clean Run reaches a terminal
+  finished/provisional state, the selector returns to Standard. The reset clears active
+  observations/profiles/Sentinel history but never
+  deletes the append-only condemnation ledger. The armed Clean Run reads that ledger run-scoped, so
+  pre-run field evidence remains durable without steering the new organic search.
+\- **Early energy-envelope refusal:** exact Apply still starts with Texture v9. If its reset-clean
+  measured p99 or peak already exceeds the shared 94%-of-board-cap publication ceiling, the pair is
+  removed from this run's profile selection and Endurance is skipped. This is explicitly power-bound,
+  not instability: it writes no blacklist/condemnation and does not trigger vertical voltage repair.
+  For Godforge, the existing closure may still calibrate the next lower clock at the same voltage
+  (fast-drop); that new pair needs the complete gate.
+\- **Complete-gate power basis:** a published profile now requires and scores the worst sustained p99
+  from one complete current-contract Texture + Endurance gate. Endurance can therefore raise
+  `power_p99_w`/`perf_per_watt`; a shorter Texture measurement can no longer make a dominated profile
+  look efficient. `max_power_w` remains the maximum recorded power shown to the user and the stricter
+  peak/p99 off-cap guard still applies.
+\- **Stock-relative efficiency:** `PowerSweepProgress` adds defaulted
+  `stock_power_p99_w: Option<f32>`, captured from the final thermally converged stock-preheat window.
+  Together with `stock_clock_mhz`, it lets the UI calculate profile MHz/W improvement against this
+  exact GPU's measured stock state. Missing legacy/sensor data renders as unavailable, never inferred.
+\- **Progress presentation:** structured current/next task fields remain canonical, but the home UI
+  intentionally renders only a progress bar, friendly current/next task cards, task elapsed/countdown,
+  total elapsed/remaining/estimated-total and estimated finish. Tested points, raw candidate details,
+  power targets and generated-profile telemetry do not belong in this progress surface. Forged
+  profiles are separate disclosures: collapsed name + forge-themed purpose; expanded target MHz/mV,
+  maximum measured power, stock-relative efficiency, MHz/W and actions.
+
+
 \## 2026-07-16 (additive): explicit Forge pause/resume, structured tasks and durable condemnations
 
 \- **Manual cooperative pause:** `StopPowerSweep` remains the existing unit method. While the
@@ -71,15 +127,15 @@
   `forge-archive/<run_id>/clean-run-manifest.txt` as log-independent proof of the mode. Added
   after the 2026-07-17 run proved the live-log tail cannot evidence which policy executed.
 
-\## Current F2 reference (2026-07-16): contract v18, Texture-first gate and profile-aware closure
+\## Current F2 reference (2026-07-18): contract v19, Texture Hop v10 and bounded Standard
 
 This section is the normative current behavior and supersedes the dated v4/v6/v7 runtime descriptions
 below where they conflict. Historical notes remain in place to explain payload evolution. No IPC method
 or existing field was removed.
 
-\- **Evidence contract v18.** Every current F2 dwell persists `evidence_provenance` with the service
+\- **Evidence contract v19.** Every current F2 dwell persists `evidence_provenance` with the service
   build version/revision, semantic workload fingerprint, actual selected render backend, adapter name,
-  driver name/details, checksum method and stock-golden configuration/values. Pre-v18 positive evidence
+  driver name/details, checksum method and stock-golden configuration/values. Pre-v19 positive evidence
   remains readable but cannot unlock Apply. Positive discovery, frontier qualification and exact-Apply
   qualification additionally require `reset_to_stock_ok == true` and `boot_flag_cleared == true`.
 
@@ -106,13 +162,17 @@ or existing field was removed.
   `checksum_count` reports the checks actually executed. The UI must not describe this as 100% frame
   checksum coverage.
 
-\- **Texture v9 and exact-Apply duration.** Texture v9 enters the golden-checked TextureRop detector
-  immediately after its short opening and returns to it before later cadence/mixed/VRAM coverage.
-  Every unique selected `(target, Apply VF bin)` requires Texture v9 5 min + one continuous Endurance
-  20 min. Endurance front-loads TextureRop, composite game load and cap-slam cycles so a bad candidate
-  can reject before the long thermal tier; a pass still completes the entire 20-minute transaction.
+\- **Texture Hop v10 and mode-specific exact-Apply duration.** Texture Hop v10 enters the
+  golden-checked TextureRop detector immediately and revisits it across deliberately irregular
+  power/composite transitions. Standard requires 30 s at each frontier candidate and, for every
+  unique selected `(target, Apply VF bin)`, 2 min Texture Hop + 5 min continuous Endurance. Long
+  requires 60 s at the frontier and 5 min Texture Hop + 20 min Endurance. Endurance front-loads
+  TextureRop, composite game load and cap-slam cycles so a bad candidate can reject before its thermal
+  tier; a pass still completes the selected mode's entire transaction.
   DX11 and standalone TransitionShock are legacy-readable but no longer execute in the mandatory gate,
   and current startup no longer captures a DX11 golden. Passing-pair dwell is 25 rather than 38 minutes.
+  A point already above the 94% publication ceiling after Texture is removed as power-bound before
+  Endurance, without blacklist; every point still eligible for publication must complete Endurance.
 
 \- **Profile-aware vertical closure.** A reset-clean physical gate failure excludes the exact bin and
   tries every viable higher physical bin at the same clock; there is no attempt-count budget. The
@@ -124,7 +184,7 @@ or existing field was removed.
   Godforge may climb the full physical voltage domain under it. Brokkr's voltage ceiling is one real
   bin below Godforge, and Deep Calm one real bin below the lowest stronger profile. After Godforge
   exhausts a clock, it may carry that voltage to the next lower real clock, but the carried pair must
-  receive fresh exact-bin power calibration and the complete v18 gate before publication.
+  receive fresh exact-bin power calibration and the complete v19 gate before publication.
 
 \- **Additive/defaulted `PowerSweepProgress` fields:**
   - `observed_boost_clock_mhz: Option<u32>` — Cboost observed after deterministic stock preheat.
@@ -133,11 +193,12 @@ or existing field was removed.
   - `preheat_converged: Option<bool>` — `false` while normalization is unresolved, `true` only after
     deterministic convergence.
   - `preheat_temperature_c: Option<f32>` — converged stock temperature.
+  - `stock_power_p99_w: Option<f32>` — sustained-p99 power from the final converged stock window.
 
-  Existing `cmax_clock_mhz` retains the proved Cmax meaning. `ForgeProgress.svelte` renders the
-  Ctable/Cboost/preheat facts from these structured fields and labels `phase == "preheat"` as stock
-  normalization. Legacy/interrupted payloads deserialize the new fields as `None`; frontend fallback
-  must remain display-only and must not infer safety or eligibility from logs.
+  Existing `cmax_clock_mhz` retains the proved Cmax meaning. The simplified progress surface uses the
+  structured task/timing fields and labels `phase == "preheat"` as stock normalization without
+  exposing Ctable/Cboost candidate telemetry. Legacy/interrupted payloads deserialize new fields as
+  `None`; frontend fallback must remain display-only and must not infer safety or eligibility from logs.
 
 
 

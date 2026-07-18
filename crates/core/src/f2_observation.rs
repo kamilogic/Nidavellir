@@ -83,8 +83,11 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// Vulkan/DX12 backends; pre-v17 positives did not exercise it and cannot unlock Apply.
 /// v18 (2026-07-16): Texture becomes TextureRop-first v9 and Endurance front-loads its aggressive
 /// rejection tier. DX11 and TransitionShock leave the mandatory gate because neither rejected a
-/// candidate in the collected runs; current deployability is exact-Apply Texture v9 + Endurance.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 18;
+/// candidate in the collected runs; v18 deployability was exact-Apply Texture v9 + Endurance.
+/// v19 (2026-07-18): Texture Hop v10 increases dependent texture/ROP work, sweeps denser multi-period
+/// load-release transitions and owns more of the early descent tier. Standard uses a bounded compact
+/// proof; Long retains the exhaustive thermal proof. Pre-v19 positives cannot unlock Apply.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 19;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -192,10 +195,10 @@ pub enum F2QualificationPattern {
     /// completeness gates or forcing a contract-version bump; publishing is gated on run_id-scoped
     /// endurance evidence instead ([`point_has_current_endurance_qualification`]).
     Endurance,
-    /// Legacy v15 candidate-only transition shock. Contract v18 no longer executes or requires it,
+    /// Legacy v15 candidate-only transition shock. Contract v19 no longer executes or requires it,
     /// but the variant remains so persisted evidence is backward-readable.
     TransitionShock,
-    /// Legacy v17 candidate-only native Direct3D 11 render/integrity gate. Contract v18 no longer
+    /// Legacy v17 candidate-only native Direct3D 11 render/integrity gate. Contract v19 no longer
     /// executes or requires it, but the variant remains so persisted evidence is backward-readable.
     Dx11Game,
 }
@@ -1070,6 +1073,79 @@ pub fn current_apply_qualification_p99_at_anchor(
     apply_qualification_p99_at_anchor(obs, Some(run_id), target_mhz, anchor_mv, gpu_key)
 }
 
+/// Highest sustained p99 from a complete exact-Apply gate: every required detector plus the
+/// continuous Endurance proof must have passed reset-clean in the same run. Unlike the legacy
+/// required-set helper above, this intentionally lets Endurance raise the power used for profile
+/// selection and publication.
+fn complete_apply_gate_p99_at_anchor(
+    obs: &[F2Observation],
+    run_id: Option<&str>,
+    target_mhz: u32,
+    anchor_mv: u32,
+    gpu_key: &str,
+) -> Option<f32> {
+    let mut runs = std::collections::BTreeMap::<
+        &str,
+        ([bool; REQUIRED_QUALIFICATION_PATTERNS.len()], bool, f32),
+    >::new();
+    for observation in obs.iter().filter(|o| {
+        run_id.is_none_or(|expected| o.run_id == expected)
+            && o.target_mhz == target_mhz
+            && o.anchor_mv == anchor_mv
+            && o.gpu_key.as_deref() == Some(gpu_key)
+            && is_current_apply_qualification_evidence(o)
+            && o.reset_to_stock_ok
+            && o.boot_flag_cleared
+            && apply_qual_reading_trustworthy(o, target_mhz)
+            && o.power_p99_w
+                .is_some_and(|power| power.is_finite() && power > 0.0)
+    }) {
+        let Some(pattern) = observation
+            .qualification_coverage
+            .as_ref()
+            .and_then(|coverage| coverage.pattern)
+        else {
+            continue;
+        };
+        let entry = runs.entry(observation.run_id.as_str()).or_insert((
+            [false; REQUIRED_QUALIFICATION_PATTERNS.len()],
+            false,
+            0.0,
+        ));
+        if let Some(index) = required_pattern_index(pattern) {
+            entry.0[index] = true;
+        } else if pattern == F2QualificationPattern::Endurance {
+            entry.1 = true;
+        } else {
+            continue;
+        }
+        entry.2 = entry.2.max(observation.power_p99_w.unwrap_or(0.0));
+    }
+    runs.into_values()
+        .filter(|(seen, endurance, _)| seen.iter().all(|present| *present) && *endurance)
+        .map(|(_, _, power)| power)
+        .max_by(f32::total_cmp)
+}
+
+pub fn current_complete_apply_gate_p99_at_anchor(
+    obs: &[F2Observation],
+    run_id: &str,
+    target_mhz: u32,
+    anchor_mv: u32,
+    gpu_key: &str,
+) -> Option<f32> {
+    complete_apply_gate_p99_at_anchor(obs, Some(run_id), target_mhz, anchor_mv, gpu_key)
+}
+
+pub fn highest_complete_apply_gate_p99_at_anchor(
+    obs: &[F2Observation],
+    target_mhz: u32,
+    anchor_mv: u32,
+    gpu_key: &str,
+) -> Option<f32> {
+    complete_apply_gate_p99_at_anchor(obs, None, target_mhz, anchor_mv, gpu_key)
+}
+
 /// Highest sustained p95 clock reached by a complete, reset-clean current set at one exact Apply pair.
 /// Missing telemetry in any required pattern fails closed.
 pub fn current_apply_qualification_p95_clock_at_anchor(
@@ -1109,8 +1185,8 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
 }
 
 /// True when the CURRENT run's candidate-only stress gate validated cleanly at this exact
-/// `(target_mhz, apply_mv)` pair on this GPU — v18 requires the continuous Endurance soak after the
-/// required exact-Apply Texture v9 pattern. DX11 and TransitionShock remain readable legacy evidence
+/// `(target_mhz, apply_mv)` pair on this GPU — v19 requires the continuous Endurance soak after the
+/// required exact-Apply Texture Hop v10 pattern. DX11 and TransitionShock remain readable legacy evidence
 /// but no longer gate publication because they never rejected a collected candidate.
 /// These gates only TIGHTEN Apply — they are not part of [`REQUIRED_QUALIFICATION_PATTERNS`] and
 /// never touch the frontier descent. They still share the current qualification contract and full
@@ -1931,6 +2007,12 @@ mod tests {
         );
         memory.run_id = "apply-v7".into();
         memory.power_p99_w = Some(172.9);
+        let mut endurance = apply_qualification_pass(
+            obs(1830, 862, F2ObsOutcome::Validated),
+            F2QualificationPattern::Endurance,
+        );
+        endurance.run_id = "apply-v7".into();
+        endurance.power_p99_w = Some(181.5);
         // Thermal slowdown that ALSO sagged the sustained clock below tolerance stays excluded
         // (fail-closed). The held-clock case (throttle but clock >= target) is trusted now and is
         // covered by `apply_qualification_held_thermal_reading_is_trusted_but_sag_is_excluded`.
@@ -1950,17 +2032,22 @@ mod tests {
         let mut other_run_memory = memory.clone();
         other_run_memory.run_id = "other-run".into();
         other_run_memory.power_p99_w = Some(190.5);
+        let mut other_run_endurance = endurance.clone();
+        other_run_endurance.run_id = "other-run".into();
+        other_run_endurance.power_p99_w = Some(192.0);
 
         let observations = [
             high_fps.clone(),
             texture,
             transitions,
             memory,
+            endurance,
             throttled,
             other_run_high_fps,
             other_run_texture,
             other_run_transitions,
             other_run_memory,
+            other_run_endurance,
         ];
         assert_eq!(
             current_apply_qualification_p99_at_anchor(
@@ -1986,6 +2073,27 @@ mod tests {
             highest_apply_qualification_p99_at_anchor(&observations, 1830, 862, "RTX 3060 Ti"),
             Some(190.0),
             "restored snapshots use the highest complete approved run"
+        );
+        assert_eq!(
+            current_complete_apply_gate_p99_at_anchor(
+                &observations,
+                "apply-v7",
+                1830,
+                862,
+                "RTX 3060 Ti"
+            ),
+            Some(181.5),
+            "complete gate power includes the harsher Endurance p99"
+        );
+        assert_eq!(
+            highest_complete_apply_gate_p99_at_anchor(
+                &observations,
+                1830,
+                862,
+                "RTX 3060 Ti"
+            ),
+            Some(192.0),
+            "restored snapshots preserve the worst complete-gate run"
         );
         assert_eq!(
             current_apply_qualification_p99_at_anchor(
@@ -2058,7 +2166,7 @@ mod tests {
             o.gpu_key = Some("RTX 4070".into());
             o
         };
-        // The current run's continuous Endurance gate at the exact pair is sufficient in v18.
+        // The current run's continuous Endurance gate at the exact pair is sufficient in v19.
         let endurance = [pass(
             "R1",
             F2QualificationPattern::Endurance,
@@ -2088,7 +2196,7 @@ mod tests {
             956,
             "RTX 4070"
         ));
-        // Removed legacy gates cannot publish a v18 point by themselves.
+        // Removed legacy gates cannot publish a v19 point by themselves.
         let shock_only =
             [pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated)];
         assert!(!point_has_current_endurance_qualification(&shock_only, "R1", 1935, 956, "RTX 4070"));

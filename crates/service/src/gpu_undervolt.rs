@@ -131,14 +131,14 @@ const F2_ADAPTIVE_MAX_STRIDE_BINS: usize = 4;
 #[cfg(windows)]
 const F2_ADAPTIVE_MAX_VOLTAGE_DROP_MV: u32 = 25;
 
-/// Relative sustained-clock margin allowed between equivalent Texture v9 qualification passes. A
+/// Relative sustained-clock margin allowed between equivalent Texture Hop v10 qualification passes. A
 /// candidate whose heavy-phase p5 falls farther than this below the median of prior stable
 /// candidates at the same target/pattern has reached the voltage-margin cliff even if it did not
 /// crash. This is policy, not a hardware limit.
 #[cfg(windows)]
 const MARGIN_DROP_TOL_MHZ: u32 = 30;
 
-/// Number of additional attempts after an inconclusive Texture v9 qualification dwell. Coverage
+/// Number of additional attempts after an inconclusive Texture Hop v10 qualification dwell. Coverage
 /// ambiguity is not instability: retry the same physical point, then skip only this clock.
 #[cfg(windows)]
 const INCONCLUSIVE_RETRY_BUDGET: usize = 2;
@@ -4280,7 +4280,7 @@ pub(crate) struct F2ClockDiscoveryProgress {
 
 /// Result of filling one missing exact-Apply-bin PowerRender measurement after the qualified
 /// frontier is complete. This step never promotes stability; it only contributes current-contract
-/// power telemetry. The distinct exact-Apply v18 gate runs after synthesis.
+/// power telemetry. The distinct exact-Apply v19 gate runs after synthesis.
 #[cfg(windows)]
 pub(crate) struct F2PowerCalibrationSummary {
     pub confirmed: bool,
@@ -4291,7 +4291,7 @@ pub(crate) struct F2PowerCalibrationSummary {
     pub logs: Vec<String>,
 }
 
-/// Result of the v18 Texture-first + Endurance gate at the exact post-margin Apply pair.
+/// Result of the v19 Texture Hop + Endurance gate at the exact post-margin Apply pair.
 /// A reset-clean rejection is local to this candidate and lets synthesis choose another point; hard
 /// device/reset/write failures still abort the Forge.
 #[cfg(windows)]
@@ -4361,6 +4361,9 @@ enum F2QualificationOutcome {
     /// A reset-clean instability — the qualifier rejected this point. Carries the failing outcome's
     /// debug string (purely for the stop reason / logs).
     Rejected(String),
+    /// Stable under the early Texture detector, but already above the common publication power
+    /// ceiling. This is an energy-envelope refusal, not instability and never condemnation.
+    PowerBound { measured_w: f32, ceiling_w: f32 },
     /// Reset-clean but coverage too weak to accept or reject after the retry budget.
     Inconclusive,
     /// Stop was requested mid-qualification.
@@ -4368,6 +4371,21 @@ enum F2QualificationOutcome {
     /// A hard failure (device lost / reset failed / arm / apply / verify / precheck / persist). The
     /// caller must abort the forge; `retain_boot_flag` follows the usual DeviceLost/ResetFailed rule.
     Aborted { stop_reason: String, retain_boot_flag: bool },
+}
+
+#[cfg(windows)]
+fn qualification_power_above_ceiling(
+    report: &F2StepReport,
+    ceiling_w: Option<f32>,
+) -> Option<(f32, f32)> {
+    let ceiling_w = ceiling_w.filter(|value| value.is_finite() && *value > 0.0)?;
+    let measured_w = report
+        .power_p99_w
+        .into_iter()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .chain(report.max_power_w.map(|value| value as f32))
+        .max_by(f32::total_cmp)?;
+    (measured_w > ceiling_w).then_some((measured_w, ceiling_w))
 }
 
 #[cfg(windows)]
@@ -4570,7 +4588,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: None,
                 line: format!(
-                    "v9 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
+                    "v10 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
                     qualification_pattern_label(pattern),
                     pass_index,
                     patterns.len(),
@@ -4602,7 +4620,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                         report.dwell = Some(F2DwellOutcome::ClockDrop);
                         report.validated = false;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV v9 {}: colapso de margem p5={current_p5} MHz (baseline {:?} MHz, tolerância {} MHz)",
+                            "{target_mhz} MHz @ {} mV v10 {}: colapso de margem p5={current_p5} MHz (baseline {:?} MHz, tolerância {} MHz)",
                             candidate.anchor.voltage_mv,
                             qualification_pattern_label(pattern),
                             median_u32(margin_history.values(pattern)),
@@ -4614,7 +4632,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                 }
             }
             logs.push(format!(
-                "{target_mhz} MHz @ {} mV v9 {} {}/{}: {:?}",
+                "{target_mhz} MHz @ {} mV v10 {} {}/{}: {:?}",
                 candidate.anchor.voltage_mv,
                 qualification_pattern_label(pattern),
                 pass_index,
@@ -4634,7 +4652,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: None,
                 line: format!(
-                    "{target_mhz} MHz @ {} mV · v9 {} {}/{} → {:?} · aguardando cleanup",
+                    "{target_mhz} MHz @ {} mV · v10 {} {}/{} → {:?} · aguardando cleanup",
                     candidate.anchor.voltage_mv,
                     qualification_pattern_label(pattern),
                     pass_index,
@@ -4658,7 +4676,7 @@ fn qualify_active_anchored_candidate<O: F2CandidateTransactionOps>(
                     if qualification_should_retry_inconclusive(inconclusive_retries) {
                         inconclusive_retries += 1;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV v9 {} inconclusivo; retentativa {}/{} com dwell ampliado",
+                            "{target_mhz} MHz @ {} mV v10 {} inconclusivo; retentativa {}/{} com dwell ampliado",
                             candidate.anchor.voltage_mv,
                             qualification_pattern_label(pattern),
                             inconclusive_retries,
@@ -4772,8 +4790,10 @@ fn gate_anchored_candidate_fsgl3(
     unpruned_steps: usize,
     final_gate_dwell_ms: u64,
     final_gate_passes: usize,
+    exact_apply_endurance_dwell_ms: u64,
     render_goldens: Option<RenderGoldens>,
     exact_apply: bool,
+    publication_power_ceiling_w: Option<f32>,
     stop: &std::sync::atomic::AtomicBool,
     logs: &mut Vec<String>,
     executed_steps: &mut usize,
@@ -4828,7 +4848,7 @@ fn gate_anchored_candidate_fsgl3(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: None,
                 line: format!(
-                    "v9 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
+                    "v10 {} {}/{}: {target_mhz} MHz @ {} mV ({} s)…",
                     qualification_pattern_label(pattern),
                     pass_index,
                     patterns.len(),
@@ -4845,7 +4865,7 @@ fn gate_anchored_candidate_fsgl3(
                 inconclusive_retries as u32,
             );
             logs.push(format!(
-                "{target_mhz} MHz @ {} mV v9 {} {}/{}: {:?}",
+                "{target_mhz} MHz @ {} mV v10 {} {}/{}: {:?}",
                 candidate.anchor.voltage_mv,
                 qualification_pattern_label(pattern),
                 pass_index,
@@ -4873,7 +4893,7 @@ fn gate_anchored_candidate_fsgl3(
                 anchor_mv: Some(candidate.anchor.voltage_mv),
                 outcome: Some(format!("{:?}", report.outcome)),
                 line: format!(
-                    "{target_mhz} MHz @ {} mV · v9 {} {}/{} → {:?} · aprendizado salvo",
+                    "{target_mhz} MHz @ {} mV · v10 {} {}/{} → {:?} · aprendizado salvo",
                     candidate.anchor.voltage_mv,
                     qualification_pattern_label(pattern),
                     pass_index,
@@ -4881,6 +4901,20 @@ fn gate_anchored_candidate_fsgl3(
                     report.outcome
                 ),
             });
+            if exact_apply
+                && pattern == F2QualificationPattern::Texture
+                && matches!(report.outcome, F2Outcome::Validated)
+            {
+                if let Some((measured_w, ceiling_w)) =
+                    qualification_power_above_ceiling(&report, publication_power_ceiling_w)
+                {
+                    logs.push(format!(
+                        "{target_mhz} MHz @ {} mV passed Texture Hop v10 but measured {measured_w:.0} W above the {ceiling_w:.0} W publication ceiling; Endurance skipped without blacklist",
+                        candidate.anchor.voltage_mv
+                    ));
+                    return F2QualificationOutcome::PowerBound { measured_w, ceiling_w };
+                }
+            }
             match &report.outcome {
                 F2Outcome::Validated => {
                     if exact_apply && inconclusive_retries > 0 {
@@ -4890,7 +4924,7 @@ fn gate_anchored_candidate_fsgl3(
                             clean_passes_after_inconclusive,
                         ) {
                             logs.push(format!(
-                                "{target_mhz} MHz @ {} mV v9 {}: dívida inconclusiva preservada; exigindo mais um passe limpo consecutivo",
+                                "{target_mhz} MHz @ {} mV v10 {}: dívida inconclusiva preservada; exigindo mais um passe limpo consecutivo",
                                 candidate.anchor.voltage_mv,
                                 qualification_pattern_label(pattern)
                             ));
@@ -4919,7 +4953,7 @@ fn gate_anchored_candidate_fsgl3(
                         inconclusive_retries += 1;
                         clean_passes_after_inconclusive = 0;
                         logs.push(format!(
-                            "{target_mhz} MHz @ {} mV v9 {} inconclusivo; {}",
+                            "{target_mhz} MHz @ {} mV v10 {} inconclusivo; {}",
                             candidate.anchor.voltage_mv,
                             qualification_pattern_label(pattern),
                             if exact_apply {
@@ -4936,115 +4970,113 @@ fn gate_anchored_candidate_fsgl3(
             }
         }
     }
-    // v18 candidate-only Endurance at the EXACT Apply point. Texture v9 already ran first as the
+    // v19 candidate-only Endurance at the EXACT Apply point. Texture Hop v10 already ran first as the
     // required pattern; DX11 and TransitionShock were removed from the mandatory path after never
-    // rejecting a collected candidate. Endurance remains one continuous ~20-minute transaction,
-    // now with its aggressive TextureRop/composite/cap-slam rejection tier at the front and the
-    // complete thermal-saturation proof behind it.
+    // rejecting a collected candidate. Endurance remains one continuous mode-specific transaction,
+    // with its aggressive TextureRop/composite/cap-slam rejection tier at the front. Long retains
+    // the complete thermal-saturation proof; Standard uses the compact bounded tier.
     // Non-Validated ⇒ the exact point is rejected (fail closed). Each pass keeps the same
     // arm→apply→verify→dwell→reset motor + NVML clock ceiling + cooperative Stop.
     if exact_apply {
         let (pattern, dwell_ms, kind) = (
             F2QualificationPattern::Endurance,
-            F2_ENDURANCE_QUALIFICATION_DWELL_MS,
+            exact_apply_endurance_dwell_ms,
             "soak contínuo agressivo",
         );
-            let label = qualification_pattern_label(pattern);
-            if stop.load(Ordering::SeqCst) {
-                return F2QualificationOutcome::Cancelled;
-            }
-            let mut gate_ops = RealF2MultiOps {
-                store,
-                curve: sane.to_vec(),
-                candidates: vec![candidate.clone()],
-                limits: *limits,
-                target_mhz,
-                baseline_offset_mhz: 0,
-                prev_offset_override_mhz: None,
-                dwell_ms,
-                stress_purpose: F2StressPurpose::ApplyQualification(pattern, goldens),
-                cancel: Some(stop),
-                cur: None,
+        let label = qualification_pattern_label(pattern);
+        if stop.load(Ordering::SeqCst) {
+            return F2QualificationOutcome::Cancelled;
+        }
+        let mut gate_ops = RealF2MultiOps {
+            store,
+            curve: sane.to_vec(),
+            candidates: vec![candidate.clone()],
+            limits: *limits,
+            target_mhz,
+            baseline_offset_mhz: 0,
+            prev_offset_override_mhz: None,
+            dwell_ms,
+            stress_purpose: F2StressPurpose::ApplyQualification(pattern, goldens),
+            cancel: Some(stop),
+            cur: None,
+        };
+        if let Err(e) = gate_ops.select(0) {
+            return F2QualificationOutcome::Aborted {
+                stop_reason: format!("{label}PrecheckFailed: {e}"),
+                retain_boot_flag: false,
             };
-            if let Err(e) = gate_ops.select(0) {
-                return F2QualificationOutcome::Aborted {
-                    stop_reason: format!("{label}PrecheckFailed: {e}"),
-                    retain_boot_flag: false,
-                };
-            }
-            on_progress(F2ClockDiscoveryProgress {
-                target_mhz,
-                planned_steps: candidate_count,
-                unpruned_steps,
-                anchor_mv: Some(candidate.anchor.voltage_mv),
-                outcome: None,
-                line: format!(
-                    "v9 {label}: {target_mhz} MHz @ {} mV — {kind} ({} min)…",
-                    candidate.anchor.voltage_mv,
-                    dwell_ms / 60_000
-                ),
-            });
-            let mut report = run_confirmed_f2_step(&mut gate_ops);
-            annotate_qualification_report(
-                &mut report,
-                F2QualificationStrength::Fsgl4,
-                Some(pattern),
-                1,
-                0,
-            );
-            logs.push(format!(
-                "{target_mhz} MHz @ {} mV v9 {label} ({kind} {} min): {:?}",
+        }
+        on_progress(F2ClockDiscoveryProgress {
+            target_mhz,
+            planned_steps: candidate_count,
+            unpruned_steps,
+            anchor_mv: Some(candidate.anchor.voltage_mv),
+            outcome: None,
+            line: format!(
+                "v10 {label}: {target_mhz} MHz @ {} mV — {kind} ({} min)…",
                 candidate.anchor.voltage_mv,
-                dwell_ms / 60_000,
-                report.outcome
-            ));
-            qual_ctx.timestamp = now_rfc3339();
-            let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
-                qual_ctx,
-                target_mhz,
-                candidate,
-                &report,
-            );
-            if let Err(e) = obs_store.append(&observation) {
+                dwell_ms / 60_000
+            ),
+        });
+        let mut report = run_confirmed_f2_step(&mut gate_ops);
+        annotate_qualification_report(
+            &mut report,
+            F2QualificationStrength::Fsgl4,
+            Some(pattern),
+            1,
+            0,
+        );
+        logs.push(format!(
+            "{target_mhz} MHz @ {} mV v10 {label} ({kind} {} min): {:?}",
+            candidate.anchor.voltage_mv,
+            dwell_ms / 60_000,
+            report.outcome
+        ));
+        qual_ctx.timestamp = now_rfc3339();
+        let observation = crate::gpu_f2_sweep::observation_from_anchored_step(
+            qual_ctx,
+            target_mhz,
+            candidate,
+            &report,
+        );
+        if let Err(e) = obs_store.append(&observation) {
+            return F2QualificationOutcome::Aborted {
+                stop_reason: format!("ObservationPersistFailed: {e}"),
+                retain_boot_flag: false,
+            };
+        }
+        *executed_steps = executed_steps.saturating_add(1);
+        on_progress(F2ClockDiscoveryProgress {
+            target_mhz,
+            planned_steps: candidate_count,
+            unpruned_steps,
+            anchor_mv: Some(candidate.anchor.voltage_mv),
+            outcome: Some(format!("{:?}", report.outcome)),
+            line: format!(
+                "{target_mhz} MHz @ {} mV · v10 {label} → {:?} · aprendizado salvo",
+                candidate.anchor.voltage_mv, report.outcome
+            ),
+        });
+        if stop.load(Ordering::SeqCst) {
+            return F2QualificationOutcome::Cancelled;
+        }
+        match &report.outcome {
+            F2Outcome::Validated => {}
+            F2Outcome::DeviceLost
+            | F2Outcome::ResetFailed
+            | F2Outcome::ArmFailed(_)
+            | F2Outcome::ApplyFailed(_)
+            | F2Outcome::VerifyFailed => {
                 return F2QualificationOutcome::Aborted {
-                    stop_reason: format!("ObservationPersistFailed: {e}"),
-                    retain_boot_flag: false,
+                    stop_reason: format!("{label}Aborted: {:?}", report.outcome),
+                    retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
                 };
             }
-            *executed_steps = executed_steps.saturating_add(1);
-            on_progress(F2ClockDiscoveryProgress {
-                target_mhz,
-                planned_steps: candidate_count,
-                unpruned_steps,
-                anchor_mv: Some(candidate.anchor.voltage_mv),
-                outcome: Some(format!("{:?}", report.outcome)),
-                line: format!(
-                    "{target_mhz} MHz @ {} mV · v9 {label} → {:?} · aprendizado salvo",
-                    candidate.anchor.voltage_mv, report.outcome
-                ),
-            });
-            if stop.load(Ordering::SeqCst) {
-                return F2QualificationOutcome::Cancelled;
+            F2Outcome::Inconclusive => return F2QualificationOutcome::Inconclusive,
+            other => {
+                return F2QualificationOutcome::Rejected(format!("{label} {other:?}"))
             }
-            match &report.outcome {
-                F2Outcome::Validated => {}
-                F2Outcome::DeviceLost
-                | F2Outcome::ResetFailed
-                | F2Outcome::ArmFailed(_)
-                | F2Outcome::ApplyFailed(_)
-                | F2Outcome::VerifyFailed => {
-                    return F2QualificationOutcome::Aborted {
-                        stop_reason: format!("{label}Aborted: {:?}", report.outcome),
-                        retain_boot_flag: f2_outcome_retains_boot_flag(&report.outcome),
-                    };
-                }
-                F2Outcome::Inconclusive => return F2QualificationOutcome::Inconclusive,
-                other => {
-                    return F2QualificationOutcome::Rejected(format!(
-                        "{label} {other:?}"
-                    ))
-                }
-            }
+        }
     }
     F2QualificationOutcome::Qualified
 }
@@ -5066,7 +5098,9 @@ pub(crate) fn run_confirmed_f2_apply_qualification(
     apply_mv: u32,
     reference_offset_mhz: i32,
     qualification_dwell_ms: u64,
+    endurance_dwell_ms: u64,
     render_goldens: Option<RenderGoldens>,
+    publication_power_ceiling_w: Option<f32>,
     stop: &std::sync::atomic::AtomicBool,
     on_progress: &mut dyn FnMut(F2ClockDiscoveryProgress),
 ) -> F2ApplyQualificationSummary {
@@ -5163,8 +5197,10 @@ pub(crate) fn run_confirmed_f2_apply_qualification(
         // gates demand every pattern, so a shorter list (this was a hardcoded 3) discards a fully
         // passed soak as "no measurable sustained p95".
         nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len(),
+        endurance_dwell_ms,
         render_goldens,
         true,
+        publication_power_ceiling_w,
         stop,
         &mut logs,
         &mut executed_steps,
@@ -5184,6 +5220,15 @@ pub(crate) fn run_confirmed_f2_apply_qualification(
             false,
             false,
             format!("ExactApplyRejected: {reason}"),
+        ),
+        F2QualificationOutcome::PowerBound { measured_w, ceiling_w } => (
+            false,
+            false,
+            false,
+            false,
+            format!(
+                "ExactApplyPowerCeilingExceeded: measured {measured_w:.0} W > {ceiling_w:.0} W"
+            ),
         ),
         F2QualificationOutcome::Inconclusive => (
             false,
@@ -5605,8 +5650,8 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
         .map(|o| o.anchor_mv)
         .min();
     // Standard/Long must not qualify a boundary that exists only because a previous run accepted it.
-    // Prior positives may guide Fast/resume, but qualification modes must rediscover the boundary with
-    // the current PowerRender discovery contract before the FailureSeekingGameLoop is allowed to run.
+    // Prior positives may guide a compatible resume, but new qualification runs must rediscover the
+    // boundary with the current PowerRender contract before the failure-seeking loop is allowed to run.
     let refresh_discovery_for_qualification = f2_refresh_discovery_for_qualification(
         qualification_passes,
         final_gate_passes,
@@ -5763,7 +5808,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     }
 
     // Qualification evidence context, separate from the Discovery `ctx` used by PowerRender.
-    // Texture v9 is the default per-candidate qualifier during descent. The optional final gate is
+    // Texture Hop v10 is the default per-candidate qualifier during descent. The optional final gate is
     // kept dormant here and shares the same boundary shape.
     let mut qual_ctx = ctx.clone();
     qual_ctx.evidence_kind = nidavellir_core::f2_observation::F2EvidenceKind::Qualification;
@@ -6328,6 +6373,13 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                             };
                             break;
                         }
+                        F2QualificationOutcome::PowerBound { measured_w, ceiling_w } => {
+                            aborted = true;
+                            stop_reason = format!(
+                                "UnexpectedDiscoveryPowerCeiling: {measured_w:.0} W > {ceiling_w:.0} W"
+                            );
+                            break;
+                        }
                         F2QualificationOutcome::Inconclusive => {
                             let shallower_safe_index = recovery_bracket
                                 .map(|(safe, _)| safe)
@@ -6415,9 +6467,9 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                         break;
                     }
                 }
-                // Fast (qualification_passes == 0) or a pre-sustain power-bound drop: keep descending.
-                // Fast leaves the deepest PowerRender-good point provisional; discovery observations
-                // carry it for synthesis.
+                // An unqualified legacy caller (qualification_passes == 0), or a pre-sustain
+                // power-bound drop, keeps descending. Discovery observations carry the deepest
+                // PowerRender-good point for synthesis, but cannot qualify it for Apply.
             }
             F2DiscoveryDecision::NextClockUnsustainable => {
                 completed = true;
@@ -6505,8 +6557,10 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                 unpruned_steps,
                 final_gate_dwell_ms,
                 final_gate_passes,
+                0,
                 render_goldens,
                 false,
+                None,
                 stop,
                 &mut logs,
                 &mut executed_steps,
@@ -6531,6 +6585,13 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
                         completed = false;
                         stop_reason = format!("V8RejectedNoHigherBin: {reason}");
                     }
+                }
+                F2QualificationOutcome::PowerBound { measured_w, ceiling_w } => {
+                    completed = false;
+                    stop_reason = format!(
+                        "UnexpectedBoundaryPowerCeiling: {measured_w:.0} W > {ceiling_w:.0} W"
+                    );
+                    break;
                 }
                 F2QualificationOutcome::Inconclusive => {
                     completed = false;
@@ -7533,7 +7594,7 @@ mod tests {
                             F2QualificationPattern::A => "fsgl3-a",
                             F2QualificationPattern::B => "fsgl3-b",
                             F2QualificationPattern::HighFps => "v8-high-fps",
-                            F2QualificationPattern::Texture => "v9-texture",
+                            F2QualificationPattern::Texture => "v10-texture-hop",
                             F2QualificationPattern::Transitions => "v8-transitions",
                             F2QualificationPattern::Memory => "v8-memory",
                             F2QualificationPattern::Endurance => "endurance",
@@ -7632,6 +7693,24 @@ mod tests {
             }
             .completes_clock()
         );
+    }
+
+    #[test]
+    fn texture_power_screen_is_conservative_and_energy_only() {
+        let mut report = empty_f2_step_report();
+        report.power_p99_w = Some(183.0);
+        report.max_power_w = Some(189);
+        assert_eq!(
+            qualification_power_above_ceiling(&report, Some(188.0)),
+            Some((189.0, 188.0)),
+            "the peak prevents a lighter p99 from admitting an off-cap candidate"
+        );
+        report.max_power_w = Some(188);
+        assert_eq!(
+            qualification_power_above_ceiling(&report, Some(188.0)),
+            None
+        );
+        assert_eq!(qualification_power_above_ceiling(&report, None), None);
     }
 
     #[test]

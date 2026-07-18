@@ -310,10 +310,12 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             IpcResponse::success(ResponseData::GpuApply(applied_status(msg)))
         }
         IpcRequest::ResetGpuTuningFull => {
-            // Deep "forget everything" reset. Same emergency recovery as ResetGpuTuning (outside the
-            // start/apply lease), but additionally wipes ALL learning: the Safe Loop blacklist (by
+            // Deep active-learning reset. Same emergency recovery as ResetGpuTuning (outside the
+            // start/apply lease), but additionally wipes the Safe Loop working blacklist (by
             // replacing the record with the default), the F2 observation frontier, and legacy
-            // knowledge. Hardware → stock and the latch are handled by gpu_apply::reset first.
+            // knowledge. The durable condemnation ledger remains hardware-derived field evidence;
+            // the UI arms the next Forge as Clean Run so that ledger does not steer the experiment.
+            // Hardware → stock and the latch are handled by gpu_apply::reset first.
             guard.real_sweep.stop();
             guard.mem_sweep.stop();
             guard.forge_all.stop();
@@ -339,10 +341,11 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
                     // the now-empty blacklist.
                     problems.extend(crate::tdr_sentinel::reset_sentinel_state());
                     guard.power_sweep.forget_after_full_reset(
-                        "Reset completo concluído; GPU em stock, Safe Loop desarmado e todo o aprendizado apagado.",
+                        "Reset completo concluído; GPU em stock, aprendizado ativo apagado e condenações reais duráveis preservadas.",
                     );
                     if problems.is_empty() {
-                        "Full reset to stock; all learning cleared".to_string()
+                        "Full reset to stock; active learning cleared and durable real-world condemnations preserved"
+                            .to_string()
                     } else {
                         format!("Full reset to stock; some state could not be cleared: {}", problems.join("; "))
                     }
@@ -408,10 +411,12 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             }
         }
         IpcRequest::StartPowerSweepFast => {
+            // Backward-compatible wire alias only. Fast no longer exists as a Forge behavior;
+            // an older UI therefore receives the same bounded, fully qualified Standard run.
             let store = guard.safe_store.clone();
             if guard
                 .power_sweep
-                .start_with_mode(store, crate::gpu_power_sweep::PowerSweepMode::Fast)
+                .start_with_mode(store, crate::gpu_power_sweep::PowerSweepMode::Standard)
             {
                 IpcResponse::success(ResponseData::PowerSweep(guard.power_sweep.progress()))
             } else {

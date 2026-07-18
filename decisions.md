@@ -2,6 +2,45 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Make Texture Hop v10 the hardware oracle; bound Standard and retire Fast (2026-07-18)
+- **Observed problem:** the clean run accepted `1800 MHz @ 856 mV`, while repeated field testing puts
+  the credible boundary near `1800 MHz @ 875 mV`; `1800 MHz @ 869 mV` is therefore the immediate
+  hardware regression oracle. These values are validation evidence for this GPU, never hardcoded
+  tuning limits for other hardware.
+- **Detector decision:** contract v19 replaces v9 with Texture Hop v10: 64 rounds with four dependent
+  texture samples per round, an immediate TextureRop entry and irregular 2/3/5/7-frame burst/gap
+  transitions around composite and power load. Its new semantic fingerprint invalidates older
+  positive evidence for Apply.
+- **Time decision:** Standard uses 30 s frontier qualification plus 2 min Texture Hop and 5 min
+  Endurance for each publishable exact pair. It cancels active GPU work at 59 minutes, reserves the
+  last minute for reset/checkpoint, preserves learning and releases no incomplete profile. Long is
+  the only explicit mode without that ceiling and retains 60 s + 5 min + 20 min proof.
+- **Product decision:** remove Fast from all current UI selectors and provisional semantics. Keep its
+  old IPC method only as a mixed-version alias that executes Standard. Put the Standard/Long selector
+  beside the main Forge action; the one-shot Clean Run inherits the Standard budget.
+- **Acceptance gate:** software tests prove workload construction and fail-closed orchestration only.
+  Hardware acceptance requires a clean Standard run to reject the known-bad `1800@869` neighborhood
+  while allowing the search to recover toward the known-good `1800@875` boundary within one hour.
+
+## Evaluate v18 organically before changing stress weights; make its power evidence honest (2026-07-17)
+- **Evidence boundary:** the latest promising profiles were produced by persistent learning spanning
+  prior Forge/game evidence, so they do not prove first-run convergence. Texture v9 is already
+  TextureRop-first and Endurance already front-loads its adversarial rejection tier. Tightening
+  weights again before one new Clean Run would confound the experiment rather than improve it.
+- **Reset decision:** successful Full Reset arms the next UI start as a one-shot Clean Run, returning
+  the selector to Standard after completion. Durable real-world condemnations remain append-only
+  product truth, but Clean Run scopes reads to the new run so old evidence cannot steer evaluation.
+- **Energy decision:** once Texture v9 proves an exact pair already exceeds the shared publication
+  ceiling, skip Endurance and exclude the pair from this run's profile pool. Power-bound is not
+  instability: never blacklist it and never infer that more voltage is a repair.
+- **Scoring decision:** profile selection and publication use the worst sustained p99 from a complete
+  Texture + Endurance gate; Endurance is not merely an off-cap peak side channel. Stock-relative
+  efficiency is calculated only from this GPU's converged stock p5/p99 measurements.
+- **UX decision:** the home progress surface contains only comprehensible progress/current-next/ETA
+  information. Candidate evidence remains in Advanced Diagnostics. Profile cards are collapsed
+  purpose-first disclosures and reveal only target MHz/mV, maximum measured power, efficiency versus
+  stock, MHz/W and actions when expanded.
+
 ## Close every viable same-clock bin; v18 uses binding tests first (2026-07-16)
 - **Problem:** the first vertical-repair patch stopped after two attempts, used one undifferentiated
   voltage policy for all profiles, read a stale condemnation snapshot and could persist non-Silent

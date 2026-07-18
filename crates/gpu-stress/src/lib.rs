@@ -26,10 +26,12 @@ const C1: u32 = 1664525;
 const C2: u32 = 1013904223;
 const HASH1: u32 = 2654435761;
 const TABLE_INIT: u32 = 2246822519;
-// FSGL3 hardware-calibration knobs: shorten the gap or increase TextureRop/MixedGame
-// weights if known unstable bins survive; use a verify ring if per-frame work causes TDR pressure.
+// Default golden-workload droop cadence. TextureRop uses the denser multi-period cadence below so
+// the graceful checksum detector crosses more VRM response periods without lengthening the dwell.
 const DROOP_BURST: u64 = 6;
 const DROOP_GAP_MS: u64 = 4;
+const TEXROP_DROOP_BURSTS: [u64; 4] = [2, 3, 5, 7];
+const TEXROP_DROOP_GAPS_MS: [u64; 4] = [2, 5, 11, 3];
 // FrameCadence idle gaps between single heavy frames, cycled per frame. Sweeping the gap
 // varies the load-release→re-load period so the droop transient crosses different VRM
 // response frequencies instead of settling into one rhythm.
@@ -277,11 +279,11 @@ pub enum VfQualifierPattern {
     V8Texture,
     V8Transitions,
     V8Memory,
-    /// Candidate-only endurance soak: one CONTINUOUS mixed dwell whose v18 plan front-loads its
-    /// aggressive rejection tier and then completes the full ~20-minute thermal proof.
-    /// Run only at the exact Apply pair, after the required Texture v9 pattern.
+    /// Candidate-only endurance soak: one CONTINUOUS mixed dwell whose v19 plan front-loads its
+    /// aggressive rejection tier. Long completes the full ~20-minute thermal proof.
+    /// Run only at the exact Apply pair, after the required Texture Hop v10 pattern.
     Endurance,
-    /// Legacy v15 candidate-only transition shock. Contract v18 no longer schedules it in the
+    /// Legacy v15 candidate-only transition shock. Contract v19 no longer schedules it in the
     /// mandatory exact-Apply gate, but the pattern remains for persisted evidence compatibility.
     TransitionShock,
 }
@@ -296,8 +298,8 @@ impl VfQualifierPattern {
             Self::Fsgl3B => "fsgl3-b",
             Self::V8HighFps => "v8-high-fps",
             // The internal variant name remains for source compatibility; qualification contract
-            // v18 gives it the v9 workload/provenance below.
-            Self::V8Texture => "v9-texture",
+            // v19 gives it the v10 Texture Hop workload/provenance below.
+            Self::V8Texture => "v10-texture-hop",
             Self::V8Transitions => "v8-transitions",
             Self::V8Memory => "v8-memory",
             Self::Endurance => "endurance",
@@ -356,20 +358,20 @@ fn mixed_game_draw_order(frame: u64) -> [usize; 3] {
 /// a pattern's plan or the execution semantics of one of its workloads changes.
 pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'static str {
     match pattern {
-        VfQualifierPattern::Fsgl1 => "f2q-mix3-rotating-final-sparse16-r1/fsgl1",
-        VfQualifierPattern::Fsgl2A => "f2q-mix3-rotating-final-sparse16-r1/fsgl2-a",
-        VfQualifierPattern::Fsgl2B => "f2q-mix3-rotating-final-sparse16-r1/fsgl2-b",
-        VfQualifierPattern::Fsgl3A => "f2q-mix3-rotating-final-sparse16-r1/fsgl3-a",
-        VfQualifierPattern::Fsgl3B => "f2q-mix3-rotating-final-sparse16-r1/fsgl3-b",
-        VfQualifierPattern::V8HighFps => "f2q-mix3-rotating-final-sparse16-r1/v8-high-fps",
-        VfQualifierPattern::V8Texture => "f2q-texture-rop-first-r1/v9-texture",
+        VfQualifierPattern::Fsgl1 => "f2q-texhop-v10-r1/fsgl1",
+        VfQualifierPattern::Fsgl2A => "f2q-texhop-v10-r1/fsgl2-a",
+        VfQualifierPattern::Fsgl2B => "f2q-texhop-v10-r1/fsgl2-b",
+        VfQualifierPattern::Fsgl3A => "f2q-texhop-v10-r1/fsgl3-a",
+        VfQualifierPattern::Fsgl3B => "f2q-texhop-v10-r1/fsgl3-b",
+        VfQualifierPattern::V8HighFps => "f2q-texhop-v10-r1/v8-high-fps",
+        VfQualifierPattern::V8Texture => "f2q-texhop-v10-r1/v10-texture",
         VfQualifierPattern::V8Transitions => {
-            "f2q-mix3-rotating-final-sparse16-r1/v8-transitions"
+            "f2q-texhop-v10-r1/v8-transitions"
         }
-        VfQualifierPattern::V8Memory => "f2q-mix3-rotating-final-sparse16-r1/v8-memory",
-        VfQualifierPattern::Endurance => "f2q-mix3-rotating-final-sparse16-r1/endurance",
+        VfQualifierPattern::V8Memory => "f2q-texhop-v10-r1/v8-memory",
+        VfQualifierPattern::Endurance => "f2q-texhop-v10-r1/endurance",
         VfQualifierPattern::TransitionShock => {
-            "f2q-mix3-rotating-final-sparse16-r1/transition-shock"
+            "f2q-texhop-v10-r1/transition-shock"
         }
     }
 }
@@ -582,24 +584,25 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 6),
     ];
-    // v9 Texture (qualification contract v18): the empirically binding, golden-checked TextureRop
-    // detector is first and owns most of the opening tier. The old lobby-first plan spent ~45% of a
-    // 60 s descent dwell on BoostEdge before reaching the detector that actually rejected candidates.
-    // A marginal bin can now fail during the first TextureRop block (roughly 6-30 s depending on the
-    // requested dwell), while a pass still crosses cadence, mixed load, VRAM and streaming coverage.
-    const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 12] = [
-        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 2),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 34),
-        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 12),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 18),
-        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 7),
+    // v10 Texture Hop (qualification contract v19): the graceful golden-checked detector starts
+    // immediately and returns twice through idle/load edges before broader coverage. Combined with
+    // the denser dependent shader and multi-period droop cadence, this spends about two thirds of a
+    // short descent dwell on TextureRop while preserving all former coverage before acceptance.
+    const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 14] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 1),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 30),
+        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 22),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 4),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 15),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 8),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 4),
         (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
-        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 3),
-        (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 3),
-        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 6),
-        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 4),
-        (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 4),
-        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 2),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 2),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 3),
+        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 3),
+        (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 3),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 1),
     ];
     const V8_TRANSITIONS: [(VfQualifierPhase, VfWorkload, u64); 20] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 8),
@@ -665,7 +668,7 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
     // gave (which never rejected a candidate as an isolated pass) but under continuous worst load —
     // stronger, so the required Transitions/Memory patterns can be dropped (contract v14).
     const ENDURANCE: [(VfQualifierPhase, VfWorkload, u64); 23] = [
-        // v18 rejection tier: start with the two loads that bound real failures, with a golden
+        // v19 rejection tier: start with the two loads that bound real failures, with a golden
         // TextureRop check between electrical shocks. A bad finalist is rejected before the long
         // thermal-soak half; a passing finalist still completes the full continuous 20-minute dwell.
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 2),
@@ -1067,8 +1070,9 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-// Texture/ROP-biased path: dependent texture sampling and alpha blending dominate while the ALU
-// chain stays deliberately lighter than PowerRender.
+// Texture Hop v10: dependent texture coordinates, four bilinear samples per hop and alpha blending
+// keep TMU/ROP/core work coupled. The source remains L2-resident and the queue stays bounded, so this
+// is still the graceful checksum detector rather than the hang-prone VRAM streaming path.
 const TEXTURE_ROP_SHADER: &str = r#"
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
@@ -1086,13 +1090,16 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut 
 fn fs(in: VOut) -> @location(0) vec4<f32> {
     var uv = fract(in.uv * 3.0 + in.seed);
     var t = vec4<f32>(0.0);
-    for (var k = 0; k < 48; k = k + 1) {
-        uv = fract(uv * vec2<f32>(1.013, 0.991) + vec2<f32>(0.017, 0.029));
-        t = t + textureSampleLevel(tex, samp, uv, 0.0);
-        t = t + textureSampleLevel(tex, samp, fract(uv.yx * 1.7), 0.0);
-        t = t + textureSampleLevel(tex, samp, fract(uv * 4.1 + t.xy * 0.0001), 0.0);
+    for (var k = 0; k < 64; k = k + 1) {
+        let dependency = t.xy * 0.00013 + vec2<f32>(f32(k) * 0.00071, f32(k) * 0.00037);
+        uv = fract(uv * vec2<f32>(1.019, 0.987) + vec2<f32>(0.017, 0.029) + dependency);
+        let a = textureSampleLevel(tex, samp, uv, 0.0);
+        let b = textureSampleLevel(tex, samp, fract(uv.yx * 1.73 + a.xy * 0.0011), 0.0);
+        let c = textureSampleLevel(tex, samp, fract(uv * 4.13 + b.zw * 0.0017), 0.0);
+        let d = textureSampleLevel(tex, samp, fract((uv + c.xy) * 2.37 + t.yz * 0.0009), 0.0);
+        t = fract(t + a + b * 1.07 + c * 0.93 + d * 1.13);
     }
-    let v = fract((t.x + t.y + t.z) * 0.0031);
+    let v = fract(dot(t, vec4<f32>(0.173, 0.311, 0.419, 0.097)));
     return vec4<f32>(v, fract(v * 7.0), fract(v * 11.0), 0.55);
 }
 "#;
@@ -3162,6 +3169,9 @@ impl GpuCtx {
             if full_workload_duration { std::time::Instant::now() } else { start };
         let mut last_idle = workload_start;
         let sparse_checksum = sparse_checksum_workload(profile);
+        let texture_rop = profile == VfWorkload::TextureRop;
+        let mut texrop_droop_index = 0usize;
+        let mut next_texrop_droop_frame = TEXROP_DROOP_BURSTS[0];
         // FrameCadence paces itself per frame (sync + gap after every submit below), so the
         // coarser droop-burst / idle-pulse pacing must not also fire.
         let frame_cadence = profile == VfWorkload::FrameCadence;
@@ -3261,7 +3271,16 @@ impl GpuCtx {
         {
             if frame_cadence {
                 // paced after submit
+            } else if golden_mode && texture_rop && frames >= next_texrop_droop_frame {
+                self.device.poll(wgpu::Maintain::Wait);
+                std::thread::sleep(std::time::Duration::from_millis(
+                    TEXROP_DROOP_GAPS_MS[texrop_droop_index],
+                ));
+                texrop_droop_index = (texrop_droop_index + 1) % TEXROP_DROOP_BURSTS.len();
+                next_texrop_droop_frame = frames
+                    .saturating_add(TEXROP_DROOP_BURSTS[texrop_droop_index]);
             } else if golden_mode
+                && !texture_rop
                 && !sparse_checksum
                 && frames > 0
                 && frames.is_multiple_of(DROOP_BURST)
@@ -3837,12 +3856,12 @@ mod tests {
     }
 
     #[test]
-    fn workload_fingerprints_are_pattern_specific_and_capture_mix_revision() {
+    fn workload_fingerprints_are_pattern_specific_and_capture_texture_hop_revision() {
         let texture = vf_qualifier_workload_fingerprint(VfQualifierPattern::V8Texture);
         let endurance = vf_qualifier_workload_fingerprint(VfQualifierPattern::Endurance);
         assert_ne!(texture, endurance);
-        assert_eq!(texture, "f2q-texture-rop-first-r1/v9-texture");
-        assert!(endurance.contains("mix3-rotating-final-sparse16-r1"));
+        assert_eq!(texture, "f2q-texhop-v10-r1/v10-texture");
+        assert_eq!(endurance, "f2q-texhop-v10-r1/endurance");
     }
 
     #[test]
@@ -3933,7 +3952,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_texture_and_legacy_v8_patterns_preserve_duration_and_bias_failure_modes() {
+    fn v10_texture_hop_and_legacy_v8_patterns_preserve_duration_and_bias_failure_modes() {
         let high_fps = vf_qualifier_plan(60_000, VfQualifierPattern::V8HighFps);
         let texture = vf_qualifier_plan(60_000, VfQualifierPattern::V8Texture);
         let transitions = vf_qualifier_plan(60_000, VfQualifierPattern::V8Transitions);
@@ -3996,7 +4015,7 @@ mod tests {
                 >= 5
         );
         assert_eq!(VfQualifierPattern::V8HighFps.label(), "v8-high-fps");
-        assert_eq!(VfQualifierPattern::V8Texture.label(), "v9-texture");
+        assert_eq!(VfQualifierPattern::V8Texture.label(), "v10-texture-hop");
         assert_eq!(VfQualifierPattern::V8Transitions.label(), "v8-transitions");
         assert_eq!(VfQualifierPattern::V8Memory.label(), "v8-memory");
         // v11: Texture and Memory also carry the banded TextureStream phase (severity-last).
@@ -4019,7 +4038,7 @@ mod tests {
         assert_eq!(
             texture.get(1).map(|segment| segment.workload),
             Some(VfWorkload::TextureRop),
-            "Texture v9 must enter the binding detector immediately after the opening"
+            "Texture Hop v10 must enter the binding detector immediately after the opening"
         );
         assert!(
             texture
@@ -4080,7 +4099,7 @@ mod tests {
         assert_eq!(
             plan.get(1).map(|segment| segment.workload),
             Some(VfWorkload::TextureRop),
-            "Endurance v18 must front-load its graceful rejection detector"
+            "Endurance v19 must front-load its graceful rejection detector"
         );
         assert!(
             plan.iter()

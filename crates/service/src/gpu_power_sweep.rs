@@ -52,10 +52,17 @@ const VOLT_SANE_MAX_MV: u32 = 1250;
 const F2_QUALIFIER_TARGET_TOL_MHZ: u32 = 30;
 #[cfg(windows)]
 const V8_GOLDEN_SAMPLE_MS: u64 = 2_000;
-/// The required exact post-margin Texture v9 pattern gets five minutes. Endurance is accounted
-/// separately because it remains one continuous 20-minute transaction.
+/// Long keeps the exhaustive five-minute Texture Hop + twenty-minute thermal Endurance proof.
+/// Standard uses the mode-specific compact dwells below and is bounded to one hour wall time.
 #[cfg(windows)]
-const F2_APPLY_QUALIFICATION_DWELL_MS: u64 = 300_000;
+const F2_LONG_APPLY_TEXTURE_DWELL_MS: u64 = 300_000;
+#[cfg(windows)]
+const F2_STANDARD_APPLY_TEXTURE_DWELL_MS: u64 = 120_000;
+#[cfg(windows)]
+const F2_STANDARD_APPLY_ENDURANCE_DWELL_MS: u64 = 300_000;
+/// Stop active Standard work with one minute reserved for the mandatory stock reset/checkpoint.
+#[cfg(windows)]
+const F2_STANDARD_ACTIVE_WALL_BUDGET_MS: u64 = 59 * 60_000;
 /// Stock thermal normalization runs in bounded windows. Each window exceeds the six-second
 /// telemetry ramp discard, so its retained tail can prove both temperature and sustained-clock
 /// convergence without turning preheat into an unbounded wait.
@@ -449,11 +456,9 @@ impl ForgeTaskTracker {
     }
 }
 
-/// Live power-sweep BUTTON mode. Every mode traverses the same complete F2 clock×voltage frontier.
-/// Modes differ only in dwell duration and independent validation passes at each discovered boundary.
+/// Live Forge mode. Standard is the bounded default; only explicit Long may exceed one hour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PowerSweepMode {
-    Fast,
     #[default]
     Standard,
     Long,
@@ -485,7 +490,6 @@ enum ForgeRunIntent {
 impl PowerSweepMode {
     fn id(self) -> &'static str {
         match self {
-            PowerSweepMode::Fast => "fast",
             PowerSweepMode::Standard => "standard",
             PowerSweepMode::Long => "long",
         }
@@ -493,7 +497,9 @@ impl PowerSweepMode {
 
     fn from_id(id: &str) -> Option<Self> {
         match id {
-            "fast" => Some(Self::Fast),
+            // Persisted preview checkpoints from builds that exposed Fast resume as Standard; the
+            // provisional no-qualification behavior no longer exists.
+            "fast" => Some(Self::Standard),
             "standard" => Some(Self::Standard),
             "long" => Some(Self::Long),
             _ => None,
@@ -504,7 +510,6 @@ impl PowerSweepMode {
     #[cfg(windows)]
     fn label(self) -> &'static str {
         match self {
-            PowerSweepMode::Fast => "rápida",
             PowerSweepMode::Standard => "padrão",
             PowerSweepMode::Long => "longa",
         }
@@ -515,7 +520,6 @@ impl PowerSweepMode {
     #[cfg(windows)]
     fn tuning(self) -> (u32, u32, u32) {
         match self {
-            PowerSweepMode::Fast => (FAST_MAX_PROBES, FAST_MAX_PROBES_PER_TARGET, 1),
             PowerSweepMode::Standard => (BUTTON_MAX_PROBES, BUTTON_MAX_PROBES_PER_TARGET, 1),
             PowerSweepMode::Long => (LONG_MAX_PROBES, LONG_MAX_PROBES_PER_TARGET, LONG_VALIDATION_PASSES,
             ),
@@ -525,19 +529,15 @@ impl PowerSweepMode {
     #[cfg(windows)]
     fn f2_policy(self) -> F2ForgeModePolicy {
         match self {
-            PowerSweepMode::Fast => F2ForgeModePolicy {
-                discovery_dwell_ms: 10_000,
-                qualification_dwell_ms: 0,
-                qualification_passes: 0,
-                final_gate_dwell_ms: 0,
-                final_gate_passes: 0,
-            },
             PowerSweepMode::Standard => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
-                qualification_dwell_ms: 60_000,
+                qualification_dwell_ms: 30_000,
                 qualification_passes: F2_DESCENT_DETECTOR_PASSES,
                 final_gate_dwell_ms: 0,
                 final_gate_passes: 0,
+                apply_texture_dwell_ms: F2_STANDARD_APPLY_TEXTURE_DWELL_MS,
+                apply_endurance_dwell_ms: F2_STANDARD_APPLY_ENDURANCE_DWELL_MS,
+                active_wall_budget_ms: Some(F2_STANDARD_ACTIVE_WALL_BUDGET_MS),
             },
             PowerSweepMode::Long => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
@@ -545,6 +545,10 @@ impl PowerSweepMode {
                 qualification_passes: F2_DESCENT_DETECTOR_PASSES,
                 final_gate_dwell_ms: 0,
                 final_gate_passes: 0,
+                apply_texture_dwell_ms: F2_LONG_APPLY_TEXTURE_DWELL_MS,
+                apply_endurance_dwell_ms:
+                    crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS,
+                active_wall_budget_ms: None,
             },
         }
     }
@@ -684,6 +688,9 @@ struct F2ForgeModePolicy {
     qualification_passes: usize,
     final_gate_dwell_ms: u64,
     final_gate_passes: usize,
+    apply_texture_dwell_ms: u64,
+    apply_endurance_dwell_ms: u64,
+    active_wall_budget_ms: Option<u64>,
 }
 
 /// v13 single-detector descent: during the per-bin descent, run ONLY the binding detector — the
@@ -968,9 +975,9 @@ fn request_active_forge_stop() {
 }
 
 impl PowerSweepHandle {
-    /// Start the live multi-clock forge in a specific button `mode` (Fast / Standard / Long). All
-    /// modes run the same complete physical frontier and fail-closed motor; only dwell duration and
-    /// independent validation count vary.
+    /// Start the live multi-clock forge in a specific button `mode` (Standard / Long). Both modes
+    /// run the same complete physical frontier and fail-closed motor; only proof depth and the
+    /// Standard wall-time ceiling differ.
     pub fn start_with_mode(&self, store: SafeLoopStore, mode: PowerSweepMode) -> bool {
         self.start_with_options(store, mode, ForgeLearning::Persistent)
     }
@@ -2087,6 +2094,7 @@ struct F2PreheatWindow {
     prehang_stall_detected: bool,
     sample_count: u32,
     p5_clock_mhz: u32,
+    power_p99_w: Option<f32>,
     start_temp_c: Option<f32>,
     end_temp_c: Option<f32>,
 }
@@ -2101,6 +2109,7 @@ impl From<&Measured> for F2PreheatWindow {
             prehang_stall_detected: measured.prehang_stall_detected,
             sample_count: measured.sample_count,
             p5_clock_mhz: measured.p5_clock_mhz,
+            power_p99_w: measured.power_p99_w,
             start_temp_c: measured.start_temp_c,
             end_temp_c: measured.end_temp_c,
         }
@@ -2141,6 +2150,7 @@ fn f2_preheat_pair_converged(previous: F2PreheatWindow, current: F2PreheatWindow
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct F2PreheatResult {
     sustained_clock_mhz: u32,
+    power_p99_w: Option<f32>,
     temperature_c: f32,
     windows: usize,
 }
@@ -2263,7 +2273,7 @@ fn f2_regime_candidate_refusal(
             confidence_threshold,
         )
     {
-        return Some("its own frontier boundary lacks current Texture v9 qualification".into());
+        return Some("its own frontier boundary lacks current Texture Hop v10 qualification".into());
     }
     let support = match f2_regime_support(point, frontier) {
         Ok(support) => support,
@@ -2569,7 +2579,7 @@ fn f2_pattern_from_stress(
         VfQualifierPattern::V8Texture => (
             F2QualificationStrength::Fsgl4,
             Some(F2QualificationPattern::Texture),
-            "v9-texture",
+            "v10-texture-hop",
         ),
         VfQualifierPattern::V8Transitions => (
             F2QualificationStrength::Fsgl4,
@@ -3031,7 +3041,7 @@ fn publish_f2_profile_power_from_apply_qualification(
         .ok_or_else(|| format!("{target_mhz} MHz @ {apply_mv} mV has no calibrated p99"))?;
     let qualification_p99 = match run_id {
         Some(run_id) => {
-            nidavellir_core::f2_observation::current_apply_qualification_p99_at_anchor(
+            nidavellir_core::f2_observation::current_complete_apply_gate_p99_at_anchor(
                 observations,
                 run_id,
                 target_mhz,
@@ -3039,7 +3049,7 @@ fn publish_f2_profile_power_from_apply_qualification(
                 gpu_key,
             )
         }
-        None => nidavellir_core::f2_observation::highest_apply_qualification_p99_at_anchor(
+        None => nidavellir_core::f2_observation::highest_complete_apply_gate_p99_at_anchor(
             observations,
             target_mhz,
             apply_mv,
@@ -3047,7 +3057,7 @@ fn publish_f2_profile_power_from_apply_qualification(
         ),
     }
     .ok_or_else(|| {
-        format!("{target_mhz} MHz @ {apply_mv} mV has no complete current v8 p99 measurement")
+        format!("{target_mhz} MHz @ {apply_mv} mV has no complete current v19 gate p99 measurement")
     })?;
     let published_p99 = discovery_p99.max(qualification_p99);
     let changed = published_p99 > discovery_p99;
@@ -3096,7 +3106,7 @@ fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
         stream: stream.0,
         stream_frame_reference_ms: stream.1,
         boost_frame_reference_us: boost.1,
-        // DX11 remains in the persisted legacy shape, but contract v18 no longer executes or
+        // DX11 remains in the persisted legacy shape, but contract v19 no longer executes or
         // captures it. A default marker prevents the removed path from adding startup risk/time.
         dx11: nidavellir_gpu_stress::Dx11Golden::default(),
     })
@@ -3424,6 +3434,9 @@ fn run_f2_stock_preheat(
                 .ok_or_else(|| "preheat convergiu sem temperatura final utilizável".to_owned())?;
             return Ok(F2PreheatResult {
                 sustained_clock_mhz: window.p5_clock_mhz,
+                power_p99_w: window
+                    .power_p99_w
+                    .filter(|power| power.is_finite() && *power > 0.0),
                 temperature_c,
                 windows: index + 1,
             });
@@ -5558,13 +5571,6 @@ const FRONTIER_PHASE_B_PROBES: u32 = 12;
 const BUTTON_MAX_PROBES: u32 = 24;
 #[cfg(windows)]
 const BUTTON_MAX_PROBES_PER_TARGET: u32 = 3;
-/// FAST button mode: trimmed discovery (~half of `BUTTON_MAX_PROBES`, one bin shallower per target)
-/// for a quicker supervised run. Reaches fewer clocks; each surviving pick STILL gets one full
-/// fail-closed ceiling soak. Cross-run confidence is intentionally left to IDLE / later manual runs.
-#[cfg(windows)]
-const FAST_MAX_PROBES: u32 = 12;
-#[cfg(windows)]
-const FAST_MAX_PROBES_PER_TARGET: u32 = 2;
 /// LONG button mode: broader (more clocks) + deeper (one extra bin/target) discovery so the three
 /// profiles can differentiate, PLUS repeated per-pick ceiling soaks (`LONG_VALIDATION_PASSES`) so a
 /// deep point earns its confidence in ONE session instead of over later runs. `LONG_MAX_PROBES`
@@ -6797,8 +6803,8 @@ fn validate_pick_at_ceiling(
 /// caller has already locked the pick's clock. Each pass independently arms → applies → verifies →
 /// soaks → resets at the discovered ceiling; ANY non-Stable pass DROPS the pick (`None`). Extra
 /// passes (LONG mode) only let a deep point ACCUMULATE in-session confirmations — they can never
-/// widen exposure or rescue a failed pass. `passes == 1` is exactly the single-soak Fast/Standard
-/// behavior. A mid-run stop keeps the last good pick (no further soaks).
+/// widen exposure or rescue a failed pass. `passes == 1` is the Standard behavior. A mid-run stop
+/// keeps the last good pick (no further soaks).
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn validate_pick_ceiling_passes(
@@ -6887,7 +6893,7 @@ fn run_power_sweep(
     // curve inside `measure_multiclock_forge`). The per-target depth cap turns on the coverage-bounded
     // scheduler (reach several clocks before deepening one) so the three profiles can differentiate;
     // the global probe cap bounds total dwell time. The probe/depth caps come from the selected MODE
-    // (Fast = trimmed, Standard = the proven default, Long = broader+deeper); `validation_passes` sets
+    // (Standard = the bounded default, Long = broader+deeper); `validation_passes` sets
     // how many times each pick is re-soaked at its ceiling. Knee-seeking and warm-start stay OFF
     // (default) in all modes to keep the live run conservative and predictable.
     let (max_probes, max_probes_per_target, validation_passes) = mode.tuning();
@@ -6999,7 +7005,7 @@ fn run_power_sweep(
         let validated = if p.vf_table_voltage_mv.is_some() {
             // Multi-clock pick: long soak AT THE DISCOVERED CEILING (mirrors the real probe write).
             // LONG mode repeats the soak (`validation_passes`) so a deep point earns in-session
-            // confidence; Fast/Standard run a single pass. Any failed pass drops the pick (fail-closed).
+            // confidence; Standard runs a single pass. Any failed pass drops the pick (fail-closed).
             validate_pick_ceiling_passes(
                 &store, clk, p, &stop, label, &progress, &mut prog, validation_passes,
             )
@@ -7149,23 +7155,22 @@ fn f2_calibration_upper_estimate_ms(
         )
 }
 
-/// Per-pair exact-Apply dwell durations IN EXECUTION ORDER: Texture v9 (5 min), then the v18
-/// aggressive continuous Endurance soak (20 min). DX11 and TransitionShock are no longer mandatory
-/// because neither rejected a collected candidate. This remains the single source for ETA.
+/// Per-pair exact-Apply dwell durations in execution order. Standard uses its compact bounded proof;
+/// Long retains the exhaustive Texture Hop + thermal Endurance proof. Single source for ETA.
 #[cfg(windows)]
-fn f2_apply_pair_dwell_ladder_ms() -> Vec<u64> {
+fn f2_apply_pair_dwell_ladder_ms(policy: F2ForgeModePolicy) -> Vec<u64> {
     let mut ladder = vec![
-        F2_APPLY_QUALIFICATION_DWELL_MS;
+        policy.apply_texture_dwell_ms;
         nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len()
     ];
-    ladder.push(crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS);
+    ladder.push(policy.apply_endurance_dwell_ms);
     ladder
 }
 
 /// Total wall-clock upper bound for ONE exact-Apply pair (every dwell + per-dwell overhead).
 #[cfg(windows)]
-fn f2_apply_pair_upper_ms() -> u64 {
-    f2_apply_pair_dwell_ladder_ms()
+fn f2_apply_pair_upper_ms(policy: F2ForgeModePolicy) -> u64 {
+    f2_apply_pair_dwell_ladder_ms(policy)
         .iter()
         .fold(0u64, |total, dwell| {
             total.saturating_add(dwell.saturating_add(PROBE_OVERHEAD_MS))
@@ -7174,15 +7179,9 @@ fn f2_apply_pair_upper_ms() -> u64 {
 
 #[cfg(windows)]
 fn f2_apply_upper_estimate_ms(pair_count: usize, policy: F2ForgeModePolicy) -> u64 {
-    // Fast (no qualification) skips exact-Apply entirely. Otherwise every pair runs the COMPLETE
-    // gate ladder — required Texture v9 + aggressive Endurance — so the ETA reflects
-    // the real deployment gate, not just the 5-min patterns.
-    if f2_required_qualification_passes(policy) == 0 {
-        return 0;
-    }
     u64::try_from(pair_count)
         .unwrap_or(u64::MAX)
-        .saturating_mul(f2_apply_pair_upper_ms())
+        .saturating_mul(f2_apply_pair_upper_ms(policy))
 }
 
 #[cfg(windows)]
@@ -7359,11 +7358,43 @@ fn measure_multiclock_undervolt_forge(
     use nidavellir_gpu_nvapi as gpu;
 
     let started = Instant::now();
+    let mode_policy = mode.f2_policy();
     let mut task_tracker = ForgeTaskTracker::new();
     info!("F2 undervolt forge starting (anchored min-stable-voltage per clock) — mode {}", mode.label());
     let previous = progress.lock().map(|g| g.clone()).unwrap_or_default();
     let resume_requested = intent == ForgeRunIntent::Resume;
     let elapsed_before_session_ms = if resume_requested { previous.elapsed_ms } else { 0 };
+    // One cancellation token combines the UI Stop signal with Standard's strict active-work budget.
+    // A weak-token watchdog cannot leak into a later run: dropping `run_cancel` ends its thread.
+    let external_stop = Arc::downgrade(stop);
+    let run_cancel = Arc::new(AtomicBool::new(false));
+    let run_cancel_weak = Arc::downgrade(&run_cancel);
+    let budget_exhausted = Arc::new(AtomicBool::new(false));
+    let budget_exhausted_watch = Arc::clone(&budget_exhausted);
+    let active_budget_remaining_ms = mode_policy
+        .active_wall_budget_ms
+        .map(|budget| budget.saturating_sub(elapsed_before_session_ms));
+    std::thread::spawn(move || {
+        let deadline = active_budget_remaining_ms
+            .map(|remaining| Instant::now() + std::time::Duration::from_millis(remaining));
+        loop {
+            let Some(run_cancel) = run_cancel_weak.upgrade() else { break };
+            if external_stop
+                .upgrade()
+                .is_none_or(|stop| stop.load(Ordering::SeqCst))
+            {
+                run_cancel.store(true, Ordering::SeqCst);
+                break;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                budget_exhausted_watch.store(true, Ordering::SeqCst);
+                run_cancel.store(true, Ordering::SeqCst);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    let stop = &run_cancel;
     // A manual resume continues the SAME run identity. This keeps clean-run observation and
     // condemnation scope intact and lets the F2 motor skip already completed evidence exactly.
     let run_id = if resume_requested {
@@ -7446,6 +7477,12 @@ fn measure_multiclock_undervolt_forge(
         "Forja F2 (undervolt anchorado, {}) — cap {cap:.0} W. Descendo a tensão mínima estável por clock…",
         mode.label()
     ));
+    if let Some(active_budget_ms) = mode_policy.active_wall_budget_ms {
+        prog.log.push(format!(
+            "Standard: teto estrito de 60 min; carga ativa encerra em {} min para reservar reset stock e checkpoint. Se a prova não fechar, nenhum perfil novo será qualificado.",
+            active_budget_ms / 60_000
+        ));
+    }
     set(progress, prog.clone());
 
     // Stable physical identity scopes observations and persisted profiles to this exact GPU.
@@ -7587,6 +7624,7 @@ fn measure_multiclock_undervolt_forge(
     prog.preheat_converged = Some(true);
     prog.preheat_temperature_c = Some(preheat.temperature_c);
     prog.stock_clock_mhz = preheat.sustained_clock_mhz;
+    prog.stock_power_p99_w = preheat.power_p99_w;
     prog.log.push(format!(
         "Stock normalizado em {} janelas: p5 sustentado {} MHz a {:.1} °C.",
         preheat.windows, preheat.sustained_clock_mhz, preheat.temperature_c
@@ -7625,7 +7663,6 @@ fn measure_multiclock_undervolt_forge(
         return;
     };
 
-    let mode_policy = mode.f2_policy();
     let qualification_needs_goldens =
         mode_policy.qualification_passes > 0 || mode_policy.final_gate_passes > 0;
     let render_goldens = if qualification_needs_goldens {
@@ -7636,11 +7673,11 @@ fn measure_multiclock_undervolt_forge(
             Some("frontier_descent"),
             None,
         );
-        prog.log.push("Qualificação v18: capturando goldens stock wgpu para Texture v9 + Endurance…".into());
+        prog.log.push("Qualificação v19: capturando goldens stock wgpu para Texture Hop v10 + Endurance…".into());
         set(progress, prog.clone());
         match capture_fsgl3_render_goldens() {
             Ok(goldens) => {
-                prog.log.push("Qualificação v18: goldens stock wgpu capturados; descida e exact-Apply podem começar.".into());
+                prog.log.push("Qualificação v19: goldens stock wgpu capturados; descida e exact-Apply podem começar.".into());
                 set(progress, prog.clone());
                 Some(goldens)
             }
@@ -7649,10 +7686,10 @@ fn measure_multiclock_undervolt_forge(
                 prog.running = false;
                 prog.phase = "incomplete".into();
                 prog.note = Some(format!(
-                    "Forja F2 abortada antes da qualificação v18 — stock não produziu golden determinístico wgpu: {e}. GPU no stock, nada aplicado."
+                    "Forja F2 abortada antes da qualificação v19 — stock não produziu golden determinístico wgpu: {e}. GPU no stock, nada aplicado."
                 ));
                 set(progress, prog);
-                warn!("f2-forge: v18 golden capture failed: {e}");
+                warn!("f2-forge: v19 golden capture failed: {e}");
                 return;
             }
         }
@@ -7775,7 +7812,7 @@ fn measure_multiclock_undervolt_forge(
     };
     prog.estimated_remaining_ms = Some(estimated_work_ms);
     prog.log.push(format!(
-        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, qualificação Texture v9 {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
+        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, qualificação Texture Hop v10 {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
         targets.len(), targets[0],
         mode.label(),
         mode_policy.discovery_dwell_ms / 1000,
@@ -8354,7 +8391,7 @@ fn measure_multiclock_undervolt_forge(
                     }
                 }
             }
-            // v18 vertical closure: a physically classified gate failure condemns the BIN, never
+            // v19 vertical closure: a physically classified gate failure condemns the BIN, never
             // the clock. Every viable same-clock bin is tried until a physical/profile/power
             // boundary is proven. Reload the ledger at each decision so a condemnation appended by
             // this very run is visible immediately (including in Clean Run's run-scoped view).
@@ -8525,28 +8562,33 @@ fn measure_multiclock_undervolt_forge(
                     task_tracker.begin(
                         &mut prog,
                         "apply_qualification",
-                        Some(f2_apply_pair_upper_ms()),
+                        Some(f2_apply_pair_upper_ms(mode_policy)),
                         Some(if remaining_apply_pairs > 1 {
                             "apply_qualification"
                         } else {
                             "final_stock_reset"
                         }),
                         Some(if remaining_apply_pairs > 1 {
-                            f2_apply_pair_upper_ms()
+                            f2_apply_pair_upper_ms(mode_policy)
                         } else {
                             PROBE_OVERHEAD_MS
                         }),
                     );
                     prog.total_steps_estimate = prog.total_steps_estimate.saturating_add(
-                        u32::try_from(f2_apply_pair_dwell_ladder_ms().len()).unwrap_or(u32::MAX),
+                        u32::try_from(f2_apply_pair_dwell_ladder_ms(mode_policy).len())
+                            .unwrap_or(u32::MAX),
                     );
                     prog.log.push(format!(
-                        "Qualificação Apply exato v18: {} {} MHz target @ {} mV VF — Texture v9 (5 min, TextureRop-first) + Endurance agressivo ({} min).",
+                        "Qualificação Apply exato v19: {} {} MHz target @ {} mV VF — Texture Hop v10 ({} min) + Endurance agressivo ({} min), modo {}.",
                         profile_role.label(), key.0, key.1,
-                        crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS / 60_000
+                        mode_policy.apply_texture_dwell_ms / 60_000,
+                        mode_policy.apply_endurance_dwell_ms / 60_000,
+                        mode.label()
                     ));
                     let future_apply_pairs = remaining_apply_pairs.saturating_sub(1);
                     let mut completed_apply_dwells = 0usize;
+                    let publication_power_ceiling_w = (prog.power_limit_w > 0.0)
+                        .then(|| off_cap_ceiling_w(prog.power_limit_w));
                     set(progress, prog.clone());
                     let mut on_apply_qualification_progress =
                         |event: crate::gpu_undervolt::F2ClockDiscoveryProgress| {
@@ -8564,7 +8606,7 @@ fn measure_multiclock_undervolt_forge(
                             // Precise remaining time: the ladder is heterogeneous (5/8/20 min),
                             // so count the CURRENT pair's remaining dwells by position and future
                             // pairs by the full per-pair total — never a flat per-dwell average.
-                            let current_pair_remaining_ms = f2_apply_pair_dwell_ladder_ms()
+                            let current_pair_remaining_ms = f2_apply_pair_dwell_ladder_ms(mode_policy)
                                 .iter()
                                 .skip(completed_apply_dwells)
                                 .fold(0u64, |total, dwell| {
@@ -8574,7 +8616,7 @@ fn measure_multiclock_undervolt_forge(
                                 });
                             let remaining_upper_ms = u64::try_from(future_apply_pairs)
                                 .unwrap_or(u64::MAX)
-                                .saturating_mul(f2_apply_pair_upper_ms())
+                                .saturating_mul(f2_apply_pair_upper_ms(mode_policy))
                                 .saturating_add(current_pair_remaining_ms);
                             prog.estimated_remaining_ms = Some(remaining_upper_ms);
                             f2_publish_upper_estimate(
@@ -8602,8 +8644,10 @@ fn measure_multiclock_undervolt_forge(
                             key.0,
                             key.1,
                             selected_point.offset_mhz,
-                            F2_APPLY_QUALIFICATION_DWELL_MS,
+                            mode_policy.apply_texture_dwell_ms,
+                            mode_policy.apply_endurance_dwell_ms,
                             render_goldens,
+                            publication_power_ceiling_w,
                             stop,
                             &mut on_apply_qualification_progress,
                         );
@@ -8624,8 +8668,10 @@ fn measure_multiclock_undervolt_forge(
                                 key.0,
                                 key.1,
                                 selected_point.offset_mhz,
-                                F2_APPLY_QUALIFICATION_DWELL_MS,
+                                mode_policy.apply_texture_dwell_ms,
+                                mode_policy.apply_endurance_dwell_ms,
                                 render_goldens,
+                                publication_power_ceiling_w,
                                 stop,
                                 &mut on_apply_qualification_progress,
                             );
@@ -8676,7 +8722,7 @@ fn measure_multiclock_undervolt_forge(
                             changed = true;
                             break;
                         };
-                        // Off-cap worst-case basis: the Endurance/TransitionShock dwells are the
+                        // Off-cap worst-case basis: the Endurance dwell is the
                         // honest worst-load power measurements, and the off-cap invariant must see
                         // them. A cool-ambient run measures PowerRender 10-15 W below a warm day at
                         // the same point — the 2026-07-10 run published the known-TDR 1920@918 that
@@ -8692,15 +8738,16 @@ fn measure_multiclock_undervolt_forge(
                                 key.1,
                                 &gpu_key,
                             );
-                        // Conservative post-gate SELECTION basis (2026-07-17): the same required-set
-                        // p99 that publication will print. The 2026-07-17 run selected Deep Calm
-                        // 1740@812 on the calm PowerRender 157 W, the gate measured 188 W, and only
+                        // Conservative post-gate SELECTION basis (2026-07-17): the worst p99 from
+                        // the complete Texture + Endurance gate that publication will print. The
+                        // run selected Deep Calm 1740@812 on the calm PowerRender 157 W, the gate
+                        // measured 188 W, and only
                         // the off-cap basis was raised — so every resynthesis kept scoring the point
                         // at 157 W and published an "efficiency" profile drawing Godforge-class
                         // worst-case power for 135 MHz less. Selection and publication must see the
                         // SAME honest number.
                         let apply_gate_p99 = nidavellir_core::f2_observation::
-                            current_apply_qualification_p99_at_anchor(
+                            current_complete_apply_gate_p99_at_anchor(
                                 &observations,
                                 &run_id,
                                 key.0,
@@ -8714,7 +8761,7 @@ fn measure_multiclock_undervolt_forge(
                                 if let Some(worst) = worst_apply_power {
                                     if worst > point.max_power_w {
                                         prog.log.push(format!(
-                                            "FORGE: pior potência medida no conjunto de Apply (incl. Endurance/TransitionShock) elevou a base off-cap de {} MHz @ {} mV: {:.0} → {:.0} W.",
+                                            "FORGE: pior potência medida no conjunto de Apply (incl. Endurance) elevou a base off-cap de {} MHz @ {} mV: {:.0} → {:.0} W.",
                                             key.0, key.1, point.max_power_w, worst
                                         ));
                                         point.max_power_w = worst;
@@ -8757,7 +8804,7 @@ fn measure_multiclock_undervolt_forge(
                                 }
                                 excluded_apply_pairs.insert(key);
                                 prog.log.push(format!(
-                                    "FORGE: p95 do conjunto v8 elevou o regime de {} MHz @ {} mV; candidato recusado — {reason}. Ressintetizando.",
+                                    "FORGE: p95 do conjunto v19 elevou o regime de {} MHz @ {} mV; candidato recusado — {reason}. Ressintetizando.",
                                     key.0, key.1
                                 ));
                                 changed = true;
@@ -8767,8 +8814,9 @@ fn measure_multiclock_undervolt_forge(
                         changed = true;
                         continue;
                     }
-                    // A BLACKLISTED Apply pair is BOUNDARY knowledge, not a safety emergency —
-                    // same principle as the frontier BlacklistedBoundary fix. The sentinel's
+                    // A power-bound or BLACKLISTED Apply pair is boundary knowledge, not a safety
+                    // emergency. Power-bound never writes condemnation; a Godforge power boundary
+                    // may still fast-drop to the next clock at the same voltage. The sentinel's
                     // real-world failures (e.g. 1905@906 damned by a field TDR) land here when the
                     // margin policy picks that exact pair. Both this refusal and a graceful gate
                     // failure flow into the VERTICAL REPAIR below: the failed/refused BIN is
@@ -8777,12 +8825,16 @@ fn measure_multiclock_undervolt_forge(
                     // failures without ever trying the validated bins above each failure).
                     let blacklist_refused =
                         summary.aborted && summary.stop_reason.contains("blacklisted");
+                    let power_ceiling_exceeded = summary
+                        .stop_reason
+                        .starts_with("ExactApplyPowerCeilingExceeded");
                     if !blacklist_refused && (summary.aborted || summary.cancelled) {
                         forge_aborted |= summary.aborted;
                         terminal = true;
                         break;
                     }
-                    let repairable = blacklist_refused
+                    let repairable = power_ceiling_exceeded
+                        || blacklist_refused
                         || f2_gate_failure_supports_vertical_repair(&summary.stop_reason);
                     if !repairable {
                         // Inconclusive/coverage/orchestration outcomes do not prove instability.
@@ -8794,7 +8846,13 @@ fn measure_multiclock_undervolt_forge(
                         terminal = true;
                         break;
                     }
-                    if blacklist_refused {
+                    if power_ceiling_exceeded {
+                        excluded_apply_pairs.insert(key);
+                        prog.log.push(format!(
+                            "FORGE: {} MHz @ {} mV já excedeu o envelope energético após Texture Hop v10; Endurance foi evitado e o par saiu apenas da seleção desta run — nenhuma blacklist foi gravada. Godforge ainda pode tentar o clock inferior na mesma tensão.",
+                            key.0, key.1
+                        ));
+                    } else if blacklist_refused {
                         excluded_apply_pairs.insert(key);
                         prog.log.push(format!(
                             "FORGE: par de Apply {} MHz @ {} mV recusado pela blacklist/ledger (falha real anterior) — bin excluído da seleção; reparo vertical tentará o próximo bin acima.",
@@ -8875,7 +8933,7 @@ fn measure_multiclock_undervolt_forge(
                                         "power_calibration",
                                         Some(f2_calibration_upper_estimate_ms(1, mode_policy)),
                                         Some("apply_qualification"),
-                                        Some(f2_apply_pair_upper_ms()),
+                                        Some(f2_apply_pair_upper_ms(mode_policy)),
                                     );
                                     prog.log.push(format!(
                                         "Godforge fast-drop: calibrando {} MHz @ {} mV (clock menor, mesma tensão do limite anterior)…",
@@ -8936,7 +8994,7 @@ fn measure_multiclock_undervolt_forge(
                                                 );
                                                 godforge_override = Some(carried_key);
                                                 prog.log.push(format!(
-                                                    "FORGE: Godforge fast-drop criado em {} MHz @ {} mV (p99 {:.0} W). Mesmo bin elétrico, clock -{} MHz; gate v18 completo obrigatório.",
+                                                    "FORGE: Godforge fast-drop criado em {} MHz @ {} mV (p99 {:.0} W). Mesmo bin elétrico, clock -{} MHz; gate v19 completo obrigatório.",
                                                     carried_target,
                                                     carried_mv,
                                                     p99,
@@ -9108,7 +9166,7 @@ fn measure_multiclock_undervolt_forge(
                             profiles.deep_calm,
                         ) {
                             prog.log.push(format!(
-                                "FORGE: p99 publicado = máximo calibrado/conjunto v8 no Apply aprovado ({updated} perfil(is) elevado(s)) — Godforge {}@{} mV {:.0} W · Brokkr's {}@{} mV {:.0} W · Deep Calm {}@{} mV {:.0} W.",
+                                "FORGE: p99 publicado = maior p99 do gate v19 completo (Texture Hop v10 + Endurance) no Apply aprovado ({updated} perfil(is) elevado(s)) — Godforge {}@{} mV {:.0} W · Brokkr's {}@{} mV {:.0} W · Deep Calm {}@{} mV {:.0} W.",
                                 godforge.target_clock_mhz.unwrap_or(godforge.clock_mhz),
                                 godforge.vf_table_voltage_mv.unwrap_or(godforge.voltage_mv),
                                 godforge.power_p99_w.unwrap_or(0.0),
@@ -9184,7 +9242,21 @@ fn measure_multiclock_undervolt_forge(
             !retain_boot_flag
         }
     };
-    let manual_pause = manual_stop.load(Ordering::SeqCst)
+    let standard_budget_exhausted = budget_exhausted.load(Ordering::SeqCst);
+    if standard_budget_exhausted {
+        forge_complete = false;
+        prog.profiles_qualified = false;
+        let reset_status = if final_reset_confirmed {
+            "GPU restaurada ao stock"
+        } else {
+            "reset final para stock não confirmado; recuperação permanece necessária"
+        };
+        prog.log.push(format!(
+            "Standard atingiu o teto de 60 min: carga interrompida, aprendizado preservado e {reset_status}. Perfis sem a prova completa permanecem bloqueados; use Long explicitamente para continuar além desse limite."
+        ));
+    }
+    let manual_pause = !standard_budget_exhausted
+        && manual_stop.load(Ordering::SeqCst)
         && stop.load(Ordering::SeqCst)
         && !forge_aborted
         && final_reset_confirmed;
@@ -9234,7 +9306,22 @@ fn measure_multiclock_undervolt_forge(
         prog.godforge.is_some(),
     )
     .into();
-    if manual_pause {
+    if standard_budget_exhausted {
+        prog.resume_available = false;
+        prog.resume_block_reason = Some(
+            "Standard encerrou no limite de uma hora; selecione Long para uma execução explicitamente mais longa"
+                .into(),
+        );
+        let reset_status = if final_reset_confirmed {
+            "GPU em stock"
+        } else {
+            "reset final para stock não confirmado"
+        };
+        prog.note = Some(format!(
+            "Standard encerrado no limite de uma hora: {} novo(s) dwell(s) preservado(s), {reset_status} e nenhum perfil incompleto liberado.",
+            prog.learned_points,
+        ));
+    } else if manual_pause {
         prog.resume_available = prog.resume_compatibility.is_some();
         prog.resume_block_reason = if prog.resume_available {
             None
@@ -9508,7 +9595,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn power_sweep_mode_tuning_preserves_standard_and_bounds_fast_long() {
+    fn power_sweep_mode_tuning_preserves_standard_and_expands_long() {
         // Legacy F1 tuning remains covered because the old engine is intentionally retained, but the
         // live F2 route uses `f2_policy()` below and does not consume these breadth/depth budgets.
         // INVARIANT: Standard stays byte-identical to the pre-modes (proven, HW-validated) button —
@@ -9518,11 +9605,6 @@ mod tests {
             PowerSweepMode::Standard.tuning(),
             (BUTTON_MAX_PROBES, BUTTON_MAX_PROBES_PER_TARGET, 1)
         );
-        // Fast: trimmed discovery (fewer probes, no deeper than Standard), still ONE fail-closed soak.
-        let (fp, fpt, fpass) = PowerSweepMode::Fast.tuning();
-        assert!(fp < BUTTON_MAX_PROBES, "fast must reduce the global probe budget");
-        assert!(fpt <= BUTTON_MAX_PROBES_PER_TARGET, "fast must not deepen per-target descent");
-        assert_eq!(fpass, 1, "fast keeps a single ceiling soak per pick");
         // Long: broader + deeper discovery and >1 confidence passes, within the defensive hard cap.
         let (lp, lpt, lpass) = PowerSweepMode::Long.tuning();
         assert!(lp > BUTTON_MAX_PROBES, "long must widen the global probe budget");
@@ -9556,7 +9638,7 @@ mod tests {
             f2_terminal_phase(true, false, false, false, false, false),
             "paused"
         );
-        assert_eq!(PowerSweepMode::Fast.id(), "fast");
+        assert_eq!(PowerSweepMode::from_id("fast"), Some(PowerSweepMode::Standard));
         assert_eq!(PowerSweepMode::Standard.id(), "standard");
         assert_eq!(PowerSweepMode::Long.id(), "long");
     }
@@ -9807,6 +9889,7 @@ mod tests {
             apply_pass(F2QualificationPattern::Texture, 203.5),
             apply_pass(F2QualificationPattern::Transitions, 204.0),
             apply_pass(F2QualificationPattern::Memory, 202.75),
+            apply_pass(F2QualificationPattern::Endurance, 207.0),
         ];
         let mut published = calibrated;
         assert!(publish_f2_profile_power_from_apply_qualification(
@@ -9816,10 +9899,10 @@ mod tests {
             "GPU-1"
         )
         .unwrap());
-        // v14: REQUIRED = [Texture] only, so the published soak p99 is Texture's (203.5), not the
-        // old 3-pattern max (Transitions 204.0). Transitions/Memory are now candidate-only composite.
-        assert_eq!(published.power_p99_w, Some(203.5));
-        assert!((published.perf_per_watt - 1875.0 / 203.5).abs() < f64::EPSILON);
+        // v19 publication uses the complete exact-Apply gate, so Endurance may conservatively raise
+        // both the displayed power and the efficiency basis above Texture's shorter p99.
+        assert_eq!(published.power_p99_w, Some(207.0));
+        assert!((published.perf_per_watt - 1875.0 / 207.0).abs() < f64::EPSILON);
 
         let mut missing_p99 = measured;
         missing_p99.power_p99_w = None;
@@ -9838,26 +9921,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn f2_modes_share_discovery_and_scale_qualification() {
-        let fast = PowerSweepMode::Fast.f2_policy();
+    fn f2_modes_share_discovery_and_separate_bounded_from_exhaustive_proof() {
         let standard = PowerSweepMode::Standard.f2_policy();
         let long = PowerSweepMode::Long.f2_policy();
         assert_eq!(
-            (
-                fast.discovery_dwell_ms,
-                standard.discovery_dwell_ms,
-                long.discovery_dwell_ms
-            ),
-            (10_000, 10_000, 10_000)
-        );
-        assert_eq!(
-            (
-                fast.qualification_dwell_ms,
-                fast.qualification_passes,
-                fast.final_gate_dwell_ms,
-                fast.final_gate_passes
-            ),
-            (0, 0, 0, 0)
+            (standard.discovery_dwell_ms, long.discovery_dwell_ms),
+            (10_000, 10_000)
         );
         assert_eq!(
             (
@@ -9866,7 +9935,7 @@ mod tests {
                 standard.final_gate_dwell_ms,
                 standard.final_gate_passes
             ),
-            (60_000, F2_DESCENT_DETECTOR_PASSES, 0, 0)
+            (30_000, F2_DESCENT_DETECTOR_PASSES, 0, 0)
         );
         assert_eq!(
             (
@@ -9877,6 +9946,12 @@ mod tests {
             ),
             (60_000, F2_DESCENT_DETECTOR_PASSES, 0, 0)
         );
+        assert_eq!(standard.apply_texture_dwell_ms, 120_000);
+        assert_eq!(standard.apply_endurance_dwell_ms, 300_000);
+        assert_eq!(standard.active_wall_budget_ms, Some(59 * 60_000));
+        assert_eq!(long.apply_texture_dwell_ms, 300_000);
+        assert_eq!(long.apply_endurance_dwell_ms, 1_200_000);
+        assert_eq!(long.active_wall_budget_ms, None);
     }
 
     #[cfg(windows)]
@@ -9892,11 +9967,6 @@ mod tests {
             ..Default::default()
         };
         let mut profiles = [Some(qualified); 3];
-        assert!(!f2_profiles_meet_qualification(
-            PowerSweepMode::Fast.f2_policy(),
-            &profiles,
-            0.85
-        ));
         assert!(f2_profiles_meet_qualification(
             PowerSweepMode::Standard.f2_policy(),
             &profiles,
@@ -10290,6 +10360,7 @@ mod tests {
             prehang_stall_detected: false,
             sample_count: 120,
             p5_clock_mhz,
+            power_p99_w: Some(180.0),
             start_temp_c: Some(start_temp_c),
             end_temp_c: Some(end_temp_c),
         };
@@ -10332,31 +10403,27 @@ mod tests {
         assert_eq!(f2_frontier_bounds(&targets, 1935), Some((1755, 13)));
 
         let standard = PowerSweepMode::Standard.f2_policy();
-        // v18 single-detector: descent = 15s discovery + 1×65s (Texture v9 only). Exact-Apply runs
-        // the gate ladder per pair: 1×305s Texture v9 + 1205s continuous Endurance.
-        assert_eq!(f2_target_upper_estimate_ms(1, standard), 80_000);
+        // v19 Standard: descent = 15s discovery + 1×35s Texture Hop. Exact-Apply runs one
+        // 125s Texture Hop plus one 305s compact Endurance transaction.
+        assert_eq!(f2_target_upper_estimate_ms(1, standard), 50_000);
         assert_eq!(f2_calibration_upper_estimate_ms(1, standard), 45_000);
-        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 1_510_000);
+        assert_eq!(f2_apply_upper_estimate_ms(1, standard), 430_000);
         assert_eq!(
             f2_apply_upper_estimate_ms(F2_ESTIMATE_MAX_PROFILE_PAIRS, standard),
-            4_530_000
+            1_290_000
         );
 
-        let fast = PowerSweepMode::Fast.f2_policy();
-        assert_eq!(f2_target_upper_estimate_ms(1, fast), 15_000);
-        assert_eq!(f2_apply_upper_estimate_ms(3, fast), 0);
-
         // The ETA and the gate can never desync: both read the SAME ladder helper (required
-        // Texture v9 + Endurance, each + overhead).
+        // Texture Hop + Endurance, each + overhead).
         assert_eq!(
-            f2_apply_pair_dwell_ladder_ms().len(),
+            f2_apply_pair_dwell_ladder_ms(standard).len(),
             nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() + 1
         );
         assert_eq!(
             f2_apply_upper_estimate_ms(1, standard),
             nidavellir_core::f2_observation::REQUIRED_QUALIFICATION_PATTERNS.len() as u64
-                * (F2_APPLY_QUALIFICATION_DWELL_MS + PROBE_OVERHEAD_MS)
-                + (crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS + PROBE_OVERHEAD_MS)
+                * (standard.apply_texture_dwell_ms + PROBE_OVERHEAD_MS)
+                + (standard.apply_endurance_dwell_ms + PROBE_OVERHEAD_MS)
         );
     }
 

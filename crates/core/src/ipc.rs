@@ -57,8 +57,8 @@ pub enum IpcRequest {
     /// startup recovery and Safe Mode stay fully active. Additive — production learning keeps the
     /// existing requests.
     StartPowerSweepClean,
-    /// Fast-evidence variant of `StartPowerSweep`: the same complete F2 frontier with shorter dwell
-    /// validation at every tested point. Additive — `StartPowerSweep` keeps its behavior.
+    /// Deprecated wire alias retained for mixed-version clients; service executes Standard and
+    /// never restores the former provisional Fast behavior.
     StartPowerSweepFast,
     /// High-confidence variant of `StartPowerSweep`: the same complete F2 frontier with longer
     /// dwells and independent repeated validations. Additive.
@@ -301,6 +301,10 @@ pub struct PowerSweepProgress {
     pub deep_calm: Option<PowerSweepPoint>,
     /// Stock baseline sustained clock (MHz) under the same load, for reference.
     pub stock_clock_mhz: u32,
+    /// Stock sustained-p99 power measured by the thermally converged preheat. The UI uses this
+    /// hardware-local baseline to express each forged profile's efficiency relative to stock.
+    #[serde(default)]
+    pub stock_power_p99_w: Option<f32>,
     /// Stock boost top observed after the F2 thermal-convergence preheat. Kept separate from Cmax,
     /// which is the first clock the candidate transaction actually proves sustainable.
     #[serde(default)]
@@ -382,8 +386,8 @@ pub struct PowerSweepProgress {
     /// True only after the full Cmax→90% frontier completed and definitive profiles were synthesized.
     #[serde(default)]
     pub frontier_complete: bool,
-    /// True only when the discovered frontier and selected profiles passed the mode's independent
-    /// qualification requirements. Fast intentionally leaves this false and is preview-only.
+    /// True only when the discovered frontier and selected profiles passed the selected mode's
+    /// independent qualification requirements.
     #[serde(default)]
     pub profiles_qualified: bool,
     /// Exact identity stamped into a resumable checkpoint. Legacy checkpoints default to `None`

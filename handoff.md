@@ -1,11 +1,48 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. Current state is the 2026-07-16 qualification-v18 + profile-aware closure
+How to pick this up cold. Current state is the 2026-07-18 qualification-v19 + bounded Standard
 build below. Older dated sections remain as history; where they claim that BoostEdge residence was a
 proven field cause, or that a detached 3 s canary timeout predicted a roughly 2 s watchdog, later
 sections supersede them. Apply still requests 12 mV above the learned boundary, snaps upward to a
 physical VF bin and must pass the complete exact-Apply gate before publication.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## START-HERE (2026-07-18) — validate Texture Hop v10 against the 1800 MHz hardware oracle
+
+- Qualification contract v19 introduces Texture Hop v10. The TextureRop shader now performs 64
+  dependent rounds with four texture samples each, and the plan drives it immediately through
+  irregular 2/3/5/7-frame bursts and gaps around composite/power transitions. The semantic
+  fingerprint is `f2q-texhop-v10-r1`; pre-v19 positive evidence cannot unlock Apply.
+- Standard is the default bounded proof: 30 s per frontier candidate, then 2 min Texture Hop + 5 min
+  Endurance per publishable exact pair. A 59-minute active-work watchdog leaves one minute for final
+  reset/checkpoint. Budget exhaustion preserves completed learning, blocks incomplete profiles and
+  cannot resume as Standard. Long is the only explicitly selected mode allowed beyond one hour and
+  retains 60 s + 5 min + 20 min.
+- Fast is removed from the product. The legacy `StartPowerSweepFast` IPC request maps to Standard only
+  for mixed-version compatibility. The main Command Deck and alternate themes expose Standard/Long;
+  the one-shot Clean option appears when armed and follows the Standard budget.
+- **Next physical action:** perform Full Reset and run Clean/Standard. This build is acceptable only
+  if it rejects the known-bad `1800 MHz @ 869 mV` neighborhood, climbs toward the repeatedly trusted
+  `1800 MHz @ 875 mV` boundary and finishes or fails closed in at most one hour. Do not encode those
+  values as universal tuning data: they are the regression oracle for this GPU.
+
+## START-HERE (2026-07-17) — next run is auto-clean; validate first-run convergence
+
+- `ResetGpuTuningFull` still preserves the append-only hardware condemnation ledger, but the UI now
+  automatically selects a one-shot Clean Run after a successful reset. Starting Forge next uses
+  `StartPowerSweepClean`, so all pre-run condemnations are ignored for search/selection while new
+  failures remain durable and steer this same run; the selector returns to Standard after completion.
+- Exact Apply runs Texture v9 first and stops before the 20-minute Endurance when Texture p99/peak
+  already exceeds the 94%-of-cap publication ceiling. This is an energy-envelope exclusion only:
+  no blacklist/ledger write and no vertical repair. Any pair still eligible must finish Endurance.
+- Profile scoring/publication use the worst p99 across the complete Texture + Endurance gate.
+  `stock_power_p99_w` comes from the converged stock preheat and drives the UI's per-hardware
+  efficiency-vs-stock metric. Progress UI no longer shows candidate/raw profile telemetry; each
+  separate profile disclosure expands to target MHz/mV, maximum power and concise efficiencies.
+- **Next physical action:** perform Full Reset, confirm the mode shows Clean Run, then start Forge.
+  This is the first valid test of whether v18 converges to the promising values without prior runs or
+  Game Trace. Do not change v18 weights until that run proves a missed real instability or excessive
+  Sentinel correction; compile tests prove orchestration, not silicon stability.
 
 ## START-HERE (2026-07-16d) — items 1/2 implemented: complete vertical closure + v18 gate
 

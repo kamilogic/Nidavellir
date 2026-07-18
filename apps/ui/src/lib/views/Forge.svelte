@@ -36,6 +36,7 @@
   const SPARK_CAP = 20;
   let powerSweep = $state(null);
   let forgeMode = $state("standard");
+  let resetCleanRunArmed = $state(false);
   let hardwareLoaded = $state(false);
   let refreshInFlight = false;
   let lastSlowRefreshAt = 0;
@@ -135,15 +136,26 @@
       applied = response.data;
       verification = null;
       const message = response.data.message || "Full reset completed";
+      if (/^reset failed/i.test(message)) throw new Error(message);
       const partial = /some state could not be cleared/i.test(message);
-      fullResetFeedback = { tone: partial ? "warning" : "success", message };
+      if (!partial) {
+        forgeMode = "clean";
+        resetCleanRunArmed = true;
+      }
+      const feedbackMessage = partial
+        ? message
+        : `${message}. The next Forge is armed as a Clean Run: durable real-world condemnations stay preserved, but they will not steer this run.`;
+      fullResetFeedback = {
+        tone: partial ? "warning" : "success",
+        message: feedbackMessage,
+      };
 
       try {
         await refreshForgeStateAfterReset();
       } catch (refreshError) {
         fullResetFeedback = {
           tone: "warning",
-          message: `${message}. The reset ran, but the UI could not refresh immediately: ${String(refreshError)}`,
+          message: `${feedbackMessage}. The reset ran, but the UI could not refresh immediately: ${String(refreshError)}`,
         };
       }
       return true;
@@ -159,13 +171,13 @@
   }
   const setPower = (r) => (powerSweep = r?.data?.type === "PowerSweep" ? r.data : powerSweep);
   const POWER_START = {
-    fast: "StartPowerSweepFast",
     standard: "StartPowerSweep",
     long: "StartPowerSweepLong",
     clean: "StartPowerSweepClean",
   };
   const selectForgeMode = (mode) => {
-    forgeMode = mode;
+    forgeMode = ["standard", "long", "clean"].includes(mode) ? mode : "standard";
+    if (mode !== "clean") resetCleanRunArmed = false;
   };
   const startPower = (mode = forgeMode) => {
     if (safeLoop?.recovery_pending_ack) return recoverAndStartPower(mode);
@@ -373,6 +385,18 @@
       return `Kept ${sentinel.target_mhz} MHz and moved the unstable point from ${sentinel.failed_mv} to ${sentinel.new_mv} mV (strike ${sentinel.strike}/3).`;
     }
     return `Removed ${sentinel.target_mhz} MHz @ ${sentinel.failed_mv} mV and returned the GPU to stock after three failures.`;
+  });
+
+  $effect(() => {
+    if (
+      resetCleanRunArmed &&
+      !powerRunning &&
+      powerSweep?.learning === "clean_run" &&
+      ["finished", "provisional"].includes(powerSweep?.phase)
+    ) {
+      forgeMode = "standard";
+      resetCleanRunArmed = false;
+    }
   });
 
   $effect(() => {

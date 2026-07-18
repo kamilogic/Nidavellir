@@ -60,25 +60,26 @@
   let resetDialog = $state(null);
   let resetTrigger = $state(null);
   let resetCancelButton = $state(null);
+  let expandedProfile = $state(null);
 
   const profileMeta = [
     {
       key: "godforge",
       name: "Godforge",
       line: "Maximum sustainable performance",
-      summary: "Prioritizes the strongest measured profile your GPU can sustain.",
+      summary: "Forged at the edge of sustainable performance for the highest clock this GPU proved it can hold.",
     },
     {
       key: "brokkrs",
       name: "Brokkr’s Best",
       line: "Balanced daily performance",
-      summary: "Balances measured performance, power and heat for daily use.",
+      summary: "Tempered for daily use, balancing strong performance with lower power, heat and noise.",
     },
     {
       key: "deep_calm",
       name: "Deep Calm",
       line: "Maximum efficiency",
-      summary: "Prioritizes lower measured power, heat and noise over peak performance.",
+      summary: "Refined for cool, quiet efficiency and the most useful performance from every watt.",
     },
   ];
 
@@ -193,26 +194,53 @@
     return average != null && average > 0 ? average : null;
   }
 
-  function profilePowerLabel(point) {
-    const sustainedP99 = finite(point?.power_p99_w);
-    if (sustainedP99 != null && sustainedP99 > 0) return "W p99";
-    const peak = finite(point?.max_power_w);
-    return peak != null && peak > 0 ? "W peak" : "W average";
-  }
-
   function profileTarget(point) {
     const target = finite(point?.target_clock_mhz ?? point?.clock_mhz);
     return target == null ? "—" : `${target.toFixed(0)} MHz`;
   }
 
-  function profilePowerText(point) {
+  function profilePeakPowerText(point) {
+    const peak = finite(point?.max_power_w);
+    if (peak != null && peak > 0) return `${peak.toFixed(0)} W`;
     const measuredPower = profilePower(point);
-    return measuredPower == null ? "—" : `${measuredPower.toFixed(0)} ${profilePowerLabel(point)}`;
+    return measuredPower == null ? "—" : `${measuredPower.toFixed(0)} W`;
+  }
+
+  function profileVoltage(point) {
+    const voltage = finite(point?.vf_table_voltage_mv ?? point?.voltage_mv);
+    return voltage == null ? "—" : `${voltage.toFixed(0)} mV`;
   }
 
   function profileEfficiency(point) {
     const efficiency = finite(point?.perf_per_watt);
     return efficiency == null ? "—" : `${efficiency.toFixed(1)} MHz/W`;
+  }
+
+  function profileEfficiencyVsStock(point) {
+    const stockClock = finite(powerSweep?.stock_clock_mhz);
+    const stockPower = finite(powerSweep?.stock_power_p99_w);
+    const efficiency = finite(point?.perf_per_watt);
+    if (stockClock == null || stockClock <= 0 || stockPower == null || stockPower <= 0 || efficiency == null) {
+      return "—";
+    }
+    const delta = ((efficiency / (stockClock / stockPower)) - 1) * 100;
+    return `${delta >= 0 ? "+" : ""}${delta.toFixed(0)}%`;
+  }
+
+  function profileExpanded(key) {
+    return profilesReady && expandedProfile === key;
+  }
+
+  function toggleProfile(key) {
+    if (!profilesReady) return;
+    expandedProfile = expandedProfile === key ? null : key;
+  }
+
+  function profileStatus(key) {
+    if (!profilesReady) return "Available after Forge";
+    if (profileActive(key)) return "Applied";
+    if (canApply(key)) return "Ready";
+    return profilesQualified ? "Measured" : "Qualification pending";
   }
 
   function profileActive(key) {
@@ -318,13 +346,64 @@
   const backgroundStyle = `--forge-texture: url('${forgeTexture}')`;
 </script>
 
+{#snippet profileDisclosure(profile, variant)}
+  {@const point = pointFor(profile.key)}
+  <article
+    class={`forge-profile-card ${variant}`}
+    class:active={profileActive(profile.key)}
+    class:expanded={profileExpanded(profile.key)}
+    class:preview={!profilesReady}
+  >
+    <button
+      class="profile-disclosure"
+      type="button"
+      onclick={() => toggleProfile(profile.key)}
+      disabled={!profilesReady}
+      aria-expanded={profileExpanded(profile.key)}
+      aria-controls={`profile-details-${variant}-${profile.key}`}
+    >
+      <span class="profile-card-icon">
+        {#if profile.key === "godforge"}<Hammer size={27} />
+        {:else if profile.key === "brokkrs"}<Star size={29} />
+        {:else}<Feather size={27} />{/if}
+      </span>
+      <span class="profile-card-copy">
+        <strong>{profile.name}</strong>
+        <small>{profile.summary}</small>
+      </span>
+      <span class="profile-card-state">
+        <small>{profileStatus(profile.key)}</small>
+        {#if profilesReady}<ChevronDown size={21} strokeWidth={1.7} />{/if}
+      </span>
+    </button>
+
+    {#if profileExpanded(profile.key)}
+      <div class="profile-card-details" id={`profile-details-${variant}-${profile.key}`}>
+        <div class="profile-card-metrics">
+          <span><small>Target clock</small><strong>{profileTarget(point)}</strong></span>
+          <span><small>Target voltage</small><strong>{profileVoltage(point)}</strong></span>
+          <span><small>Maximum power</small><strong>{profilePeakPowerText(point)}</strong></span>
+          <span><small>Efficiency vs stock</small><strong>{profileEfficiencyVsStock(point)}</strong></span>
+          <span><small>Efficiency</small><strong>{profileEfficiency(point)}</strong></span>
+        </div>
+        <div class="profile-card-actions">
+          <button class="profile-apply" type="button" onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)}>
+            {#if profileActive(profile.key)}<ShieldCheck size={17} />Applied{:else}Apply {profile.name}{/if}
+          </button>
+          <button class="field-failure" type="button" onclick={() => reportProfile(profile)} disabled={powerRunning || !point}>Mark unstable</button>
+        </div>
+      </div>
+    {/if}
+  </article>
+{/snippet}
+
 {#snippet fullResetControl()}
   {#if !powerRunning}
     <section class="full-reset-strip" aria-label="Reset total">
       <div class="full-reset-copy">
         <span>RECUPERAÇÃO DESTRUTIVA</span>
         <strong>Reset Total</strong>
-        <p>Volta a GPU para stock e apaga perfis, aprendizado e histórico do Sentinela.</p>
+        <p>Volta a GPU para stock, limpa a forja ativa e prepara a próxima execução como Clean Run.</p>
       </div>
       <button class="full-reset-action" type="button" onclick={openResetConfirmation} disabled={fullResetBusy}>
         <Trash2 size={18} strokeWidth={1.7} />
@@ -373,6 +452,18 @@
             <img src={copperPlate} alt="" />
             <span>{powerRunning ? "Forging…" : resumeAvailable ? "Resume Forge" : forgePaused ? "Resume unavailable" : recoveryPending ? "Review & Continue" : "Forge GPU"}</span>
           </button>
+          <div class="command-run-mode">
+            <label for="command-run-mode">
+              <span>RUN</span>
+              <select id="command-run-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>
+                {#if forgeMode === "clean"}<option value="clean">Clean Run · Standard budget</option>{/if}
+                <option value="standard">Standard · up to 1 hour</option>
+                <option value="long">Long · exhaustive proof</option>
+              </select>
+              <ChevronDown size={18} />
+            </label>
+            <small>{forgeMode === "long" ? "Explicit long run · may exceed one hour" : forgeMode === "clean" ? "Organic learning · Standard time limit" : "Recommended · fails closed at one hour"}</small>
+          </div>
           {#if profilesReady}
             <span class="refine">Profiles forged from measured hardware data <ShieldCheck size={23} /></span>
           {/if}
@@ -422,38 +513,7 @@
       <section class="command-profiles" class:profile-overview={!profilesReady}>
         <div class="section-label"><span>{profilesReady ? "FORGED PROFILES" : "PROFILE OVERVIEW"}</span></div>
         {#each profileMeta as profile}
-          {@const point = pointFor(profile.key)}
-          <article class="command-profile" class:active={profileActive(profile.key)} class:preview={!profilesReady}>
-            <div class="profile-icon">
-              {#if profile.key === "godforge"}<Hammer size={35} />
-              {:else if profile.key === "brokkrs"}<Star size={40} />
-              {:else}<Feather size={35} />{/if}
-            </div>
-            <div class="profile-copy">
-              <strong>{profile.name}</strong>
-              <span>{profile.line}</span>
-              {#if !profilesReady}<small>{profile.summary}</small>{/if}
-            </div>
-            {#if profilesReady}
-              <div class="profile-measurements">
-                <span><small>Target</small><strong>{profileTarget(point)}</strong></span>
-                <span><small>Measured power</small><strong>{profilePowerText(point)}</strong></span>
-                <span><small>Efficiency</small><strong>{profileEfficiency(point)}</strong></span>
-              </div>
-              <div class="profile-result">
-                <strong>{profileActive(profile.key) ? "Applied" : canApply(profile.key) ? "Ready" : "Measured"}</strong>
-                <span>{profilesQualified ? "Qualified profile" : "Qualification pending"}</span>
-              </div>
-              <div class="profile-actions">
-                <button class="profile-select" class:selected={profileActive(profile.key)} onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)} aria-label={`Apply ${profile.name}`}>
-                  {#if profileActive(profile.key)}<ShieldCheck size={24} />{:else}<ChevronRight size={22} />{/if}
-                </button>
-                <button class="field-failure" onclick={() => reportProfile(profile)} disabled={powerRunning || !point}>Mark unstable</button>
-              </div>
-            {:else}
-              <div class="profile-await"><strong>Available after Forge</strong><span>Generated from this GPU’s measured behavior.</span></div>
-            {/if}
-          </article>
+          {@render profileDisclosure(profile, "command")}
         {/each}
       </section>
 
@@ -523,31 +583,7 @@
             <span class="instrument-kicker">{profilesReady ? "FORGED PROFILES" : "PROFILE OVERVIEW"}</span>
             <div class="instrument-profile-grid" class:ready={profilesReady}>
               {#each profileMeta as profile}
-                {@const point = pointFor(profile.key)}
-                <article class:active={profileActive(profile.key)}>
-                  <div class="instrument-profile-name">
-                    <span class="round-hammer">
-                      {#if profile.key === "godforge"}<Hammer size={27} />
-                      {:else if profile.key === "brokkrs"}<Star size={29} />
-                      {:else}<Feather size={27} />{/if}
-                    </span>
-                    <div><strong>{profile.name}</strong><small>{profile.line}</small></div>
-                  </div>
-                  {#if profilesReady}
-                    <div class="instrument-profile-readings">
-                      <span>Target<strong>{profileTarget(point)}</strong></span>
-                      <span>Power<strong>{profilePowerText(point)}</strong></span>
-                      <span>Efficiency<strong>{profileEfficiency(point)}</strong></span>
-                    </div>
-                    <button onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)}>
-                      {profileActive(profile.key) ? "APPLIED" : canApply(profile.key) ? "APPLY" : "MEASURED"}
-                    </button>
-                    <button class="field-failure" onclick={() => reportProfile(profile)} disabled={powerRunning || !point}>MARK UNSTABLE</button>
-                  {:else}
-                    <p>{profile.summary}</p>
-                    <small class="profile-availability">Available after Forge completes.</small>
-                  {/if}
-                </article>
+                {@render profileDisclosure(profile, "instrument")}
               {/each}
             </div>
           </section>
@@ -560,10 +596,9 @@
           <div class="mode-block">
             <label for="instrument-mode">MODE</label>
             <select id="instrument-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>
-              <option value="fast">Fast — preview only</option>
-              <option value="standard">Standard — recommended</option>
-              <option value="long">Long — strongest confidence</option>
-              <option value="clean">Clean run — experimental (organic)</option>
+              {#if forgeMode === "clean"}<option value="clean">Clean Run — Standard budget</option>{/if}
+              <option value="standard">Standard — up to 1 hour</option>
+              <option value="long">Long — exhaustive proof</option>
             </select>
             <p>Builds safe profiles while you use your PC.</p>
             <small>Learns your GPU, tests limits safely and creates personalized profiles.</small>
@@ -604,7 +639,7 @@
         <p class:pending={!safeLoopKnown} class:review={safeLoopKnown && !protectedState}><i></i> {safeLoopKnown ? (protectedState ? "Protected by Safe Loop" : "Safe Loop needs review") : "Safe Loop status unavailable"}</p>
         <div class="workshop-actions">
           <button class="workshop-forge" onclick={runForge} disabled={powerRunning || (forgePaused && !resumeAvailable)}><Anvil size={25} />{powerRunning ? "Forging…" : resumeAvailable ? "Resume Forge" : forgePaused ? "Resume unavailable" : recoveryPending ? "Review & Continue" : "Forge GPU"}</button>
-          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}><option value="fast">Fast · Preview only</option><option value="standard">Standard · Recommended</option><option value="long">Long · Strongest confidence</option><option value="clean">Clean run · Experimental</option></select><ChevronDown size={20} /></label>
+          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>{#if forgeMode === "clean"}<option value="clean">Clean Run · Standard budget</option>{/if}<option value="standard">Standard · Up to 1 hour</option><option value="long">Long · Exhaustive proof</option></select><ChevronDown size={20} /></label>
         </div>
       </section>
 
@@ -626,29 +661,7 @@
       <section class="workshop-profile" class:ready={profilesReady}>
         <div class="workshop-current"><span>Current profile</span><div><span class="workshop-profile-icon"><Hammer size={33} /></span><strong>{activeName}</strong></div><small><i></i>{activeKey ? "Applied" : "Stock"}</small></div>
         {#each profileMeta as profile}
-          {@const point = pointFor(profile.key)}
-          <article class="workshop-profile-summary" class:active={profileActive(profile.key)}>
-            <div class="workshop-profile-heading">
-              {#if profile.key === "godforge"}<Hammer size={25} />
-              {:else if profile.key === "brokkrs"}<Star size={27} />
-              {:else}<Feather size={25} />{/if}
-              <span><strong>{profile.name}</strong><small>{profile.line}</small></span>
-            </div>
-            {#if profilesReady}
-              <div class="workshop-profile-readings">
-                <span>Target<strong>{profileTarget(point)}</strong></span>
-                <span>Power<strong>{profilePowerText(point)}</strong></span>
-                <span>Efficiency<strong>{profileEfficiency(point)}</strong></span>
-              </div>
-              <button onclick={() => profileAction(profile.key)} disabled={!canApply(profile.key)}>
-                {profileActive(profile.key) ? "Applied" : canApply(profile.key) ? "Apply" : "Measured"}
-              </button>
-              <button class="field-failure" onclick={() => reportProfile(profile)} disabled={powerRunning || !point}>Mark unstable</button>
-            {:else}
-              <p>{profile.summary}</p>
-              <small class="profile-availability">Available after Forge completes.</small>
-            {/if}
-          </article>
+          {@render profileDisclosure(profile, "workshop")}
         {/each}
       </section>
 
@@ -717,8 +730,8 @@
           <h2 id="reset-dialog-title">Reset Total</h2>
         </div>
       </div>
-      <p id="reset-dialog-description">Isto apaga TODOS os perfis forjados e todo o aprendizado — a GPU volta a stock e a forja recomeça do zero.</p>
-      <p class="reset-dialog-note">Esta ação é destrutiva, irreversível e também apaga o histórico do Sentinela.</p>
+      <p id="reset-dialog-description">Isto apaga os perfis forjados, as observações da forja e o histórico do Sentinela. A GPU volta a stock e a próxima execução é preparada como Clean Run.</p>
+      <p class="reset-dialog-note">Falhas reais já confirmadas continuam guardadas no ledger durável, mas não influenciam essa próxima busca orgânica.</p>
       <div class="reset-dialog-actions">
         <button bind:this={resetCancelButton} class="reset-cancel" type="button" onclick={closeResetConfirmation} disabled={fullResetBusy}>Cancelar</button>
         <button class="reset-confirm" type="button" onclick={confirmFullReset} disabled={fullResetBusy}>
@@ -1308,6 +1321,69 @@
     opacity: 0.65;
   }
 
+  .command-run-mode {
+    display: grid;
+    width: 335px;
+    gap: 7px;
+  }
+
+  .command-run-mode label {
+    position: relative;
+    display: grid;
+    min-height: 62px;
+    grid-template-columns: 1fr auto;
+    align-content: center;
+    border: 1px solid #4a5054;
+    padding: 8px 42px 8px 15px;
+    background: rgba(9, 13, 15, 0.82);
+  }
+
+  .command-run-mode label > span {
+    grid-column: 1 / -1;
+    color: #7f8b94;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+  }
+
+  .command-run-mode select {
+    width: 100%;
+    appearance: none;
+    border: 0;
+    padding: 2px 0 0;
+    background: transparent;
+    color: #d8dbde;
+    font-size: 15px;
+    font-weight: 600;
+    outline: none;
+    cursor: pointer;
+  }
+
+  .command-run-mode label :global(svg) {
+    position: absolute;
+    right: 15px;
+    bottom: 15px;
+    color: #c58a55;
+    pointer-events: none;
+  }
+
+  .command-run-mode label:focus-within {
+    border-color: #b37c4d;
+    box-shadow: 0 0 0 2px rgba(179, 124, 77, 0.16);
+  }
+
+  .command-run-mode select:disabled {
+    cursor: not-allowed;
+    opacity: 0.62;
+  }
+
+  .command-run-mode small {
+    color: #78838b;
+    font-size: 11px;
+    line-height: 1.35;
+    text-align: center;
+  }
+
   .refine {
     display: flex;
     align-items: center;
@@ -1403,152 +1479,6 @@
 
   .section-label::before { width: 18px; }
   .section-label::after { flex: 1; }
-
-  .command-profile {
-    display: grid;
-    grid-template-columns: minmax(86px, 125px) minmax(250px, 1.1fr) minmax(300px, 1fr) minmax(135px, 0.7fr) minmax(92px, 112px);
-    align-items: center;
-    min-height: 80px;
-    border: 1px solid #485158;
-    background: rgba(8, 11, 13, 0.4);
-  }
-
-  .command-profile + .command-profile {
-    margin-top: 3px;
-  }
-
-  .command-profile.active {
-    border-color: #bd7d3f;
-    background: rgba(59, 36, 18, 0.28);
-    box-shadow: inset 0 0 26px rgba(186, 111, 48, 0.08);
-  }
-
-  .profile-icon {
-    display: flex;
-    height: 100%;
-    align-items: center;
-    justify-content: center;
-    border-right: 1px solid #42494f;
-    color: #7d8891;
-  }
-
-  .active .profile-icon,
-  .active .profile-copy strong {
-    color: #d39a5c;
-  }
-
-  .profile-copy {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding-left: 24px;
-  }
-
-  .profile-copy strong {
-    color: #b6babd;
-    font-size: 21px;
-    font-weight: 500;
-  }
-
-  .profile-copy span,
-  .profile-copy small,
-  .profile-result span {
-    color: #8c9399;
-    font-size: 14px;
-  }
-
-  .profile-copy small {
-    max-width: 54ch;
-    margin-top: 4px;
-    color: #737c82;
-    line-height: 1.45;
-    text-wrap: pretty;
-  }
-
-  .command-profile.preview {
-    grid-template-columns: 125px minmax(320px, 0.72fr) 1fr;
-    min-height: 96px;
-  }
-
-  .profile-measurements {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 18px;
-    padding-right: 24px;
-  }
-
-  .profile-measurements > span {
-    display: flex;
-    min-width: 0;
-    flex-direction: column;
-    gap: 5px;
-  }
-
-  .profile-measurements small,
-  .profile-await span {
-    color: #737c82;
-    font-size: 11px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-
-  .profile-measurements strong,
-  .profile-await strong {
-    color: #c9cdcf;
-    font-size: 14px;
-    font-weight: 550;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .profile-await {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 0 28px;
-  }
-
-  .profile-result {
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-    padding-left: 20px;
-  }
-
-  .profile-result strong {
-    color: #b6babd;
-    font-size: 16px;
-    font-weight: 500;
-  }
-
-  .active .profile-result strong,
-  .active .profile-result span {
-    color: #84ba36;
-  }
-
-  .profile-select {
-    display: flex;
-    width: 40px;
-    height: 40px;
-    min-height: 40px;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid #75818a;
-    border-radius: 50%;
-    background: transparent;
-    color: #84bf35;
-    cursor: pointer;
-  }
-
-  .profile-select.selected {
-    border-color: #83bd31;
-  }
-
-  .profile-actions {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 5px;
-  }
 
   .field-failure {
     min-height: 40px !important;
@@ -1710,11 +1640,18 @@
     padding: 19px 0 0;
   }
 
-  .instrument-main-column :global(.forge-all),
-  .command-body :global(.forge-all) {
+  .instrument-main-column :global(.forge-progress) {
+    --progress-surface: rgba(9, 13, 13, 0.58);
+    --progress-outline: rgba(126, 136, 143, 0.34);
     min-width: 0;
-    border-radius: 0;
-    box-shadow: inset 0 0 0 1px var(--forge-line);
+    border-radius: 8px;
+  }
+
+  .command-body :global(.forge-progress) {
+    --progress-surface: rgba(7, 10, 12, 0.58);
+    --progress-outline: rgba(126, 136, 143, 0.34);
+    min-width: 0;
+    border-radius: 11px;
   }
 
   .instrument-intro h1 {
@@ -1871,119 +1808,6 @@
 
   .recommended-panel { margin-top: 7px; }
   .recommended-panel > .instrument-kicker { display: block; padding-left: 24px; }
-
-  .instrument-profile-grid {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    margin-top: 8px;
-    border: 1px solid #6b6759;
-    background: rgba(6, 10, 10, 0.38);
-    box-shadow: inset 0 0 0 3px rgba(0, 0, 0, 0.32);
-  }
-
-  .instrument-profile-grid article {
-    display: flex;
-    min-width: 0;
-    min-height: 184px;
-    flex-direction: column;
-    padding: 20px 22px;
-  }
-
-  .instrument-profile-grid article + article {
-    border-left: 1px solid #4b504e;
-  }
-
-  .instrument-profile-grid article.active {
-    background: rgba(183, 139, 74, 0.08);
-    box-shadow: inset 0 -2px #b88d52;
-  }
-
-  .instrument-profile-name {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-  }
-
-  .instrument-profile-name > div {
-    display: flex;
-    min-width: 0;
-    flex-direction: column;
-    gap: 3px;
-  }
-
-  .instrument-profile-name strong {
-    color: #d7d8d5;
-    font-size: 18px;
-    font-weight: 600;
-  }
-
-  .instrument-profile-name small,
-  .instrument-profile-grid article > p,
-  .profile-availability {
-    color: #929894;
-    font-size: 12px;
-    line-height: 1.45;
-    text-wrap: pretty;
-  }
-
-  .instrument-profile-grid article > p {
-    margin: 18px 0 8px;
-  }
-
-  .instrument-profile-readings {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 12px;
-    margin-top: 18px;
-  }
-
-  .instrument-profile-readings > span {
-    display: flex;
-    min-width: 0;
-    flex-direction: column;
-    gap: 4px;
-    color: #8f9591;
-    font-size: 10px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-
-  .instrument-profile-readings strong {
-    color: #cfd1ce;
-    font-size: 12px;
-    font-weight: 550;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: 0;
-    text-transform: none;
-  }
-
-  .instrument-profile-grid article > button {
-    min-height: 40px;
-    margin-top: auto;
-    border: 1px solid #71664f;
-    background: transparent;
-    color: #d0b27e;
-    font-size: 12px;
-    cursor: pointer;
-  }
-
-  .instrument-profile-grid article > button:disabled {
-    color: #7e837f;
-    cursor: default;
-    opacity: 0.7;
-  }
-
-  .round-hammer {
-    display: flex;
-    width: 65px;
-    height: 65px;
-    align-items: center;
-    justify-content: center;
-    border: 2px solid #908574;
-    border-radius: 50%;
-    color: #9eb6c4;
-    background: #172027;
-  }
 
   .instrument-action-panel {
     display: flex;
@@ -2319,93 +2143,6 @@
   .workshop-current small { display: flex; align-items: center; gap: 8px; margin: -20px 0 0 94px; color: #70b66a; font-size: 17px; }
   .workshop-current small i { width: 17px; height: 17px; }
 
-  .workshop-profile-summary {
-    display: flex;
-    min-width: 0;
-    min-height: 176px;
-    flex-direction: column;
-    border-left: 1px solid #484b4b;
-    padding: 13px 26px;
-  }
-
-  .workshop-profile-summary.active {
-    background: linear-gradient(180deg, rgba(185, 114, 70, 0.08), transparent);
-  }
-
-  .workshop-profile-heading {
-    display: flex;
-    align-items: center;
-    gap: 13px;
-    color: #ca8e68;
-  }
-
-  .workshop-profile-heading > span {
-    display: flex;
-    min-width: 0;
-    flex-direction: column;
-    gap: 3px;
-  }
-
-  .workshop-profile-heading strong {
-    color: #e4e1dc;
-    font-size: 17px;
-    font-weight: 550;
-  }
-
-  .workshop-profile-heading small,
-  .workshop-profile-summary > p,
-  .workshop-profile-summary > .profile-availability {
-    color: #929695;
-    font-size: 12px;
-    line-height: 1.45;
-    text-wrap: pretty;
-  }
-
-  .workshop-profile-summary > p {
-    margin: 18px 0 7px;
-  }
-
-  .workshop-profile-readings {
-    display: grid;
-    gap: 6px;
-    margin-top: 14px;
-  }
-
-  .workshop-profile-readings > span {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 10px;
-    color: #828786;
-    font-size: 10px;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-  }
-
-  .workshop-profile-readings strong {
-    color: #cfd1cf;
-    font-size: 12px;
-    font-weight: 500;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: 0;
-    text-transform: none;
-  }
-
-  .workshop-profile-summary > button {
-    min-height: 40px;
-    margin-top: auto;
-    border: 1px solid #695244;
-    background: transparent;
-    color: #cf9169;
-    cursor: pointer;
-  }
-
-  .workshop-profile-summary > button:disabled {
-    color: #777c7b;
-    cursor: default;
-    opacity: 0.72;
-  }
-
   .workshop-telemetry {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -2441,9 +2178,10 @@
     padding: 24px 40px;
   }
 
-  .workshop-progress-wrap :global(.forge-all) {
-    border-radius: 0;
-    box-shadow: inset 0 0 0 1px #373a3a;
+  .workshop-progress-wrap :global(.forge-progress) {
+    --progress-surface: rgba(12, 14, 15, 0.64);
+    --progress-outline: #373a3a;
+    border-radius: 11px;
   }
 
   .workshop-advanced {
@@ -2480,7 +2218,6 @@
   @media (max-width: 1440px) {
     .command-hero { grid-template-columns: minmax(300px, 390px) minmax(360px, 1fr); }
     .command-cta { grid-column: 1 / -1; flex-direction: row; justify-content: center; }
-    .command-profile { grid-template-columns: 90px minmax(240px, 1fr) minmax(290px, 1.2fr) minmax(130px, 0.65fr) 96px; }
   }
 
   @media (min-width: 981px) and (max-width: 1599px) {
@@ -2500,8 +2237,6 @@
     .command-nav { gap: 2px; }
     .command-nav button { min-width: auto; padding-inline: 10px; }
     .command-hero { grid-template-columns: minmax(280px, 330px) 1fr; }
-    .command-profile { grid-template-columns: 90px 1fr 1.4fr 1fr 55px; }
-    .workshop-profile { grid-template-columns: 280px repeat(2, 1fr); gap: 24px 0; padding-block: 32px; }
     .workshop-telemetry { grid-template-columns: repeat(3, 1fr); gap: 28px 0; padding-block: 28px; }
   }
 
@@ -2537,17 +2272,10 @@
     .command-page { min-height: calc(100vh - 140px); padding: 22px 18px 36px; }
     .connected { display: none; }
     .command-hero { grid-template-columns: 1fr; }
+    .command-cta { flex-wrap: wrap; }
     .command-gpu-wrap { height: 220px; }
     .command-identity { padding: 0; }
     .command-telemetry { grid-template-columns: 1fr 1fr; }
-    .command-profile { grid-template-columns: 70px 1fr 50px; }
-    .profile-result { display: none; }
-    .command-profile:not(.preview) .profile-icon { grid-row: 1 / span 2; }
-    .command-profile:not(.preview) .profile-copy { grid-column: 2; grid-row: 1; padding-block: 14px; }
-    .command-profile:not(.preview) .profile-measurements { grid-column: 2 / 4; grid-row: 2; padding: 0 18px 14px 24px; }
-    .command-profile:not(.preview) .profile-actions { grid-column: 3; grid-row: 1; justify-self: center; }
-    .command-profile.preview { grid-template-columns: 70px 1fr; }
-    .command-profile.preview .profile-await { grid-column: 2; padding: 0 18px 15px 24px; }
     .instrument-frame { grid-template-columns: 1fr; }
     .instrument-rail { min-height: auto; border-right: 0; }
     .instrument-lockup { height: 120px; }
@@ -2559,12 +2287,8 @@
     .gauge-layout { grid-template-columns: 1fr; height: auto; }
     .gauge-side { order: 2; }
     .gauge-bezel { margin-inline: auto; }
-    .instrument-profile-grid { grid-template-columns: 1fr; }
-    .instrument-profile-grid article + article { border-top: 1px solid #4b504e; border-left: 0; }
     .workshop-header { grid-template-columns: 1fr auto; padding-inline: 18px; }
     .workshop-header nav { grid-column: 1 / -1; order: 3; }
-    .workshop-profile { grid-template-columns: 1fr 1fr; padding-inline: 24px; }
-    .workshop-current { grid-column: 1 / -1; border-right: 0; }
     .workshop-content.diagnostics-view { padding: 22px 18px 36px; }
     .workshop-telemetry { grid-template-columns: 1fr 1fr; }
   }
@@ -2577,29 +2301,352 @@
     .state-status { width: 100%; grid-template-columns: 1fr 1fr; }
     .state-status > div + div { padding-left: 20px; }
     .state-status strong { font-size: 30px; }
-    .plate-button { width: min(100%, 320px); }
+    .command-cta { flex-direction: column; }
+    .plate-button,
+    .command-run-mode { width: min(100%, 320px); }
     .command-telemetry { grid-template-columns: 1fr; }
     .command-metric,
     .command-metric:nth-last-child(-n + 3),
     .command-metric:last-child { grid-column: auto; }
-    .profile-measurements { grid-template-columns: 1fr; }
-    .command-profile:not(.preview) .profile-measurements { grid-column: 2 / 4; }
     .gauge-side { grid-template-columns: 1fr; }
     .gauge-side > div { min-height: 170px; border-right: 0; border-bottom: 1px solid #5b605d; }
     .gauge-side.right > div:first-child { border-left: 0; }
     .workshop-actions { width: 100%; flex-direction: column; gap: 14px; }
     .workshop-forge,
     .workshop-actions label { width: min(100%, 355px); }
-    .workshop-profile { grid-template-columns: 1fr; }
-    .workshop-current { grid-column: 1; }
     .workshop-telemetry { grid-template-columns: 1fr; }
     .workshop-progress-wrap { padding-inline: 16px; }
     .workshop-footer { align-items: flex-start; flex-direction: column; gap: 10px; padding-block: 18px; }
   }
 
+  /* Shared profile disclosure: the three visual themes keep their own color language while the
+     information hierarchy and responsive behavior stay identical. */
+  .forge-profile-card {
+    --profile-accent: #c78a54;
+    --profile-surface: rgba(7, 10, 12, 0.58);
+    min-width: 0;
+    overflow: hidden;
+    border-radius: 11px;
+    background: var(--profile-surface);
+    box-shadow: inset 0 0 0 1px rgba(126, 136, 143, 0.34);
+  }
+
+  .forge-profile-card + .forge-profile-card {
+    margin-top: 8px;
+  }
+
+  .forge-profile-card.active {
+    background: color-mix(in srgb, var(--profile-accent) 8%, var(--profile-surface));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--profile-accent) 72%, transparent);
+  }
+
+  .forge-profile-card.instrument {
+    --profile-accent: #b9905a;
+    --profile-surface: rgba(9, 13, 13, 0.58);
+    border-radius: 8px;
+  }
+
+  .forge-profile-card.workshop {
+    --profile-accent: #c98660;
+    --profile-surface: rgba(12, 14, 15, 0.64);
+  }
+
+  .profile-disclosure {
+    display: grid;
+    width: 100%;
+    min-height: 88px;
+    grid-template-columns: 52px minmax(0, 1fr) minmax(120px, auto);
+    align-items: center;
+    gap: 15px;
+    border: 0;
+    border-radius: 11px;
+    padding: 14px 16px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 150ms ease, transform 100ms ease;
+  }
+
+  .profile-disclosure:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.028);
+  }
+
+  .profile-disclosure:active:not(:disabled) {
+    transform: scale(0.992);
+  }
+
+  .profile-disclosure:disabled {
+    cursor: default;
+    opacity: 1;
+  }
+
+  .profile-card-icon {
+    display: grid;
+    width: 48px;
+    height: 48px;
+    place-items: center;
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--profile-accent) 9%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--profile-accent) 30%, transparent);
+    color: #8e989f;
+  }
+
+  .forge-profile-card.active .profile-card-icon {
+    color: var(--profile-accent);
+  }
+
+  .profile-card-copy {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .profile-card-copy strong {
+    color: #e3e3df;
+    font-size: 18px;
+    font-weight: 580;
+    letter-spacing: -0.01em;
+  }
+
+  .profile-card-copy small {
+    max-width: 74ch;
+    color: #92999d;
+    font-size: 12px;
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .profile-card-state {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+    color: var(--profile-accent);
+  }
+
+  .profile-card-state small {
+    overflow: hidden;
+    font-size: 11px;
+    font-weight: 680;
+    letter-spacing: 0.04em;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  .profile-card-state :global(svg) {
+    flex: 0 0 auto;
+    transition: transform 160ms ease;
+  }
+
+  .forge-profile-card.expanded .profile-card-state :global(svg) {
+    transform: rotate(180deg);
+  }
+
+  .profile-card-details {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 16px;
+    margin: 0 14px 14px;
+    border-radius: 9px;
+    padding: 14px;
+    background: rgba(0, 0, 0, 0.2);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.055);
+  }
+
+  .profile-card-metrics {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(105px, 1fr));
+    gap: 8px;
+  }
+
+  .profile-card-metrics > span {
+    display: flex;
+    min-width: 0;
+    min-height: 62px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 5px;
+    border-radius: 8px;
+    padding: 9px 10px;
+    background: rgba(255, 255, 255, 0.025);
+  }
+
+  .profile-card-metrics small {
+    color: #737d82;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .profile-card-metrics strong {
+    overflow: hidden;
+    color: #d7d9d7;
+    font-size: 12px;
+    font-weight: 580;
+    font-variant-numeric: tabular-nums;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .profile-card-actions {
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .profile-card-actions button {
+    display: inline-flex;
+    min-height: 44px !important;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    border: 0 !important;
+    border-radius: 8px;
+    margin: 0 !important;
+    padding: 0 14px;
+    background: transparent;
+    color: #aeb4b4;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 670;
+    cursor: pointer;
+    transition: background-color 150ms ease, box-shadow 150ms ease, color 150ms ease, transform 100ms ease;
+  }
+
+  .profile-card-actions .profile-apply {
+    background: color-mix(in srgb, var(--profile-accent) 12%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--profile-accent) 46%, transparent);
+    color: color-mix(in srgb, var(--profile-accent) 78%, white);
+  }
+
+  .profile-card-actions .field-failure {
+    box-shadow: inset 0 0 0 1px rgba(133, 141, 143, 0.32);
+  }
+
+  .profile-card-actions button:hover:not(:disabled) {
+    background-color: color-mix(in srgb, var(--profile-accent) 18%, transparent);
+    color: #f0eee9;
+  }
+
+  .profile-card-actions button:active:not(:disabled) {
+    transform: scale(0.96);
+  }
+
+  .profile-card-actions button:disabled {
+    cursor: default;
+    opacity: 0.52;
+  }
+
+  .instrument-profile-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    margin-top: 8px;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .instrument-profile-grid .forge-profile-card {
+    display: block;
+    min-height: 0;
+    padding: 0;
+  }
+
+  .instrument-profile-grid .forge-profile-card + .forge-profile-card {
+    border-top: 0;
+    border-left: 0;
+  }
+
+  .workshop-profile {
+    grid-template-columns: 280px minmax(0, 1fr);
+    align-items: start;
+    gap: 8px 22px;
+    padding-block: 30px;
+  }
+
+  .workshop-current {
+    grid-column: 1;
+    grid-row: 1 / span 3;
+  }
+
+  .workshop-profile .forge-profile-card {
+    grid-column: 2;
+  }
+
+  @media (max-width: 1080px) {
+    .profile-card-details {
+      grid-template-columns: 1fr;
+    }
+    .profile-card-metrics {
+      grid-template-columns: repeat(3, minmax(105px, 1fr));
+    }
+    .profile-card-actions {
+      justify-content: flex-end;
+    }
+  }
+
+  @media (max-width: 820px) {
+    .workshop-profile {
+      grid-template-columns: 1fr;
+      padding-inline: 24px;
+    }
+    .workshop-current {
+      grid-column: 1;
+      grid-row: auto;
+      border-right: 0;
+    }
+    .workshop-profile .forge-profile-card {
+      grid-column: 1;
+    }
+    .profile-disclosure {
+      grid-template-columns: 48px minmax(0, 1fr) auto;
+      padding-inline: 12px;
+    }
+    .profile-card-state small {
+      display: none;
+    }
+  }
+
+  @media (max-width: 560px) {
+    .workshop-profile {
+      padding-inline: 16px;
+    }
+    .profile-disclosure {
+      grid-template-columns: 44px minmax(0, 1fr) auto;
+      gap: 11px;
+    }
+    .profile-card-icon {
+      width: 44px;
+      height: 44px;
+    }
+    .profile-card-copy strong {
+      font-size: 16px;
+    }
+    .profile-card-metrics {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .profile-card-actions {
+      flex-direction: column;
+    }
+    .profile-card-actions button {
+      width: 100%;
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .full-reset-action,
-    .reset-dialog-actions button {
+    .reset-dialog-actions button,
+    .profile-disclosure,
+    .profile-card-state :global(svg),
+    .profile-card-actions button {
       transition: none;
     }
   }
