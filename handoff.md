@@ -7,6 +7,61 @@ sections supersede them. Apply still requests 12 mV above the learned boundary, 
 physical VF bin and must pass the complete exact-Apply gate before publication.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
 
+## START-HERE (2026-07-18e) — manual point replaces the retired Texture Lab
+
+- Advanced Diagnostics now exposes Manual point instead of Texture Lab. Enter any hardware-local
+  clock and VF-bin request; the backend resolves only to the nearest physical bin within 8 mV and
+  applies the same bounded anchored curve used by F2 profiles, without a hard voltage lock.
+- The point is temporary and never becomes Forge evidence or a persisted profile. Applying clears a
+  previously saved GPU profile, holds the Safe Loop intent throughout the real workload and blocks
+  other GPU writers. Return to stock explicitly after the test; graceful service shutdown also resets.
+- Current experiment: apply the known-bad `1800@869` request, open Game Trace, play the real Overwatch
+  scenario and stop Game Trace after leaving the match. Texture Lab IPC/UI and its unproven synthetic
+  experimental helpers were removed; fixed Forge qualification v19 remains unchanged.
+
+## START-HERE (2026-07-18d) — manual Overwatch oracle with Game Trace v2
+
+- Exact `1800@868` survived every fixed synthetic method tried, including a 30 s Heaven + internal
+  checksum co-load at 172.5 W p99. Automated Overwatch only exercised its menu (~55 W), so it was
+  not representative gameplay evidence. The next experiment is operator-played Overwatch at the
+  known-bad `1800@869` request with Game Trace enabled.
+- Game Trace now writes contract `game-trace-v2`: its header snapshots the complete live VF curve,
+  initial voltage and pre-run `nvlddmkm` TDR event; each row includes wall time, actual sampling gap,
+  NVML validity and distinguishes attempted/successful voltage reads. It flushes every 50 rows.
+- A clean stop appends aggregate clock/power/voltage/gap/missing-sample statistics and compares the
+  latest TDR event with the baseline. The trace remains read-only. If a reboot interrupts the
+  summary, the flushed pre-failure rows plus Sentinel startup reconciliation remain the evidence.
+- Before playing: apply `1800@869`, start Game Trace, verify the live mV/clock values respond, then
+  play the workload that has reproduced the failure. Stop Game Trace only after leaving the match.
+
+## START-HERE (2026-07-18c) — calibrate Texture Hop numerically
+
+- Texture Lab now exposes real runtime controls for Texture Hop instead of requiring another
+  workload-version bump: dependent shader rounds (8–256), frames per load-release hop (1–64) and
+  the true idle transition gap (0–500 ms). Four UI presets are only shortcuts over the same sliders.
+- Every configuration captures a matching stock golden before the exact point is applied and the
+  three values are retained in current status/history. Forge itself remains fixed at contract v19;
+  experimental values cannot leak into Standard/Long.
+- Use 1800@869 first. Change one axis at a time: rounds tests sustained TMU/ROP computation,
+  frames-per-hop tests transition frequency, and gap tests transition depth. Repeat the winning
+  configuration at 1815@875. A reset-clean rejection remains diagnostic-only; a real device loss
+  still follows normal Safe Loop recovery.
+
+## START-HERE (2026-07-18b) — use the temporary Texture Lab, not another full Forge
+
+- The most recent run was interrupted correctly: it reported persistent learning and repeatedly
+  stopped on BlacklistedBoundary, so it was not evidence of organic v19 discovery. Clean Run now
+  remains visible in all primary mode selectors instead of appearing only after Full Reset.
+- Advanced Diagnostics → Texture Lab owns the next physical experiment. Start with the editable
+  presets 1800@869 and 1815@875, select one method, and run 10–55 seconds. The UI shows the real
+  physical VF bin chosen for a non-physical request; the backend never descends clock or voltage.
+- Compare Texture Hop v10, Texture transitions, Stream pressure and Endurance front one at a time.
+  Trial history is memory-only and clears on service restart. Reset-clean rejection is deliberately
+  not persisted as blacklist/condemnation/Forge evidence; device loss still arms normal recovery.
+- **Acceptance:** a method must reject both known-bad points repeatably in under one minute. After
+  that, fold the winner into the Forge qualification contract, retire the temporary experiment and
+  only then spend time on a new full Clean Run.
+
 ## START-HERE (2026-07-18) — validate Texture Hop v10 against the 1800 MHz hardware oracle
 
 - Qualification contract v19 introduces Texture Hop v10. The TextureRop shader now performs 64
@@ -19,8 +74,8 @@ Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
   cannot resume as Standard. Long is the only explicitly selected mode allowed beyond one hour and
   retains 60 s + 5 min + 20 min.
 - Fast is removed from the product. The legacy `StartPowerSweepFast` IPC request maps to Standard only
-  for mixed-version compatibility. The main Command Deck and alternate themes expose Standard/Long;
-  the one-shot Clean option appears when armed and follows the Standard budget.
+  for mixed-version compatibility. The main Command Deck and alternate themes expose Clean,
+  Standard and Long; Clean always remains available and follows the Standard budget.
 - **Next physical action:** perform Full Reset and run Clean/Standard. This build is acceptable only
   if it rejects the known-bad `1800 MHz @ 869 mV` neighborhood, climbs toward the repeatedly trusted
   `1800 MHz @ 875 mV` boundary and finishes or fails closed in at most one hour. Do not encode those

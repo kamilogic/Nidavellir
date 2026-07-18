@@ -3,8 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 /** True during `tauri dev` / Vite dev server; false in release installer builds. */
 const isDev = import.meta.env.DEV;
 
-export async function serviceCall(method) {
-  return invoke("service_request", { method });
+export async function serviceCall(method, params = null) {
+  return params == null
+    ? invoke("service_request", { method })
+    : invoke("service_request", { method, params });
 }
 
 export async function pingService() {

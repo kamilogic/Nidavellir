@@ -300,6 +300,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             guard.power_sweep.abort();
             let msg = match crate::gpu_apply::reset(&guard.safe_store) {
                 Ok(()) => {
+                    guard.manual_point.mark_reset();
                     guard.power_sweep.recover_after_reset(
                         "Reset concluído; GPU em stock e Safe Loop desarmado. O checkpoint e a sequência da Forge foram preservados.",
                     );
@@ -323,6 +324,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             guard.power_sweep.abort();
             let msg = match crate::gpu_apply::reset(&guard.safe_store) {
                 Ok(()) => {
+                    guard.manual_point.mark_reset();
                     let mut problems: Vec<String> = Vec::new();
                     // Replace the whole Safe Loop record with the default — this is what additionally
                     // drops the blacklist that the latch-only reset preserves.
@@ -497,6 +499,26 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         IpcRequest::GetGameTraceStatus => {
             IpcResponse::success(ResponseData::GameTrace(guard.game_trace.status()))
         }
+        IpcRequest::ApplyManualDiagnosticPoint {
+            target_mhz,
+            voltage_mv,
+        } => {
+            let store = guard.safe_store.clone();
+            match guard.manual_point.apply(&store, *target_mhz, *voltage_mv) {
+                Ok(status) => IpcResponse::success(ResponseData::ManualDiagnosticPoint(status)),
+                Err(error) => IpcResponse::failure(error),
+            }
+        }
+        IpcRequest::ResetManualDiagnosticPoint => {
+            let store = guard.safe_store.clone();
+            match guard.manual_point.reset(&store) {
+                Ok(status) => IpcResponse::success(ResponseData::ManualDiagnosticPoint(status)),
+                Err(error) => IpcResponse::failure(error),
+            }
+        }
+        IpcRequest::GetManualDiagnosticPointStatus => {
+            IpcResponse::success(ResponseData::ManualDiagnosticPoint(guard.manual_point.status()))
+        }
         IpcRequest::ExportForgeLog => {
             let prog = guard.power_sweep.progress();
             match crate::gpu_power_sweep::export_forge_log(&prog) {
@@ -527,6 +549,7 @@ fn gpu_operation_running(state: &AppState) -> bool {
         || state.forge_all.progress().running
         || state.benchmark.progress().running
         || state.power_sweep.progress().running
+        || state.manual_point.status().active
 }
 
 fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
@@ -550,6 +573,7 @@ fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
             | IpcRequest::ApplyPowerGodforge
             | IpcRequest::ApplyPowerBrokkrs
             | IpcRequest::ApplyPowerDeepCalm
+            | IpcRequest::ApplyManualDiagnosticPoint { .. }
     )
 }
 
@@ -865,6 +889,10 @@ mod tests {
             IpcRequest::ApplyPowerGodforge,
             IpcRequest::ApplyPowerBrokkrs,
             IpcRequest::ApplyPowerDeepCalm,
+            IpcRequest::ApplyManualDiagnosticPoint {
+                target_mhz: 1800,
+                voltage_mv: 869,
+            },
         ] {
             assert!(
                 gpu_write_requires_idle(&request),

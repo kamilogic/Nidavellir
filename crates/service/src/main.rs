@@ -10,6 +10,7 @@ mod gpu_sweep_real;
 mod gpu_undervolt;
 mod gpu_verify;
 mod ipc_server;
+mod manual_point;
 mod safe_loop_runtime;
 mod sensor_gather;
 mod service_impl;
@@ -44,6 +45,7 @@ pub struct AppState {
     pub benchmark: BenchmarkHandle,
     pub power_sweep: PowerSweepHandle,
     pub game_trace: game_trace::GameTraceHandle,
+    pub manual_point: manual_point::ManualPointHandle,
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -387,6 +389,7 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         // profiles/points instead of showing an unforged GPU.
         power_sweep: gpu_power_sweep::restore_handle(),
         game_trace: game_trace::GameTraceHandle::default(),
+        manual_point: manual_point::ManualPointHandle::default(),
     }));
     #[cfg(windows)]
     console_shutdown::install(Arc::clone(&state));
@@ -446,18 +449,19 @@ mod console_shutdown {
             "shutdown signal — stopping motors, restoring GPU to stock (Ctrl+C again to force)"
         );
         if let Some(state) = STATE.get() {
-            if let Ok(s) = state.lock() {
+            if let Ok(mut s) = state.lock() {
                 s.power_sweep.stop();
                 s.real_sweep.stop();
                 s.mem_sweep.stop();
                 s.forge_all.stop();
                 s.benchmark.stop();
+                let store = s.safe_store.clone();
+                if let Err(error) = s.manual_point.reset(&store) {
+                    tracing::warn!("shutdown: manual point stock reset failed: {error}");
+                }
             }
             for poll in 0..GRACE_POLLS {
-                let busy = state
-                    .lock()
-                    .map(|s| s.power_sweep.progress().running)
-                    .unwrap_or(false);
+                let busy = state.lock().map(|s| s.power_sweep.progress().running).unwrap_or(false);
                 if !busy {
                     break;
                 }

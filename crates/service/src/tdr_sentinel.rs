@@ -96,7 +96,7 @@ pub(crate) fn parse_event_system_time(xml: &str) -> Option<String> {
 }
 
 /// Newest nvlddmkm-153 event timestamp, if any.
-fn query_latest_tdr_event() -> Option<String> {
+pub(crate) fn query_latest_tdr_event() -> Option<String> {
     let out = std::process::Command::new("wevtutil")
         .args([
             "qe",

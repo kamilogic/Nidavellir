@@ -89,6 +89,14 @@ pub enum IpcRequest {
     StartGameTrace,
     StopGameTrace,
     GetGameTraceStatus,
+    /// Apply one operator-selected F2 point for real-world diagnostics. The point is temporary,
+    /// never becomes a persisted profile and remains protected by the Safe Loop until reset.
+    ApplyManualDiagnosticPoint {
+        target_mhz: u32,
+        voltage_mv: u32,
+    },
+    ResetManualDiagnosticPoint,
+    GetManualDiagnosticPointStatus,
 }
 
 /// Live status of the read-only game-workload telemetry logger ([`IpcRequest::StartGameTrace`]).
@@ -105,6 +113,18 @@ pub struct GameTraceStatus {
     pub last_volt_mv: Option<u32>,
     /// Short human note (starting / stopped / error).
     pub note: Option<String>,
+}
+
+/// Live state for the temporary manual point in Advanced Diagnostics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ManualDiagnosticPointStatus {
+    pub active: bool,
+    pub target_mhz: Option<u32>,
+    pub requested_voltage_mv: Option<u32>,
+    pub resolved_voltage_mv: Option<u32>,
+    pub applied_at_epoch_ms: Option<u64>,
+    pub verified: bool,
+    pub note: String,
 }
 
 /// Result of [`IpcRequest::ExportForgeLog`]: where the rich log was written and how much it covered.
@@ -732,6 +752,7 @@ pub enum ResponseData {
     /// Struct variant: the enum is internally tagged, which cannot carry a bare Option.
     SentinelStatus { status: Option<String> },
     GameTrace(GameTraceStatus),
+    ManualDiagnosticPoint(ManualDiagnosticPointStatus),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -791,6 +812,21 @@ mod tests {
     fn resume_power_sweep_request_is_additive_unit_method() {
         let req = parse_request(r#"{"method":"ResumePowerSweep"}"#).unwrap();
         assert!(matches!(req, IpcRequest::ResumePowerSweep));
+    }
+
+    #[test]
+    fn manual_diagnostic_point_request_roundtrips_parameter_object() {
+        let req = parse_request(
+            r#"{"method":"ApplyManualDiagnosticPoint","params":{"target_mhz":1800,"voltage_mv":869}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            req,
+            IpcRequest::ApplyManualDiagnosticPoint {
+                target_mhz: 1800,
+                voltage_mv: 869,
+            }
+        ));
     }
 
     #[test]

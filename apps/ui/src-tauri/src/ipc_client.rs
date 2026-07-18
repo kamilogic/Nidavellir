@@ -6,7 +6,19 @@ use std::io::{Read, Write};
 const PIPE_NAME: &str = r"\\.\pipe\NidavellirCore";
 
 pub fn call_service(method: &str) -> Result<Value, String> {
-    let request = format!(r#"{{"method":"{method}"}}"#);
+    call_service_with_params(method, None)
+}
+
+pub fn call_service_with_params(method: &str, params: Option<Value>) -> Result<Value, String> {
+    let request = match params {
+        Some(params) => serde_json::to_string(&serde_json::json!({
+            "method": method,
+            "params": params,
+        }))
+        .map_err(|e| format!("Invalid service request: {e}"))?,
+        None => serde_json::to_string(&serde_json::json!({ "method": method }))
+            .map_err(|e| format!("Invalid service request: {e}"))?,
+    };
     let response = send_request(&request)?;
     let parsed: Value = serde_json::from_str(&response)
         .map_err(|e| format!("Invalid service response: {e}"))?;

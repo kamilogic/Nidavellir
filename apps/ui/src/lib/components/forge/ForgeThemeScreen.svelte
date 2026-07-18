@@ -456,7 +456,7 @@
             <label for="command-run-mode">
               <span>RUN</span>
               <select id="command-run-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>
-                {#if forgeMode === "clean"}<option value="clean">Clean Run · Standard budget</option>{/if}
+                <option value="clean">Clean Run · ignores prior boundaries</option>
                 <option value="standard">Standard · up to 1 hour</option>
                 <option value="long">Long · exhaustive proof</option>
               </select>
@@ -520,7 +520,7 @@
       {@render fullResetControl()}
 
       <button class="command-advanced" onclick={() => navigate("advanced")}
-        ><span>Advanced diagnostics <ChevronRight size={22} /></span><small>Live log, Sentinel and Game Trace</small><ChevronDown size={24} /></button
+        ><span>Advanced diagnostics <ChevronRight size={22} /></span><small>Live log, Sentinel, Game Trace and manual point</small><ChevronDown size={24} /></button
       >
     </div>
     {/if}
@@ -596,7 +596,7 @@
           <div class="mode-block">
             <label for="instrument-mode">MODE</label>
             <select id="instrument-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>
-              {#if forgeMode === "clean"}<option value="clean">Clean Run — Standard budget</option>{/if}
+              <option value="clean">Clean Run — ignores prior boundaries</option>
               <option value="standard">Standard — up to 1 hour</option>
               <option value="long">Long — exhaustive proof</option>
             </select>
@@ -614,7 +614,7 @@
           </div>
         </aside>
 
-        <button class="instrument-advanced" onclick={() => navigate("advanced")}><Activity size={40} /><span><strong>ADVANCED DETAILS</strong><small>Live terminal, Sentinel protection and Game Trace</small></span><small>Open workspace</small><ChevronRight size={22} /></button>
+        <button class="instrument-advanced" onclick={() => navigate("advanced")}><Activity size={40} /><span><strong>ADVANCED DETAILS</strong><small>Live terminal, Sentinel, Game Trace and manual point</small></span><small>Open workspace</small><ChevronRight size={22} /></button>
         {/if}
       </main>
     </div>
@@ -639,7 +639,7 @@
         <p class:pending={!safeLoopKnown} class:review={safeLoopKnown && !protectedState}><i></i> {safeLoopKnown ? (protectedState ? "Protected by Safe Loop" : "Safe Loop needs review") : "Safe Loop status unavailable"}</p>
         <div class="workshop-actions">
           <button class="workshop-forge" onclick={runForge} disabled={powerRunning || (forgePaused && !resumeAvailable)}><Anvil size={25} />{powerRunning ? "Forging…" : resumeAvailable ? "Resume Forge" : forgePaused ? "Resume unavailable" : recoveryPending ? "Review & Continue" : "Forge GPU"}</button>
-          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>{#if forgeMode === "clean"}<option value="clean">Clean Run · Standard budget</option>{/if}<option value="standard">Standard · Up to 1 hour</option><option value="long">Long · Exhaustive proof</option></select><ChevronDown size={20} /></label>
+          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}><option value="clean">Clean Run · Ignores prior boundaries</option><option value="standard">Standard · Up to 1 hour</option><option value="long">Long · Exhaustive proof</option></select><ChevronDown size={20} /></label>
         </div>
       </section>
 
@@ -682,7 +682,7 @@
             <TelemetrySpark values={values(metric.key)} color="#87aada" fill="rgba(135, 170, 218, 0.04)" height={43} />
           </article>
         {/each}
-        <button class="workshop-advanced" onclick={() => navigate("advanced")}><ChevronRight size={23} /><span><strong>Advanced</strong><small>Logs, Sentinel and Game Trace</small></span></button>
+        <button class="workshop-advanced" onclick={() => navigate("advanced")}><ChevronRight size={23} /><span><strong>Advanced</strong><small>Logs, Sentinel, Game Trace and manual point</small></span></button>
       </section>
 
       <footer class="workshop-footer" class:pending={!safeLoopKnown}>

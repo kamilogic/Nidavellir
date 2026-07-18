@@ -3,8 +3,8 @@ mod ipc_client;
 use serde_json::Value;
 
 #[tauri::command]
-fn service_request(method: String) -> Result<Value, String> {
-    ipc_client::call_service(&method)
+fn service_request(method: String, params: Option<Value>) -> Result<Value, String> {
+    ipc_client::call_service_with_params(&method, params)
 }
 
 #[tauri::command]

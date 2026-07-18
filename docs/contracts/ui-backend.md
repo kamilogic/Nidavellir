@@ -5,6 +5,29 @@
 > surface (methods + payload shapes). Keep it current when the IPC changes.
 
 
+\## 2026-07-18 (current): always-available Clean Run and temporary manual diagnostic point
+
+\- **Clean Run is a permanent selector choice.** Command, Instrument and Workshop always expose
+  Clean, alongside Standard and Long. Full Reset still selects it automatically for one run, but
+  manual selection does not require a preceding reset. StartPowerSweepClean prevents pre-run
+  blacklist/condemnation evidence from steering that new search; Sentinel, Safe Mode and new
+  same-run failures remain active.
+\- **Parameterized IPC:** `ApplyManualDiagnosticPoint` accepts `target_mhz` and `voltage_mv`.
+  `ResetManualDiagnosticPoint` returns the GPU to stock and `GetManualDiagnosticPointStatus` is
+  read-only. All three responses use `ManualDiagnosticPoint` with
+  `ManualDiagnosticPointStatus { active, target_mhz, requested_voltage_mv, resolved_voltage_mv,
+  applied_at_epoch_ms, verified, note }`.
+\- **Point semantics:** the requested voltage resolves to the nearest physical VF bin on the live
+  GPU (maximum 8 mV difference). Apply uses the existing bounded anchored F2 curve writer plus the
+  absolute target-clock ceiling; it does not use a hard voltage lock, start a synthetic workload,
+  descend the curve, write observations or publish a profile.
+\- **Safety and lifetime:** apply is refused in Safe Mode or while a recovery boot flag is already
+  armed. The service-wide GPU lease blocks concurrent tuning operations. The manual point clears a
+  previously persisted GPU profile and remains temporary, with its Safe Loop intent armed for the
+  entire real-workload test. Explicit reset and graceful service shutdown restore stock and disarm
+  that intent; a crash/reboot leaves it available to startup recovery.
+
+
 \## 2026-07-18 (current): qualification v19, bounded Standard and explicit Long
 
 \- **Texture Hop v10 is the early hardware discriminator.** The current TextureRop shader performs
@@ -24,9 +47,9 @@
 \- **Fast is retired as a product mode.** It is absent from every current selector and has no
   provisional publication path. `StartPowerSweepFast` remains only as a deprecated mixed-version
   wire alias and executes the Standard policy; it never restores the former Fast semantics.
-\- **Primary Forge selector.** The main forge-themed Command Deck exposes Standard and Long beside
-  the Forge action. After Full Reset, its one-shot Clean option is shown as using the Standard time
-  budget. The instrument/workshop selectors use the same set and meaning.
+\- **Primary Forge selector.** The main forge-themed Command Deck exposes Clean, Standard and Long
+  beside the Forge action. Clean always remains selectable and uses the Standard time budget; Full
+  Reset merely selects it automatically for the next run. Instrument/workshop use the same set.
 
 
 \## 2026-07-17 (additive): organic reset handoff, honest full-gate power and simplified Forge UX

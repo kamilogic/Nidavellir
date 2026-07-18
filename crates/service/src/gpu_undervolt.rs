@@ -4141,6 +4141,46 @@ pub(crate) fn f2_forge_inputs(clock_ceiling_mhz: u32) -> Option<F2ForgeInputs> {
     })
 }
 
+#[cfg(windows)]
+fn resolve_manual_diagnostic_anchor(
+    sane: &[(usize, u32, u32)],
+    target_mhz: u32,
+    requested_voltage_mv: u32,
+) -> Result<(usize, u32, u32), String> {
+    let resolved = sane
+        .iter()
+        .copied()
+        .filter(|(_, _, base_mhz)| *base_mhz < target_mhz)
+        .min_by_key(|(_, voltage_mv, _)| voltage_mv.abs_diff(requested_voltage_mv))
+        .ok_or_else(|| format!("no physical VF anchor can reach {target_mhz} MHz"))?;
+    let distance_mv = resolved.1.abs_diff(requested_voltage_mv);
+    if distance_mv > 8 {
+        return Err(format!(
+            "requested {requested_voltage_mv} mV is {distance_mv} mV from the nearest physical VF bin ({} mV)",
+            resolved.1
+        ));
+    }
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_manual_diagnostic_point(
+    target_mhz: u32,
+    requested_voltage_mv: u32,
+) -> Result<(u32, i32), String> {
+    let inputs = f2_forge_inputs(target_mhz)
+        .ok_or_else(|| "no sane physical VF curve is available".to_string())?;
+    let (_, resolved_voltage_mv, base_mhz) = resolve_manual_diagnostic_anchor(
+        &inputs.sane_base_curve,
+        target_mhz,
+        requested_voltage_mv,
+    )?;
+    Ok((
+        resolved_voltage_mv,
+        target_mhz as i32 - base_mhz as i32,
+    ))
+}
+
 /// Apply ONE F2 anchored undervolt point to hardware and LEAVE it applied — the APPLY path (not a probe).
 /// Reads the live static VF base curve, plans+writes the bounded anchored offset for `target_mhz` anchored
 /// at the exact validated `anchor_mv` bin, then verifies the write. FAIL-CLOSED: a missing anchor, a writer
@@ -7693,6 +7733,17 @@ mod tests {
             }
             .completes_clock()
         );
+    }
+
+    #[test]
+    fn manual_diagnostic_resolves_only_the_nearest_physical_bin() {
+        let curve = vec![(0, 850, 1600), (1, 868, 1650), (2, 875, 1680), (3, 900, 1800)];
+        assert_eq!(
+            resolve_manual_diagnostic_anchor(&curve, 1800, 869).unwrap(),
+            (1, 868, 1650)
+        );
+        assert!(resolve_manual_diagnostic_anchor(&curve, 1800, 886).is_err());
+        assert!(resolve_manual_diagnostic_anchor(&curve, 1500, 869).is_err());
     }
 
     #[test]

@@ -28,6 +28,9 @@
   let gameTraceActionError = $state("");
   let gameTraceExportBusy = $state(false);
   let gameTraceExportMsg = $state("");
+  let manualPoint = $state(null);
+  let manualPointBusy = $state(false);
+  let manualPointActionError = $state("");
   let fullResetBusy = $state(false);
   let fullResetFeedback = $state(null);
   // Live GPU telemetry (ReadSensors) + rolling sparkline buffers for the monitoring panel.
@@ -334,6 +337,56 @@
     }
   }
 
+  async function refreshManualPoint(clearRecoveredError = true) {
+    try {
+      const r = await serviceCall("GetManualDiagnosticPointStatus");
+      if (r?.ok === false) throw new Error(r.error || "Unable to read manual point status");
+      if (r?.data?.type === "ManualDiagnosticPoint") {
+        manualPoint = r.data;
+        if (clearRecoveredError && !manualPointBusy) manualPointActionError = "";
+      }
+    } catch {
+      /* diagnostic status is best-effort UI information */
+    }
+  }
+
+  async function applyManualPoint(config) {
+    if (manualPointBusy || manualPoint?.active) return;
+    const confirmed = globalThis.confirm?.(
+      `Apply the temporary diagnostic point ${config.target_mhz} MHz @ ${config.voltage_mv} mV? It may cause a driver reset during real workloads. The point will not become a profile; use Return to stock when the test is finished.`,
+    ) ?? true;
+    if (!confirmed) return;
+    manualPointBusy = true;
+    manualPointActionError = "";
+    try {
+      const r = await serviceCall("ApplyManualDiagnosticPoint", config);
+      if (r?.ok === false) throw new Error(r.error || "Unable to apply the manual point");
+      if (r?.data?.type !== "ManualDiagnosticPoint") throw new Error("Invalid manual point response");
+      manualPoint = r.data;
+    } catch (e) {
+      manualPointActionError = String(e);
+    } finally {
+      await refreshManualPoint(false);
+      manualPointBusy = false;
+    }
+  }
+
+  async function resetManualPoint() {
+    if (manualPointBusy) return;
+    manualPointBusy = true;
+    manualPointActionError = "";
+    try {
+      const r = await serviceCall("ResetManualDiagnosticPoint");
+      if (r?.ok === false) throw new Error(r.error || "Unable to return the GPU to stock");
+      if (r?.data?.type === "ManualDiagnosticPoint") manualPoint = r.data;
+    } catch (e) {
+      manualPointActionError = String(e);
+    } finally {
+      await refreshManualPoint(false);
+      manualPointBusy = false;
+    }
+  }
+
   function closeAdvancedDiagnostics() {
     changeView("forge");
   }
@@ -405,15 +458,18 @@
     refreshSentinel();
     refreshSensors();
     refreshGameTrace();
+    refreshManualPoint();
     timer = setInterval(refresh, 500);
     const sentinelTimer = setInterval(refreshSentinel, 10_000);
     const sensorTimer = setInterval(refreshSensors, 2000);
     const gameTraceTimer = setInterval(refreshGameTrace, 1000);
+    const manualPointTimer = setInterval(refreshManualPoint, 2000);
     return () => {
       clearInterval(timer);
       clearInterval(sentinelTimer);
       clearInterval(sensorTimer);
       clearInterval(gameTraceTimer);
+      clearInterval(manualPointTimer);
     };
   });
 </script>
@@ -461,9 +517,14 @@
       {gameTraceActionError}
       {gameTraceExportBusy}
       {gameTraceExportMsg}
+      {manualPoint}
+      {manualPointBusy}
+      {manualPointActionError}
       onExportLog={exportLog}
       onToggleGameTrace={toggleGameTrace}
       onOpenGameTraceLog={openGameTraceLog}
+      onApplyManualPoint={applyManualPoint}
+      onResetManualPoint={resetManualPoint}
       onClose={closeAdvancedDiagnostics}
     />
   </ForgeThemeScreen>

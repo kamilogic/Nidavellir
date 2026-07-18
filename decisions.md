@@ -2,6 +2,60 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Replace the temporary Texture Lab with a supervised manual point (2026-07-18)
+- **Evidence:** no synthetic method rejected the known-bad point, while automated Overwatch reached
+  only its low-load menu. Keeping a method-comparison product surface no longer served the active
+  experiment; real operator-played gameplay is the current oracle.
+- **Decision:** Advanced Diagnostics accepts a clock and requested VF bin, resolves the nearest real
+  bin within 8 mV and applies the normal bounded anchored F2 curve without starting any workload.
+  The temporary Texture Lab IPC/UI and its unproven workload helpers are removed.
+- **Safety:** the manual point is not persisted as a profile or observation, but its Safe Loop boot
+  intent stays armed for the whole test. It blocks concurrent GPU writers and is reset on explicit
+  operator action or graceful service shutdown. No hard voltage lock is used.
+
+## Use manual real gameplay as the hardware oracle and make its trace self-proving (2026-07-18)
+- **Evidence:** exact `1800@868` survived fixed Texture/transition/DX11/compute methods and a 172.5 W
+  p99 Heaven + checksum co-load. Automated Overwatch stayed in its low-load menu, so neither elapsed
+  time nor more synthetic density established the known field failure.
+- **Decision:** the operator will apply `1800@869`, enable Game Trace and play the Overwatch workload
+  that already reproduces the instability. Synthetic promotion remains blocked until its mechanism
+  can discriminate the same point and pass the known-stable control.
+- **Trace contract:** `game-trace-v2` captures the effective VF curve, high-rate telemetry timing and
+  validity, honest fresh voltage reads, frequent buffer flushes and before/after TDR-event
+  correlation. These additions are observation-only and cannot change GPU tuning.
+
+## Make Texture Hop an operator-calibrated workload before versioning it again (2026-07-18)
+- **Problem:** four fixed lab methods can identify a winning family but cannot determine which
+  computational density or load transition actually rejects the hardware oracle. Repeated source
+  bumps would confound the experiment and require a build for every calibration step.
+- **Decision:** expose three numeric Texture Hop controls only in the temporary lab: dependent shader
+  rounds (8–256), rendered frames per queue-drain hop (1–64), and true idle gap (0–500 ms). Presets
+  are named coordinate shortcuts, never separate workload contracts.
+- **Integrity:** shader rounds change deterministic output, so every unique configuration captures
+  and caches a matching stock golden before apply. Parameters enter evidence provenance and the
+  in-memory trial record. The fixed Forge v19 path uses none of these runtime inputs.
+- **Safety:** 256 rounds is the hard compute ceiling. Configurations above the fixed 64-round Forge
+  default render in 16 preemptible bands with a 500 ms per-band pre-hang cutoff, so high density does
+  not become one monolithic TDR-class submission. Longer gaps are idle, not extra computation;
+  duration stays capped at 55 seconds and prior Safe Loop/reset evidence boundaries remain active.
+
+## Isolate the hardware oracle in a temporary exact-point Texture Lab (2026-07-18)
+- **Evidence:** the interrupted run was explicitly learning: persistent and terminated multiple
+  clocks as BlacklistedBoundary; it therefore could not measure first-run organic convergence.
+- **Product decision:** Clean Run is permanently visible in every primary run selector. Full Reset
+  may auto-select it, but it is no longer discoverable only while that one-shot arm is active.
+- **Experiment decision:** pause full Forge iteration and compare existing aggressive qualifier
+  methods at the fixed known-bad 1800@869 and 1815@875 requests. The backend resolves each request
+  to the nearest real VF bin, never changes the point during a trial and caps each method at
+  55 seconds. Results stay in memory and are not promoted into Forge Knowledge.
+- **Safety boundary:** existing blacklist evidence is ignored only for executing this explicit lab
+  point. Safe Mode, the service-wide GPU write lease, Safe Loop arm/apply/verify/reset and TDR
+  recovery remain mandatory. Reset-clean failures do not pollute later Forge evaluation; device
+  loss remains durable safety evidence.
+- **Acceptance gate:** find a repeatable method that organically rejects both known-bad points in
+  under one minute per method. Only then promote that method into the bounded Forge contract; retire
+  the temporary tab after the new contract is proven on clean hardware runs.
+
 ## Make Texture Hop v10 the hardware oracle; bound Standard and retire Fast (2026-07-18)
 - **Observed problem:** the clean run accepted `1800 MHz @ 856 mV`, while repeated field testing puts
   the credible boundary near `1800 MHz @ 875 mV`; `1800 MHz @ 869 mV` is therefore the immediate

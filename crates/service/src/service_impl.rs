@@ -69,6 +69,7 @@ pub fn run_service() -> windows_service::Result<()> {
         // profiles/points instead of showing an unforged GPU.
         power_sweep: crate::gpu_power_sweep::restore_handle(),
         game_trace: crate::game_trace::GameTraceHandle::default(),
+        manual_point: crate::manual_point::ManualPointHandle::default(),
     }));
 
     let pipe_state = Arc::clone(&state);
@@ -79,6 +80,13 @@ pub fn run_service() -> windows_service::Result<()> {
     });
 
     let _ = shutdown_rx.recv();
+
+    if let Ok(mut state) = state.lock() {
+        let store = state.safe_store.clone();
+        if let Err(error) = state.manual_point.reset(&store) {
+            tracing::warn!("service stop: manual point stock reset failed: {error}");
+        }
+    }
 
     // This stop is graceful (Windows sent Stop/Shutdown — e.g. a user-initiated restart). Record a
     // one-shot marker so startup recovery does not mistake an armed boot-flag for a crash.

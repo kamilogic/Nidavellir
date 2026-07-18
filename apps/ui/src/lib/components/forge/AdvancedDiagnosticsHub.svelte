@@ -3,7 +3,9 @@
     ArrowLeft,
     ExternalLink,
     FileDown,
+    Gauge,
     Radio,
+    RotateCcw,
     ShieldCheck,
     Terminal,
   } from "@lucide/svelte";
@@ -26,9 +28,14 @@
     gameTraceActionError = "",
     gameTraceExportBusy = false,
     gameTraceExportMsg = "",
+    manualPoint = null,
+    manualPointBusy = false,
+    manualPointActionError = "",
     onExportLog,
     onToggleGameTrace,
     onOpenGameTraceLog,
+    onApplyManualPoint,
+    onResetManualPoint,
     onClose,
   } = $props();
 
@@ -64,12 +71,36 @@
       detail: gameTrace?.running ? `Gravando · ${gameTrace.samples ?? 0}` : "Parado",
       icon: Radio,
     },
+    {
+      id: "manual-point",
+      label: "Manual point",
+      detail: manualPoint?.active
+        ? `${manualPoint.target_mhz} MHz · ${manualPoint.resolved_voltage_mv} mV`
+        : "Temporary curve",
+      icon: Gauge,
+    },
   ]);
 
   const terminalStatus = $derived(
     powerSweep?.running ? powerSweep.phase : logLines.length ? "ready" : "idle",
   );
   const traceReady = $derived(Boolean(gameTrace));
+  let manualTargetMhz = $state("");
+  let manualVoltageMv = $state("");
+  const manualPointValid = $derived(
+    Number(manualTargetMhz) >= 300 &&
+      Number(manualTargetMhz) <= 4000 &&
+      Number(manualVoltageMv) >= 500 &&
+      Number(manualVoltageMv) <= 1250,
+  );
+
+  function applyManualPoint() {
+    if (!manualPointValid || manualPoint?.active) return;
+    onApplyManualPoint?.({
+      target_mhz: Number(manualTargetMhz),
+      voltage_mv: Number(manualVoltageMv),
+    });
+  }
 
   function formatElapsed(seconds) {
     const total = Math.max(0, Number(seconds) || 0);
@@ -281,7 +312,7 @@
         Sentinel is automatic and has no manual switch here. This panel reports events; it does not change GPU tuning.
       </p>
     </div>
-  {:else}
+  {:else if activeTab === "game-trace"}
     <div
       class="diagnostic-panel game-trace-panel"
       id="diagnostic-panel-game-trace"
@@ -371,6 +402,149 @@
       {#if gameTraceExportMsg}
         <p class="inline-message" role="status">{gameTraceExportMsg}</p>
       {/if}
+    </div>
+  {:else}
+    <div
+      class="diagnostic-panel manual-point-panel"
+      id="diagnostic-panel-manual-point"
+      role="tabpanel"
+      aria-label="Manual diagnostic point"
+    >
+      <div class="panel-toolbar manual-toolbar">
+        <div>
+          <span class="panel-kicker">Temporary hardware point</span>
+          <h3>Manual diagnostic point</h3>
+          <p>Apply one anchored V/F point for a real game test, without starting Forge or a synthetic workload.</p>
+        </div>
+        <span class:active={Boolean(manualPoint?.active)} class="manual-state">
+          <i aria-hidden="true"></i>
+          {manualPoint?.active ? "Applied" : "Inactive"}
+        </span>
+      </div>
+
+      <div class="manual-safety-note">
+        <ShieldCheck size={19} strokeWidth={1.75} />
+        <p>
+          <strong>Temporary and supervised.</strong> This replaces the current GPU curve but never
+          becomes a saved profile. Safe Loop remains armed until you return to stock.
+        </p>
+      </div>
+
+      <div class="manual-layout">
+        <section class="manual-setup" aria-labelledby="manual-point-setup-title">
+          <span class="panel-kicker">Point selection</span>
+          <h4 id="manual-point-setup-title">Choose the clock and VF-bin request</h4>
+          <p class="manual-copy">
+            The voltage request is resolved to the nearest physical bin on this GPU. Requests more
+            than 8 mV from a real bin are refused instead of being guessed.
+          </p>
+
+          <div class="manual-point-fields">
+            <label>
+              <span>Target clock</span>
+              <span class="numeric-input">
+                <input
+                  type="number"
+                  min="300"
+                  max="4000"
+                  step="15"
+                  placeholder="—"
+                  bind:value={manualTargetMhz}
+                  disabled={manualPoint?.active}
+                />
+                <small>MHz</small>
+              </span>
+            </label>
+            <label>
+              <span>Requested VF bin</span>
+              <span class="numeric-input">
+                <input
+                  type="number"
+                  min="500"
+                  max="1250"
+                  step="1"
+                  placeholder="—"
+                  bind:value={manualVoltageMv}
+                  disabled={manualPoint?.active}
+                />
+                <small>mV</small>
+              </span>
+            </label>
+          </div>
+
+          {#if manualPointActionError}
+            <p class="inline-message error" role="alert">{manualPointActionError}</p>
+          {/if}
+
+          <div class="manual-actions">
+            {#if manualPoint?.active}
+              <button
+                class="action-button reset-point"
+                type="button"
+                onclick={onResetManualPoint}
+                disabled={manualPointBusy}
+              >
+                <RotateCcw size={17} strokeWidth={1.8} />
+                <span>{manualPointBusy ? "Returning to stock…" : "Return to stock"}</span>
+              </button>
+              <button class="action-button" type="button" onclick={() => (activeTab = "game-trace")}>
+                <Radio size={17} strokeWidth={1.8} />
+                <span>Open Game Trace</span>
+              </button>
+            {:else}
+              <button
+                class="action-button primary"
+                type="button"
+                onclick={applyManualPoint}
+                disabled={manualPointBusy || !manualPointValid}
+              >
+                <Gauge size={17} strokeWidth={1.8} />
+                <span>{manualPointBusy ? "Applying…" : "Apply temporary point"}</span>
+              </button>
+            {/if}
+          </div>
+          <p class="manual-footnote">
+            Applying clears any currently saved GPU profile. Returning to stock ends the diagnostic
+            and disarms its recovery intent.
+          </p>
+        </section>
+
+        <aside class="manual-live" aria-labelledby="manual-point-live-title" aria-live="polite">
+          <span class="panel-kicker">Manual point status</span>
+          <h4 id="manual-point-live-title">
+            {manualPoint?.active ? "Manual curve verified" : "No manual point applied"}
+          </h4>
+          <p>{manualPoint?.note ?? "Enter a hardware-local point to begin."}</p>
+          <dl>
+            <div>
+              <dt>Requested</dt>
+              <dd>
+                {manualPoint?.target_mhz == null
+                  ? "—"
+                  : `${manualPoint.target_mhz} MHz @ ${manualPoint.requested_voltage_mv} mV`}
+              </dd>
+            </div>
+            <div>
+              <dt>Physical VF bin</dt>
+              <dd>
+                {manualPoint?.resolved_voltage_mv == null
+                  ? "Resolved before apply"
+                  : `${manualPoint.resolved_voltage_mv} mV`}
+              </dd>
+            </div>
+            <div>
+              <dt>Curve verification</dt>
+              <dd class:verified={Boolean(manualPoint?.verified)}>
+                {manualPoint?.verified ? "Verified" : "Not applied"}
+              </dd>
+            </div>
+            <div>
+              <dt>Next step</dt>
+              <dd>{manualPoint?.active ? "Start Game Trace, then launch the game" : "Choose a point"}</dd>
+            </div>
+          </dl>
+        </aside>
+      </div>
     </div>
   {/if}
 </section>
@@ -538,7 +712,7 @@
 
   .diagnostic-tabs {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     border-top: 1px solid var(--forge-line);
     border-bottom: 1px solid var(--forge-line);
   }
@@ -949,6 +1123,247 @@
     word-break: break-all;
   }
 
+  .manual-toolbar {
+    margin-bottom: 0.85rem;
+  }
+
+  .manual-state {
+    display: inline-flex;
+    min-height: 32px;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.65rem;
+    color: var(--diag-muted);
+    font-size: 0.7rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border: 1px solid var(--forge-line);
+  }
+
+  .manual-state i {
+    width: 7px;
+    height: 7px;
+    background: currentColor;
+    border-radius: 50%;
+  }
+
+  .manual-state.active {
+    color: var(--forge-green);
+    border-color: color-mix(in srgb, var(--forge-green) 42%, var(--forge-line));
+  }
+
+  .manual-safety-note {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.7rem;
+    margin-bottom: 1.15rem;
+    padding: 0.8rem 0.9rem;
+    color: var(--forge-blue);
+    background: color-mix(in srgb, var(--forge-blue) 6%, transparent);
+    border-left: 2px solid currentColor;
+  }
+
+  .manual-safety-note :global(svg) {
+    flex: 0 0 auto;
+    margin-top: 0.08rem;
+  }
+
+  .manual-safety-note p {
+    color: var(--diag-muted);
+    font-size: 0.78rem;
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .manual-safety-note strong {
+    color: var(--diag-text);
+  }
+
+  .manual-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+    border-top: 1px solid var(--forge-line);
+    border-bottom: 1px solid var(--forge-line);
+  }
+
+  .manual-setup {
+    min-width: 0;
+    padding: 1.2rem 1.3rem 1.25rem 0;
+  }
+
+  .manual-live {
+    min-width: 0;
+    padding: 1.2rem 0 1.25rem 1.3rem;
+    border-left: 1px solid var(--forge-line);
+  }
+
+  .manual-setup h4,
+  .manual-live h4 {
+    margin: 0.22rem 0 0;
+    color: var(--diag-text);
+    font-size: 0.98rem;
+    font-weight: 620;
+    text-wrap: balance;
+  }
+
+  .manual-copy,
+  .manual-live > p {
+    margin-top: 0.55rem;
+    color: var(--diag-muted);
+    font-size: 0.76rem;
+    line-height: 1.55;
+    text-wrap: pretty;
+  }
+
+  .manual-copy {
+    max-width: 64ch;
+  }
+
+  .manual-live > p {
+    min-height: 3.4em;
+  }
+
+  .manual-point-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.7rem;
+    margin-top: 1rem;
+  }
+
+  .manual-point-fields > label {
+    display: grid;
+    gap: 0.42rem;
+    color: var(--diag-dim);
+    font-size: 0.69rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .numeric-input {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    min-height: 44px;
+    background: color-mix(in srgb, var(--forge-void) 88%, transparent);
+    border: 1px solid var(--forge-line);
+  }
+
+  .numeric-input:focus-within {
+    border-color: var(--forge-blue);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--forge-blue) 40%, transparent);
+  }
+
+  .numeric-input input {
+    min-width: 0;
+    padding: 0.65rem 0.75rem;
+    color: var(--diag-text);
+    background: transparent;
+    border: 0;
+    outline: 0;
+    font: 600 0.95rem/1 "Cascadia Code", "Consolas", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .numeric-input input::placeholder {
+    color: color-mix(in srgb, var(--diag-dim) 70%, transparent);
+  }
+
+  .numeric-input small {
+    padding-right: 0.75rem;
+    color: var(--diag-dim);
+    font-size: 0.68rem;
+  }
+
+  .manual-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.65rem;
+    margin-top: 1rem;
+  }
+
+  .manual-actions .action-button {
+    min-height: 42px;
+    transition:
+      color 150ms ease,
+      background-color 150ms ease,
+      border-color 150ms ease,
+      transform 100ms ease;
+  }
+
+  .manual-actions .action-button:active:not(:disabled) {
+    transform: scale(0.96);
+  }
+
+  .action-button.reset-point {
+    color: #f2aaa0;
+    border-color: color-mix(in srgb, var(--diag-danger) 55%, var(--forge-line));
+  }
+
+  .manual-footnote {
+    margin-top: 0.7rem;
+    color: var(--diag-dim);
+    font-size: 0.68rem;
+    line-height: 1.45;
+    text-wrap: pretty;
+  }
+
+  .manual-live dl {
+    margin: 0.85rem 0 0;
+  }
+
+  .manual-live dl > div {
+    display: grid;
+    grid-template-columns: 110px minmax(0, 1fr);
+    gap: 0.65rem;
+    padding: 0.62rem 0;
+    border-bottom: 1px solid var(--forge-line);
+  }
+
+  .manual-live dt {
+    color: var(--diag-dim);
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .manual-live dd {
+    color: var(--diag-muted);
+    text-align: right;
+    overflow-wrap: anywhere;
+    font-size: 0.76rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .manual-live dd.verified {
+    color: var(--forge-green);
+  }
+  @media (max-width: 980px) {
+    .diagnostic-tabs {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .diagnostic-tabs small {
+      display: none;
+    }
+
+    .manual-layout {
+      grid-template-columns: 1fr;
+    }
+
+    .manual-setup {
+      padding-right: 0;
+    }
+
+    .manual-live {
+      padding-left: 0;
+      border-top: 1px solid var(--forge-line);
+      border-left: 0;
+    }
+  }
+
   @media (max-width: 780px) {
     .advanced-hub,
     .advanced-hub.workshop {
@@ -972,10 +1387,6 @@
       grid-template-columns: auto 1fr;
     }
 
-    .diagnostic-tabs small {
-      display: none;
-    }
-
     .trace-metrics {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
@@ -987,6 +1398,17 @@
     .sentinel-readout > div {
       grid-template-columns: 1fr;
       gap: 0.35rem;
+    }
+  }
+
+  @media (max-width: 560px) {
+    .manual-actions {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .manual-point-fields {
+      grid-template-columns: 1fr;
     }
   }
 

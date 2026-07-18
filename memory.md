@@ -8,6 +8,51 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-18e) — manual diagnostic point replaces Texture Lab
+- Advanced Diagnostics now applies one operator-selected clock/VF-bin request directly for a real
+  workload. Requests resolve to the nearest physical bin within 8 mV and use the normal bounded,
+  elastic anchored F2 curve plus max-clock ceiling; no diagnostic hard-voltage lock remains.
+- The point is temporary: it clears any saved GPU profile, writes no Forge observations/profiles and
+  holds its Safe Loop boot intent until explicit stock reset. Concurrent GPU writes are blocked and
+  graceful service shutdown resets it. Game Trace remains independent and can run alongside it.
+- Texture Lab IPC/UI, runtime texture tuning, in-memory method history and all unproven external/
+  synthetic experimental helpers were removed. Forge qualification contract v19 is unchanged.
+
+## Latest (2026-07-18d) — manual gameplay oracle and resilient Game Trace
+- Exact `1800@868` survived the current synthetic matrix and a 172.5 W p99 Heaven + checksum
+  co-load. Overwatch automation reached only the menu (~55 W), so it cannot replace the user's
+  known failure-producing gameplay. The active experiment is manual Overwatch at `1800@869`.
+- Game Trace contract `game-trace-v2` snapshots the effective VF curve and TDR baseline, timestamps
+  every row against Windows events, records real sampler gaps/NVML validity, separates attempted
+  from successful voltage reads, and flushes every 50 samples to preserve pre-reset evidence.
+- Clean stop appends a summary with power/clock/voltage envelopes, missing telemetry, maximum sample
+  gap and before/after `nvlddmkm` TDR correlation. The recorder remains strictly read-only.
+
+## Latest (2026-07-18c) — operator-calibrated Texture Hop
+- Texture Lab's Texture Hop now accepts three bounded runtime controls: 8–256 dependent shader
+  rounds, 1–64 frames between queue-drain hops and 0–500 ms of true idle transition gap. These are
+  real shader/cadence inputs, not display-only sliders or new named workload versions.
+- Each unique configuration receives its own stock checksum golden and its parameters are visible in
+  current status and bounded trial history. Other lab methods retain fixed plans; the versioned v19
+  Forge workload is unchanged and cannot inherit lab settings.
+- Hardware acceptance remains empirical: find one configuration that rejects both known-bad points
+  repeatably inside 55 seconds, then promote the measured winner into a later Forge contract change.
+
+## Latest (2026-07-18b) — exact-point Texture Lab before more full Forge runs
+- The last interrupted run was not organic: its header reported persistent learning and its clock
+  results reused BlacklistedBoundary. Clean Run is now always present in every forge-themed run
+  selector; Full Reset still auto-selects it, but manual clean experiments no longer depend on that
+  temporary UI state.
+- Advanced Diagnostics now contains a temporary Texture Lab. It tests one operator-selected point
+  with one of four existing qualifier patterns for 10–55 seconds, shows the requested-to-physical VF
+  bin resolution, never descends the curve and keeps a bounded comparison history in service memory.
+- Lab reset-clean failures do not enter F2 observations, the operational blacklist or the durable
+  condemnation ledger. Safe Mode, boot-flag recovery, exact writer verification, reset confirmation,
+  device-loss accounting and the service-wide GPU write lease remain active.
+- Next hardware work: alternate methods on the known-bad 1800@869 and 1815@875 requests until one
+  rejects both repeatably in under one minute. Promote only that proven discriminator into
+  Standard/Long; no further full clean run is useful before this detector gate is met.
+
 ## Latest (2026-07-18) — Texture Hop v10, bounded Standard and explicit Long
 - Qualification contract v19 replaces Texture v9 with Texture Hop v10. TextureRop now performs
   denser dependent sampling and is exercised immediately through irregular multi-period load

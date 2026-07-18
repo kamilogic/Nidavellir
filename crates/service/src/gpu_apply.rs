@@ -53,7 +53,7 @@ fn save_applied(p: &AppliedProfile) {
     }
 }
 
-fn clear_applied() {
+pub(crate) fn clear_applied() {
     let _ = std::fs::remove_file(applied_path());
 }
 

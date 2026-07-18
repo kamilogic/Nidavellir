@@ -114,10 +114,18 @@ fn parse_config(args: &[OsString], default: PathBuf) -> Result<Config, String> {
 struct Row {
     #[serde(flatten)]
     s: NvmlSample,
+    /// Wall-clock correlation with Windows event logs and external game/crash timestamps.
+    wall_epoch_ms: u128,
+    /// Actual time since the preceding row. A large gap is a pre-hang/TDR precursor.
+    sample_gap_ms: u64,
+    /// False when the persistent NVML handle returned no usable GPU telemetry for this row.
+    nvml_sample_valid: bool,
     /// NVAPI core voltage (mV), sampled at `--volt-ms`; carried forward between fresh reads.
     volt_mv: Option<u32>,
-    /// True only on the sample where voltage was freshly read (else the value is carried).
+    /// True only when this row contains a successful new voltage read.
     volt_fresh: bool,
+    /// True when a voltage read was attempted, including attempts that failed and carried old data.
+    volt_attempted: bool,
 }
 
 /// The shared sampling loop. Opens the JSONL trace, streams samples until `stop` or the optional
@@ -136,17 +144,34 @@ fn run_sampling(
     let file = std::fs::File::create(&cfg.out)
         .map_err(|e| format!("create {}: {e}", cfg.out.display()))?;
     let mut w = std::io::BufWriter::new(file);
+    let tdr_before = crate::tdr_sentinel::query_latest_tdr_event();
+    let live_vf_curve: Vec<_> = nidavellir_gpu_nvapi::read_vf_curve_modern()
+        .into_iter()
+        .map(|(index, voltage_mv, freq_mhz)| {
+            serde_json::json!({
+                "index": index,
+                "voltage_mv": voltage_mv,
+                "freq_mhz": freq_mhz,
+            })
+        })
+        .collect();
+    let initial_voltage_mv = nidavellir_gpu_nvapi::read_core_voltage_mv();
 
     let meta = serde_json::json!({
         "meta": true,
+        "trace_contract": "game-trace-v2",
         "gpu": gpu,
         "power_limit_w": power_limit_w,
         "interval_ms": cfg.interval_ms,
         "volt_ms": cfg.volt_ms,
         "started_epoch_ms": epoch_ms(),
+        "initial_voltage_mv": initial_voltage_mv,
+        "tdr_event_before": tdr_before.clone(),
+        "live_vf_curve": live_vf_curve,
         "note": "read-only NVML+NVAPI game workload trace",
     });
     writeln!(w, "{meta}").map_err(|e| format!("write meta: {e}"))?;
+    w.flush().map_err(|e| format!("flush meta: {e}"))?;
 
     let out_str = cfg.out.display().to_string();
     tracing::info!(
@@ -155,21 +180,69 @@ fn run_sampling(
         cfg.volt_ms
     );
 
-    let mut volt_mv: Option<u32> = nidavellir_gpu_nvapi::read_core_voltage_mv();
+    let mut volt_mv = initial_voltage_mv;
     let mut last_volt = std::time::Instant::now();
     let mut rows: u64 = 0;
     let start = std::time::Instant::now();
+    let mut last_row_at = start;
+    let mut max_sample_gap_ms = 0u64;
+    let mut missing_nvml_samples = 0u64;
+    let mut missing_nvml_streak = 0u64;
+    let mut max_missing_nvml_streak = 0u64;
+    let mut voltage_fresh_samples = 0u64;
+    let mut voltage_read_failures = 0u64;
+    let mut voltage_min_mv: Option<u32> = None;
+    let mut voltage_max_mv: Option<u32> = None;
+    let mut power_max_w: Option<f32> = None;
+    let mut core_min_mhz: Option<u32> = None;
+    let mut core_max_mhz: Option<u32> = None;
 
     while !stop.load(Ordering::SeqCst) {
         if cfg.secs > 0 && start.elapsed().as_secs() >= cfg.secs {
             break;
         }
         let s: NvmlSample = sampler.sample();
+        let row_at = std::time::Instant::now();
+        let sample_gap_ms = if rows == 0 {
+            0
+        } else {
+            row_at.duration_since(last_row_at).as_millis() as u64
+        };
+        last_row_at = row_at;
+        max_sample_gap_ms = max_sample_gap_ms.max(sample_gap_ms);
+        let nvml_sample_valid = s.power_w.is_some()
+            || s.core_mhz.is_some()
+            || s.mem_mhz.is_some()
+            || s.util_pct.is_some()
+            || s.temp_c.is_some();
+        if nvml_sample_valid {
+            missing_nvml_streak = 0;
+        } else {
+            missing_nvml_samples += 1;
+            missing_nvml_streak += 1;
+            max_missing_nvml_streak = max_missing_nvml_streak.max(missing_nvml_streak);
+        }
+        if let Some(power_w) = s.power_w {
+            power_max_w = Some(power_max_w.map_or(power_w, |value| value.max(power_w)));
+        }
+        if let Some(core_mhz) = s.core_mhz {
+            core_min_mhz = Some(core_min_mhz.map_or(core_mhz, |value| value.min(core_mhz)));
+            core_max_mhz = Some(core_max_mhz.map_or(core_mhz, |value| value.max(core_mhz)));
+        }
 
-        let volt_fresh = last_volt.elapsed().as_millis() as u64 >= cfg.volt_ms;
-        if volt_fresh {
+        let volt_attempted = last_volt.elapsed().as_millis() as u64 >= cfg.volt_ms;
+        let mut volt_fresh = false;
+        if volt_attempted {
             last_volt = std::time::Instant::now();
-            volt_mv = nidavellir_gpu_nvapi::read_core_voltage_mv().or(volt_mv);
+            if let Some(fresh_mv) = nidavellir_gpu_nvapi::read_core_voltage_mv() {
+                volt_mv = Some(fresh_mv);
+                volt_fresh = true;
+                voltage_fresh_samples += 1;
+                voltage_min_mv = Some(voltage_min_mv.map_or(fresh_mv, |value| value.min(fresh_mv)));
+                voltage_max_mv = Some(voltage_max_mv.map_or(fresh_mv, |value| value.max(fresh_mv)));
+            } else {
+                voltage_read_failures += 1;
+            }
         }
 
         writeln!(
@@ -177,14 +250,19 @@ fn run_sampling(
             "{}",
             serde_json::to_string(&Row {
                 s,
+                wall_epoch_ms: epoch_ms(),
+                sample_gap_ms,
+                nvml_sample_valid,
                 volt_mv,
-                volt_fresh
+                volt_fresh,
+                volt_attempted,
             })
             .map_err(|e| e.to_string())?
         )
         .map_err(|e| format!("write row: {e}"))?;
         rows += 1;
-        if rows.is_multiple_of(200) {
+        // Preserve the lead-up to a TDR/reset instead of leaving two seconds in the userspace buffer.
+        if rows.is_multiple_of(50) {
             w.flush().ok();
         }
 
@@ -202,6 +280,29 @@ fn run_sampling(
         std::thread::sleep(std::time::Duration::from_millis(cfg.interval_ms));
     }
 
+    let tdr_after = crate::tdr_sentinel::query_latest_tdr_event();
+    let tdr_detected = tdr_after.is_some() && tdr_after != tdr_before;
+    let summary = serde_json::json!({
+        "summary": true,
+        "trace_contract": "game-trace-v2",
+        "stopped_epoch_ms": epoch_ms(),
+        "elapsed_ms": start.elapsed().as_millis() as u64,
+        "samples": rows,
+        "max_sample_gap_ms": max_sample_gap_ms,
+        "missing_nvml_samples": missing_nvml_samples,
+        "max_missing_nvml_streak": max_missing_nvml_streak,
+        "voltage_fresh_samples": voltage_fresh_samples,
+        "voltage_read_failures": voltage_read_failures,
+        "voltage_min_mv": voltage_min_mv,
+        "voltage_max_mv": voltage_max_mv,
+        "power_max_w": power_max_w,
+        "core_min_mhz": core_min_mhz,
+        "core_max_mhz": core_max_mhz,
+        "tdr_event_before": tdr_before,
+        "tdr_event_after": tdr_after,
+        "tdr_detected": tdr_detected,
+    });
+    writeln!(w, "{summary}").map_err(|e| format!("write summary: {e}"))?;
     w.flush().ok();
     tracing::info!(
         "game-trace: stopped — {rows} samples over {:.1} s to {out_str}",
