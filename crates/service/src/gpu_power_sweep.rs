@@ -2273,7 +2273,7 @@ fn f2_regime_candidate_refusal(
             confidence_threshold,
         )
     {
-        return Some("its own frontier boundary lacks current Texture Hop v10 qualification".into());
+        return Some("its own frontier boundary lacks current Texture Hop v11 qualification".into());
     }
     let support = match f2_regime_support(point, frontier) {
         Ok(support) => support,
@@ -2579,7 +2579,7 @@ fn f2_pattern_from_stress(
         VfQualifierPattern::V8Texture => (
             F2QualificationStrength::Fsgl4,
             Some(F2QualificationPattern::Texture),
-            "v10-texture-hop",
+            "v11-texture-hop",
         ),
         VfQualifierPattern::V8Transitions => (
             F2QualificationStrength::Fsgl4,
@@ -3057,7 +3057,7 @@ fn publish_f2_profile_power_from_apply_qualification(
         ),
     }
     .ok_or_else(|| {
-        format!("{target_mhz} MHz @ {apply_mv} mV has no complete current v19 gate p99 measurement")
+        format!("{target_mhz} MHz @ {apply_mv} mV has no complete current v20 gate p99 measurement")
     })?;
     let published_p99 = discovery_p99.max(qualification_p99);
     let changed = published_p99 > discovery_p99;
@@ -7673,11 +7673,11 @@ fn measure_multiclock_undervolt_forge(
             Some("frontier_descent"),
             None,
         );
-        prog.log.push("Qualificação v19: capturando goldens stock wgpu para Texture Hop v10 + Endurance…".into());
+        prog.log.push("Qualificação v20: capturando goldens stock wgpu para Texture Hop v11 + Endurance…".into());
         set(progress, prog.clone());
         match capture_fsgl3_render_goldens() {
             Ok(goldens) => {
-                prog.log.push("Qualificação v19: goldens stock wgpu capturados; descida e exact-Apply podem começar.".into());
+                prog.log.push("Qualificação v20: goldens stock wgpu capturados; descida e exact-Apply podem começar.".into());
                 set(progress, prog.clone());
                 Some(goldens)
             }
@@ -7686,10 +7686,10 @@ fn measure_multiclock_undervolt_forge(
                 prog.running = false;
                 prog.phase = "incomplete".into();
                 prog.note = Some(format!(
-                    "Forja F2 abortada antes da qualificação v19 — stock não produziu golden determinístico wgpu: {e}. GPU no stock, nada aplicado."
+                    "Forja F2 abortada antes da qualificação v20 — stock não produziu golden determinístico wgpu: {e}. GPU no stock, nada aplicado."
                 ));
                 set(progress, prog);
-                warn!("f2-forge: v19 golden capture failed: {e}");
+                warn!("f2-forge: v20 golden capture failed: {e}");
                 return;
             }
         }
@@ -7812,7 +7812,7 @@ fn measure_multiclock_undervolt_forge(
     };
     prog.estimated_remaining_ms = Some(estimated_work_ms);
     prog.log.push(format!(
-        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, qualificação Texture Hop v10 {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
+        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, qualificação Texture Hop v11 {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
         targets.len(), targets[0],
         mode.label(),
         mode_policy.discovery_dwell_ms / 1000,
@@ -8391,7 +8391,7 @@ fn measure_multiclock_undervolt_forge(
                     }
                 }
             }
-            // v19 vertical closure: a physically classified gate failure condemns the BIN, never
+            // v20 vertical closure: a physically classified gate failure condemns the BIN, never
             // the clock. Every viable same-clock bin is tried until a physical/profile/power
             // boundary is proven. Reload the ledger at each decision so a condemnation appended by
             // this very run is visible immediately (including in Clean Run's run-scoped view).
@@ -8579,7 +8579,7 @@ fn measure_multiclock_undervolt_forge(
                             .unwrap_or(u32::MAX),
                     );
                     prog.log.push(format!(
-                        "Qualificação Apply exato v19: {} {} MHz target @ {} mV VF — Texture Hop v10 ({} min) + Endurance agressivo ({} min), modo {}.",
+                        "Qualificação Apply exato v20: {} {} MHz target @ {} mV VF — Texture Hop v11 ({} min) + Endurance agressivo ({} min), modo {}.",
                         profile_role.label(), key.0, key.1,
                         mode_policy.apply_texture_dwell_ms / 60_000,
                         mode_policy.apply_endurance_dwell_ms / 60_000,
@@ -8804,7 +8804,7 @@ fn measure_multiclock_undervolt_forge(
                                 }
                                 excluded_apply_pairs.insert(key);
                                 prog.log.push(format!(
-                                    "FORGE: p95 do conjunto v19 elevou o regime de {} MHz @ {} mV; candidato recusado — {reason}. Ressintetizando.",
+                                    "FORGE: p95 do conjunto v20 elevou o regime de {} MHz @ {} mV; candidato recusado — {reason}. Ressintetizando.",
                                     key.0, key.1
                                 ));
                                 changed = true;
@@ -8849,7 +8849,7 @@ fn measure_multiclock_undervolt_forge(
                     if power_ceiling_exceeded {
                         excluded_apply_pairs.insert(key);
                         prog.log.push(format!(
-                            "FORGE: {} MHz @ {} mV já excedeu o envelope energético após Texture Hop v10; Endurance foi evitado e o par saiu apenas da seleção desta run — nenhuma blacklist foi gravada. Godforge ainda pode tentar o clock inferior na mesma tensão.",
+                            "FORGE: {} MHz @ {} mV já excedeu o envelope energético após Texture Hop v11; Endurance foi evitado e o par saiu apenas da seleção desta run — nenhuma blacklist foi gravada. Godforge ainda pode tentar o clock inferior na mesma tensão.",
                             key.0, key.1
                         ));
                     } else if blacklist_refused {
@@ -8994,7 +8994,7 @@ fn measure_multiclock_undervolt_forge(
                                                 );
                                                 godforge_override = Some(carried_key);
                                                 prog.log.push(format!(
-                                                    "FORGE: Godforge fast-drop criado em {} MHz @ {} mV (p99 {:.0} W). Mesmo bin elétrico, clock -{} MHz; gate v19 completo obrigatório.",
+                                                    "FORGE: Godforge fast-drop criado em {} MHz @ {} mV (p99 {:.0} W). Mesmo bin elétrico, clock -{} MHz; gate v20 completo obrigatório.",
                                                     carried_target,
                                                     carried_mv,
                                                     p99,
@@ -9166,7 +9166,7 @@ fn measure_multiclock_undervolt_forge(
                             profiles.deep_calm,
                         ) {
                             prog.log.push(format!(
-                                "FORGE: p99 publicado = maior p99 do gate v19 completo (Texture Hop v10 + Endurance) no Apply aprovado ({updated} perfil(is) elevado(s)) — Godforge {}@{} mV {:.0} W · Brokkr's {}@{} mV {:.0} W · Deep Calm {}@{} mV {:.0} W.",
+                                "FORGE: p99 publicado = maior p99 do gate v20 completo (Texture Hop v11 + Endurance) no Apply aprovado ({updated} perfil(is) elevado(s)) — Godforge {}@{} mV {:.0} W · Brokkr's {}@{} mV {:.0} W · Deep Calm {}@{} mV {:.0} W.",
                                 godforge.target_clock_mhz.unwrap_or(godforge.clock_mhz),
                                 godforge.vf_table_voltage_mv.unwrap_or(godforge.voltage_mv),
                                 godforge.power_p99_w.unwrap_or(0.0),
@@ -9899,7 +9899,7 @@ mod tests {
             "GPU-1"
         )
         .unwrap());
-        // v19 publication uses the complete exact-Apply gate, so Endurance may conservatively raise
+        // v20 publication uses the complete exact-Apply gate, so Endurance may conservatively raise
         // both the displayed power and the efficiency basis above Texture's shorter p99.
         assert_eq!(published.power_p99_w, Some(207.0));
         assert!((published.perf_per_watt - 1875.0 / 207.0).abs() < f64::EPSILON);
@@ -10230,7 +10230,7 @@ mod tests {
             Some(F2QualificationPattern::Texture)
         );
         assert_eq!(texture_pass.phases_completed, 12);
-        assert_eq!(texture_pass.phases_expected, 11);
+        assert_eq!(texture_pass.phases_expected, 12);
 
         // A v8 run that never completed FrameCadence is Inconclusive, not Pass.
         let missing_cadence = qualification_coverage_from_run(
@@ -10403,7 +10403,7 @@ mod tests {
         assert_eq!(f2_frontier_bounds(&targets, 1935), Some((1755, 13)));
 
         let standard = PowerSweepMode::Standard.f2_policy();
-        // v19 Standard: descent = 15s discovery + 1×35s Texture Hop. Exact-Apply runs one
+        // v20 Standard: descent = 15s discovery + 1×35s Texture Hop. Exact-Apply runs one
         // 125s Texture Hop plus one 305s compact Endurance transaction.
         assert_eq!(f2_target_upper_estimate_ms(1, standard), 50_000);
         assert_eq!(f2_calibration_upper_estimate_ms(1, standard), 45_000);

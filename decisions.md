@@ -2,6 +2,21 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## Combine TextureRop with one CompositeGameLoad slam in Texture Hop v11 (2026-07-18)
+- **Evidence:** collected v17/v18 organic silent-error rejections all failed in `texture-rop`; v19's
+  remaining failures were inconclusive. Separately, the existing CompositeGameLoad is the suite's
+  highest combined real-game-like draw because heavy render, texture and near-full VRAM gather share
+  one submit and one core rail.
+- **Decision:** contract v20 runs TextureRop first, enters CompositeGameLoad directly from a short
+  idle and returns immediately to TextureRop. Roughly 71% of the dwell is dedicated to this pair;
+  all prior broader coverage remains mandatory before acceptance.
+- **Efficiency and safety:** use one composite segment per cycle to avoid repeating its large VRAM
+  pool setup. Keep TextureStream severity-last and do not increase shader density or create a
+  compute-only power virus. Standard/Long budgets and recovery behavior stay unchanged.
+- **Evidence boundary:** the Texture pattern fingerprint becomes `f2q-texhop-v11-r1/v11-texture`
+  and qualification contract 20 rejects pre-v20 positives. Hardware-local bad/good voltages remain
+  regression controls only and are never encoded as blacklists or cross-GPU defaults.
+
 ## Replace the temporary Texture Lab with a supervised manual point (2026-07-18)
 - **Evidence:** no synthetic method rejected the known-bad point, while automated Overwatch reached
   only its low-load menu. Keeping a method-comparison product surface no longer served the active

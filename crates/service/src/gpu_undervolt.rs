@@ -131,14 +131,14 @@ const F2_ADAPTIVE_MAX_STRIDE_BINS: usize = 4;
 #[cfg(windows)]
 const F2_ADAPTIVE_MAX_VOLTAGE_DROP_MV: u32 = 25;
 
-/// Relative sustained-clock margin allowed between equivalent Texture Hop v10 qualification passes. A
+/// Relative sustained-clock margin allowed between equivalent Texture Hop v11 qualification passes. A
 /// candidate whose heavy-phase p5 falls farther than this below the median of prior stable
 /// candidates at the same target/pattern has reached the voltage-margin cliff even if it did not
 /// crash. This is policy, not a hardware limit.
 #[cfg(windows)]
 const MARGIN_DROP_TOL_MHZ: u32 = 30;
 
-/// Number of additional attempts after an inconclusive Texture Hop v10 qualification dwell. Coverage
+/// Number of additional attempts after an inconclusive Texture Hop v11 qualification dwell. Coverage
 /// ambiguity is not instability: retry the same physical point, then skip only this clock.
 #[cfg(windows)]
 const INCONCLUSIVE_RETRY_BUDGET: usize = 2;
@@ -4320,7 +4320,7 @@ pub(crate) struct F2ClockDiscoveryProgress {
 
 /// Result of filling one missing exact-Apply-bin PowerRender measurement after the qualified
 /// frontier is complete. This step never promotes stability; it only contributes current-contract
-/// power telemetry. The distinct exact-Apply v19 gate runs after synthesis.
+/// power telemetry. The distinct exact-Apply v20 gate runs after synthesis.
 #[cfg(windows)]
 pub(crate) struct F2PowerCalibrationSummary {
     pub confirmed: bool,
@@ -4331,7 +4331,7 @@ pub(crate) struct F2PowerCalibrationSummary {
     pub logs: Vec<String>,
 }
 
-/// Result of the v19 Texture Hop + Endurance gate at the exact post-margin Apply pair.
+/// Result of the v20 Texture Hop v11 + Endurance gate at the exact post-margin Apply pair.
 /// A reset-clean rejection is local to this candidate and lets synthesis choose another point; hard
 /// device/reset/write failures still abort the Forge.
 #[cfg(windows)]
@@ -4949,7 +4949,7 @@ fn gate_anchored_candidate_fsgl3(
                     qualification_power_above_ceiling(&report, publication_power_ceiling_w)
                 {
                     logs.push(format!(
-                        "{target_mhz} MHz @ {} mV passed Texture Hop v10 but measured {measured_w:.0} W above the {ceiling_w:.0} W publication ceiling; Endurance skipped without blacklist",
+                        "{target_mhz} MHz @ {} mV passed Texture Hop v11 but measured {measured_w:.0} W above the {ceiling_w:.0} W publication ceiling; Endurance skipped without blacklist",
                         candidate.anchor.voltage_mv
                     ));
                     return F2QualificationOutcome::PowerBound { measured_w, ceiling_w };
@@ -5010,7 +5010,7 @@ fn gate_anchored_candidate_fsgl3(
             }
         }
     }
-    // v19 candidate-only Endurance at the EXACT Apply point. Texture Hop v10 already ran first as the
+    // v20 candidate-only Endurance at the EXACT Apply point. Texture Hop v11 already ran first as the
     // required pattern; DX11 and TransitionShock were removed from the mandatory path after never
     // rejecting a collected candidate. Endurance remains one continuous mode-specific transaction,
     // with its aggressive TextureRop/composite/cap-slam rejection tier at the front. Long retains
@@ -5848,7 +5848,7 @@ pub(crate) fn run_confirmed_f2_clock_discovery(
     }
 
     // Qualification evidence context, separate from the Discovery `ctx` used by PowerRender.
-    // Texture Hop v10 is the default per-candidate qualifier during descent. The optional final gate is
+    // Texture Hop v11 is the default per-candidate qualifier during descent. The optional final gate is
     // kept dormant here and shares the same boundary shape.
     let mut qual_ctx = ctx.clone();
     qual_ctx.evidence_kind = nidavellir_core::f2_observation::F2EvidenceKind::Qualification;
@@ -7634,7 +7634,7 @@ mod tests {
                             F2QualificationPattern::A => "fsgl3-a",
                             F2QualificationPattern::B => "fsgl3-b",
                             F2QualificationPattern::HighFps => "v8-high-fps",
-                            F2QualificationPattern::Texture => "v10-texture-hop",
+                            F2QualificationPattern::Texture => "v11-texture-hop",
                             F2QualificationPattern::Transitions => "v8-transitions",
                             F2QualificationPattern::Memory => "v8-memory",
                             F2QualificationPattern::Endurance => "endurance",

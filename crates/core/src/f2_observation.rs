@@ -87,7 +87,10 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// v19 (2026-07-18): Texture Hop v10 increases dependent texture/ROP work, sweeps denser multi-period
 /// load-release transitions and owns more of the early descent tier. Standard uses a bounded compact
 /// proof; Long retains the exhaustive thermal proof. Pre-v19 positives cannot unlock Apply.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 19;
+/// v20 (2026-07-18): Texture Hop v11 combines the precise golden-checked TextureRop oracle with an
+/// early idle-to-CompositeGameLoad slam, then checks TextureRop again before broader coverage. Its
+/// new workload fingerprint prevents pre-v20 positives from unlocking Apply.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 20;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -1185,9 +1188,9 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
 }
 
 /// True when the CURRENT run's candidate-only stress gate validated cleanly at this exact
-/// `(target_mhz, apply_mv)` pair on this GPU — v19 requires the continuous Endurance soak after the
-/// required exact-Apply Texture Hop v10 pattern. DX11 and TransitionShock remain readable legacy evidence
-/// but no longer gate publication because they never rejected a collected candidate.
+/// `(target_mhz, apply_mv)` pair on this GPU — v20 requires the continuous Endurance soak after the
+/// required exact-Apply Texture Hop v11 pattern. DX11 and TransitionShock remain readable legacy
+/// evidence but no longer gate publication because they never rejected a collected candidate.
 /// These gates only TIGHTEN Apply — they are not part of [`REQUIRED_QUALIFICATION_PATTERNS`] and
 /// never touch the frontier descent. They still share the current qualification contract and full
 /// reproducibility/cleanup requirements; the publish gate is also run_id-scoped. Fail closed:
@@ -2166,7 +2169,7 @@ mod tests {
             o.gpu_key = Some("RTX 4070".into());
             o
         };
-        // The current run's continuous Endurance gate at the exact pair is sufficient in v19.
+        // The current run's continuous Endurance gate at the exact pair is sufficient in v20.
         let endurance = [pass(
             "R1",
             F2QualificationPattern::Endurance,
@@ -2196,7 +2199,7 @@ mod tests {
             956,
             "RTX 4070"
         ));
-        // Removed legacy gates cannot publish a v19 point by themselves.
+        // Removed legacy gates cannot publish a v20 point by themselves.
         let shock_only =
             [pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated)];
         assert!(!point_has_current_endurance_qualification(&shock_only, "R1", 1935, 956, "RTX 4070"));

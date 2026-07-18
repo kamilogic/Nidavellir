@@ -8,6 +8,21 @@ This file is the continuity index. See also: `AGENTS.md` (canonical product/agen
 governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
 `product.md`, and the methodology doc `docs/gpu-forge.md`.
 
+## Latest (2026-07-18f) — Texture Hop v11 promotes the strongest efficient co-load
+- Qualification contract v20 keeps TextureRop as the precise stock-golden oracle because collected
+  organic silent-error rejections in v17/v18 all reported `texture-rop`; the v19 failures were
+  inconclusive rather than a stronger detector finding a new error.
+- Texture Hop v11 now runs TextureRop, a short idle-to-CompositeGameLoad slam, then TextureRop again.
+  CompositeGameLoad is the suite's highest combined game-like draw (render + texture + near-full
+  VRAM gather in one submit). It appears once per cycle to avoid repeating its large VRAM-pool setup;
+  about 71% of each dwell is assigned to this binding pair before the broader acceptance coverage.
+- Only Texture Hop's exact semantic fingerprint changes to `f2q-texhop-v11-r1/v11-texture`; the
+  contract bump quarantines all pre-v20 positive qualification evidence. Standard/Long durations,
+  clean-run learning rules, blacklist policy and the one-hour Standard ceiling are unchanged.
+- Software tests can verify construction and fail-closed provenance, not the hardware boundary. A
+  clean run must still prove that v11 rejects the known-bad neighborhood without rejecting the known
+  good control; neither voltage is encoded as a global default or blacklist.
+
 ## Latest (2026-07-18e) — manual diagnostic point replaces Texture Lab
 - Advanced Diagnostics now applies one operator-selected clock/VF-bin request directly for a real
   workload. Requests resolve to the nearest physical bin within 8 mV and use the normal bounded,
@@ -16,7 +31,7 @@ governance), `architecture.md`, `decisions.md`, `roadmap.md`, `handoff.md`,
   holds its Safe Loop boot intent until explicit stock reset. Concurrent GPU writes are blocked and
   graceful service shutdown resets it. Game Trace remains independent and can run alongside it.
 - Texture Lab IPC/UI, runtime texture tuning, in-memory method history and all unproven external/
-  synthetic experimental helpers were removed. Forge qualification contract v19 is unchanged.
+  synthetic experimental helpers were removed. Forge qualification was v19 at that checkpoint.
 
 ## Latest (2026-07-18d) — manual gameplay oracle and resilient Game Trace
 - Exact `1800@868` survived the current synthetic matrix and a 172.5 W p99 Heaven + checksum

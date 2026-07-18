@@ -28,15 +28,14 @@
   that intent; a crash/reboot leaves it available to startup recovery.
 
 
-\## 2026-07-18 (current): qualification v19, bounded Standard and explicit Long
+\## 2026-07-18 (current): qualification v20, bounded Standard and explicit Long
 
-\- **Texture Hop v10 is the early hardware discriminator.** The current TextureRop shader performs
-  denser dependent texture work (64 rounds with four dependent samples per round), while the
-  workload alternates it through short 2/3/5/7-frame bursts and non-uniform gaps. The plan enters
-  TextureRop immediately, returns to it repeatedly around power/composite transitions and remains
-  stock-golden checked. The semantic workload fingerprint is `f2q-texhop-v10-r1`; positive evidence
-  from pre-v19 contracts cannot unlock Apply.
-\- **Standard is strict and bounded.** Frontier candidates receive 30 s of Texture Hop v10. Each
+\- **Texture Hop v11 is the early hardware discriminator.** The current TextureRop shader retains
+  its 64 rounds with four dependent samples per round and remains the precise stock-golden oracle.
+  The plan enters it immediately, drops through a short idle into the suite's strongest combined
+  game-like load, then checks TextureRop again before broader coverage. The exact fingerprint is
+  `f2q-texhop-v11-r1/v11-texture`; positive evidence from pre-v20 contracts cannot unlock Apply.
+\- **Standard is strict and bounded.** Frontier candidates receive 30 s of Texture Hop v11. Each
   unique exact-Apply pair that remains publishable must then pass 120 s of Texture Hop plus 300 s of
   Endurance. A watchdog stops new GPU work after 59 active minutes, reserving the final minute for
   reset/checkpoint. Reaching that ceiling is fail-closed: learning is preserved, incomplete profiles
@@ -150,15 +149,15 @@
   `forge-archive/<run_id>/clean-run-manifest.txt` as log-independent proof of the mode. Added
   after the 2026-07-17 run proved the live-log tail cannot evidence which policy executed.
 
-\## Current F2 reference (2026-07-18): contract v19, Texture Hop v10 and bounded Standard
+\## Current F2 reference (2026-07-18): contract v20, Texture Hop v11 and bounded Standard
 
 This section is the normative current behavior and supersedes the dated v4/v6/v7 runtime descriptions
 below where they conflict. Historical notes remain in place to explain payload evolution. No IPC method
 or existing field was removed.
 
-\- **Evidence contract v19.** Every current F2 dwell persists `evidence_provenance` with the service
+\- **Evidence contract v20.** Every current F2 dwell persists `evidence_provenance` with the service
   build version/revision, semantic workload fingerprint, actual selected render backend, adapter name,
-  driver name/details, checksum method and stock-golden configuration/values. Pre-v19 positive evidence
+  driver name/details, checksum method and stock-golden configuration/values. Pre-v20 positive evidence
   remains readable but cannot unlock Apply. Positive discovery, frontier qualification and exact-Apply
   qualification additionally require `reset_to_stock_ok == true` and `boot_flag_cleared == true`.
 
@@ -185,9 +184,11 @@ or existing field was removed.
   `checksum_count` reports the checks actually executed. The UI must not describe this as 100% frame
   checksum coverage.
 
-\- **Texture Hop v10 and mode-specific exact-Apply duration.** Texture Hop v10 enters the
-  golden-checked TextureRop detector immediately and revisits it across deliberately irregular
-  power/composite transitions. Standard requires 30 s at each frontier candidate and, for every
+\- **Texture Hop v11 and mode-specific exact-Apply duration.** Texture Hop v11 enters the
+  golden-checked TextureRop detector immediately, performs one idle-to-CompositeGameLoad slam and
+  returns directly to TextureRop. One composite allocation per cycle keeps the stronger co-load
+  efficient; about 71% of the dwell is assigned to this binding pair. Standard requires 30 s at
+  each frontier candidate and, for every
   unique selected `(target, Apply VF bin)`, 2 min Texture Hop + 5 min continuous Endurance. Long
   requires 60 s at the frontier and 5 min Texture Hop + 20 min Endurance. Endurance front-loads
   TextureRop, composite game load and cap-slam cycles so a bad candidate can reject before its thermal

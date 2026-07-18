@@ -1,11 +1,24 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. Current state is the 2026-07-18 qualification-v19 + bounded Standard
+How to pick this up cold. Current state is the 2026-07-18 qualification-v20 + bounded Standard
 build below. Older dated sections remain as history; where they claim that BoostEdge residence was a
 proven field cause, or that a detached 3 s canary timeout predicted a roughly 2 s watchdog, later
 sections supersede them. Apply still requests 12 mV above the learned boundary, snaps upward to a
 physical VF bin and must pass the complete exact-Apply gate before publication.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## START-HERE (2026-07-18f) — Texture Hop v11 combines the proven oracle with the strongest co-load
+
+- Contract v20 promotes the strongest efficient fixed plan: golden-checked TextureRop first, a short
+  idle-to-CompositeGameLoad slam, then TextureRop again. CompositeGameLoad combines heavy render,
+  texture and a near-full VRAM-resident gather in one submit; it appears once so its large pool setup
+  is not paid twice. About 71% of the dwell belongs to this detector pair.
+- Historical observations support the split: organic v17/v18 silent-error rejections named
+  `texture-rop`, while the current suite already identifies CompositeGameLoad as its highest combined
+  real-game-like draw. TextureStream remains severity-last because it is more TDR-prone.
+- Texture Hop's fingerprint is now `f2q-texhop-v11-r1/v11-texture`; all pre-v20 positive evidence is
+  quarantined by the contract bump. Durations, Standard's one-hour bound and blacklist semantics did
+  not change. Hardware acceptance still requires a clean run against the bad and good local controls.
 
 ## START-HERE (2026-07-18e) — manual point replaces the retired Texture Lab
 
@@ -17,7 +30,7 @@ Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
   other GPU writers. Return to stock explicitly after the test; graceful service shutdown also resets.
 - Current experiment: apply the known-bad `1800@869` request, open Game Trace, play the real Overwatch
   scenario and stop Game Trace after leaving the match. Texture Lab IPC/UI and its unproven synthetic
-  experimental helpers were removed; fixed Forge qualification v19 remains unchanged.
+  experimental helpers were removed; fixed Forge qualification was v19 at that checkpoint.
 
 ## START-HERE (2026-07-18d) — manual Overwatch oracle with Game Trace v2
 
