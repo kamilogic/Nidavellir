@@ -31,6 +31,9 @@
   let manualPoint = $state(null);
   let manualPointBusy = $state(false);
   let manualPointActionError = $state("");
+  let detectorLab = $state(null);
+  let detectorLabBusy = $state(false);
+  let detectorLabActionError = $state("");
   let fullResetBusy = $state(false);
   let fullResetFeedback = $state(null);
   // Live GPU telemetry (ReadSensors) + rolling sparkline buffers for the monitoring panel.
@@ -353,7 +356,7 @@
   async function applyManualPoint(config) {
     if (manualPointBusy || manualPoint?.active) return;
     const confirmed = globalThis.confirm?.(
-      `Apply the temporary diagnostic point ${config.target_mhz} MHz @ ${config.voltage_mv} mV? It may cause a driver reset during real workloads. The point will not become a profile; use Return to stock when the test is finished.`,
+      `Apply the temporary diagnostic point ${config.target_mhz} MHz @ ${config.voltage_mv} mV? Clock may step down, but the resolved voltage will be locked. It may cause a driver reset during real workloads. The point will not become a profile; use Return to stock when the test is finished.`,
     ) ?? true;
     if (!confirmed) return;
     manualPointBusy = true;
@@ -384,6 +387,66 @@
     } finally {
       await refreshManualPoint(false);
       manualPointBusy = false;
+    }
+  }
+
+  async function refreshDetectorLab(clearRecoveredError = true) {
+    try {
+      const r = await serviceCall("GetDetectorLabStatus");
+      if (r?.ok === false) throw new Error(r.error || "Unable to read Detector Lab status");
+      if (r?.data?.type === "DetectorLab") {
+        detectorLab = r.data;
+        if (clearRecoveredError && !detectorLabBusy) detectorLabActionError = "";
+      }
+    } catch {
+      /* experimental diagnostic status is best-effort UI information */
+    }
+  }
+
+  async function startDetectorLab(config) {
+    if (detectorLabBusy || detectorLab?.running || !manualPoint?.active) return;
+    const recipeLabel = config.recipe === "dense_v14" ? "v14 dense candidate" : "v25 control";
+    const confirmed = globalThis.confirm?.(
+      `Run ${recipeLabel} for ${config.duration_s} seconds at ${manualPoint.target_mhz} MHz @ ${manualPoint.resolved_voltage_mv} mV? A marginal point may cause a TDR. Detector Lab will not qualify a profile or write blacklist.`,
+    ) ?? true;
+    if (!confirmed) return;
+    detectorLabBusy = true;
+    detectorLabActionError = "";
+    try {
+      const r = await serviceCall("StartDetectorLab", config);
+      if (r?.ok === false) throw new Error(r.error || "Unable to start Detector Lab");
+      if (r?.data?.type !== "DetectorLab") throw new Error("Invalid Detector Lab response");
+      detectorLab = r.data;
+    } catch (e) {
+      detectorLabActionError = String(e);
+    } finally {
+      await Promise.all([refreshDetectorLab(false), refreshManualPoint(false)]);
+      detectorLabBusy = false;
+    }
+  }
+
+  async function stopDetectorLab() {
+    if (detectorLabBusy || !detectorLab?.running) return;
+    detectorLabBusy = true;
+    detectorLabActionError = "";
+    try {
+      const r = await serviceCall("StopDetectorLab");
+      if (r?.ok === false) throw new Error(r.error || "Unable to stop Detector Lab");
+      if (r?.data?.type === "DetectorLab") detectorLab = r.data;
+    } catch (e) {
+      detectorLabActionError = String(e);
+    } finally {
+      await refreshDetectorLab(false);
+      detectorLabBusy = false;
+    }
+  }
+
+  async function openDetectorLabLog() {
+    if (!detectorLab?.out_path) return;
+    try {
+      await open(detectorLab.out_path);
+    } catch (e) {
+      detectorLabActionError = `Unable to open the Detector Lab journal: ${String(e)}`;
     }
   }
 
@@ -459,17 +522,20 @@
     refreshSensors();
     refreshGameTrace();
     refreshManualPoint();
+    refreshDetectorLab();
     timer = setInterval(refresh, 500);
     const sentinelTimer = setInterval(refreshSentinel, 10_000);
     const sensorTimer = setInterval(refreshSensors, 2000);
     const gameTraceTimer = setInterval(refreshGameTrace, 1000);
     const manualPointTimer = setInterval(refreshManualPoint, 2000);
+    const detectorLabTimer = setInterval(refreshDetectorLab, 1000);
     return () => {
       clearInterval(timer);
       clearInterval(sentinelTimer);
       clearInterval(sensorTimer);
       clearInterval(gameTraceTimer);
       clearInterval(manualPointTimer);
+      clearInterval(detectorLabTimer);
     };
   });
 </script>
@@ -520,11 +586,17 @@
       {manualPoint}
       {manualPointBusy}
       {manualPointActionError}
+      {detectorLab}
+      {detectorLabBusy}
+      {detectorLabActionError}
       onExportLog={exportLog}
       onToggleGameTrace={toggleGameTrace}
       onOpenGameTraceLog={openGameTraceLog}
       onApplyManualPoint={applyManualPoint}
       onResetManualPoint={resetManualPoint}
+      onStartDetectorLab={startDetectorLab}
+      onStopDetectorLab={stopDetectorLab}
+      onOpenDetectorLabLog={openDetectorLabLog}
       onClose={closeAdvancedDiagnostics}
     />
   </ForgeThemeScreen>

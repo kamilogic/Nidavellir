@@ -168,17 +168,17 @@
       id: "standard",
       label: "Standard",
       summaryLabel: "Std",
-      meta: "up to 1 hour",
-      title: "Bounded Texture Hop qualification",
-      description: "Runs the aggressive Texture Hop detector and compact Endurance proof. At one hour it stops safely and keeps incomplete profiles locked.",
+      meta: "compact proof",
+      title: "Compact Texture Hop qualification",
+      description: "Runs Texture Hop v13-r3 and the compact Endurance proof to completion. Duration follows the hardware frontier; there is no artificial one-hour cutoff.",
     },
     {
       id: "long",
       label: "Long",
       summaryLabel: "Long",
-      meta: "may exceed 1 hour",
+      meta: "exhaustive proof",
       title: "Exhaustive qualification",
-      description: "Keeps the full five-minute Texture Hop and twenty-minute thermal Endurance proof. This is the only mode allowed to run beyond one hour.",
+      description: "Keeps the full five-minute Texture Hop and twenty-minute thermal Endurance proof for every final Apply point.",
     },
     {
       id: "clean",
@@ -186,7 +186,7 @@
       summaryLabel: "Clean",
       meta: "experimental",
       title: "Organic search — no historical memory",
-      description: "Uses the Standard one-hour budget, but starts organically: pre-run learning is archived and only failures from this run steer it. Sentinel and Safe Loop remain active.",
+      description: "Uses the Standard compact proof, but starts organically: pre-run learning is archived and only failures from this run steer it. Sentinel and Safe Loop remain active.",
     },
   ];
   const selectedMode = $derived(forgeModes.find((mode) => mode.id === forgeMode) ?? forgeModes[0]);

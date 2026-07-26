@@ -1,11 +1,218 @@
 # Nidavellir — Session Handoff
 
-How to pick this up cold. Current state is the 2026-07-18 qualification-v20 + bounded Standard
-build below. Older dated sections remain as history; where they claim that BoostEdge residence was a
-proven field cause, or that a detached 3 s canary timeout predicted a roughly 2 s watchdog, later
-sections supersede them. Apply still requests 12 mV above the learned boundary, snaps upward to a
-physical VF bin and must pass the complete exact-Apply gate before publication.
+How to pick this up cold. Current state is the 2026-07-23 qualification-v25 authoritative-point
+build plus uncapped Standard and the isolated Detector Lab v14 bake-off below. Older dated sections
+remain as history;
+where they describe qualification v22 cap
+coverage, device-churn Field Concurrency or a single frontier for both learning and publication, the
+v25 section supersedes them.
+Apply still requests 12 mV above the learned boundary, snaps upward to a physical VF bin and must
+pass the complete exact-Apply gate before publication.
 Deep NvAPI struct details live in `~/.claude/.../memory/gpu-forge-real-v031.md`.
+
+## START-HERE (2026-07-23) — v25 enforces the selected voltage and exact-clock evidence
+
+- Game Trace at the requested `1815@875` exposed that the former point was only an elastic clock
+  envelope: about 92% of high-utilization samples were 1800 MHz, only about 63 s accumulated at
+  `1815@875`, and live voltage could exceed 875 mV. The previous clean 10-minute synthetic result
+  therefore did not prove the labeled point.
+- Active F2 now writes the anchored curve, applies a max-only clock ceiling and sets/read-backs an
+  exact NVAPI voltage lock at the resolved physical bin. Clock can still downclock; voltage cannot
+  rise above the selected bin. Profile Apply and Manual Point use the same writer.
+- Discovery contract is 6: p5 below the exact target is ClockDrop, even by one boost bin.
+  Qualification contract is 25: only samples at the exact target count toward the existing 35%
+  residency requirement, and missing/insufficient/above-bin voltage evidence is Inconclusive.
+  Pre-v6/v25 positives cannot seed/publish under the new semantics.
+- Detector Lab canonical key/UI is `control_v25`; v24/v23 keys are compatibility aliases. Candidate
+  runs use `single_qualifier_dwell_with_cancel`, record clock/voltage/power/coverage in the journal,
+  and return stock with `inconclusive` when point authority is not proven.
+- Reset paths and boot reapply release stale clock and voltage locks before continuing. Fixed
+  voltage is intentionally more TDR-prone than the old elastic rail; Safe Loop remains the recovery
+  boundary. The clock is deliberately not min=max pinned.
+- First hardware Apply exposed a ClockBoostLock slot bug: the API returned success for a write to
+  entry `0` but retained no manual lock. Stock readback exposes entries `0..6`; the corrected writer
+  derives entry `6` as the highest writable voltage slot, clears all entries in a dedicated write,
+  then writes only entry `6`. Readback polls for up to one second before requiring the exact sole
+  entry/voltage. Unlock clears all entries too. A new failure reports the full readback reason
+  instead of the former opaque “could not be verified”.
+- The next Apply exposed a driver ordering constraint: `GetClockBoostLock` returned
+  `ArgumentExceedMaxSize` only after the VF curve and NVML ceiling were active. Both Forge candidates
+  and Manual/Profile Apply now lock and verify voltage in the stock control state before writing the
+  anchored curve and max-clock ceiling. Service 415/0, gpu-nvapi 40/0, service check and
+  `git diff --check` pass; the debug backend was rebuilt/restarted clean and hardware Apply retry is
+  pending.
+- Software gates passed: workspace tests 583/0 (1 hardware smoke ignored), `cargo check
+  --workspace`, UI production build, clippy with baseline warnings only and `git diff --check`.
+  No GPU workload was executed while implementing v25.
+- Hardware acceptance after a clean reboot: first run the trusted `1800@875` control and verify
+  journal voltage max `<=875`, exact-clock residency and a clean reset; only then compare
+  `1815@875`. Do not interpret a low-residency Inconclusive as stability or instability.
+
+## START-HERE (2026-07-23) — v24 keeps dual-queue stress and removes device-lifetime churn
+
+- Latest 10-minute Lab attempt at trusted `1800@875` did not test that point. Its full v23 stock
+  control failed during Field Concurrency before the journal ever recorded `point_reapplied`.
+  A previous `1815@875` attempt also failed at stock after entering the same phase.
+- The old secondary worker repeatedly constructed and dropped a complete `GpuCtx`. The 10-minute
+  mirror therefore became a driver-resource churn test and could reset an otherwise-stock GPU.
+- Texture Hop v13-r3 creates one secondary TextureRop context after the primary Texture Stack begins,
+  keeps it resident for the whole phase and uses cooperative cancellation. The independent queue and
+  checksum oracle remain; only repeated device lifetime transitions are gone.
+- A secondary initialization failure, worker panic or fewer than two secondary checksum windows
+  produces an internal `inconclusive_reason`, removes Field Concurrency from coverage and aborts the
+  stock/Lab control as an environment error. Candidate failure/blacklist paths cannot consume it.
+- Qualification contract is 24. Current fingerprints are
+  `f2q-texhop-v13-r3/v13-persistent-field-concurrency` and
+  `f2q-texhop-v13-r3/endurance-persistent-field-concurrency`; all v23 positives are quarantined.
+  Detector Lab and UI use `control_v24`, with `control_v23` accepted backend-only as a compatibility
+  alias.
+- Software gates passed: gpu-stress 20/0 (1 hardware smoke ignored), core 106/0, service 415/0,
+  `cargo check --workspace`, UI production build and clippy with the existing warnings only.
+  Repository-wide rustfmt check remains noisy from the pre-existing formatting baseline.
+- Do not run more hardware load in the TDR-dirty boot. After reboot, acceptance starts with the full
+  v24 stock mirror. Only after repeated stock passes should the same trusted point and a deliberately
+  marginal point be compared.
+
+## START-HERE (2026-07-22) — quarantine v23 after TDR; mirror the full stock sequence
+
+- Hardware bake-off exposed three `nvlddmkm-153` resets at the same v23 boundary
+  (`Field Concurrency → TextureRop`): one at `1845@856` and two at the operator-proven
+  `1800@875`, while dense v14 passed between the latter two. The two post-TDR v23 results are not
+  valid candidate evidence; they can be a dirty driver/context state that the former stock preflight
+  did not reproduce.
+- A TDR now latches `reboot_required` for the current Windows boot from the durable Event Log. Service
+  restart cannot clear it. Forge, resume, profile/manual Apply and Detector Lab are refused until a
+  newer Windows boot; Reset and read-only diagnostics remain available. This latch writes no
+  blacklist or condemnation.
+- v23 no longer treats a standalone 15 s Field Concurrency preflight as an equivalent control.
+  Production runs one complete 60 s v23 Texture Hop at stock before the first candidate. Detector Lab
+  mirrors the selected v23 duration at stock and journals every stock segment before applying the
+  candidate. A stock failure is environmental/recipe evidence, never candidate evidence.
+- Detector Lab preserves the panic payload and correlates a new `nvlddmkm-153` with its session. The
+  terminal state is `tdr` / `reboot_required`, including the active phase and event timestamp, rather
+  than the generic `environment_error`. Candidate and stock segment records carry an explicit scope.
+- Candidate workload, contract v23 fingerprints and non-publishable Lab boundary are unchanged.
+  Software validation is required; hardware acceptance begins only after reboot and must start with
+  the automatic full-stock control. Do not run the old v23 binary again on an undervolted point.
+
+## START-HERE (2026-07-22) — run the v14 bake-off from Advanced Diagnostics
+
+- Detector Lab is available under Manual Point. Apply a temporary point first, then compare
+  `v23 control` and `v14 dense` for the same selected duration (15–600 s). The worker briefly returns
+  stock for golden capture, reapplies the exact resolved point under Safe Loop and shows live
+  stage/phase/progress. Do not start a risky point unattended.
+- `dense_v14` is a static experimental sequence: Power opening, then short HeavySpike,
+  FrameCadence, MixedGame and BoostEdge perturbations, each followed by a dense TextureRop oracle;
+  TextureRop owns at least 60% of the requested GPU dwell. `control_v23` runs the current v23 Texture
+  Hop so the same hardware point has a direct baseline.
+- Evidence boundary is strict: neither result touches `f2_observations.jsonl`, Apply qualification,
+  profiles, blacklist or condemnation. The only artifact is
+  `%ProgramData%\Nidavellir\detector-lab-<epoch>.jsonl`, synchronously recording each upcoming segment.
+  Qualification contract v23 is unchanged.
+- Stable leaves the temporary point active for the other recipe or Game Trace. SilentError,
+  Unstable, Crash, cooperative Stop, panic or environment failure returns stock and disarms Safe
+  Loop. A hard reset during a segment remains attributable through the armed boot flag and the last
+  flushed journal line.
+- Software gates passed: core/gpu-stress/service tests and UI production build. No hardware run was
+  performed. Next action: supervised paired runs at the same point and duration, starting with v23
+  control, then v14 dense; preserve both journals for comparison.
+
+## START-HERE (2026-07-22) — publish only qualified frontier points; measure cap coverage numerically
+
+- Clean run `f2-forge-1784759763148` finished its search in about 25.7 minutes without a hardware
+  incident but published no profiles. Discovery had valid qualified points at `1860@937`, `1815@937`,
+  `1725@925` and `1695@900`; later discovery-only passes at lower voltage displaced them in the one
+  shared frontier, so exact Apply tried unqualified pairs and reconciliation refused publication.
+  Separately, eight pairs produced 24 `PowerTelemetryInconclusive` rows in the 98–99% cap band, and
+  short BoostEdge phases let a few sticky `SW_POWER_CAP` samples contradict numeric power.
+- Contract v23 separates the deepest physical discovery frontier from the deepest publishable
+  frontier. Exact Apply/profile synthesis consume only a pair with every required current-contract
+  qualification pass; a deeper inconclusive point stays available for boundary learning but cannot
+  erase the shallower qualified result.
+- Texture/Endurance qualification now uses BoostEdge numeric p95 against the actual board limit when
+  available. At least 20 samples are required; p95 >=99% is power-bound, while the raw cap flag is
+  diagnostic/fallback only. Texture Hop v13-r2 assigns 4% of the unchanged dwell to BoostEdge (about
+  1.2 s in the 30 s Standard frontier pass). Fingerprints are
+  `f2q-texhop-v13-r2/v13-field-concurrency` and
+  `f2q-texhop-v13-r2/endurance-field-concurrency`.
+- Discovery cap classification now has real hysteresis: >=99% NearCap, <=98% OffCap, and the middle
+  band inherits the previous state. With no previous state it starts conservatively NearCap. There is
+  no ambiguity blacklist and no looser stability threshold.
+- Software validation passed: `cargo check --workspace`, `cargo test --workspace` (576 passed,
+  1 hardware smoke ignored), targeted frontier/coverage/hysteresis/workload regressions and the UI
+  production build. Clippy completes with the existing repository warnings only. Hardware acceptance
+  remains one Clean/Standard run: qualified shallower
+  points must survive into exact Apply instead of being replaced by deeper inconclusive discovery;
+  ordinary off-cap BoostEdge telemetry must not consume three retries.
+
+## START-HERE (2026-07-20) — inconclusive handling hardened after the v13 re-hammer TDR
+
+- Clean run `f2-forge-1784423357172` (contract v22 / Texture Hop v13) TDR'd at `1890@925` on the 6th
+  texture dwell of that pair, after `1905@925` was skipped with 3 Inconclusive. The persisted
+  `f2_observations.jsonl` shows the 6 `QualificationInconclusive` rows were `boost_edge_power_bound`
+  (4×) + `phase_contrast_low` (2×) — deterministic power-cap interference (p99 192–195 W vs 200 W cap),
+  not silicon. The engine then re-hammered the unproven bin: it seeded the next clock from the
+  inconclusive point and the warm-start fallback re-descended to the exact same pair and re-ran the
+  heaviest qualifier until the driver watchdog fired. The real TDR was blacklisted correctly.
+- Fixed in the engine only (`gpu_undervolt.rs` + `gpu_power_sweep.rs`); no workload/contract/threshold
+  change, no per-GPU constant, no version bump. Inconclusive is now treated as *unproven*, never as
+  good-frontier memory or a repeat target, and is still never blacklisted (blacklisting ambiguity would
+  over-condemn every top clock near the cap): (1) reason-aware retry — the two cap-interference reasons
+  no longer burn the retry budget and the reason is logged; (2) an anchor left qualification-Inconclusive
+  this run is excluded from the `last_good_mv` seed; (3) the warm-start fallback is suppressed on an
+  inconclusive stop, plus a guard that skips re-qualifying a pair already inconclusive this run.
+- Validation: `cargo check --workspace`, service tests 411/0 (3 new pure-helper regression tests),
+  clippy unchanged from baseline. NO hardware/Forge/Apply run.
+- **Next physical action:** acknowledge the reconciled TDR incident and run manual Reset (the run log
+  requires it), then a Clean/Standard run. Acceptance: cap-bound bins print their reason and run ONE
+  texture dwell (no 30→45→45 s escalation); a skipped clock seeds the next from the last clean point;
+  NO second planning round or texture re-run on the same pair after an inconclusive skip. Systemic
+  watch: if 1905/1890/1875 all report `boost_edge_power_bound` on every off-cap bin, top clocks may be
+  unqualifiable under v22's 200 W cap — that is a workload/threshold discussion, not silicon; do not
+  weaken the gate to force a pass. Texture Hop v13 itself is unchanged and still permits real TDR.
+
+## START-HERE (2026-07-18h) — Texture Hop v13 learns the missing field-concurrency dimension
+
+- Trace `game-trace-1784411518295.jsonl` at Brokkr's `1800@831` held 1800 MHz and 97–100% GPU
+  utilization around 145–152 W before a 131→89→56 W power collapse, two nvlddmkm-153 events and a
+  `0x133` reboot. Existing v12 Texture Stack/Endurance p95 power was already 150.5/151.9 W, so higher
+  synthetic power was rejected as the wrong lever. The trace exposed one missing topology: the game
+  context overlapped the independently created live-Sentinel canary context/queue.
+- Contract v22 / Texture Hop v13 keeps the established primary Texture Stack resident and repeatedly
+  creates a fresh secondary `GpuCtx` for the same 700 ms TextureRop self-check used in the field.
+  Irregular compressed gaps yield several context-creation/scheduling overlaps within Standard's
+  short dwell. Primary stock-golden mismatch, secondary self-reference divergence, DeviceLost or TDR
+  rejects the point; neither context has a pre-hang wall-time abort.
+- Golden capture now ends with a 15 s stock Field Concurrency preflight before any candidate write.
+  A driver/backend that cannot support the dual-device path aborts Forge at stock and creates no bad
+  candidate evidence. Current fingerprints are `f2q-texhop-v13-r1/v13-field-concurrency` and
+  `f2q-texhop-v13-r1/endurance-field-concurrency`; all pre-v22 positives are quarantined.
+- Do NOT manually blacklist `1800@831` from this experiment. It was a deliberately selected
+  calibration point. The implementation did not mutate ProgramData or import the trace. Acceptance:
+  run Clean/Standard and require `field-concurrency` to reject the neighborhood organically; if it
+  still passes, use Game Trace v3's canary active/sequence markers for the next refinement.
+- Future non-calibration field failures are safer: applied profiles persist `applied_at`; startup
+  only attributes a later OC-class WER bugcheck to that session. The Event Log watcher polls every
+  second and persists its cursor only after recovery returns, so a reset-time wedge remains pending
+  for next boot. Legacy profiles remain unattributable, preventing retroactive learning here.
+
+## START-HERE (2026-07-18g) — Texture Hop v12 permits real failure; Standard completes its plan
+
+- Contract v21 turns the legacy CompositeGameLoad workload into a heterogeneous Texture Stack.
+  TextureRop on the small cache-resident source, TextureStream on the large VRAM-resident source,
+  power render and near-full-VRAM scattered gather execute in one submit. The final render lane
+  rotates across TextureRop/TextureStream/PowerRender and is checked against the matching stock golden.
+- The active Texture Hop no longer schedules standalone banded TextureStream, whose pre-hang timer
+  ended a phase before the driver watchdog. Texture Stack has no wall-time abort; wrong output,
+  DeviceLost or Windows TDR rejects the exact point. Keep the per-frame queue fence: it models a game
+  present boundary and prevents an unrelated driver-queue flood. Safe Loop recovery remains mandatory.
+- Standard's individual proof remains 30 s frontier + 2 min Texture Hop + 5 min Endurance per unique
+  exact Apply pair, but the global 59-minute watchdog and all budget-exhaustion terminal copy are gone.
+  Standard now finishes its hardware-derived plan unless Stop or a real failure interrupts it. Long
+  remains the explicit exhaustive 60 s + 5 min + 20 min mode.
+- Next physical gate: run Clean/Standard. If a point that is known to fail in actual gameplay is still
+  accepted, apply that exact point in Advanced Diagnostics and capture `game-trace-v2` through the
+  reproducing match. Compare the TDR/sampler-gap/clock-power signature before changing the workload.
 
 ## START-HERE (2026-07-18f) — Texture Hop v11 combines the proven oracle with the strongest co-load
 

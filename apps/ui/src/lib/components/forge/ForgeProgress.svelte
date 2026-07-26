@@ -151,7 +151,7 @@
       descend: ["Testing the stability frontier", "Searching the real voltage boundary of each useful clock."],
       calibrate: ["Measuring profile power", "Recording real power at the exact Apply points."],
       synthesize: ["Forging the profiles", "Selecting performance, balance and efficiency from measured evidence."],
-      "apply-qualify": ["Tempering the final profiles", "Texture Hop v11 and Endurance are challenging each final Apply point."],
+      "apply-qualify": ["Tempering the final profiles", "Texture Hop v13-r3 and Endurance are challenging each final Apply point."],
       stopping: ["Stopping safely", "Saving learning and returning the GPU to stock."],
     };
     const [label, detail] = stages[phase] ?? ["Refining the forge", "The next estimate arrives with the current hardware task."];

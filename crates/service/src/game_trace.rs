@@ -126,6 +126,10 @@ struct Row {
     volt_fresh: bool,
     /// True when a voltage read was attempted, including attempts that failed and carried old data.
     volt_attempted: bool,
+    /// True while the live Sentinel owns its independent TextureRop context for this sample.
+    sentinel_canary_active: bool,
+    /// Monotonic canary-attempt id, retained between attempts for exact trace correlation.
+    sentinel_canary_sequence: u64,
 }
 
 /// The shared sampling loop. Opens the JSONL trace, streams samples until `stop` or the optional
@@ -156,10 +160,11 @@ fn run_sampling(
         })
         .collect();
     let initial_voltage_mv = nidavellir_gpu_nvapi::read_core_voltage_mv();
+    let (_, canary_sequence_before) = crate::tdr_sentinel::canary_trace_marker();
 
     let meta = serde_json::json!({
         "meta": true,
-        "trace_contract": "game-trace-v2",
+        "trace_contract": "game-trace-v3",
         "gpu": gpu,
         "power_limit_w": power_limit_w,
         "interval_ms": cfg.interval_ms,
@@ -167,8 +172,9 @@ fn run_sampling(
         "started_epoch_ms": epoch_ms(),
         "initial_voltage_mv": initial_voltage_mv,
         "tdr_event_before": tdr_before.clone(),
+        "sentinel_canary_sequence_before": canary_sequence_before,
         "live_vf_curve": live_vf_curve,
-        "note": "read-only NVML+NVAPI game workload trace",
+        "note": "read-only NVML+NVAPI game workload trace with live Sentinel canary correlation",
     });
     writeln!(w, "{meta}").map_err(|e| format!("write meta: {e}"))?;
     w.flush().map_err(|e| format!("flush meta: {e}"))?;
@@ -244,6 +250,8 @@ fn run_sampling(
                 voltage_read_failures += 1;
             }
         }
+        let (sentinel_canary_active, sentinel_canary_sequence) =
+            crate::tdr_sentinel::canary_trace_marker();
 
         writeln!(
             w,
@@ -256,6 +264,8 @@ fn run_sampling(
                 volt_mv,
                 volt_fresh,
                 volt_attempted,
+                sentinel_canary_active,
+                sentinel_canary_sequence,
             })
             .map_err(|e| e.to_string())?
         )
@@ -282,9 +292,10 @@ fn run_sampling(
 
     let tdr_after = crate::tdr_sentinel::query_latest_tdr_event();
     let tdr_detected = tdr_after.is_some() && tdr_after != tdr_before;
+    let (_, canary_sequence_after) = crate::tdr_sentinel::canary_trace_marker();
     let summary = serde_json::json!({
         "summary": true,
-        "trace_contract": "game-trace-v2",
+        "trace_contract": "game-trace-v3",
         "stopped_epoch_ms": epoch_ms(),
         "elapsed_ms": start.elapsed().as_millis() as u64,
         "samples": rows,
@@ -301,6 +312,8 @@ fn run_sampling(
         "tdr_event_before": tdr_before,
         "tdr_event_after": tdr_after,
         "tdr_detected": tdr_detected,
+        "sentinel_canary_sequence_before": canary_sequence_before,
+        "sentinel_canary_sequence_after": canary_sequence_after,
     });
     writeln!(w, "{summary}").map_err(|e| format!("write summary: {e}"))?;
     w.flush().ok();

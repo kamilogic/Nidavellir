@@ -32,7 +32,12 @@ pub const F2_OBSERVATIONS_FILE: &str = "f2_observations.jsonl";
 /// focus target, so the measured point IS the labeled point (p95 == target; the pre-v5 thermal
 /// curve shift let every pair run +15/+30 MHz above its label). v4 clocks/powers describe
 /// shifted regimes and cannot seed the new frontier.
-pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
+///
+/// v6 (2026-07-23): every candidate additionally uses a verified graphics-domain voltage lock at
+/// its physical VF bin, and stable discovery requires p5 to reach the exact target instead of
+/// accepting the adjacent lower boost bin. Pre-v6 evidence did not prove the labeled clock/voltage
+/// pair was exercised authoritatively.
+pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 6;
 /// Current FailureSeekingGameLoop qualification contract.
 ///
 /// v7 requires the High-FPS, Texture and Transitions qualification set and reconciles the exact
@@ -90,7 +95,24 @@ pub const F2_DISCOVERY_CONTRACT_VERSION: u32 = 5;
 /// v20 (2026-07-18): Texture Hop v11 combines the precise golden-checked TextureRop oracle with an
 /// early idle-to-CompositeGameLoad slam, then checks TextureRop again before broader coverage. Its
 /// new workload fingerprint prevents pre-v20 positives from unlocking Apply.
-pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 20;
+/// v21 (2026-07-18): Texture Hop v12 turns CompositeGameLoad into a heterogeneous Texture Stack:
+/// cache-bound TextureRop, VRAM-bound TextureStream, power render and scattered VRAM gather share
+/// one submit with per-lane rotating goldens. The active Texture path no longer uses the banded
+/// pre-hang wall-time abort; silent error, DeviceLost and TDR are valid rejection evidence.
+/// v22 (2026-07-18): Texture Hop v13 introduced the measured game-like primary Texture Stack envelope
+/// resident while fresh independent devices/queues run the live TextureRop canary concurrently.
+/// v23 keeps the v13 field-derived concurrency but makes its coverage decision numeric-power-first,
+/// lengthens Boost Edge enough for representative telemetry and separates the physical discovery
+/// frontier from the qualified publication frontier. Pre-v23 positives cannot unlock Apply.
+/// v24 (2026-07-23): Field Concurrency keeps one independent secondary TextureRop device resident
+/// for the whole phase instead of repeatedly creating and destroying devices. Secondary
+/// initialization/coverage failure is environmental Inconclusive evidence, never VF instability.
+/// The new workload fingerprint and contract quarantine all positives produced by the self-failing
+/// context-churn recipe.
+/// v25 (2026-07-23): qualification runs under a verified voltage lock and only samples at the exact
+/// target clock count as target residency. Missing voltage authority, an observed voltage above the
+/// selected bin, or insufficient exact-clock residency is Inconclusive and cannot unlock Apply.
+pub const F2_QUALIFICATION_CONTRACT_VERSION: u32 = 25;
 
 /// What kind of evidence one observation contributes. Old JSONL lines default to `Legacy`: they may
 /// guide discovery, but can never satisfy the current qualification gate.
@@ -820,29 +842,11 @@ pub fn crash_floor_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<
         .max()
 }
 
-/// Build one learned frontier entry for a target from its observations, or `None` if the target has no
-/// Validated observation. Chooses the LOWEST-voltage validated point (the deepest undervolt) and
-/// annotates it with first-bad / bracket / counts / aggregate confidence, enforcing the
-/// crash-proximity margin ([`F2_CRASH_PROXIMITY_MIN_MV`]). Pure.
-pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<F2FrontierEntry> {
-    let crash_floor = crash_floor_for_target(obs, target_mhz);
-    let best = obs
-        .iter()
-        .filter(|o| {
-            o.target_mhz == target_mhz
-                && o.outcome.is_validated()
-                && is_current_discovery_evidence(o)
-        })
-        .filter(|o| {
-            first_bad_for_target(obs, target_mhz)
-                .is_none_or(|bad| o.anchor_mv > bad.anchor_mv)
-        })
-        .filter(|o| {
-            crash_floor.is_none_or(|crash_mv| {
-                o.anchor_mv >= crash_mv.saturating_add(F2_CRASH_PROXIMITY_MIN_MV)
-            })
-        })
-        .min_by_key(|o| o.anchor_mv)?;
+fn frontier_entry_from_best(
+    obs: &[F2Observation],
+    target_mhz: u32,
+    best: &F2Observation,
+) -> F2FrontierEntry {
     let evidence_at_best: Vec<&F2Observation> = obs
         .iter()
         .filter(|o| {
@@ -853,18 +857,18 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
         })
         .collect();
     let qualification_count = REQUIRED_QUALIFICATION_PATTERNS
-    .into_iter()
-    .filter(|pattern| {
-        evidence_at_best.iter().any(|o| {
-            is_current_qualification_pass(o)
-                && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
-                    == Some(*pattern)
+        .into_iter()
+        .filter(|pattern| {
+            evidence_at_best.iter().any(|o| {
+                is_current_qualification_pass(o)
+                    && o.qualification_coverage.as_ref().and_then(|c| c.pattern)
+                        == Some(*pattern)
+            })
         })
-    })
-    .count();
+        .count();
     let observation_count = obs.iter().filter(|o| o.target_mhz == target_mhz).count();
     let bracket = bracket_for_target(obs, target_mhz);
-    Some(F2FrontierEntry {
+    F2FrontierEntry {
         target_mhz,
         best_anchor_mv: best.anchor_mv,
         offset_mhz: best.offset_mhz,
@@ -886,7 +890,55 @@ pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Opti
         observation_count,
         last_updated: best.timestamp.clone(),
         safety_notes: None,
+    }
+}
+
+fn discovery_frontier_candidates(
+    obs: &[F2Observation],
+    target_mhz: u32,
+) -> impl Iterator<Item = &F2Observation> {
+    let crash_floor = crash_floor_for_target(obs, target_mhz);
+    let first_bad_mv = first_bad_for_target(obs, target_mhz).map(|bad| bad.anchor_mv);
+    obs.iter().filter(move |o| {
+        o.target_mhz == target_mhz
+            && o.outcome.is_validated()
+            && is_current_discovery_evidence(o)
+            && first_bad_mv.is_none_or(|bad_mv| o.anchor_mv > bad_mv)
+            && crash_floor.is_none_or(|crash_mv| {
+                o.anchor_mv >= crash_mv.saturating_add(F2_CRASH_PROXIMITY_MIN_MV)
+            })
     })
+}
+
+/// Build one physical discovery frontier entry for a target. This deliberately preserves the
+/// deepest current Discovery pass even when its qualification is still inconclusive; callers that
+/// publish profiles must use [`qualified_frontier_entry_for_target`] instead.
+pub fn frontier_entry_for_target(obs: &[F2Observation], target_mhz: u32) -> Option<F2FrontierEntry> {
+    let best = discovery_frontier_candidates(obs, target_mhz).min_by_key(|o| o.anchor_mv)?;
+    Some(frontier_entry_from_best(obs, target_mhz, best))
+}
+
+/// Build the deepest frontier entry that is publishable under the current qualification contract.
+/// An inconclusive deeper Discovery point remains physical boundary knowledge, but it cannot replace
+/// the nearest shallower pair that completed every currently required qualification pattern.
+pub fn qualified_frontier_entry_for_target(
+    obs: &[F2Observation],
+    target_mhz: u32,
+) -> Option<F2FrontierEntry> {
+    let best = discovery_frontier_candidates(obs, target_mhz)
+        .filter(|candidate| {
+            REQUIRED_QUALIFICATION_PATTERNS.into_iter().all(|pattern| {
+                obs.iter().any(|qualification| {
+                    qualification.target_mhz == target_mhz
+                        && qualification.anchor_mv == candidate.anchor_mv
+                        && is_current_qualification_pass(qualification)
+                        && qualification.qualification_coverage.as_ref().and_then(|c| c.pattern)
+                            == Some(pattern)
+                })
+            })
+        })
+        .min_by_key(|o| o.anchor_mv)?;
+    Some(frontier_entry_from_best(obs, target_mhz, best))
 }
 
 /// Build the full learned F2 frontier: one entry per target that has a Validated observation, sorted by
@@ -909,6 +961,26 @@ pub fn learned_frontier_for_gpu(obs: &[F2Observation], gpu_key: &str) -> Vec<F2F
         .cloned()
         .collect();
     learned_frontier(&scoped)
+}
+
+/// Build the profile-publication projection for one exact physical GPU. The physical discovery
+/// frontier remains available through [`learned_frontier_for_gpu`].
+pub fn qualified_frontier_for_gpu(
+    obs: &[F2Observation],
+    gpu_key: &str,
+) -> Vec<F2FrontierEntry> {
+    let scoped: Vec<F2Observation> = obs
+        .iter()
+        .filter(|o| o.gpu_key.as_deref() == Some(gpu_key))
+        .cloned()
+        .collect();
+    let mut targets: Vec<u32> = scoped.iter().map(|o| o.target_mhz).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+        .into_iter()
+        .filter_map(|target| qualified_frontier_entry_for_target(&scoped, target))
+        .collect()
 }
 
 /// Bridge ONE learned frontier entry to the canonical telemetry point the existing GPU profile
@@ -994,11 +1066,11 @@ pub fn current_discovery_observation_at_anchor<'a>(
         })
 }
 
-/// Sustained-clock tolerance (MHz) mirroring the service classifier's `F2_CLOCK_DROP_TOL_MHZ`: an
-/// Apply-qualification dwell whose sustained (p5) clock stayed within this margin of target still
-/// exercised the hard VF point despite any thermal-slowdown flag. Kept in sync with
-/// `gpu_undervolt::F2_CLOCK_DROP_TOL_MHZ` (30).
-pub const F2_APPLY_CLOCK_HOLD_TOL_MHZ: u32 = 30;
+/// Sustained-clock tolerance (MHz) mirroring the service classifier's `F2_CLOCK_DROP_TOL_MHZ`.
+/// Contract v25 requires the exact target bin: an adjacent lower boost bin is runtime elasticity,
+/// not proof that the labeled point was exercised. Kept in sync with
+/// `gpu_undervolt::F2_CLOCK_DROP_TOL_MHZ` (0).
+pub const F2_APPLY_CLOCK_HOLD_TOL_MHZ: u32 = 0;
 
 /// True when an Apply-qualification observation's power/clock telemetry is trustworthy. A
 /// thermal-slowdown flag only invalidates it when the slowdown actually backed the card OFF the
@@ -1188,8 +1260,8 @@ pub fn current_apply_qualification_p95_clock_at_anchor(
 }
 
 /// True when the CURRENT run's candidate-only stress gate validated cleanly at this exact
-/// `(target_mhz, apply_mv)` pair on this GPU — v20 requires the continuous Endurance soak after the
-/// required exact-Apply Texture Hop v11 pattern. DX11 and TransitionShock remain readable legacy
+/// `(target_mhz, apply_mv)` pair on this GPU — v24 requires the continuous Endurance soak after the
+/// required exact-Apply Texture Hop v13 pattern. DX11 and TransitionShock remain readable legacy
 /// evidence but no longer gate publication because they never rejected a collected candidate.
 /// These gates only TIGHTEN Apply — they are not part of [`REQUIRED_QUALIFICATION_PATTERNS`] and
 /// never touch the frontier descent. They still share the current qualification contract and full
@@ -1740,6 +1812,53 @@ mod tests {
     }
 
     #[test]
+    fn qualified_frontier_keeps_shallower_pass_when_deeper_point_is_inconclusive() {
+        let target = 1860;
+        let qualified_discovery = obs(target, 937, F2ObsOutcome::Validated);
+        let qualified = qualification_pass(qualified_discovery.clone());
+        let deeper_discovery = obs(target, 931, F2ObsOutcome::Validated);
+        let mut deeper_inconclusive = qualification_pass(deeper_discovery.clone());
+        deeper_inconclusive.outcome = F2ObsOutcome::QualificationInconclusive;
+        deeper_inconclusive.qualification_coverage.as_mut().unwrap().verdict =
+            F2QualificationVerdict::Inconclusive;
+
+        let observations = [
+            qualified_discovery,
+            qualified,
+            deeper_discovery,
+            deeper_inconclusive,
+        ];
+        assert_eq!(
+            frontier_entry_for_target(&observations, target)
+                .unwrap()
+                .best_anchor_mv,
+            931,
+            "the physical discovery frontier preserves the deeper unproven observation"
+        );
+        let publishable = qualified_frontier_entry_for_target(&observations, target).unwrap();
+        assert_eq!(publishable.best_anchor_mv, 937);
+        assert_eq!(publishable.validation_count, 1);
+    }
+
+    #[test]
+    fn qualified_frontier_for_gpu_excludes_targets_without_current_qualification() {
+        let qualified_discovery = obs(1860, 937, F2ObsOutcome::Validated);
+        let qualified = qualification_pass(qualified_discovery.clone());
+        let unqualified = obs(1785, 937, F2ObsOutcome::Validated);
+        let frontier = qualified_frontier_for_gpu(
+            &[qualified_discovery, qualified, unqualified],
+            "RTX 3060 Ti",
+        );
+        assert_eq!(
+            frontier
+                .iter()
+                .map(|entry| (entry.target_mhz, entry.best_anchor_mv))
+                .collect::<Vec<_>>(),
+            vec![(1860, 937)]
+        );
+    }
+
+    #[test]
     fn learned_frontier_ignores_legacy_strengths_for_apply_qualification() {
         let discovery = obs(1800, 962, F2ObsOutcome::Validated);
         let mut fsgl1 = qualification_pass(discovery.clone());
@@ -1932,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_v5_rejects_v4_and_unconfirmed_positive_evidence() {
+    fn discovery_v6_rejects_v5_and_unconfirmed_positive_evidence() {
         let mut old = obs(1800, 962, F2ObsOutcome::Validated);
         old.discovery_contract_version = Some(3);
         assert!(!is_current_discovery_evidence(&old));
@@ -2169,7 +2288,7 @@ mod tests {
             o.gpu_key = Some("RTX 4070".into());
             o
         };
-        // The current run's continuous Endurance gate at the exact pair is sufficient in v20.
+        // The current run's continuous Endurance gate at the exact pair is sufficient in v24.
         let endurance = [pass(
             "R1",
             F2QualificationPattern::Endurance,
@@ -2199,7 +2318,7 @@ mod tests {
             956,
             "RTX 4070"
         ));
-        // Removed legacy gates cannot publish a v20 point by themselves.
+        // Removed legacy gates cannot publish a v24 point by themselves.
         let shock_only =
             [pass("R1", F2QualificationPattern::TransitionShock, F2ObsOutcome::Validated)];
         assert!(!point_has_current_endurance_qualification(&shock_only, "R1", 1935, 956, "RTX 4070"));

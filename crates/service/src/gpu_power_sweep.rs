@@ -18,6 +18,8 @@
 //! Windows-only (NVAPI/NVML).
 
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(windows)]
@@ -49,20 +51,25 @@ const POWER_PEAK_MIN_SAMPLES: usize = 100;
 const VOLT_SANE_MIN_MV: u32 = 500;
 const VOLT_SANE_MAX_MV: u32 = 1250;
 #[cfg(windows)]
-const F2_QUALIFIER_TARGET_TOL_MHZ: u32 = 30;
+const F2_QUALIFIER_TARGET_TOL_MHZ: u32 = 0;
+#[cfg(windows)]
+const F2_QUALIFIER_TARGET_RESIDENCY_MIN: f32 = 0.35;
+#[cfg(windows)]
+const F2_QUALIFIER_BOOST_EDGE_MIN_SAMPLES: usize = 20;
+#[cfg(windows)]
+const F2_QUALIFIER_NEAR_CAP_RATIO: f32 = 0.99;
 #[cfg(windows)]
 const V8_GOLDEN_SAMPLE_MS: u64 = 2_000;
+#[cfg(windows)]
+const V24_TEXTURE_HOP_STOCK_CHECK_MS: u64 = 60_000;
 /// Long keeps the exhaustive five-minute Texture Hop + twenty-minute thermal Endurance proof.
-/// Standard uses the mode-specific compact dwells below and is bounded to one hour wall time.
+/// Standard uses the mode-specific compact dwells below and runs until that planned proof closes.
 #[cfg(windows)]
 const F2_LONG_APPLY_TEXTURE_DWELL_MS: u64 = 300_000;
 #[cfg(windows)]
 const F2_STANDARD_APPLY_TEXTURE_DWELL_MS: u64 = 120_000;
 #[cfg(windows)]
 const F2_STANDARD_APPLY_ENDURANCE_DWELL_MS: u64 = 300_000;
-/// Stop active Standard work with one minute reserved for the mandatory stock reset/checkpoint.
-#[cfg(windows)]
-const F2_STANDARD_ACTIVE_WALL_BUDGET_MS: u64 = 59 * 60_000;
 /// Stock thermal normalization runs in bounded windows. Each window exceeds the six-second
 /// telemetry ramp discard, so its retained tail can prove both temperature and sustained-clock
 /// convergence without turning preheat into an unbounded wait.
@@ -456,7 +463,7 @@ impl ForgeTaskTracker {
     }
 }
 
-/// Live Forge mode. Standard is the bounded default; only explicit Long may exceed one hour.
+/// Live Forge mode. Standard uses compact evidence; Long uses exhaustive evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PowerSweepMode {
     #[default]
@@ -537,7 +544,6 @@ impl PowerSweepMode {
                 final_gate_passes: 0,
                 apply_texture_dwell_ms: F2_STANDARD_APPLY_TEXTURE_DWELL_MS,
                 apply_endurance_dwell_ms: F2_STANDARD_APPLY_ENDURANCE_DWELL_MS,
-                active_wall_budget_ms: Some(F2_STANDARD_ACTIVE_WALL_BUDGET_MS),
             },
             PowerSweepMode::Long => F2ForgeModePolicy {
                 discovery_dwell_ms: 10_000,
@@ -548,7 +554,6 @@ impl PowerSweepMode {
                 apply_texture_dwell_ms: F2_LONG_APPLY_TEXTURE_DWELL_MS,
                 apply_endurance_dwell_ms:
                     crate::gpu_undervolt::F2_ENDURANCE_QUALIFICATION_DWELL_MS,
-                active_wall_budget_ms: None,
             },
         }
     }
@@ -690,7 +695,6 @@ struct F2ForgeModePolicy {
     final_gate_passes: usize,
     apply_texture_dwell_ms: u64,
     apply_endurance_dwell_ms: u64,
-    active_wall_budget_ms: Option<u64>,
 }
 
 /// v13 single-detector descent: during the per-bin descent, run ONLY the binding detector — the
@@ -1802,7 +1806,7 @@ fn load_forge_state(gpu_key: &str) -> Option<PowerSweepProgress> {
                         prog.deep_calm = profiles[2];
                         prog.recommended = prog.brokkrs;
                         prog.log.push(format!(
-                            "FORGE: p99 publicado restaurado pelo maior conjunto v8 aprovado ({updated} perfil(is) elevado(s))."
+                            "FORGE: p99 publicado restaurado pelo maior gate v24 completo aprovado ({updated} perfil(is) elevado(s))."
                         ));
                         save_forge_state(gpu_key, &prog);
                     }
@@ -2273,7 +2277,7 @@ fn f2_regime_candidate_refusal(
             confidence_threshold,
         )
     {
-        return Some("its own frontier boundary lacks current Texture Hop v11 qualification".into());
+        return Some("its own frontier boundary lacks current Texture Hop v13-r3 qualification".into());
     }
     let support = match f2_regime_support(point, frontier) {
         Ok(support) => support,
@@ -2579,7 +2583,7 @@ fn f2_pattern_from_stress(
         VfQualifierPattern::V8Texture => (
             F2QualificationStrength::Fsgl4,
             Some(F2QualificationPattern::Texture),
-            "v11-texture-hop",
+            "v13-texture-hop",
         ),
         VfQualifierPattern::V8Transitions => (
             F2QualificationStrength::Fsgl4,
@@ -2601,6 +2605,48 @@ fn f2_pattern_from_stress(
             Some(F2QualificationPattern::TransitionShock),
             "transition-shock",
         ),
+        // Detector Lab bypasses the Forge evidence writer entirely. This arm only keeps the
+        // shared pattern mapping exhaustive; no lab result can reach profile qualification.
+        VfQualifierPattern::DetectorLabDense => (
+            F2QualificationStrength::Fsgl4,
+            Some(F2QualificationPattern::Texture),
+            "detector-lab-v14-dense",
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn qualifier_power_contrast(samples: &[PhaseSample], pattern: VfQualifierPattern) -> Option<f32> {
+    if matches!(pattern, VfQualifierPattern::V8Texture | VfQualifierPattern::Endurance) {
+        let heavy = [
+            VfQualifierPhase::CompositeGameLoad,
+            VfQualifierPhase::MixedGame,
+            VfQualifierPhase::FrameCadence,
+            VfQualifierPhase::TextureRop,
+            VfQualifierPhase::VramPressure,
+            VfQualifierPhase::HeavySpike,
+            VfQualifierPhase::PowerOpening,
+            VfQualifierPhase::PowerClosing,
+        ]
+        .into_iter()
+        .filter_map(|phase| avg_power_for_phases(samples, &[phase]))
+        .reduce(f32::max);
+        let light = [VfQualifierPhase::IdlePulse, VfQualifierPhase::BoostEdge]
+            .into_iter()
+            .filter_map(|phase| avg_power_for_phases(samples, &[phase]))
+            .reduce(f32::min);
+        heavy.zip(light).map(|(heavy, light)| heavy - light)
+    } else {
+        let heavy = avg_power_for_phases(
+            samples,
+            &[
+                VfQualifierPhase::PowerOpening,
+                VfQualifierPhase::HeavySpike,
+                VfQualifierPhase::PowerClosing,
+            ],
+        );
+        let light = avg_power_for_phases(samples, &[VfQualifierPhase::BoostEdge]);
+        heavy.zip(light).map(|(heavy, light)| heavy - light)
     }
 }
 
@@ -2611,6 +2657,8 @@ fn qualification_coverage_from_run(
     samples: &[PhaseSample],
     target_mhz: Option<u32>,
     pattern: VfQualifierPattern,
+    power_limit_w: Option<f32>,
+    inconclusive_reason: Option<&str>,
 ) -> F2QualificationCoverage {
     // Coverage denominator is pattern-specific: legacy FSGL plans exercise 8 phases, the
     // current v8 plans exercise 9 (FrameCadence). A fixed count would mark legacy runs
@@ -2652,26 +2700,31 @@ fn qualification_coverage_from_run(
         }
         (total > 0).then(|| resident as f32 / total as f32)
     });
-    let heavy_power = avg_power_for_phases(
-        samples,
-        &[VfQualifierPhase::PowerOpening, VfQualifierPhase::HeavySpike, VfQualifierPhase::PowerClosing],
-    );
-    let light_power = avg_power_for_phases(samples, &[VfQualifierPhase::BoostEdge]);
-    let heavy_light_power_delta_w = heavy_power.zip(light_power).map(|(heavy, light)| heavy - light);
-    let boost_samples = samples
+    let heavy_light_power_delta_w = qualifier_power_contrast(samples, pattern);
+    let boost_phase_samples = samples
         .iter()
         .filter(|sample| VfQualifierPhase::from_code(sample.4) == Some(VfQualifierPhase::BoostEdge))
-        .count();
+        .collect::<Vec<_>>();
+    let boost_samples = boost_phase_samples.len();
     let boost_capped_fraction = (boost_samples > 0).then(|| {
-        samples
+        boost_phase_samples
             .iter()
-            .filter(|sample| {
-                VfQualifierPhase::from_code(sample.4) == Some(VfQualifierPhase::BoostEdge)
-                    && sample.2
-            })
+            .filter(|sample| sample.2)
             .count() as f32
             / boost_samples as f32
     });
+    let boost_power_p95 = pct_f32(
+        boost_phase_samples.iter().map(|sample| sample.1).collect(),
+        0.95,
+    );
+    let numeric_power_limit = power_limit_w.filter(|limit| limit.is_finite() && *limit > 0.0);
+    let boost_power_bound = match numeric_power_limit {
+        Some(limit) => boost_power_p95
+            .is_some_and(|power| power >= limit * F2_QUALIFIER_NEAR_CAP_RATIO),
+        None => boost_capped_fraction.is_some_and(|frac| frac > 0.20),
+    };
+    let current_texture_contract =
+        matches!(pattern, VfQualifierPattern::V8Texture | VfQualifierPattern::Endurance);
     let (strength, qualifier_pattern, phase_pattern) = f2_pattern_from_stress(pattern);
     let phase_metrics = phase_reports
         .iter()
@@ -2734,7 +2787,12 @@ fn qualification_coverage_from_run(
         })
         .collect::<Vec<_>>();
 
-    let (verdict, reason) = if !result.is_stable() {
+    let (verdict, reason) = if let Some(reason) = inconclusive_reason {
+        (
+            F2QualificationVerdict::Inconclusive,
+            Some(reason.to_string()),
+        )
+    } else if !result.is_stable() {
         (F2QualificationVerdict::Fail, Some("workload_failed".to_string()))
     } else if phases_completed < expected_phases {
         (F2QualificationVerdict::Inconclusive, Some("phase_not_completed".to_string()))
@@ -2742,9 +2800,16 @@ fn qualification_coverage_from_run(
         (F2QualificationVerdict::Inconclusive, Some("checksum_coverage_low".to_string()))
     } else if phase_sample_count == 0 {
         (F2QualificationVerdict::Inconclusive, Some("telemetry_missing".to_string()))
-    } else if target_residency_frac.is_some_and(|frac| frac < 0.35) {
+    } else if target_residency_frac
+        .is_some_and(|frac| frac < F2_QUALIFIER_TARGET_RESIDENCY_MIN)
+    {
         (F2QualificationVerdict::Inconclusive, Some("target_residency_low".to_string()))
-    } else if boost_capped_fraction.is_some_and(|frac| frac > 0.20) {
+    } else if current_texture_contract && boost_samples < F2_QUALIFIER_BOOST_EDGE_MIN_SAMPLES {
+        (
+            F2QualificationVerdict::Inconclusive,
+            Some("boost_edge_telemetry_low".to_string()),
+        )
+    } else if boost_power_bound {
         (
             F2QualificationVerdict::Inconclusive,
             Some("boost_edge_power_bound".to_string()),
@@ -2806,7 +2871,9 @@ fn dx11_qualification_coverage_from_run(
         (F2QualificationVerdict::Inconclusive, Some("checksum_coverage_low".into()))
     } else if phase_samples.is_empty() {
         (F2QualificationVerdict::Inconclusive, Some("telemetry_missing".into()))
-    } else if target_residency_frac.is_some_and(|fraction| fraction < 0.35) {
+    } else if target_residency_frac
+        .is_some_and(|fraction| fraction < F2_QUALIFIER_TARGET_RESIDENCY_MIN)
+    {
         (F2QualificationVerdict::Inconclusive, Some("target_residency_low".into()))
     } else {
         (F2QualificationVerdict::Pass, None)
@@ -3057,7 +3124,7 @@ fn publish_f2_profile_power_from_apply_qualification(
         ),
     }
     .ok_or_else(|| {
-        format!("{target_mhz} MHz @ {apply_mv} mV has no complete current v20 gate p99 measurement")
+        format!("{target_mhz} MHz @ {apply_mv} mV has no complete current v24 gate p99 measurement")
     })?;
     let published_p99 = discovery_p99.max(qualification_p99);
     let changed = published_p99 > discovery_p99;
@@ -3087,7 +3154,7 @@ fn publish_f2_profile_set_power_from_apply_qualification(
 }
 
 #[cfg(windows)]
-fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
+pub(crate) fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
     fn capture(label: &str, workload: VfWorkload) -> Result<(u32, u32), String> {
         let ctx = nidavellir_gpu_stress::GpuCtx::new()
             .map_err(|e| format!("{label}: GpuCtx init failed: {e}"))?;
@@ -3110,6 +3177,39 @@ fn capture_fsgl3_render_goldens() -> Result<RenderGoldens, String> {
         // captures it. A default marker prevents the removed path from adding startup risk/time.
         dx11: nidavellir_gpu_stress::Dx11Golden::default(),
     })
+}
+
+#[cfg(windows)]
+pub(crate) fn validate_v24_texture_hop_stock(
+    goldens: RenderGoldens,
+    duration_ms: u64,
+) -> Result<(), String> {
+    let ctx = nidavellir_gpu_stress::GpuCtx::new()
+        .map_err(|e| format!("full v24 stock control: GpuCtx init failed: {e}"))?;
+    let phase_state = AtomicU8::new(VfQualifierPhase::NONE_CODE);
+    let preflight = ctx.run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel(
+        duration_ms,
+        &phase_state,
+        VfQualifierPattern::V8Texture,
+        Some(goldens),
+        None,
+    );
+    if let Some(reason) = preflight.inconclusive_reason {
+        return Err(format!(
+            "full v24 stock control was inconclusive at the environment level: {reason}"
+        ));
+    }
+    if preflight.result != StabilityResult::Stable {
+        return Err(format!(
+            "full v24 stock control was not stable during {}: {:?}",
+            preflight
+                .failure_phase
+                .map(VfQualifierPhase::label)
+                .unwrap_or("unknown phase"),
+            preflight.result
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -3144,6 +3244,17 @@ fn load_and_measure_for(
         Err(_) => return Measured::degenerate(StabilityResult::Crash, 0),
     };
     let evidence_provenance = Some(f2_evidence_provenance(&session, purpose));
+    let qualification_power_limit_w = matches!(
+        &purpose,
+        RenderStressPurpose::VfQualification(_, _)
+    )
+    .then(|| {
+        nidavellir_core::nvml_gpu::read_nvidia_gpus_nvml()
+            .into_iter()
+            .next()
+            .and_then(|reading| reading.power_limit_w)
+    })
+    .flatten();
     let sampler_stop = Arc::new(AtomicBool::new(false));
     // Collect raw samples in the sampler thread for precise stats (mean/max/std + the
     // richer min/p5/temperature stats). Tuple: (clock_mhz, power_w, capped, temp_c, qualifier_phase).
@@ -3236,7 +3347,14 @@ fn load_and_measure_for(
                 Some(token) => ctx.run_render_stress_with_cancel(ms, token),
                 None => ctx.run_render_stress(ms),
             };
-            (run.result, run.phase_reports, run.frames, run.fps, None)
+            (
+                run.result,
+                run.phase_reports,
+                run.frames,
+                run.fps,
+                None,
+                run.inconclusive_reason,
+            )
         }
         (RenderSession::Wgpu(ctx), RenderStressPurpose::VfQualification(pattern, goldens)) => {
             let run = ctx.run_vf_qualifier_stress_with_phase_pattern_goldens_and_cancel(
@@ -3249,25 +3367,41 @@ fn load_and_measure_for(
             if let Some(phase) = run.failure_phase {
                 warn!("VF qualifier failed during phase {}", phase.label());
             }
-            (run.result, run.phase_reports, run.frames, run.fps, None)
+            (
+                run.result,
+                run.phase_reports,
+                run.frames,
+                run.fps,
+                None,
+                run.inconclusive_reason,
+            )
         }
         (RenderSession::Dx11(ctx), RenderStressPurpose::Dx11Qualification(golden)) => {
             phase_state.store(VfQualifierPhase::CompositeGameLoad.code(), Ordering::SeqCst);
             let run = ctx.run_with_golden(ms, golden, cancel);
-            (run.result, Vec::new(), run.frames, run.fps, Some(run))
+            (
+                run.result,
+                Vec::new(),
+                run.frames,
+                run.fps,
+                Some(run),
+                None,
+            )
         }
         _ => unreachable!("render session must match its purpose"),
     }));
-    let (res, phase_reports, render_frames, render_fps, dx11_report) = match render {
-        Ok((result, reports, frames, fps, dx11_report)) => (
-            result,
-            reports,
-            Some(frames),
-            (fps.is_finite() && fps >= 0.0).then_some(fps),
-            dx11_report,
-        ),
-        Err(_) => (StabilityResult::Crash, Vec::new(), None, None, None),
-    };
+    let (res, phase_reports, render_frames, render_fps, dx11_report, inconclusive_reason) =
+        match render {
+            Ok((result, reports, frames, fps, dx11_report, inconclusive_reason)) => (
+                result,
+                reports,
+                Some(frames),
+                (fps.is_finite() && fps >= 0.0).then_some(fps),
+                dx11_report,
+                inconclusive_reason,
+            ),
+            Err(_) => (StabilityResult::Crash, Vec::new(), None, None, None, None),
+        };
     let cancelled = cancel.is_some_and(|token| token.load(Ordering::SeqCst));
     sampler_stop.store(true, Ordering::SeqCst);
     let _ = sampler.join();
@@ -3278,7 +3412,15 @@ fn load_and_measure_for(
     let v = samples.lock().map(|g| g.clone()).unwrap_or_default();
     let qualification_coverage = match purpose {
         RenderStressPurpose::VfQualification(pattern, _) => {
-            Some(qualification_coverage_from_run(res, &phase_reports, &v, target_mhz, pattern))
+            Some(qualification_coverage_from_run(
+                res,
+                &phase_reports,
+                &v,
+                target_mhz,
+                pattern,
+                qualification_power_limit_w,
+                inconclusive_reason.as_deref(),
+            ))
         }
         RenderStressPurpose::Dx11Qualification(_) => Some(dx11_qualification_coverage_from_run(
             res,
@@ -5911,6 +6053,7 @@ pub(crate) fn f2_stock_clock_ceiling(
 /// build-frontier (single source of truth); behavior is unchanged for F1.
 #[cfg(windows)]
 pub(crate) fn reset_to_stock() {
+    let _ = nidavellir_gpu_nvapi::unlock_core_voltage();
     let _ = nidavellir_gpu_nvapi::set_core_offset_mhz(0);
     let _ = nidavellir_gpu_nvapi::reset_vf_curve();
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
@@ -7364,37 +7507,6 @@ fn measure_multiclock_undervolt_forge(
     let previous = progress.lock().map(|g| g.clone()).unwrap_or_default();
     let resume_requested = intent == ForgeRunIntent::Resume;
     let elapsed_before_session_ms = if resume_requested { previous.elapsed_ms } else { 0 };
-    // One cancellation token combines the UI Stop signal with Standard's strict active-work budget.
-    // A weak-token watchdog cannot leak into a later run: dropping `run_cancel` ends its thread.
-    let external_stop = Arc::downgrade(stop);
-    let run_cancel = Arc::new(AtomicBool::new(false));
-    let run_cancel_weak = Arc::downgrade(&run_cancel);
-    let budget_exhausted = Arc::new(AtomicBool::new(false));
-    let budget_exhausted_watch = Arc::clone(&budget_exhausted);
-    let active_budget_remaining_ms = mode_policy
-        .active_wall_budget_ms
-        .map(|budget| budget.saturating_sub(elapsed_before_session_ms));
-    std::thread::spawn(move || {
-        let deadline = active_budget_remaining_ms
-            .map(|remaining| Instant::now() + std::time::Duration::from_millis(remaining));
-        loop {
-            let Some(run_cancel) = run_cancel_weak.upgrade() else { break };
-            if external_stop
-                .upgrade()
-                .is_none_or(|stop| stop.load(Ordering::SeqCst))
-            {
-                run_cancel.store(true, Ordering::SeqCst);
-                break;
-            }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                budget_exhausted_watch.store(true, Ordering::SeqCst);
-                run_cancel.store(true, Ordering::SeqCst);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    });
-    let stop = &run_cancel;
     // A manual resume continues the SAME run identity. This keeps clean-run observation and
     // condemnation scope intact and lets the F2 motor skip already completed evidence exactly.
     let run_id = if resume_requested {
@@ -7477,12 +7589,14 @@ fn measure_multiclock_undervolt_forge(
         "Forja F2 (undervolt anchorado, {}) — cap {cap:.0} W. Descendo a tensão mínima estável por clock…",
         mode.label()
     ));
-    if let Some(active_budget_ms) = mode_policy.active_wall_budget_ms {
-        prog.log.push(format!(
-            "Standard: teto estrito de 60 min; carga ativa encerra em {} min para reservar reset stock e checkpoint. Se a prova não fechar, nenhum perfil novo será qualificado.",
-            active_budget_ms / 60_000
-        ));
-    }
+    prog.log.push(match mode {
+        PowerSweepMode::Standard => {
+            "Standard: dwells compactos e sem corte global; a execução termina quando a prova planejada fechar ou quando Stop/falha real interromper.".into()
+        }
+        PowerSweepMode::Long => {
+            "Long: prova exaustiva sem corte global; a execução termina quando a prova planejada fechar ou quando Stop/falha real interromper.".into()
+        }
+    });
     set(progress, prog.clone());
 
     // Stable physical identity scopes observations and persisted profiles to this exact GPU.
@@ -7669,15 +7783,22 @@ fn measure_multiclock_undervolt_forge(
         task_tracker.begin(
             &mut prog,
             "capture_goldens",
-            Some(V8_GOLDEN_SAMPLE_MS.saturating_mul(2)),
+            Some(
+                V8_GOLDEN_SAMPLE_MS
+                    .saturating_mul(6)
+                    .saturating_add(V24_TEXTURE_HOP_STOCK_CHECK_MS),
+            ),
             Some("frontier_descent"),
             None,
         );
-        prog.log.push("Qualificação v20: capturando goldens stock wgpu para Texture Hop v11 + Endurance…".into());
+        prog.log.push("Qualificação v24: capturando goldens stock e executando o Texture Hop completo em stock com Field Concurrency persistente…".into());
         set(progress, prog.clone());
-        match capture_fsgl3_render_goldens() {
+        match capture_fsgl3_render_goldens().and_then(|goldens| {
+            validate_v24_texture_hop_stock(goldens, V24_TEXTURE_HOP_STOCK_CHECK_MS)?;
+            Ok(goldens)
+        }) {
             Ok(goldens) => {
-                prog.log.push("Qualificação v20: goldens stock wgpu capturados; descida e exact-Apply podem começar.".into());
+                prog.log.push("Qualificação v24: controle stock completo aprovado; a concorrência persistente entre as duas filas é válida neste boot.".into());
                 set(progress, prog.clone());
                 Some(goldens)
             }
@@ -7686,10 +7807,10 @@ fn measure_multiclock_undervolt_forge(
                 prog.running = false;
                 prog.phase = "incomplete".into();
                 prog.note = Some(format!(
-                    "Forja F2 abortada antes da qualificação v20 — stock não produziu golden determinístico wgpu: {e}. GPU no stock, nada aplicado."
+                    "Forja F2 abortada antes da qualificação v24 — o controle stock completo falhou: {e}. Reinicie antes de outro teste; GPU no stock, nada aplicado."
                 ));
                 set(progress, prog);
-                warn!("f2-forge: v20 golden capture failed: {e}");
+                warn!("f2-forge: full v24 stock control failed: {e}");
                 return;
             }
         }
@@ -7812,7 +7933,7 @@ fn measure_multiclock_undervolt_forge(
     };
     prog.estimated_remaining_ms = Some(estimated_work_ms);
     prog.log.push(format!(
-        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, qualificação Texture Hop v11 {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
+        "Frontier F2: {} clock(s) reais disponíveis, começando em {} MHz; modo {} = descoberta {} s, qualificação Texture Hop v13-r3 {}×{} s, gate final extra {}×{} s; ~{} dwells na estimativa inicial.",
         targets.len(), targets[0],
         mode.label(),
         mode_policy.discovery_dwell_ms / 1000,
@@ -8173,7 +8294,27 @@ fn measure_multiclock_undervolt_forge(
     );
     set(progress, prog.clone());
     if let (true, Some(max)) = (forge_complete && !forge_aborted, cmax) {
-        let frontier = obs_store.learned_frontier_for_gpu(&gpu_key)
+        let frontier_observations = obs_store.load_all();
+        let physical_frontier = obs_store.learned_frontier_for_gpu(&gpu_key);
+        let publishable_frontier =
+            nidavellir_core::f2_observation::qualified_frontier_for_gpu(
+                &frontier_observations,
+                &gpu_key,
+            );
+        let require_boundary_qualification =
+            f2_required_qualification_passes(mode_policy) > 0;
+        let frontier = if require_boundary_qualification {
+            if publishable_frontier.len() < physical_frontier.len() {
+                prog.log.push(format!(
+                    "Fronteira publicável: {} de {} alvo(s) físicos possuem Texture Hop atual no mesmo par; pontos mais profundos inconclusivos permanecem apenas como limite de descoberta.",
+                    publishable_frontier.len(),
+                    physical_frontier.len()
+                ));
+            }
+            publishable_frontier
+        } else {
+            physical_frontier
+        }
             .into_iter()
             .filter(|entry| {
                 entry.target_mhz <= max && f2_clock_within_cmax_floor(entry.target_mhz, max)
@@ -8391,7 +8532,7 @@ fn measure_multiclock_undervolt_forge(
                     }
                 }
             }
-            // v20 vertical closure: a physically classified gate failure condemns the BIN, never
+            // v24 vertical closure: a physically classified gate failure condemns the BIN, never
             // the clock. Every viable same-clock bin is tried until a physical/profile/power
             // boundary is proven. Reload the ledger at each decision so a condemnation appended by
             // this very run is visible immediately (including in Clean Run's run-scoped view).
@@ -8579,7 +8720,7 @@ fn measure_multiclock_undervolt_forge(
                             .unwrap_or(u32::MAX),
                     );
                     prog.log.push(format!(
-                        "Qualificação Apply exato v20: {} {} MHz target @ {} mV VF — Texture Hop v11 ({} min) + Endurance agressivo ({} min), modo {}.",
+                        "Qualificação Apply exato v24: {} {} MHz target @ {} mV VF — Texture Hop v13-r3 ({} min) + Endurance agressivo ({} min), modo {}.",
                         profile_role.label(), key.0, key.1,
                         mode_policy.apply_texture_dwell_ms / 60_000,
                         mode_policy.apply_endurance_dwell_ms / 60_000,
@@ -8716,7 +8857,7 @@ fn measure_multiclock_undervolt_forge(
                         else {
                             excluded_apply_pairs.insert(key);
                             prog.log.push(format!(
-                                "FORGE: candidato {} MHz target @ {} mV VF recusado — conjunto v8 completo sem p95 sustentado mensurável.",
+                                "FORGE: candidato {} MHz target @ {} mV VF recusado — gate v24 completo sem p95 sustentado mensurável.",
                                 key.0, key.1
                             ));
                             changed = true;
@@ -8804,7 +8945,7 @@ fn measure_multiclock_undervolt_forge(
                                 }
                                 excluded_apply_pairs.insert(key);
                                 prog.log.push(format!(
-                                    "FORGE: p95 do conjunto v20 elevou o regime de {} MHz @ {} mV; candidato recusado — {reason}. Ressintetizando.",
+                                    "FORGE: p95 do conjunto v24 elevou o regime de {} MHz @ {} mV; candidato recusado — {reason}. Ressintetizando.",
                                     key.0, key.1
                                 ));
                                 changed = true;
@@ -8849,7 +8990,7 @@ fn measure_multiclock_undervolt_forge(
                     if power_ceiling_exceeded {
                         excluded_apply_pairs.insert(key);
                         prog.log.push(format!(
-                            "FORGE: {} MHz @ {} mV já excedeu o envelope energético após Texture Hop v11; Endurance foi evitado e o par saiu apenas da seleção desta run — nenhuma blacklist foi gravada. Godforge ainda pode tentar o clock inferior na mesma tensão.",
+                            "FORGE: {} MHz @ {} mV já excedeu o envelope energético após Texture Hop v13-r3; Endurance foi evitado e o par saiu apenas da seleção desta run — nenhuma blacklist foi gravada. Godforge ainda pode tentar o clock inferior na mesma tensão.",
                             key.0, key.1
                         ));
                     } else if blacklist_refused {
@@ -8994,7 +9135,7 @@ fn measure_multiclock_undervolt_forge(
                                                 );
                                                 godforge_override = Some(carried_key);
                                                 prog.log.push(format!(
-                                                    "FORGE: Godforge fast-drop criado em {} MHz @ {} mV (p99 {:.0} W). Mesmo bin elétrico, clock -{} MHz; gate v20 completo obrigatório.",
+                                                    "FORGE: Godforge fast-drop criado em {} MHz @ {} mV (p99 {:.0} W). Mesmo bin elétrico, clock -{} MHz; gate v24 completo obrigatório.",
                                                     carried_target,
                                                     carried_mv,
                                                     p99,
@@ -9166,7 +9307,7 @@ fn measure_multiclock_undervolt_forge(
                             profiles.deep_calm,
                         ) {
                             prog.log.push(format!(
-                                "FORGE: p99 publicado = maior p99 do gate v20 completo (Texture Hop v11 + Endurance) no Apply aprovado ({updated} perfil(is) elevado(s)) — Godforge {}@{} mV {:.0} W · Brokkr's {}@{} mV {:.0} W · Deep Calm {}@{} mV {:.0} W.",
+                                "FORGE: p99 publicado = maior p99 do gate v24 completo (Texture Hop v13-r3 + Endurance) no Apply aprovado ({updated} perfil(is) elevado(s)) — Godforge {}@{} mV {:.0} W · Brokkr's {}@{} mV {:.0} W · Deep Calm {}@{} mV {:.0} W.",
                                 godforge.target_clock_mhz.unwrap_or(godforge.clock_mhz),
                                 godforge.vf_table_voltage_mv.unwrap_or(godforge.voltage_mv),
                                 godforge.power_p99_w.unwrap_or(0.0),
@@ -9186,7 +9327,7 @@ fn measure_multiclock_undervolt_forge(
                     }
                     Err(e) => {
                         prog.log.push(format!(
-                            "FORGE: p99 final do conjunto v8 aprovado indisponível — {e}; perfis recusados."
+                            "FORGE: p99 final do gate v24 aprovado indisponível — {e}; perfis recusados."
                         ));
                     }
                 }
@@ -9198,7 +9339,7 @@ fn measure_multiclock_undervolt_forge(
             );
             if !prog.profiles_qualified {
                 prog.log.push(format!(
-                    "FORGE: perfis provisórios — modo {} exige fronteira qualificada, confiança ≥ {:.2} e o conjunto v8 no par exato de Apply; Apply permanece bloqueado.",
+                    "FORGE: perfis provisórios — modo {} exige fronteira publicável qualificada, confiança ≥ {:.2} e o gate v24 no par exato de Apply; Apply permanece bloqueado.",
                     mode.label(),
                     ForgePolicy::balanced().confidence_threshold
                 ));
@@ -9242,21 +9383,7 @@ fn measure_multiclock_undervolt_forge(
             !retain_boot_flag
         }
     };
-    let standard_budget_exhausted = budget_exhausted.load(Ordering::SeqCst);
-    if standard_budget_exhausted {
-        forge_complete = false;
-        prog.profiles_qualified = false;
-        let reset_status = if final_reset_confirmed {
-            "GPU restaurada ao stock"
-        } else {
-            "reset final para stock não confirmado; recuperação permanece necessária"
-        };
-        prog.log.push(format!(
-            "Standard atingiu o teto de 60 min: carga interrompida, aprendizado preservado e {reset_status}. Perfis sem a prova completa permanecem bloqueados; use Long explicitamente para continuar além desse limite."
-        ));
-    }
-    let manual_pause = !standard_budget_exhausted
-        && manual_stop.load(Ordering::SeqCst)
+    let manual_pause = manual_stop.load(Ordering::SeqCst)
         && stop.load(Ordering::SeqCst)
         && !forge_aborted
         && final_reset_confirmed;
@@ -9306,22 +9433,7 @@ fn measure_multiclock_undervolt_forge(
         prog.godforge.is_some(),
     )
     .into();
-    if standard_budget_exhausted {
-        prog.resume_available = false;
-        prog.resume_block_reason = Some(
-            "Standard encerrou no limite de uma hora; selecione Long para uma execução explicitamente mais longa"
-                .into(),
-        );
-        let reset_status = if final_reset_confirmed {
-            "GPU em stock"
-        } else {
-            "reset final para stock não confirmado"
-        };
-        prog.note = Some(format!(
-            "Standard encerrado no limite de uma hora: {} novo(s) dwell(s) preservado(s), {reset_status} e nenhum perfil incompleto liberado.",
-            prog.learned_points,
-        ));
-    } else if manual_pause {
+    if manual_pause {
         prog.resume_available = prog.resume_compatibility.is_some();
         prog.resume_block_reason = if prog.resume_available {
             None
@@ -9899,7 +10011,7 @@ mod tests {
             "GPU-1"
         )
         .unwrap());
-        // v20 publication uses the complete exact-Apply gate, so Endurance may conservatively raise
+        // v24 publication uses the complete exact-Apply gate, so Endurance may conservatively raise
         // both the displayed power and the efficiency basis above Texture's shorter p99.
         assert_eq!(published.power_p99_w, Some(207.0));
         assert!((published.perf_per_watt - 1875.0 / 207.0).abs() < f64::EPSILON);
@@ -9921,7 +10033,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn f2_modes_share_discovery_and_separate_bounded_from_exhaustive_proof() {
+    fn f2_modes_share_discovery_and_keep_compact_vs_exhaustive_proof_depth() {
         let standard = PowerSweepMode::Standard.f2_policy();
         let long = PowerSweepMode::Long.f2_policy();
         assert_eq!(
@@ -9948,10 +10060,8 @@ mod tests {
         );
         assert_eq!(standard.apply_texture_dwell_ms, 120_000);
         assert_eq!(standard.apply_endurance_dwell_ms, 300_000);
-        assert_eq!(standard.active_wall_budget_ms, Some(59 * 60_000));
         assert_eq!(long.apply_texture_dwell_ms, 300_000);
         assert_eq!(long.apply_endurance_dwell_ms, 1_200_000);
-        assert_eq!(long.active_wall_budget_ms, None);
     }
 
     #[cfg(windows)]
@@ -10173,7 +10283,7 @@ mod tests {
             VfQualifierPhase::PowerClosing,
             VfQualifierPhase::FrameCadence,
             VfQualifierPhase::VramPressure,
-            VfQualifierPhase::GeometryDepth,
+            VfQualifierPhase::CompositeGameLoad,
             VfQualifierPhase::TextureStream,
         ];
         let reports: Vec<_> = phases
@@ -10196,7 +10306,7 @@ mod tests {
                     | VfQualifierPhase::PowerClosing => 180.0,
                     _ => 145.0,
                 };
-                (0..4).map(move |_| (1800, power, false, None, phase.code(), false))
+                (0..24).map(move |_| (1800, power, false, None, phase.code(), false))
             })
             .collect();
 
@@ -10206,6 +10316,8 @@ mod tests {
             &samples,
             Some(1800),
             VfQualifierPattern::Fsgl3A,
+            Some(200.0),
+            None,
         );
         assert_eq!(pass.verdict, F2QualificationVerdict::Pass);
         assert_eq!(pass.strength, F2QualificationStrength::Fsgl3);
@@ -10222,6 +10334,8 @@ mod tests {
             &samples,
             Some(1800),
             VfQualifierPattern::V8Texture,
+            Some(200.0),
+            None,
         );
         assert_eq!(texture_pass.verdict, F2QualificationVerdict::Pass);
         assert_eq!(texture_pass.strength, F2QualificationStrength::Fsgl4);
@@ -10230,7 +10344,112 @@ mod tests {
             Some(F2QualificationPattern::Texture)
         );
         assert_eq!(texture_pass.phases_completed, 12);
-        assert_eq!(texture_pass.phases_expected, 12);
+        assert_eq!(texture_pass.phases_expected, 11);
+
+        let adjacent_lower_bin_samples = samples
+            .iter()
+            .map(|sample| (1785, sample.1, sample.2, sample.3, sample.4, sample.5))
+            .collect::<Vec<_>>();
+        let adjacent_lower_bin = qualification_coverage_from_run(
+            StabilityResult::Stable,
+            &reports,
+            &adjacent_lower_bin_samples,
+            Some(1800),
+            VfQualifierPattern::V8Texture,
+            Some(200.0),
+            None,
+        );
+        assert_eq!(
+            adjacent_lower_bin.verdict,
+            F2QualificationVerdict::Inconclusive
+        );
+        assert_eq!(
+            adjacent_lower_bin.reason.as_deref(),
+            Some("target_residency_low")
+        );
+        assert_eq!(adjacent_lower_bin.target_residency_frac, Some(0.0));
+
+        let environment_inconclusive = qualification_coverage_from_run(
+            StabilityResult::Stable,
+            &reports,
+            &samples,
+            Some(1800),
+            VfQualifierPattern::V8Texture,
+            Some(200.0),
+            Some("field_secondary_init_failed: test"),
+        );
+        assert_eq!(
+            environment_inconclusive.verdict,
+            F2QualificationVerdict::Inconclusive
+        );
+        assert_eq!(
+            environment_inconclusive.reason.as_deref(),
+            Some("field_secondary_init_failed: test")
+        );
+
+        let mut misleading_cap_flag = samples.clone();
+        for sample in &mut misleading_cap_flag {
+            if VfQualifierPhase::from_code(sample.4) == Some(VfQualifierPhase::BoostEdge) {
+                sample.1 = 150.0;
+                sample.2 = true;
+            }
+        }
+        let numeric_pass = qualification_coverage_from_run(
+            StabilityResult::Stable,
+            &reports,
+            &misleading_cap_flag,
+            Some(1800),
+            VfQualifierPattern::V8Texture,
+            Some(200.0),
+            None,
+        );
+        assert_eq!(numeric_pass.verdict, F2QualificationVerdict::Pass);
+
+        let mut boost_samples_kept = 0usize;
+        let sparse_boost = samples
+            .iter()
+            .copied()
+            .filter(|sample| {
+                if VfQualifierPhase::from_code(sample.4) != Some(VfQualifierPhase::BoostEdge) {
+                    return true;
+                }
+                boost_samples_kept += 1;
+                boost_samples_kept <= 4
+            })
+            .collect::<Vec<_>>();
+        let low_telemetry = qualification_coverage_from_run(
+            StabilityResult::Stable,
+            &reports,
+            &sparse_boost,
+            Some(1800),
+            VfQualifierPattern::V8Texture,
+            Some(200.0),
+            None,
+        );
+        assert_eq!(low_telemetry.verdict, F2QualificationVerdict::Inconclusive);
+        assert_eq!(
+            low_telemetry.reason.as_deref(),
+            Some("boost_edge_telemetry_low")
+        );
+
+        let mut numeric_cap = samples.clone();
+        for sample in &mut numeric_cap {
+            if VfQualifierPhase::from_code(sample.4) == Some(VfQualifierPhase::BoostEdge) {
+                sample.1 = 199.0;
+                sample.2 = false;
+            }
+        }
+        let power_bound = qualification_coverage_from_run(
+            StabilityResult::Stable,
+            &reports,
+            &numeric_cap,
+            Some(1800),
+            VfQualifierPattern::V8Texture,
+            Some(200.0),
+            None,
+        );
+        assert_eq!(power_bound.verdict, F2QualificationVerdict::Inconclusive);
+        assert_eq!(power_bound.reason.as_deref(), Some("boost_edge_power_bound"));
 
         // A v8 run that never completed FrameCadence is Inconclusive, not Pass.
         let missing_cadence = qualification_coverage_from_run(
@@ -10239,6 +10458,8 @@ mod tests {
             &samples,
             Some(1800),
             VfQualifierPattern::V8Texture,
+            Some(200.0),
+            None,
         );
         assert_eq!(missing_cadence.verdict, F2QualificationVerdict::Inconclusive);
 
@@ -10248,6 +10469,8 @@ mod tests {
             &samples,
             Some(1800),
             VfQualifierPattern::Fsgl3B,
+            Some(200.0),
+            None,
         );
         assert_eq!(failed.verdict, F2QualificationVerdict::Fail);
         assert_eq!(failed.strength, F2QualificationStrength::Fsgl3);
@@ -10258,6 +10481,8 @@ mod tests {
             &samples,
             Some(1800),
             VfQualifierPattern::Fsgl1,
+            Some(200.0),
+            None,
         );
         assert_eq!(missing_phase.verdict, F2QualificationVerdict::Inconclusive);
         assert_eq!(missing_phase.strength, F2QualificationStrength::Fsgl1);
@@ -10403,7 +10628,7 @@ mod tests {
         assert_eq!(f2_frontier_bounds(&targets, 1935), Some((1755, 13)));
 
         let standard = PowerSweepMode::Standard.f2_policy();
-        // v20 Standard: descent = 15s discovery + 1×35s Texture Hop. Exact-Apply runs one
+        // v24 Standard: descent = 15s discovery + 1×35s Texture Hop v13-r3. Exact-Apply runs one
         // 125s Texture Hop plus one 305s compact Endurance transaction.
         assert_eq!(f2_target_upper_estimate_ms(1, standard), 50_000);
         assert_eq!(f2_calibration_upper_estimate_ms(1, standard), 45_000);

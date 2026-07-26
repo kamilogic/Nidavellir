@@ -2,6 +2,228 @@
 
 Durable technical decisions and their rationale. Newest first.
 
+## F2 voltage is authoritative; clock remains a max-only ceiling (2026-07-23)
+- **Evidence:** Game Trace requested at `1815@875` spent about 92% of loaded samples at 1800 MHz and
+  also observed voltage above 875 mV. The anchored curve plus max-clock ceiling therefore constrained
+  the top clock but did not prove that the labeled clock/voltage pair was exercised. A clean workload
+  result under that elastic voltage cannot validate the requested point.
+- **Decision:** every active F2 candidate and applied F2 profile keeps the bounded anchored curve,
+  uses NVML `min=idle-floor, max=target` for clock, and sets an exact NVAPI graphics-domain voltage
+  lock at the resolved physical VF bin. The write is successful only when both the curve/clock
+  ceiling and voltage-lock readbacks verify. Clock may still step down; voltage may not step above
+  the selected bin.
+- **Authority gates:** Discovery requires sustained p5 to reach the exact target rather than the
+  adjacent lower boost bin. Qualification counts target residency only at the exact target or above,
+  still requiring 35%. A clean workload with missing/insufficient voltage telemetry, measured
+  voltage above the selected bin, missing explicit coverage Pass, or insufficient exact-clock
+  residence is `Inconclusive`, never positive evidence.
+- **Evidence quarantine:** discovery contract 5→6 and qualification contract 24→25. Detector Lab
+  canonicalizes to `control_v25`, uses the same sampled candidate gate as Forge, and retains
+  `control_v24`/`control_v23` only as compatibility aliases.
+- **Safety/reset:** all stock, failure, Stop, shutdown and boot-reapply paths release the voltage
+  lock as well as the clock ceiling. Safe Loop remains armed across manual/active use.
+- **ClockBoostLock slot semantics:** the private API's `id` is a table-entry index, not graphics
+  domain `0`. Hardware readback on the RTX 3060 Ti exposes entries `0..6`, while the voltage-bearing
+  writable slot is the highest reported entry. Apply derives that slot from the live table, clears
+  every entry in a dedicated write, then writes only the selected slot. Because the driver can
+  acknowledge SET before GET reflects it, verification polls for up to one second and accepts
+  success only when exactly that slot reads back at the requested voltage. Reset likewise clears
+  every reported entry.
+- **Control ordering:** RTX 3060 Ti driver 595.97 returns `ArgumentExceedMaxSize` when
+  `GetClockBoostLock` is queried after the modern VF curve and NVML clock ceiling have mutated the
+  control state, even though the same query succeeds at stock. F2 therefore establishes and
+  readback-verifies the exact voltage lock while still in the reset control state, then writes and
+  verifies the anchored curve, and only then applies the max-only clock ceiling. Any failure in the
+  later controls resets the already-established voltage lock as part of the same fail-closed
+  transaction.
+- **Tradeoff accepted:** NVAPI exposes a fixed manual voltage lock, not a max-only voltage ceiling.
+  This is more electrically rigid and can expose a marginal point as TDR sooner than the former
+  elastic curve. That risk is intentional for authoritative testing; a rigid min=max clock pin is
+  still rejected because the clock must remain free to drop under power/thermal management.
+- **Supersedes:** the 2026-07-18/earlier “elastic VF ceiling, no voltage lock” decision for active F2
+  discovery, qualification, manual diagnostics and profile Apply. Legacy F1 behavior is unchanged.
+
+## Field Concurrency uses one persistent secondary context; environment faults are inconclusive (2026-07-23)
+- **Evidence:** the 10-minute Lab run requested at trusted `1800@875` failed inside the full v23
+  stock mirror before candidate reapply. A preceding `1815@875` attempt also failed at stock.
+  Candidate voltage cannot explain either result.
+- **Root cause:** v23 compressed the live Sentinel topology by repeatedly creating and destroying
+  complete secondary wgpu devices. Test duration multiplied those driver-resource transitions, so a
+  long control increasingly measured context lifetime churn instead of the VF boundary.
+- **Decision:** retain two independent queues, but construct one secondary TextureRop context after
+  the primary load starts and keep it resident for the whole Field Concurrency phase. The secondary
+  runs one continuous, checksum-checked, cancelable canary.
+- **Attribution boundary:** secondary initialization failure, worker panic or insufficient checksum
+  coverage is environment-level `Inconclusive`. The phase is removed from qualification coverage;
+  it cannot be translated to `Unstable`, candidate condemnation or blacklist. A real checksum
+  divergence or device loss after both contexts are active remains physical rejection evidence.
+- **Evidence quarantine:** bump qualification contract 23→24 and fingerprint Texture/Endurance as
+  v13-r3 persistent concurrency. Detector Lab key becomes `control_v24`; `control_v23` remains a
+  backend compatibility alias only.
+- **Alternatives rejected:** keeping the churn and only lengthening stock control (failure probability
+  grows with duration); treating context-init failure as point instability (wrong attribution);
+  removing concurrency entirely (throws away the field-derived independent-queue discriminator).
+- **Acceptance:** after a Windows reboot, the complete stock mirror must pass repeatedly before any
+  candidate comparison. A stock failure aborts with environment error and no candidate learning.
+
+## A TDR dirties the boot; v23 must mirror its full stock transition (2026-07-22)
+- **Failure:** v23 reset the NVIDIA driver three times at the same
+  `Field Concurrency → TextureRop` boundary. The latter two were at the operator-proven
+  `1800@875` control after the first TDR, while dense v14 completed between them. The old 15 s stock
+  preflight exercised Field Concurrency alone and therefore never proved the exact transition that
+  failed. Treating those resets as voltage evidence would over-condemn valid hardware.
+- **Decision — reboot is the evidence boundary.** A new `nvlddmkm-153` latches the current Windows
+  boot as dirty. The latch is reconstructed from Event Log time versus boot uptime, survives service
+  restart and closes every GPU-mutating start/apply route until reboot. Reset/read-only routes remain
+  available. A Lab-owned TDR stays outside blacklist and condemnation.
+- **Decision — like-for-like stock control.** Production runs one complete 60 s v23 Texture Hop at
+  stock before candidates. Detector Lab runs the same selected v23 duration at stock, with the same
+  segment order, before applying the point. Every segment is journaled with `stock` or `candidate`
+  scope. Stock failure invalidates the recipe/environment; only a stock pass permits candidate
+  attribution.
+- **Decision — preserve the actual failure class.** Detector Lab records the panic payload and
+  correlates a new Event 153 to the session. It returns `tdr` / `reboot_required` plus phase and event
+  timestamp, never the generic `environment_error` seen after the device was already reset.
+- **Tradeoff:** the stock mirror adds one bounded minute to a production Forge and one selected dwell
+  to a v23 Lab comparison. This cost is accepted because the previous cheaper preflight could not
+  distinguish stable-point false rejection from dirty driver/context state. Candidate workload,
+  contract-v23 fingerprints and thresholds do not change.
+
+## Bake off v14 in an isolated Detector Lab before changing production qualification (2026-07-22)
+- **Problem:** repeated full Forge runs are too slow and mix detector research with frontier search,
+  while immediately replacing v23 would let an uncalibrated workload either publish false positives
+  or over-condemn hardware. A known point must be comparable across recipes without importing the
+  operator's expectation as blacklist evidence.
+- **Decision — laboratory before promotion.** Keep qualification contract v23 and every production
+  route unchanged. Advanced Diagnostics may explicitly run `control_v23` or `dense_v14` for 15–600 s
+  only after a manual point has been physically resolved, applied and verified. Dense v14 pairs each
+  short heterogeneous perturbation with a golden-checked TextureRop canary and gives the canary at
+  least 60% of the selected dwell.
+- **Decision — lab evidence is non-publishable.** It cannot append Forge observations, qualify a
+  profile, unlock Apply or write blacklist/condemnation. The separate append-only journal flushes a
+  segment-start record before GPU work. This gives useful post-TDR attribution without treating a
+  deliberate calibration failure as durable hardware learning.
+- **Decision — fail closed around hardware ownership.** The lab returns stock for golden capture,
+  reapplies the exact manual point with the Safe Loop intent armed and restores stock after rejection,
+  Stop, panic or environment error. A clean pass leaves the temporary point active only for another
+  diagnostic comparison; it is not stability proof. Hardware promotion requires supervised paired
+  results, not a code-only verdict.
+- **Alternatives rejected:** replacing v23 immediately (no comparative evidence); dynamically
+  stacking arbitrary workloads (unbounded search space and poor reproducibility); hardcoding known
+  failing points (violates per-hardware learning); importing lab failure into blacklist (contaminates
+  the experiment the lab exists to measure).
+
+## Separate physical and publishable frontiers; make cap evidence numeric (2026-07-22)
+- **Failure:** clean run `f2-forge-1784759763148` completed without a hardware incident yet produced
+  no profiles. The engine did qualify useful points, then let lower-voltage Discovery passes without
+  matching qualification replace them in the shared frontier. Exact Apply consequently chose the
+  unqualified deeper pairs and reconciliation refused them. In parallel, 24 inconclusives across
+  eight pairs clustered in the nominal 98–99% power zone; very short BoostEdge residence allowed a
+  handful of sticky sampled `SW_POWER_CAP` flags to override much lower numeric power.
+- **Decision — preserve both meanings instead of discarding either.** The physical frontier remains
+  the deepest current-contract Discovery pass and continues to describe the learned silicon boundary.
+  A separate publishable frontier selects the deepest pair per target that passed every required
+  current-contract qualification pattern at that exact pair. Only the publishable view feeds exact
+  Apply and profile synthesis. This prevents an inconclusive deeper point from erasing a shallower
+  proven point without pretending that the deeper discovery never happened.
+- **Decision — numeric board power is authoritative when it exists.** Texture/Endurance BoostEdge is
+  power-bound at p95 >=99% of a valid numeric limit. The raw cap fraction is retained for diagnostics
+  and is a fallback only when no numeric limit exists. At least 20 BoostEdge samples are required;
+  missing coverage may retry, while a numerically power-bound shape remains deterministic.
+- **Decision — use true stateful hysteresis for discovery.** >=99% is NearCap and <=98% is OffCap.
+  A valid sample inside that band inherits the preceding state; the first sample defaults NearCap so
+  discovery remains conservative. This removes the former third terminal ambiguity without relaxing
+  the boundary.
+- **Contract/workload:** qualification contract v23 and Texture Hop v13-r2. BoostEdge receives 4% of
+  the unchanged plan (about 1.2 s in a 30 s dwell); Field Concurrency and all stability oracles remain
+  unchanged. New fingerprints quarantine older positives. No per-GPU constant, ambiguity blacklist,
+  IPC shape change or weaker stability threshold was introduced.
+- **Validation:** workspace check, 576 workspace tests passed (1 hardware smoke ignored), UI
+  production build and targeted frontier/coverage/hysteresis/workload regressions. Hardware proof is
+  deliberately deferred to the next Clean/Standard run.
+
+## Inconclusive qualification is unproven, not neutral — stop re-hammering it (2026-07-20)
+- **Failure:** clean run `f2-forge-1784423357172` (contract v22 / Texture Hop v13) TDR'd at `1890@925`
+  during the 6th texture dwell on that pair, after `1905@925` had already been skipped with 3
+  Inconclusive. Root cause from the persisted `f2_observations.jsonl`: the 6 `QualificationInconclusive`
+  rows were `boost_edge_power_bound` (4×) and `phase_contrast_low` (2×) — deterministic power-cap
+  interference (p99 192–195 W vs 200 W cap), NOT silicon evidence. The engine then treated the
+  inconclusive bin as (a) good frontier memory and (b) safe to repeat: it seeded the next clock from
+  it and the warm-start fallback re-descended to the exact same unproven pair and re-ran the heaviest
+  qualifier until the driver watchdog fired.
+- **Decision — inconclusive never becomes memory or a repeat target, but is never blacklisted either.**
+  Blacklisting ambiguity would over-condemn (near the cap every top clock is inconclusive by
+  construction, and the project forbids durable condemnation from ambiguity). The real TDR is the hard
+  evidence and it was blacklisted correctly. Three surgical engine changes (`gpu_undervolt.rs`,
+  `gpu_power_sweep.rs`), no workload/contract/threshold change, no per-GPU constant:
+  1. **Reason-aware retry** — cap-interference reasons (`boost_edge_power_bound`, `phase_contrast_low`)
+     are deterministic; they no longer burn the inconclusive retry budget (which only re-stressed the
+     bin with a longer dwell). The reason is now printed in the descent log/progress lines.
+  2. **Inconclusive anchors excluded from the frontier seed** — an anchor left qualification-Inconclusive
+     this run (never a clean Pass) is dropped before picking `last_good_mv`, so it cannot seed the next
+     clock's warm start. First-bad / validated / power-bound derivations still see the full evidence.
+  3. **No re-qualification of an exhausted pair** — the warm-start fallback is suppressed on an
+     inconclusive stop (`stop_reason` contains `Inconclusive`), the direct cause of the re-hammer; plus
+     a belt-and-suspenders guard that skips qualification (no new stress) for a pair already left
+     inconclusive earlier in the run — covers resume / any re-entry.
+- **Systemic watch:** with a 200 W cap, top clocks (1905/1890/maybe 1875) may never qualify under v22
+  because the boost segments always clip the limiter. If the next run shows every off-cap bin at those
+  clocks as `boost_edge_power_bound`, that is a workload/threshold conversation (a measurement gap),
+  not silicon — do not fix it by weakening the gate.
+- **Validation:** `cargo check --workspace`, service tests 411/0 (3 new regression tests for the pure
+  helpers), clippy unchanged from baseline. No hardware/Forge/Apply run. Acceptance is the next Clean
+  Standard run (after acknowledge + manual Reset): cap-bound bins log their reason and run one texture
+  dwell (no 45 s escalation); a skipped clock seeds the next from the last clean point; no second
+  planning round or texture re-run on the same pair after an inconclusive skip.
+
+## Reproduce field context concurrency in Texture Hop v13; keep calibration failures out of blacklist (2026-07-18)
+- **Trace evidence:** Brokkr's Best `1800@831` held 1800 MHz at 97–100% utilization and roughly
+  145–152 W before power collapsed to 131→89→56 W, two nvlddmkm-153 events and a reboot with
+  `0x133 DPC_WATCHDOG_VIOLATION`. Contract v21 had already exercised nearly the same power envelope
+  (Texture Stack p95 150.5 W; Endurance p95 151.9 W), so simply increasing synthetic watts is not
+  justified. The material missing variable was the game's primary context overlapping the live
+  Sentinel's independently created TextureRop device/queue and repeated context churn.
+- **Workload decision:** qualification contract v22 / Texture Hop v13 keeps the existing measured
+  Texture Stack resident on a primary device while a secondary thread repeatedly creates a fresh
+  `GpuCtx`, runs the same 700 ms TextureRop self-check as the live Sentinel and destroys it. Compressed
+  irregular gaps create several independent scheduling overlaps inside a short frontier dwell. A
+  wrong stock golden on the primary, self-reference divergence on the secondary, DeviceLost or TDR
+  rejects the point. No pre-hang wall timer shields either context.
+- **Environment gate:** the same dual-device path runs for 15 s at stock after golden capture and
+  before any candidate write. If the backend/driver cannot sustain it at stock, Forge aborts as an
+  environment incompatibility and writes no candidate blacklist. Fingerprints are
+  `f2q-texhop-v13-r1/v13-field-concurrency` and
+  `f2q-texhop-v13-r1/endurance-field-concurrency`; pre-v22 positives cannot unlock Apply.
+- **Evidence policy:** this specific Game Trace was an operator-selected known-failing calibration
+  point. It is not imported into Safe Loop or the condemnation ledger and no voltage/margin constant
+  is derived from it. Acceptance requires a future Clean Standard run to reject the neighborhood
+  organically through `field-concurrency`.
+- **Future real-use recovery:** new applied profiles carry `applied_at`; only a later session-correlated
+  OC-class WER bugcheck may be attributed at boot. The live TDR watcher polls every second and commits
+  its event cursor only after durable failure accounting/recovery returns. Game Trace v3 samples the
+  live canary active flag and sequence. Legacy applied payloads have no timestamp and deliberately
+  cannot retroactively import this calibration incident.
+
+## Allow real TDR evidence, use a heterogeneous Texture Stack and remove Standard's wall cutoff (2026-07-18)
+- **Problem:** standalone TextureStream split work into bands and stopped on a pre-hang wall-time
+  threshold, which could terminate before the silent error/TDR behavior seen in normal gameplay.
+  Separately, the 59-minute Standard watchdog interrupted a valid hardware-derived plan without
+  changing the dwell durations that actually made Standard shorter than Long.
+- **Workload decision:** contract v21 / Texture Hop v12 runs cache-bound TextureRop, VRAM-bound
+  TextureStream, power render and near-full-VRAM scattered gather in one submit. The final render
+  lane rotates so every deterministic output has its own stock-golden comparison. Non-final lanes use
+  one instance; this adds simultaneous variety without manufacturing a stock TDR from one oversized
+  command. The active pattern no longer schedules the preventive banded TextureStream phase.
+- **TDR boundary:** do not change or disable Windows TDR. Do not remove Safe Loop arm/recovery. A
+  natural SilentError, DeviceLost or TDR under Texture Stack is a valid rejection. Keep a per-frame
+  queue fence because real games also bound frames at present; unbounded queue flooding is not useful
+  silicon evidence.
+- **Time decision:** remove Standard's global 59/60-minute deadline and its budget terminal state.
+  Keep all Standard dwell/probe settings unchanged and let the planned search finish. Long remains
+  distinct by exhaustive evidence depth, not by exclusive permission to run longer than one hour.
+- **Evidence boundary:** fingerprints become `f2q-texhop-v12-r1/v12-texture-stack` and
+  `f2q-texhop-v12-r1/endurance-texture-stack`; contract 21 quarantines every older positive.
+
 ## Combine TextureRop with one CompositeGameLoad slam in Texture Hop v11 (2026-07-18)
 - **Evidence:** collected v17/v18 organic silent-error rejections all failed in `texture-rop`; v19's
   remaining failures were inconclusive. Separately, the existing CompositeGameLoad is the suite's

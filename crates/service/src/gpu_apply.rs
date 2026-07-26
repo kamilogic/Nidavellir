@@ -30,6 +30,11 @@ pub struct AppliedProfile {
     pub label: String,
     pub core: Option<VfPoint>,
     pub mem_offset_mhz: Option<i32>,
+    /// UTC timestamp of the most recent successful hardware apply. Startup recovery uses this to
+    /// attribute a WER bugcheck only when it happened during this persisted profile's own session.
+    /// Legacy payloads intentionally remain unattributable instead of importing old crashes.
+    #[serde(default)]
+    pub applied_at: Option<String>,
     /// F2 anchored-undervolt descriptor. `Some` ⇒ this profile is an F2 undervolt (apply routes to the
     /// anchored writer; `core` remains status metadata). `#[serde(default)]` ⇒ legacy F1 payloads load
     /// as `None`.
@@ -198,7 +203,13 @@ pub fn apply_and_persist(
         nidavellir_gpu_nvapi::set_mem_offset_mhz(m)?;
     }
 
-    save_applied(&AppliedProfile { label, core, mem_offset_mhz, undervolt: None });
+    save_applied(&AppliedProfile {
+        label,
+        core,
+        mem_offset_mhz,
+        applied_at: Some(nidavellir_core::f2_observation::now_rfc3339()),
+        undervolt: None,
+    });
 
     // Clear the boot-flag after a short survival window on a background thread.
     let store = store.clone();
@@ -209,12 +220,14 @@ pub fn apply_and_persist(
     Ok(())
 }
 
-/// Apply an F2 anchored-undervolt profile (`target_mhz` held at the `anchor_mv` VF bin) and persist it.
-/// Mirrors [`apply_and_persist`] but writes the anchored undervolt instead of the F1 ceiling: arms the
-/// Safe Loop boot-flag around the write (a crash leaves it armed → not re-applied next boot), writes via
-/// the fail-closed [`crate::gpu_undervolt::apply_anchored_undervolt`] (which resets to stock on any
-/// non-verified outcome), persists `gpu_applied.json` with the [`UndervoltApply`] descriptor, then clears
-/// the boot-flag after a short survival window. Preserves any existing memory offset.
+/// Apply an F2 anchored-undervolt profile and persist it. The clock is a max-only ceiling (so it may
+/// step down) while `anchor_mv` is a verified graphics-domain voltage lock. Mirrors
+/// [`apply_and_persist`] but writes the anchored curve plus those two authoritative controls: arms
+/// the Safe Loop boot-flag around the write (a crash leaves it armed → not re-applied next boot),
+/// writes via the fail-closed [`crate::gpu_undervolt::apply_anchored_undervolt`] (which resets to
+/// stock on any non-verified outcome), persists `gpu_applied.json` with the [`UndervoltApply`]
+/// descriptor, then clears the boot-flag after a short survival window. Preserves any existing
+/// memory offset.
 #[cfg(windows)]
 pub fn apply_and_persist_undervolt(
     label: String,
@@ -254,6 +267,7 @@ pub fn apply_and_persist_undervolt(
         // `undervolt` descriptor remains the authoritative apply-on-boot route.
         core: Some(VfPoint { freq_mhz: target_mhz, voltage_mv: anchor_mv }),
         mem_offset_mhz,
+        applied_at: Some(nidavellir_core::f2_observation::now_rfc3339()),
         undervolt: Some(UndervoltApply { target_mhz, anchor_mv }),
     });
 
@@ -327,11 +341,17 @@ pub fn reset(_store: &SafeLoopStore) -> Result<(), String> {
 /// requires explicit operator acknowledgement.
 #[cfg(windows)]
 pub fn reapply_on_boot(store: &SafeLoopStore) {
-    // v13 (audit N1): the NVML clock ceiling is driver-resident and would survive a service
-    // restart WITHOUT a reboot. Release it unconditionally BEFORE the early-return guards so
-    // every service start begins from a known clock-lock state (idempotent; the success branch
-    // re-sets it via the apply below).
+    // Driver-resident clock and voltage locks survive a service restart without a reboot. Release
+    // both before the early-return guards so every service start begins from known stock controls;
+    // the success branch re-establishes the persisted profile below.
     let _ = nidavellir_core::nvml_gpu::reset_core_clock_lock();
+    let _ = nidavellir_gpu_nvapi::unlock_core_voltage();
+    if let Some(event) = crate::tdr_sentinel::reboot_required_event() {
+        warn!(
+            "GPU apply-on-boot: driver reset {event} belongs to this Windows boot — reboot required, not re-applying"
+        );
+        return;
+    }
     if store.is_boot_flag_armed() {
         warn!("GPU apply-on-boot: boot-flag armed (prior crash) — not re-applying");
         if let Err(e) = store.clear_boot_flag() {
@@ -383,12 +403,14 @@ mod tests {
             label: "Godforge".into(),
             core: Some(VfPoint { freq_mhz: 1800, voltage_mv: 875 }),
             mem_offset_mhz: None,
+            applied_at: Some("2026-07-18T21:50:00+00:00".into()),
             undervolt: Some(UndervoltApply { target_mhz: 1800, anchor_mv: 875 }),
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: AppliedProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.undervolt, Some(UndervoltApply { target_mhz: 1800, anchor_mv: 875 }));
         assert_eq!(back.core, Some(VfPoint { freq_mhz: 1800, voltage_mv: 875 }));
+        assert_eq!(back.applied_at.as_deref(), Some("2026-07-18T21:50:00+00:00"));
     }
 
     #[test]
@@ -398,6 +420,7 @@ mod tests {
         let legacy = r#"{"label":"Brokkr's Best","core":{"freq_mhz":1800,"voltage_mv":906},"mem_offset_mhz":null}"#;
         let p: AppliedProfile = serde_json::from_str(legacy).unwrap();
         assert!(p.undervolt.is_none(), "missing key must default to legacy F1 behavior");
+        assert!(p.applied_at.is_none(), "legacy payload must not inherit crash attribution");
         assert!(p.core.is_some());
     }
 

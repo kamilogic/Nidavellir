@@ -73,6 +73,13 @@ const BOOST_EDGE_BUBBLE_US: &[u64] = &[0, 200, 500, 900, 300, 800];
 // fail Unstable long BEFORE the ~2 s driver watchdog can fire (never reproduce the cascade itself).
 const BOOST_ENTRY_GAPS_MS: [u64; 3] = [10_000, 20_000, 30_000];
 const BOOST_ENTRY_STALL_MS: u64 = 500;
+// Field trace 1784411518295 failed while the game held 97-100% utilization at only 145-152 W —
+// the same power envelope as Texture Stack — and the live Sentinel had an independent TextureRop
+// queue active. Keep that missing DRIVER-SCHEDULING dimension, but create only one secondary device
+// per phase and keep it alive for the whole overlap. Repeated device create/destroy churn made the
+// old control fail at stock and measured driver-resource lifetime rather than the candidate VF point.
+// There is deliberately no wall-time pre-hang abort in either context.
+const FIELD_CANARY_INITIAL_DELAY_MS: u64 = 250;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -110,6 +117,9 @@ pub struct RenderResult {
     pub fps: f64,
     /// Present only when the transient VF qualifier failed inside a named phase.
     pub failure_phase: Option<VfQualifierPhase>,
+    /// Present when the recipe could not produce candidate-attributable evidence. Callers must
+    /// classify this as environment-level Inconclusive, never as VF instability.
+    pub inconclusive_reason: Option<String>,
     pub phase_reports: Vec<VfPhaseReport>,
 }
 
@@ -170,7 +180,8 @@ pub struct Dx11QualificationResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderIntegrityGoldens {
     Single(u32),
-    /// BoostEdge, TextureRop, PowerRender, matching `MIXED_GAME_WORKLOADS`.
+    /// Three rotating render lanes. MixedGame uses BoostEdge/TextureRop/PowerRender; Texture Stack
+    /// uses TextureRop/TextureStream/PowerRender.
     Mixed([u32; 3]),
 }
 
@@ -212,7 +223,8 @@ pub enum VfQualifierPhase {
     /// v15 boost-entry shock: true-idle (seconds, GPU leaves the high P-state) → instant heavy
     /// slam, cycling. Targets the launch-transition failure the continuous phases never enter.
     BoostEntry,
-    /// v16.1 composite game load: heavy render + near-full VRAM-resident gather in the same submit.
+    /// v13 Field Concurrency (legacy enum name retained for source compatibility): the v12
+    /// Texture Stack remains resident while a persistent secondary TextureRop device overlaps it.
     CompositeGameLoad,
 }
 
@@ -237,7 +249,7 @@ impl VfQualifierPhase {
             VfQualifierPhase::GeometryDepth => "geometry-depth",
             VfQualifierPhase::TextureStream => "texture-stream",
             VfQualifierPhase::BoostEntry => "boost-entry",
-            VfQualifierPhase::CompositeGameLoad => "composite-game-load",
+            VfQualifierPhase::CompositeGameLoad => "field-concurrency",
         }
     }
 
@@ -279,13 +291,16 @@ pub enum VfQualifierPattern {
     V8Texture,
     V8Transitions,
     V8Memory,
-    /// Candidate-only endurance soak: one CONTINUOUS mixed dwell whose v20 plan front-loads its
+    /// Candidate-only endurance soak: one CONTINUOUS mixed dwell whose v24 plan front-loads its
     /// aggressive rejection tier. Long completes the full ~20-minute thermal proof.
-    /// Run only at the exact Apply pair, after the required Texture Hop v11 pattern.
+    /// Run only at the exact Apply pair, after the required Texture Hop v13 pattern.
     Endurance,
-    /// Legacy v15 candidate-only transition shock. Contract v20 no longer schedules it in the
+    /// Legacy v15 candidate-only transition shock. Contract v24 no longer schedules it in the
     /// mandatory exact-Apply gate, but the pattern remains for persisted evidence compatibility.
     TransitionShock,
+    /// Experimental Advanced Diagnostics recipe. It is never scheduled by Forge qualification;
+    /// the service exposes it only through Detector Lab against an operator-selected point.
+    DetectorLabDense,
 }
 
 impl VfQualifierPattern {
@@ -298,12 +313,13 @@ impl VfQualifierPattern {
             Self::Fsgl3B => "fsgl3-b",
             Self::V8HighFps => "v8-high-fps",
             // The internal variant name remains for source compatibility; qualification contract
-            // v20 gives it the v11 Texture Hop workload/provenance below.
-            Self::V8Texture => "v11-texture-hop",
+            // v24 gives it the v13-r3 Texture Hop workload/provenance below.
+            Self::V8Texture => "v13-texture-hop",
             Self::V8Transitions => "v8-transitions",
             Self::V8Memory => "v8-memory",
             Self::Endurance => "endurance",
             Self::TransitionShock => "transition-shock",
+            Self::DetectorLabDense => "detector-lab-v14-dense",
         }
     }
 }
@@ -323,9 +339,9 @@ pub enum VfWorkload {
     TextureStream,
     /// v15: true-idle (10-30 s, GPU leaves the high P-state) → instant heavy golden-checked slam.
     BoostEntry,
-    /// v16.1: heavy 8-instance render (texture hops, golden-checked) with a near-full VRAM-resident
-    /// pool gathered IN THE SAME per-frame submit — composite real game load (compute + texture +
-    /// memory controller on the shared rail simultaneously), the highest combined draw the soak has.
+    /// v13 Field Concurrency: the v12 cache/VRAM/power stack stays resident on the primary device
+    /// while a persistent secondary device runs the live TextureRop canary. The final primary render lane
+    /// still rotates so all three deterministic images remain golden-checked.
     CompositeGameLoad,
 }
 
@@ -336,7 +352,10 @@ const MIXED_GAME_WORKLOADS: [VfWorkload; 3] = [
 ];
 
 fn sparse_checksum_workload(workload: VfWorkload) -> bool {
-    matches!(workload, VfWorkload::BoostEdge | VfWorkload::MixedGame)
+    matches!(
+        workload,
+        VfWorkload::BoostEdge | VfWorkload::MixedGame | VfWorkload::CompositeGameLoad
+    )
 }
 
 fn sparse_checksum_due(frame: u64) -> bool {
@@ -364,32 +383,34 @@ pub fn vf_qualifier_workload_fingerprint(pattern: VfQualifierPattern) -> &'stati
         VfQualifierPattern::Fsgl3A => "f2q-texhop-v10-r1/fsgl3-a",
         VfQualifierPattern::Fsgl3B => "f2q-texhop-v10-r1/fsgl3-b",
         VfQualifierPattern::V8HighFps => "f2q-texhop-v10-r1/v8-high-fps",
-        VfQualifierPattern::V8Texture => "f2q-texhop-v11-r1/v11-texture",
+        VfQualifierPattern::V8Texture => "f2q-texhop-v13-r3/v13-persistent-field-concurrency",
         VfQualifierPattern::V8Transitions => {
             "f2q-texhop-v10-r1/v8-transitions"
         }
         VfQualifierPattern::V8Memory => "f2q-texhop-v10-r1/v8-memory",
-        VfQualifierPattern::Endurance => "f2q-texhop-v10-r1/endurance",
+        VfQualifierPattern::Endurance => {
+            "f2q-texhop-v13-r3/endurance-persistent-field-concurrency"
+        }
         VfQualifierPattern::TransitionShock => {
             "f2q-texhop-v10-r1/transition-shock"
+        }
+        VfQualifierPattern::DetectorLabDense => {
+            "detector-lab-v14-r1/dense-pulse-canary"
         }
     }
 }
 
 /// Stable description of the framebuffer integrity mechanism persisted with F2 evidence.
 pub fn vf_qualifier_checksum_method() -> &'static str {
-    "reduce3-gpu-compare-r1;dense-default;sparse16=boost-edge,mixed-game;mixed-game=rotating-final"
+    "reduce3-gpu-compare-r1;dense-default;sparse16=boost-edge,mixed-game,field-concurrency;primary=rotating-final;secondary=persistent-device-texture-selfcheck"
 }
 
 fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u32> {
     match workload {
-        // BoostEntry / CompositeGameLoad slam the same 8-instance heavy frame → same golden image
-        // (the VRAM gather writes to a separate sink, never the rendered texture).
         VfWorkload::PowerRender
         | VfWorkload::HeavySpike
         | VfWorkload::IdlePulse
-        | VfWorkload::BoostEntry
-        | VfWorkload::CompositeGameLoad => {
+        | VfWorkload::BoostEntry => {
             Some(goldens.power)
         }
         VfWorkload::BoostEdge => Some(goldens.boost),
@@ -398,7 +419,10 @@ fn golden_for_workload(goldens: RenderGoldens, workload: VfWorkload) -> Option<u
         VfWorkload::GeometryDepth => Some(goldens.geometry),
         VfWorkload::TextureStream => Some(goldens.stream),
         // VramPressure is compute-path: its gather sum is a known answer, self-verified.
-        VfWorkload::ComputeBurst | VfWorkload::MixedGame | VfWorkload::VramPressure => None,
+        VfWorkload::ComputeBurst
+        | VfWorkload::MixedGame
+        | VfWorkload::VramPressure
+        | VfWorkload::CompositeGameLoad => None,
     }
 }
 
@@ -406,14 +430,18 @@ fn integrity_goldens_for_workload(
     goldens: RenderGoldens,
     workload: VfWorkload,
 ) -> Option<RenderIntegrityGoldens> {
-    if workload == VfWorkload::MixedGame {
-        Some(RenderIntegrityGoldens::Mixed([
+    match workload {
+        VfWorkload::MixedGame => Some(RenderIntegrityGoldens::Mixed([
             goldens.boost,
             goldens.texrop,
             goldens.power,
-        ]))
-    } else {
-        golden_for_workload(goldens, workload).map(RenderIntegrityGoldens::Single)
+        ])),
+        VfWorkload::CompositeGameLoad => Some(RenderIntegrityGoldens::Mixed([
+            goldens.texrop,
+            goldens.stream,
+            goldens.power,
+        ])),
+        other => golden_for_workload(goldens, other).map(RenderIntegrityGoldens::Single),
     }
 }
 
@@ -450,6 +478,58 @@ fn render_integrity_result(crashed: bool, diverged: bool) -> StabilityResult {
         StabilityResult::SilentError
     } else {
         StabilityResult::Stable
+    }
+}
+
+fn stronger_stability_failure(a: StabilityResult, b: StabilityResult) -> StabilityResult {
+    fn rank(result: StabilityResult) -> u8 {
+        match result {
+            StabilityResult::Stable => 0,
+            StabilityResult::Unstable => 1,
+            StabilityResult::SilentError => 2,
+            StabilityResult::Crash => 3,
+        }
+    }
+    if rank(b) > rank(a) { b } else { a }
+}
+
+#[derive(Debug, Clone)]
+struct FieldCanaryReport {
+    result: StabilityResult,
+    cycles: u32,
+    frames: u64,
+    checksum_count: u32,
+    inconclusive_reason: Option<String>,
+}
+
+fn merge_field_canary(
+    primary: &mut RenderResult,
+    secondary: FieldCanaryReport,
+    phase: VfQualifierPhase,
+) {
+    if primary.result == StabilityResult::Stable {
+        let missing_secondary = secondary.cycles == 0 || secondary.checksum_count < 2;
+        if secondary.inconclusive_reason.is_some() || missing_secondary {
+            primary.inconclusive_reason = secondary
+                .inconclusive_reason
+                .or_else(|| Some("field_secondary_coverage_missing".into()));
+            // Do not let the primary queue alone satisfy the Field Concurrency phase.
+            primary.phase_reports.clear();
+            primary.failure_phase = None;
+            return;
+        }
+    }
+
+    primary.result = stronger_stability_failure(primary.result, secondary.result);
+    primary.frames = primary.frames.saturating_add(secondary.frames);
+    if let Some(report) = primary.phase_reports.first_mut() {
+        report.result = primary.result;
+        report.checksum_count = report
+            .checksum_count
+            .saturating_add(secondary.checksum_count);
+    }
+    if primary.result != StabilityResult::Stable {
+        primary.failure_phase = Some(phase);
     }
 }
 
@@ -584,26 +664,28 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 8),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 6),
     ];
-    // v11 Texture Hop (qualification contract v20): preserve the TextureRop oracle that produced
-    // organic silent-error rejections, then drive one idle-to-CompositeGameLoad slam before checking
-    // TextureRop again. CompositeGameLoad is the highest combined real-game-like draw in the suite
-    // (render + texture + near-full VRAM gather in one submit). One composite segment avoids paying
-    // its large VRAM-pool setup twice. Roughly 71% of a short dwell remains in the binding detector
-    // pair, and all broader coverage still runs before acceptance.
-    const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 14] = [
+    // v13-r3 Texture Hop (qualification contract v24): trace 1784411518295 proved that v12 already
+    // matched the game's 145-152 W envelope but missed its multi-context scheduling. Keep that
+    // primary stack resident for half the dwell while one secondary device runs a continuous live
+    // TextureRop canary. Wrong output, DeviceLost and a real TDR remain valid rejection evidence;
+    // neither context has a wall-time pre-hang abort. The remaining half preserves the established
+    // TextureRop oracle plus minimal broader coverage.
+    const V8_TEXTURE: [(VfQualifierPhase, VfWorkload, u64); 13] = [
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 1),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 18),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 15),
         (VfQualifierPhase::IdlePulse, VfWorkload::IdlePulse, 2),
-        (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 28),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 16),
-        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 4),
-        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 10),
-        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 6),
-        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 4),
-        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 2),
-        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 3),
-        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 3),
-        (VfQualifierPhase::TextureStream, VfWorkload::TextureStream, 3),
+        (VfQualifierPhase::CompositeGameLoad, VfWorkload::CompositeGameLoad, 50),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 9),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 3),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 7),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 3),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 2),
+        (VfQualifierPhase::ComputeBurst, VfWorkload::ComputeBurst, 1),
+        // Four percent guarantees about 1.2 s / 40 numeric power samples in the compact 30 s
+        // descent dwell. The previous 300 ms phase let two sticky SW_POWER_CAP samples dominate
+        // coverage even when numeric power was tens of watts below the board limit.
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 4),
+        (VfQualifierPhase::VramPressure, VfWorkload::VramPressure, 2),
         (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 1),
     ];
     const V8_TRANSITIONS: [(VfQualifierPhase, VfWorkload, u64); 20] = [
@@ -670,7 +752,7 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
     // gave (which never rejected a candidate as an isolated pass) but under continuous worst load —
     // stronger, so the required Transitions/Memory patterns can be dropped (contract v14).
     const ENDURANCE: [(VfQualifierPhase, VfWorkload, u64); 23] = [
-        // v20 rejection tier: start with the two loads that bound real failures, with a golden
+        // v24 rejection tier: start with the two loads that bound real failures, with a golden
         // TextureRop check between electrical shocks. A bad finalist is rejected before the long
         // thermal-soak half; a passing finalist still completes the full continuous 20-minute dwell.
         (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 2),
@@ -711,6 +793,22 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 4),
         (VfQualifierPhase::BoostEntry, VfWorkload::BoostEntry, 12),
     ];
+    // v14 Detector Lab candidate: brief heterogeneous perturbations always land in a dense,
+    // golden-checked TextureRop canary. This is intentionally a static bake-off recipe rather
+    // than qualification evidence; it cannot be selected by the Forge pipeline.
+    const DETECTOR_LAB_DENSE: [(VfQualifierPhase, VfWorkload, u64); 11] = [
+        (VfQualifierPhase::PowerOpening, VfWorkload::PowerRender, 2),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 20),
+        (VfQualifierPhase::HeavySpike, VfWorkload::HeavySpike, 5),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
+        (VfQualifierPhase::FrameCadence, VfWorkload::FrameCadence, 5),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
+        (VfQualifierPhase::MixedGame, VfWorkload::MixedGame, 5),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 12),
+        (VfQualifierPhase::BoostEdge, VfWorkload::BoostEdge, 4),
+        (VfQualifierPhase::TextureRop, VfWorkload::TextureRop, 9),
+        (VfQualifierPhase::PowerClosing, VfWorkload::PowerRender, 2),
+    ];
 
     let template: &[(VfQualifierPhase, VfWorkload, u64)] = match pattern {
         VfQualifierPattern::Fsgl1 => &FSGL1,
@@ -724,6 +822,7 @@ fn vf_qualifier_plan(target_ms: u64, pattern: VfQualifierPattern) -> Vec<VfQuali
         VfQualifierPattern::V8Memory => &V8_MEMORY,
         VfQualifierPattern::Endurance => &ENDURANCE,
         VfQualifierPattern::TransitionShock => &TRANSITION_SHOCK,
+        VfQualifierPattern::DetectorLabDense => &DETECTOR_LAB_DENSE,
     };
     let total_weight = template.iter().map(|(_, _, weight)| *weight).sum::<u64>();
     let mut assigned = 0u64;
@@ -1105,6 +1204,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     let v = fract(dot(t, vec4<f32>(0.173, 0.311, 0.419, 0.097)));
     return vec4<f32>(v, fract(v * 7.0), fract(v * 11.0), 0.55);
 }
+
 "#;
 
 // TextureStream: the HANG-PRONE heavy memory detector, split out of TextureRop (which stays the
@@ -2332,6 +2432,114 @@ impl GpuCtx {
         )
     }
 
+    fn run_field_canary_worker(target_ms: u64, stop: Arc<AtomicBool>) -> FieldCanaryReport {
+        let started = std::time::Instant::now();
+        let mut report = FieldCanaryReport {
+            result: StabilityResult::Stable,
+            cycles: 0,
+            frames: 0,
+            checksum_count: 0,
+            inconclusive_reason: None,
+        };
+
+        let initial_delay = FIELD_CANARY_INITIAL_DELAY_MS.min(target_ms);
+        while started.elapsed().as_millis() < u128::from(initial_delay)
+            && !stop.load(Ordering::SeqCst)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let remaining = target_ms.saturating_sub(started.elapsed().as_millis() as u64);
+        if remaining < 600 || stop.load(Ordering::SeqCst) {
+            return report;
+        }
+
+        // One independent queue remains resident for the phase. This keeps real multi-queue
+        // scheduling pressure without repeatedly allocating and tearing down whole wgpu devices.
+        let ctx = match Self::new() {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                report.inconclusive_reason =
+                    Some(format!("field_secondary_init_failed: {error}"));
+                return report;
+            }
+        };
+        let canary = ctx.run_render_profile(
+            remaining,
+            VfWorkload::TextureRop,
+            Some(VfQualifierPhase::CompositeGameLoad),
+            false,
+            true,
+            None,
+            None,
+            Some(stop.as_ref()),
+        );
+        report.cycles = 1;
+        report.frames = canary.frames;
+        report.checksum_count = canary
+            .phase_reports
+            .iter()
+            .map(|phase| phase.checksum_count)
+            .sum();
+        report.result = canary.result;
+        report
+    }
+
+    /// Field-derived v13 Texture Stack: a game-envelope render stays resident on this device while
+    /// one persistent secondary device runs the exact TextureRop self-check used by the live
+    /// Sentinel. The independent queues retain the concurrency seen in trace `1784411518295`
+    /// without turning device-lifetime churn into a false candidate verdict.
+    fn run_field_concurrency_profile(
+        &self,
+        target_ms: u64,
+        phase: VfQualifierPhase,
+        goldens: Option<RenderIntegrityGoldens>,
+        cancel: Option<&AtomicBool>,
+    ) -> RenderResult {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            Self::run_field_canary_worker(target_ms, worker_stop)
+        });
+        let mut primary = self.run_render_profile(
+            target_ms,
+            VfWorkload::CompositeGameLoad,
+            Some(phase),
+            false,
+            true,
+            goldens,
+            None,
+            cancel,
+        );
+        stop.store(true, Ordering::SeqCst);
+        let secondary = worker.join().unwrap_or(FieldCanaryReport {
+            result: StabilityResult::Stable,
+            cycles: 0,
+            frames: 0,
+            checksum_count: 0,
+            inconclusive_reason: Some("field_secondary_worker_panicked".into()),
+        });
+
+        merge_field_canary(&mut primary, secondary, phase);
+        primary
+    }
+
+    /// Stock preflight for the field-concurrency path. A platform that cannot create two healthy
+    /// devices under load is inconclusive at the environment level and must fail before candidates
+    /// are written, never manufacture a blacklist from a capability problem.
+    pub fn run_field_concurrency_stock_check(
+        &self,
+        target_ms: u64,
+        goldens: RenderGoldens,
+    ) -> RenderResult {
+        self.run_field_concurrency_profile(
+            target_ms,
+            VfQualifierPhase::CompositeGameLoad,
+            integrity_goldens_for_workload(goldens, VfWorkload::CompositeGameLoad),
+            None,
+        )
+    }
+
     pub fn run_render_stress(&self, target_ms: u64) -> RenderResult {
         self.run_render_profile(
             target_ms,
@@ -2420,11 +2628,7 @@ impl GpuCtx {
         };
 
         let (shader_source, instances, blend) = match profile {
-            // BoostEntry / CompositeGameLoad slam the same 8-instance frame — share PowerRender's
-            // golden (the composite's VRAM gather writes only to its sink, never the render image).
-            VfWorkload::PowerRender
-            | VfWorkload::BoostEntry
-            | VfWorkload::CompositeGameLoad => {
+            VfWorkload::PowerRender | VfWorkload::BoostEntry => {
                 (RENDER_SHADER, 8, wgpu::BlendState::REPLACE)
             }
             VfWorkload::BoostEdge => (BOOST_EDGE_SHADER, 1, wgpu::BlendState::REPLACE),
@@ -2439,7 +2643,8 @@ impl GpuCtx {
             | VfWorkload::IdlePulse
             | VfWorkload::ComputeBurst
             | VfWorkload::MixedGame
-            | VfWorkload::VramPressure => {
+            | VfWorkload::VramPressure
+            | VfWorkload::CompositeGameLoad => {
                 return Err(format!("unsupported golden render profile: {profile:?}"));
             }
         };
@@ -2654,16 +2859,40 @@ impl GpuCtx {
         goldens: Option<RenderGoldens>,
         cancel: Option<&AtomicBool>,
     ) -> RenderResult {
+        let mut no_segment_hook = |_: usize, _: VfQualifierPhase, _: u64| {};
+        self.run_vf_qualifier_stress_with_segment_hook(
+            target_ms,
+            phase_state,
+            pattern,
+            goldens,
+            cancel,
+            &mut no_segment_hook,
+        )
+    }
+
+    /// Detector-lab entry point with a synchronous pre-segment hook. The caller can durably record
+    /// the next segment before its GPU work starts, so a machine reset still leaves useful
+    /// attribution. Forge uses the hook-free wrapper above and is behaviorally unchanged.
+    pub fn run_vf_qualifier_stress_with_segment_hook(
+        &self,
+        target_ms: u64,
+        phase_state: &AtomicU8,
+        pattern: VfQualifierPattern,
+        goldens: Option<RenderGoldens>,
+        cancel: Option<&AtomicBool>,
+        segment_hook: &mut dyn FnMut(usize, VfQualifierPhase, u64),
+    ) -> RenderResult {
         let started = std::time::Instant::now();
         let mut frames = 0u64;
         let mut reports = Vec::new();
         let plan = vf_qualifier_plan(target_ms, pattern);
 
-        for segment in plan {
+        for (segment_index, segment) in plan.into_iter().enumerate() {
             if cancel.is_some_and(|token| token.load(Ordering::SeqCst)) {
                 break;
             }
             phase_state.store(segment.phase.code(), Ordering::SeqCst);
+            segment_hook(segment_index, segment.phase, segment.duration_ms);
             let workload = segment.workload;
             let result = match workload {
                 VfWorkload::ComputeBurst => {
@@ -2680,6 +2909,7 @@ impl GpuCtx {
                         fps: 0.0,
                         failure_phase: (stage.result != StabilityResult::Stable)
                             .then_some(segment.phase),
+                        inconclusive_reason: None,
                         phase_reports: vec![VfPhaseReport {
                             phase: segment.phase,
                             result: stage.result,
@@ -2698,6 +2928,7 @@ impl GpuCtx {
                         fps: 0.0,
                         failure_phase: (stage.result != StabilityResult::Stable)
                             .then_some(segment.phase),
+                        inconclusive_reason: None,
                         phase_reports: vec![VfPhaseReport {
                             phase: segment.phase,
                             result: stage.result,
@@ -2707,6 +2938,12 @@ impl GpuCtx {
                         }],
                     }
                 }
+                VfWorkload::CompositeGameLoad => self.run_field_concurrency_profile(
+                    segment.duration_ms,
+                    segment.phase,
+                    goldens.and_then(|g| integrity_goldens_for_workload(g, workload)),
+                    cancel,
+                ),
                 other => self.run_render_profile(
                     segment.duration_ms,
                     other,
@@ -2727,6 +2964,7 @@ impl GpuCtx {
                 ),
             };
             frames = frames.saturating_add(result.frames);
+            let inconclusive_reason = result.inconclusive_reason.clone();
             reports.extend(result.phase_reports);
             if result.result != StabilityResult::Stable {
                 phase_state.store(VfQualifierPhase::NONE_CODE, Ordering::SeqCst);
@@ -2736,6 +2974,19 @@ impl GpuCtx {
                     frames,
                     fps: frames as f64 / secs,
                     failure_phase: result.failure_phase.or(Some(segment.phase)),
+                    inconclusive_reason: None,
+                    phase_reports: reports,
+                };
+            }
+            if let Some(reason) = inconclusive_reason {
+                phase_state.store(VfQualifierPhase::NONE_CODE, Ordering::SeqCst);
+                let secs = started.elapsed().as_secs_f64().max(0.001);
+                return RenderResult {
+                    result: StabilityResult::Stable,
+                    frames,
+                    fps: frames as f64 / secs,
+                    failure_phase: None,
+                    inconclusive_reason: Some(reason),
                     phase_reports: reports,
                 };
             }
@@ -2748,6 +2999,7 @@ impl GpuCtx {
             frames,
             fps: frames as f64 / secs,
             failure_phase: None,
+            inconclusive_reason: None,
             phase_reports: reports,
         }
     }
@@ -2973,13 +3225,20 @@ impl GpuCtx {
             ],
         });
 
-        // MixedGame is one continuous frame loop. Each frame records BoostEdge, TextureRop and
-        // PowerRender passes into this function's single command encoder, then submits once. The
-        // final pass rotates so the sparse integrity sample eventually validates every component.
+        // MixedGame and the v13 primary Texture Stack are continuous multi-lane frame loops. Every frame
+        // records three render lanes in one command encoder and rotates the final lane so each
+        // deterministic image is checked against its own stock golden. Texture Stack uses a
+        // cache-bound TextureRop lane, a VRAM-bound TextureStream lane and a power-render lane.
         let mixed_game = profile == VfWorkload::MixedGame;
-        let mixed_resources = mixed_game.then(|| {
+        let texture_stack = profile == VfWorkload::CompositeGameLoad;
+        let rotating_game = mixed_game || texture_stack;
+        let rotating_resources = rotating_game.then(|| {
+            let stream_src_view = texture_stack.then(|| self.create_texture_stream_source_view());
             let create_resources =
-                |label: &'static str, shader_source: &'static str, blend: wgpu::BlendState| {
+                |label: &'static str,
+                 shader_source: &'static str,
+                 source_view: &wgpu::TextureView,
+                 blend: wgpu::BlendState| {
                     let shader =
                         self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                             label: Some(label),
@@ -3016,7 +3275,7 @@ impl GpuCtx {
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&src_view),
+                                resource: wgpu::BindingResource::TextureView(source_view),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
@@ -3026,17 +3285,37 @@ impl GpuCtx {
                     });
                     (pipeline, bind)
                 };
-            let (boost_pipeline, boost_bind) = create_resources(
-                "mixed-game-boost",
-                BOOST_EDGE_SHADER,
-                wgpu::BlendState::REPLACE,
-            );
-            let (texrop_pipeline, texrop_bind) = create_resources(
-                "mixed-game-texrop",
-                TEXTURE_ROP_SHADER,
-                wgpu::BlendState::ALPHA_BLENDING,
-            );
-            (boost_pipeline, boost_bind, texrop_pipeline, texrop_bind)
+            if texture_stack {
+                let (texrop_pipeline, texrop_bind) = create_resources(
+                    "texture-stack-texrop",
+                    TEXTURE_ROP_SHADER,
+                    &src_view,
+                    wgpu::BlendState::ALPHA_BLENDING,
+                );
+                let (stream_pipeline, stream_bind) = create_resources(
+                    "texture-stack-stream",
+                    TEXTURE_STREAM_SHADER,
+                    stream_src_view
+                        .as_ref()
+                        .expect("Texture Stack must own its VRAM-resident source"),
+                    wgpu::BlendState::REPLACE,
+                );
+                (texrop_pipeline, texrop_bind, stream_pipeline, stream_bind)
+            } else {
+                let (boost_pipeline, boost_bind) = create_resources(
+                    "mixed-game-boost",
+                    BOOST_EDGE_SHADER,
+                    &src_view,
+                    wgpu::BlendState::REPLACE,
+                );
+                let (texrop_pipeline, texrop_bind) = create_resources(
+                    "mixed-game-texrop",
+                    TEXTURE_ROP_SHADER,
+                    &src_view,
+                    wgpu::BlendState::ALPHA_BLENDING,
+                );
+                (boost_pipeline, boost_bind, texrop_pipeline, texrop_bind)
+            }
         });
 
         // Readback: copy the frame to a buffer, reduce to one checksum u32.
@@ -3044,7 +3323,7 @@ impl GpuCtx {
             label: Some("render-px"), size: (DIM as u64) * (DIM as u64) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
         });
-        let checksum_slots = if mixed_game { MIXED_GAME_WORKLOADS.len() } else { 1 };
+        let checksum_slots = if rotating_game { MIXED_GAME_WORKLOADS.len() } else { 1 };
         let sum_bufs: Vec<wgpu::Buffer> = (0..checksum_slots)
             .map(|_| {
                 self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3057,7 +3336,7 @@ impl GpuCtx {
                 })
             })
             .collect();
-        let golden_values: Vec<u32> = match (mixed_game, goldens) {
+        let golden_values: Vec<u32> = match (rotating_game, goldens) {
             (false, Some(RenderIntegrityGoldens::Single(golden))) => vec![golden],
             (true, Some(RenderIntegrityGoldens::Mixed(goldens))) => goldens.to_vec(),
             _ => Vec::new(),
@@ -3347,18 +3626,27 @@ impl GpuCtx {
                 }
             }
             let mut enc = self.device.create_command_encoder(&Default::default());
-            let mixed_order = mixed_game.then(|| mixed_game_draw_order(frames));
-            if let (Some((boost_pipe, boost_bind, texrop_pipe, texrop_bind)), Some(order)) =
-                (&mixed_resources, mixed_order)
+            let rotating_order = rotating_game.then(|| mixed_game_draw_order(frames));
+            if let (Some((first_pipe, first_bind, second_pipe, second_bind)), Some(order)) =
+                (&rotating_resources, rotating_order)
             {
                 for workload_index in order {
-                    let (draw_pipeline, draw_bind, draw_instances) = match workload_index {
-                        0 => (boost_pipe, boost_bind, 1),
-                        1 => (texrop_pipe, texrop_bind, 4),
+                    let (draw_pipeline, draw_bind, canonical_instances) = match workload_index {
+                        0 => (first_pipe, first_bind, if texture_stack { 4 } else { 1 }),
+                        1 => (second_pipe, second_bind, if texture_stack { 2 } else { 4 }),
                         _ => (&pipeline, &tex_bind, 8),
                     };
+                    // The final lane runs its canonical instance count so its stock golden remains
+                    // exact. The other two Texture Stack lanes still execute in the same submit but
+                    // use one instance each, keeping a stock-stable frame game-sized rather than
+                    // manufacturing a TDR through an oversized synthetic command.
+                    let draw_instances = if texture_stack && workload_index != order[2] {
+                        1
+                    } else {
+                        canonical_instances
+                    };
                     let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("mixed-game"),
+                        label: Some(if texture_stack { "texture-stack" } else { "mixed-game" }),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &view,
                             resolve_target: None,
@@ -3398,7 +3686,7 @@ impl GpuCtx {
                 rp.set_bind_group(0, &tex_bind, &[]);
                 rp.draw(0..vertex_count, 0..instances);
             }
-            let checksum_slot = mixed_order.map(|order| order[2]).unwrap_or(0);
+            let checksum_slot = rotating_order.map(|order| order[2]).unwrap_or(0);
             let checksum_due = !sparse_checksum || sparse_checksum_due(frames);
             if (golden_mode || sparse_checksum) && checksum_due {
                 enc.copy_texture_to_buffer(
@@ -3425,9 +3713,9 @@ impl GpuCtx {
                 sample_sequences[checksum_slot] =
                     sample_sequences[checksum_slot].saturating_add(1);
             }
-            // v16.1: the VRAM-resident gather rides in the SAME submit as the render frame — the
-            // heavy texture render and the DRAM/memory-controller pressure hit the shared core rail
-            // together (highest combined draw in the soak).
+            // The VRAM-resident gather rides in the SAME submit as every Texture Stack render lane:
+            // cache-bound texture, VRAM-bound texture, ROP and DRAM/controller pressure overlap on
+            // the shared core rail rather than running as permissive serial micro-tests.
             if let Some((gather_pipe, gather_binds)) = &composite_gather {
                 let bind = &gather_binds[(frames as usize) % gather_binds.len()];
                 let mut cp = enc.begin_compute_pass(&Default::default());
@@ -3438,13 +3726,9 @@ impl GpuCtx {
             self.queue.submit(Some(enc.finish()));
             frames += 1;
 
-            // Throttle the queue: bound in-flight frames so we don't flood the
-            // submission queue. Without this, a tight submit loop floods the driver
-            // — the first dwell survives but leaves it stressed, and the SECOND call
-            // TDRs (device lost, unrecoverable). The heavy compute load (run_power_
-            // load) polls every 8 submits for the same reason; render frames are far
-            // heavier, so bound tighter (every 3). Keeps the GPU saturated (~199 W,
-            // game power) while staying safely repeatable across a full sweep.
+            // Bound in-flight frames like a present/fence boundary in a real game. This prevents a
+            // false driver-queue flood, but does not inspect wall time or abort a slow Texture Stack
+            // frame: silent error, DeviceLost and the Windows TDR remain natural verdicts.
             if boost_entry {
                 // v15: finish the slam frame and TIME it. A post-idle slam that stalls toward the
                 // ~2 s driver watchdog is the pre-hang precursor of the in-game BusReset TDR
@@ -3496,7 +3780,7 @@ impl GpuCtx {
                         std::hint::spin_loop();
                     }
                 }
-            } else if frames % 3 == 0 {
+            } else if texture_stack || frames.is_multiple_of(3) {
                 self.device.poll(wgpu::Maintain::Wait);
             }
 
@@ -3620,6 +3904,7 @@ impl GpuCtx {
             frames,
             fps: frames as f64 / secs,
             failure_phase: (result != StabilityResult::Stable).then_some(phase).flatten(),
+            inconclusive_reason: None,
             phase_reports,
         }
     }
@@ -3832,6 +4117,7 @@ mod tests {
     fn sparse_checksum_cadence_is_explicit_and_starts_on_first_frame() {
         assert!(sparse_checksum_workload(VfWorkload::BoostEdge));
         assert!(sparse_checksum_workload(VfWorkload::MixedGame));
+        assert!(sparse_checksum_workload(VfWorkload::CompositeGameLoad));
         assert!(!sparse_checksum_workload(VfWorkload::TextureRop));
         assert!(sparse_checksum_due(0));
         assert!(!sparse_checksum_due(SPARSE_CHECKSUM_FRAME_INTERVAL - 1));
@@ -3859,12 +4145,99 @@ mod tests {
     }
 
     #[test]
+    fn texture_stack_uses_each_texture_domain_and_its_matching_golden() {
+        let goldens = RenderGoldens {
+            power: 1,
+            boost: 2,
+            texrop: 3,
+            cadence: 4,
+            geometry: 5,
+            stream: 6,
+            stream_frame_reference_ms: 7,
+            boost_frame_reference_us: 8,
+            dx11: Dx11Golden::default(),
+        };
+        assert_eq!(
+            integrity_goldens_for_workload(goldens, VfWorkload::CompositeGameLoad),
+            Some(RenderIntegrityGoldens::Mixed([3, 6, 1]))
+        );
+        for frame in 0..3 {
+            let mut order = mixed_game_draw_order(frame);
+            order.sort_unstable();
+            assert_eq!(order, [0, 1, 2], "each Texture Stack frame must run all lanes");
+        }
+    }
+
+    #[test]
     fn workload_fingerprints_are_pattern_specific_and_capture_texture_hop_revision() {
         let texture = vf_qualifier_workload_fingerprint(VfQualifierPattern::V8Texture);
         let endurance = vf_qualifier_workload_fingerprint(VfQualifierPattern::Endurance);
         assert_ne!(texture, endurance);
-        assert_eq!(texture, "f2q-texhop-v11-r1/v11-texture");
-        assert_eq!(endurance, "f2q-texhop-v10-r1/endurance");
+        assert_eq!(
+            texture,
+            "f2q-texhop-v13-r3/v13-persistent-field-concurrency"
+        );
+        assert_eq!(
+            endurance,
+            "f2q-texhop-v13-r3/endurance-persistent-field-concurrency"
+        );
+        assert!(vf_qualifier_checksum_method().contains("secondary=persistent-device"));
+        assert!(!vf_qualifier_checksum_method().contains("fresh-device"));
+    }
+
+    #[test]
+    fn field_concurrency_preserves_the_strongest_failure() {
+        assert_eq!(
+            stronger_stability_failure(StabilityResult::Stable, StabilityResult::Unstable),
+            StabilityResult::Unstable
+        );
+        assert_eq!(
+            stronger_stability_failure(StabilityResult::SilentError, StabilityResult::Unstable),
+            StabilityResult::SilentError
+        );
+        assert_eq!(
+            stronger_stability_failure(StabilityResult::SilentError, StabilityResult::Crash),
+            StabilityResult::Crash
+        );
+    }
+
+    #[test]
+    fn field_concurrency_environment_failure_is_inconclusive_not_unstable() {
+        let phase = VfQualifierPhase::CompositeGameLoad;
+        let mut primary = RenderResult {
+            result: StabilityResult::Stable,
+            frames: 100,
+            fps: 60.0,
+            failure_phase: None,
+            inconclusive_reason: None,
+            phase_reports: vec![VfPhaseReport {
+                phase,
+                result: StabilityResult::Stable,
+                frames: 100,
+                checksum_count: 8,
+                elapsed_ms: 1_000,
+            }],
+        };
+        let secondary = FieldCanaryReport {
+            result: StabilityResult::Stable,
+            cycles: 0,
+            frames: 0,
+            checksum_count: 0,
+            inconclusive_reason: Some("field_secondary_init_failed: test".into()),
+        };
+
+        merge_field_canary(&mut primary, secondary, phase);
+
+        assert_eq!(primary.result, StabilityResult::Stable);
+        assert_eq!(
+            primary.inconclusive_reason.as_deref(),
+            Some("field_secondary_init_failed: test")
+        );
+        assert!(primary.failure_phase.is_none());
+        assert!(
+            primary.phase_reports.is_empty(),
+            "the primary queue alone must not complete Field Concurrency"
+        );
     }
 
     #[test]
@@ -3955,9 +4328,39 @@ mod tests {
     }
 
     #[test]
-    fn v11_texture_hop_and_legacy_v8_patterns_preserve_duration_and_bias_failure_modes() {
+    fn detector_lab_dense_is_canary_dominant_and_pairs_each_perturbation() {
+        let plan = vf_qualifier_plan(60_000, VfQualifierPattern::DetectorLabDense);
+        assert_eq!(plan.iter().map(|segment| segment.duration_ms).sum::<u64>(), 60_000);
+        assert_eq!(plan.first().map(|segment| segment.phase), Some(VfQualifierPhase::PowerOpening));
+        assert_eq!(plan.last().map(|segment| segment.phase), Some(VfQualifierPhase::PowerClosing));
+
+        let texture_ms = plan
+            .iter()
+            .filter(|segment| segment.workload == VfWorkload::TextureRop)
+            .map(|segment| segment.duration_ms)
+            .sum::<u64>();
+        assert!(texture_ms * 100 / 60_000 >= 60);
+        assert!(!plan.iter().any(|segment| matches!(
+            segment.workload,
+            VfWorkload::IdlePulse | VfWorkload::ComputeBurst | VfWorkload::CompositeGameLoad
+        )));
+        for window in plan[2..plan.len() - 1].windows(2) {
+            if window[0].workload != VfWorkload::TextureRop {
+                assert_eq!(window[1].workload, VfWorkload::TextureRop);
+            }
+        }
+        assert_eq!(VfQualifierPattern::DetectorLabDense.label(), "detector-lab-v14-dense");
+        assert_ne!(
+            vf_qualifier_workload_fingerprint(VfQualifierPattern::DetectorLabDense),
+            vf_qualifier_workload_fingerprint(VfQualifierPattern::V8Texture)
+        );
+    }
+
+    #[test]
+    fn v13_texture_hop_and_legacy_v8_patterns_preserve_duration_and_bias_failure_modes() {
         let high_fps = vf_qualifier_plan(60_000, VfQualifierPattern::V8HighFps);
         let texture = vf_qualifier_plan(60_000, VfQualifierPattern::V8Texture);
+        let compact_texture = vf_qualifier_plan(30_000, VfQualifierPattern::V8Texture);
         let transitions = vf_qualifier_plan(60_000, VfQualifierPattern::V8Transitions);
         let memory = vf_qualifier_plan(60_000, VfQualifierPattern::V8Memory);
         let required_phases = [
@@ -4010,6 +4413,11 @@ mod tests {
             duration_for(&texture, VfWorkload::TextureRop)
                 > duration_for(&high_fps, VfWorkload::TextureRop)
         );
+        assert_eq!(
+            duration_for(&compact_texture, VfWorkload::BoostEdge),
+            1_200,
+            "the compact frontier dwell must leave enough BoostEdge residence for numeric coverage"
+        );
         assert!(
             transitions
                 .iter()
@@ -4018,30 +4426,34 @@ mod tests {
                 >= 5
         );
         assert_eq!(VfQualifierPattern::V8HighFps.label(), "v8-high-fps");
-        assert_eq!(VfQualifierPattern::V8Texture.label(), "v11-texture-hop");
+        assert_eq!(VfQualifierPattern::V8Texture.label(), "v13-texture-hop");
         assert_eq!(VfQualifierPattern::V8Transitions.label(), "v8-transitions");
         assert_eq!(VfQualifierPattern::V8Memory.label(), "v8-memory");
-        // Texture and Memory also carry the banded TextureStream phase (severity-last).
+        // Only the legacy Memory pattern retains the preventive banded TextureStream phase.
+        // Texture Hop v13 exercises the same VRAM-bound primary stack plus a persistent secondary
+        // canary without a pre-hang wall-time abort on either context.
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8HighFps), 10);
-        assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Texture), 12);
+        assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Texture), 11);
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Transitions), 10);
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::V8Memory), 12);
         // Severity ladder: hang-prone detectors sit AFTER the last graceful TextureRop segment.
-        for plan in [&texture, &memory] {
-            let last_texrop = plan
-                .iter()
-                .rposition(|s| s.workload == VfWorkload::TextureRop)
-                .unwrap();
-            let stream = plan
-                .iter()
-                .position(|s| s.workload == VfWorkload::TextureStream)
-                .unwrap();
-            assert!(stream > last_texrop, "TextureStream must run after graceful detectors");
-        }
+        let last_texrop = memory
+            .iter()
+            .rposition(|s| s.workload == VfWorkload::TextureRop)
+            .unwrap();
+        let stream = memory
+            .iter()
+            .position(|s| s.workload == VfWorkload::TextureStream)
+            .unwrap();
+        assert!(stream > last_texrop, "TextureStream must run after graceful detectors");
+        assert!(
+            texture.iter().all(|s| s.workload != VfWorkload::TextureStream),
+            "Texture Hop v13 must not use the preventive banded TextureStream path"
+        );
         assert_eq!(
             texture.get(1).map(|segment| segment.workload),
             Some(VfWorkload::TextureRop),
-            "Texture Hop v11 must enter the binding detector immediately after the opening"
+            "Texture Hop v13 must enter the binding detector immediately after the opening"
         );
         assert!(
             duration_for(&texture, VfWorkload::TextureRop)
@@ -4055,7 +4467,11 @@ mod tests {
                 .filter(|segment| segment.workload == VfWorkload::CompositeGameLoad)
                 .count(),
             1,
-            "Texture Hop must pay the large composite VRAM-pool setup only once per cycle"
+            "Texture Hop must pay the large primary Texture Stack VRAM-pool setup only once per cycle"
+        );
+        assert!(
+            duration_for(&texture, VfWorkload::CompositeGameLoad) >= 30_000,
+            "at least half of Texture Hop must exercise field concurrency"
         );
         let idle = texture
             .iter()
@@ -4064,12 +4480,12 @@ mod tests {
         assert_eq!(
             texture.get(idle + 1).map(|segment| segment.workload),
             Some(VfWorkload::CompositeGameLoad),
-            "the strongest combined load must be entered directly from idle"
+            "the Texture Stack must be entered directly from idle"
         );
         assert_eq!(
             texture.get(idle + 2).map(|segment| segment.workload),
             Some(VfWorkload::TextureRop),
-            "the golden-checked oracle must immediately inspect the composite slam"
+            "the golden-checked oracle must immediately inspect the Texture Stack slam"
         );
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::Fsgl1), 8);
         assert_eq!(qualifier_expected_phases(VfQualifierPattern::Fsgl3A), 8);
@@ -4120,7 +4536,7 @@ mod tests {
         assert_eq!(
             plan.get(1).map(|segment| segment.workload),
             Some(VfWorkload::TextureRop),
-            "Endurance v20 must front-load its graceful rejection detector"
+            "Endurance v24 must front-load its graceful rejection detector"
         );
         assert!(
             plan.iter()

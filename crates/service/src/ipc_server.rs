@@ -155,6 +155,13 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             "Another GPU operation owns the service-wide tuning lease; stop it before starting or applying another operation",
         );
     }
+    if gpu_reboot_guard_applies(&request) {
+        if let Some(event) = crate::tdr_sentinel::reboot_required_event() {
+            return IpcResponse::failure(format!(
+                "GPU driver reset detected at {event}. Reboot Windows before another GPU test, Forge run or profile apply"
+            ));
+        }
+    }
 
     match &request {
         IpcRequest::Ping => IpcResponse::success(ResponseData::Pong),
@@ -298,6 +305,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             guard.forge_all.stop();
             guard.benchmark.stop();
             guard.power_sweep.abort();
+            guard.detector_lab.stop();
             let msg = match crate::gpu_apply::reset(&guard.safe_store) {
                 Ok(()) => {
                     guard.manual_point.mark_reset();
@@ -322,6 +330,7 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             guard.forge_all.stop();
             guard.benchmark.stop();
             guard.power_sweep.abort();
+            guard.detector_lab.stop();
             let msg = match crate::gpu_apply::reset(&guard.safe_store) {
                 Ok(()) => {
                     guard.manual_point.mark_reset();
@@ -510,6 +519,11 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
             }
         }
         IpcRequest::ResetManualDiagnosticPoint => {
+            if guard.detector_lab.running() {
+                return IpcResponse::failure(
+                    "Stop Detector Lab and wait for stock recovery before resetting the manual point",
+                );
+            }
             let store = guard.safe_store.clone();
             match guard.manual_point.reset(&store) {
                 Ok(status) => IpcResponse::success(ResponseData::ManualDiagnosticPoint(status)),
@@ -518,6 +532,23 @@ fn handle_request(line: &str, state: &Arc<Mutex<AppState>>) -> IpcResponse {
         }
         IpcRequest::GetManualDiagnosticPointStatus => {
             IpcResponse::success(ResponseData::ManualDiagnosticPoint(guard.manual_point.status()))
+        }
+        IpcRequest::StartDetectorLab { recipe, duration_s } => {
+            let store = guard.safe_store.clone();
+            let manual_status = guard.manual_point.status_slot();
+            match guard
+                .detector_lab
+                .start(store, manual_status, recipe, *duration_s)
+            {
+                Ok(status) => IpcResponse::success(ResponseData::DetectorLab(status)),
+                Err(error) => IpcResponse::failure(error),
+            }
+        }
+        IpcRequest::StopDetectorLab => {
+            IpcResponse::success(ResponseData::DetectorLab(guard.detector_lab.stop()))
+        }
+        IpcRequest::GetDetectorLabStatus => {
+            IpcResponse::success(ResponseData::DetectorLab(guard.detector_lab.status()))
         }
         IpcRequest::ExportForgeLog => {
             let prog = guard.power_sweep.progress();
@@ -550,6 +581,7 @@ fn gpu_operation_running(state: &AppState) -> bool {
         || state.benchmark.progress().running
         || state.power_sweep.progress().running
         || state.manual_point.status().active
+        || state.detector_lab.running()
 }
 
 fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
@@ -575,6 +607,10 @@ fn gpu_write_requires_idle(request: &IpcRequest) -> bool {
             | IpcRequest::ApplyPowerDeepCalm
             | IpcRequest::ApplyManualDiagnosticPoint { .. }
     )
+}
+
+fn gpu_reboot_guard_applies(request: &IpcRequest) -> bool {
+    gpu_write_requires_idle(request) || matches!(request, IpcRequest::StartDetectorLab { .. })
 }
 
 /// Route a forge-profile apply to the correct writer (Phase 2). When the active forge produced an F2
@@ -903,6 +939,16 @@ mod tests {
         assert!(!gpu_write_requires_idle(&IpcRequest::GetPowerSweepProgress));
         assert!(!gpu_write_requires_idle(&IpcRequest::StopPowerSweep));
         assert!(!gpu_write_requires_idle(&IpcRequest::ReadSensors));
+        assert!(!gpu_write_requires_idle(&IpcRequest::StartDetectorLab {
+            recipe: "dense_v14".into(),
+            duration_s: 60,
+        }));
+        assert!(gpu_reboot_guard_applies(&IpcRequest::StartDetectorLab {
+            recipe: "control_v25".into(),
+            duration_s: 60,
+        }));
+        assert!(gpu_reboot_guard_applies(&IpcRequest::StartPowerSweep));
+        assert!(!gpu_reboot_guard_applies(&IpcRequest::ResetGpuTuning));
     }
 
     fn dummy_store() -> nidavellir_core::safe_loop::SafeLoopStore {

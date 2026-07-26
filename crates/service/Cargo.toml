@@ -16,6 +16,7 @@ nidavellir-driver-pawnio = { workspace = true }
 nidavellir-gpu-stress = { path = "../gpu-stress" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -29,5 +30,6 @@ windows = { version = "0.58", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

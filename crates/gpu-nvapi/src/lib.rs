@@ -182,22 +182,95 @@ pub fn calibrate_vf_unit() -> Result<(i32, i32, i32), String> {
     Ok((PROBE, after - base, base))
 }
 
+/// One active manual voltage lock reported by the legacy ClockBoostLock table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreVoltageLock {
+    pub entry_id: usize,
+    pub voltage_mv: u32,
+}
+
 /// Lock the core voltage to `mv` (the GPU runs at the curve frequency for that
 /// voltage). Reversible via [`unlock_core_voltage`].
+///
+/// ClockBoostLock's `id` is an entry index, not the public graphics clock-domain
+/// id. On this API the writable voltage lives on the highest reported entry.
+/// Clear every reported entry first, then set only that last slot so an old
+/// manual lock cannot remain active beside the requested one. The driver treats
+/// the SET payload as a command list rather than a full GET-table replacement;
+/// keeping clear and apply as separate writes avoids a mixed batch being
+/// acknowledged before the manual entry becomes observable.
 #[cfg(windows)]
-pub fn lock_core_voltage_mv(mv: u32) -> Result<(), String> {
+pub fn lock_core_voltage_mv(mv: u32) -> Result<usize, String> {
     let gpu = first_gpu()?;
-    gpu.set_vfp_locks(std::iter::once((0usize, Some(nvapi::Microvolts(mv * 1000)),
+    let locks = gpu
+        .vfp_locks()
+        .map_err(|e| format!("get_vfp_locks before write failed: {e:?}"))?;
+    let entry_id = locks
+        .keys()
+        .next_back()
+        .copied()
+        .ok_or_else(|| "ClockBoostLock table has no writable entries".to_string())?;
+    gpu.set_vfp_locks(locks.keys().copied().map(|id| (id, None)))
+        .map_err(|e| format!("clear_vfp_locks before entry {entry_id} failed: {e:?}"))?;
+    gpu.set_vfp_locks(std::iter::once((
+        entry_id,
+        Some(nvapi::Microvolts(mv * 1000)),
     )))
-        .map_err(|e| format!("set_vfp_locks failed: {e:?}"))
+    .map_err(|e| format!("set_vfp_locks entry {entry_id} failed: {e:?}"))?;
+    Ok(entry_id)
+}
+
+/// Read every active manual voltage lock from the driver table.
+///
+/// This is the authoritative post-write verifier for [`lock_core_voltage_mv`];
+/// live rail telemetry is sampled separately under load.
+#[cfg(windows)]
+pub fn read_core_voltage_locks() -> Result<Vec<CoreVoltageLock>, String> {
+    let gpu = first_gpu()?;
+    let locks = gpu
+        .vfp_locks()
+        .map_err(|e| format!("get_vfp_locks readback failed: {e:?}"))?;
+    Ok(locks
+        .into_iter()
+        .filter_map(|(entry_id, lock)| {
+            (lock.mode == nvapi::ClockLockMode::Manual && lock.voltage.0 > 0).then_some(
+                CoreVoltageLock {
+                    entry_id,
+                    voltage_mv: lock.voltage.0 / 1000,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Read the sole active manual voltage in mV.
+///
+/// Multiple simultaneous manual entries are treated as an invalid/ambiguous
+/// state instead of silently choosing one.
+#[cfg(windows)]
+pub fn read_core_voltage_lock_mv() -> Result<Option<u32>, String> {
+    let active = read_core_voltage_locks()?;
+    match active.as_slice() {
+        [] => Ok(None),
+        [lock] => Ok(Some(lock.voltage_mv)),
+        _ => Err(format!(
+            "multiple manual voltage locks are active: {active:?}"
+        )),
+    }
 }
 
 /// Release any core voltage lock (back to the dynamic curve).
 #[cfg(windows)]
 pub fn unlock_core_voltage() -> Result<(), String> {
     let gpu = first_gpu()?;
-    gpu.set_vfp_locks(std::iter::once((0usize, None)))
-        .map_err(|e| format!("set_vfp_locks(None) failed: {e:?}"))
+    let locks = gpu
+        .vfp_locks()
+        .map_err(|e| format!("get_vfp_locks before unlock failed: {e:?}"))?;
+    if locks.is_empty() {
+        return Ok(());
+    }
+    gpu.set_vfp_locks(locks.keys().copied().map(|id| (id, None)))
+        .map_err(|e| format!("set_vfp_locks(all None) failed: {e:?}"))
 }
 
 /// Read the current core voltage in mV (parsed from NVAPI's formatted value).

@@ -1,3 +1,4 @@
+mod detector_lab;
 mod game_trace;
 mod gpu_apply;
 mod gpu_benchmark;
@@ -46,6 +47,7 @@ pub struct AppState {
     pub power_sweep: PowerSweepHandle,
     pub game_trace: game_trace::GameTraceHandle,
     pub manual_point: manual_point::ManualPointHandle,
+    pub detector_lab: detector_lab::DetectorLabHandle,
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -367,6 +369,8 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
     // v17 boot reconciliation: a hard wedge freezes the live sentinel with the machine — detect a
     // TDR that happened while we were down BEFORE re-applying the very profile that caused it.
     #[cfg(windows)]
+    tdr_sentinel::initialize_reboot_guard();
+    #[cfg(windows)]
     tdr_sentinel::startup_reconcile(&safe_store);
     gpu_apply::reapply_on_boot(&safe_store);
     // v17 runtime TDR sentinel: watch nvlddmkm-153 while a profile is applied; on the FIRST
@@ -390,6 +394,7 @@ fn run_standalone() -> Result<(), Box<dyn std::error::Error>> {
         power_sweep: gpu_power_sweep::restore_handle(),
         game_trace: game_trace::GameTraceHandle::default(),
         manual_point: manual_point::ManualPointHandle::default(),
+        detector_lab: detector_lab::DetectorLabHandle::default(),
     }));
     #[cfg(windows)]
     console_shutdown::install(Arc::clone(&state));
@@ -455,6 +460,7 @@ mod console_shutdown {
                 s.mem_sweep.stop();
                 s.forge_all.stop();
                 s.benchmark.stop();
+                s.detector_lab.stop();
                 let store = s.safe_store.clone();
                 if let Err(error) = s.manual_point.reset(&store) {
                     tracing::warn!("shutdown: manual point stock reset failed: {error}");

@@ -50,6 +50,7 @@ pub fn run_service() -> windows_service::Result<()> {
     crate::safe_loop_runtime::spawn_heartbeat(safe_store.clone());
     // The installed Windows service is the product runtime. It must own the same boot and live TDR
     // reconciliation as console mode before any persisted profile can be reapplied.
+    crate::tdr_sentinel::initialize_reboot_guard();
     crate::tdr_sentinel::startup_reconcile(&safe_store);
     crate::gpu_apply::reapply_on_boot(&safe_store);
     crate::tdr_sentinel::spawn(safe_store.clone());
@@ -70,6 +71,7 @@ pub fn run_service() -> windows_service::Result<()> {
         power_sweep: crate::gpu_power_sweep::restore_handle(),
         game_trace: crate::game_trace::GameTraceHandle::default(),
         manual_point: crate::manual_point::ManualPointHandle::default(),
+        detector_lab: crate::detector_lab::DetectorLabHandle::default(),
     }));
 
     let pipe_state = Arc::clone(&state);
@@ -82,6 +84,7 @@ pub fn run_service() -> windows_service::Result<()> {
     let _ = shutdown_rx.recv();
 
     if let Ok(mut state) = state.lock() {
+        state.detector_lab.stop();
         let store = state.safe_store.clone();
         if let Err(error) = state.manual_point.reset(&store) {
             tracing::warn!("service stop: manual point stock reset failed: {error}");

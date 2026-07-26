@@ -457,12 +457,12 @@
               <span>RUN</span>
               <select id="command-run-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>
                 <option value="clean">Clean Run · ignores prior boundaries</option>
-                <option value="standard">Standard · up to 1 hour</option>
+                <option value="standard">Standard · compact proof</option>
                 <option value="long">Long · exhaustive proof</option>
               </select>
               <ChevronDown size={18} />
             </label>
-            <small>{forgeMode === "long" ? "Explicit long run · may exceed one hour" : forgeMode === "clean" ? "Organic learning · Standard time limit" : "Recommended · fails closed at one hour"}</small>
+            <small>{forgeMode === "long" ? "Explicit long run · exhaustive evidence" : forgeMode === "clean" ? "Organic learning · compact Standard proof" : "Recommended · compact proof to completion"}</small>
           </div>
           {#if profilesReady}
             <span class="refine">Profiles forged from measured hardware data <ShieldCheck size={23} /></span>
@@ -597,7 +597,7 @@
             <label for="instrument-mode">MODE</label>
             <select id="instrument-mode" value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}>
               <option value="clean">Clean Run — ignores prior boundaries</option>
-              <option value="standard">Standard — up to 1 hour</option>
+              <option value="standard">Standard — compact proof</option>
               <option value="long">Long — exhaustive proof</option>
             </select>
             <p>Builds safe profiles while you use your PC.</p>
@@ -639,7 +639,7 @@
         <p class:pending={!safeLoopKnown} class:review={safeLoopKnown && !protectedState}><i></i> {safeLoopKnown ? (protectedState ? "Protected by Safe Loop" : "Safe Loop needs review") : "Safe Loop status unavailable"}</p>
         <div class="workshop-actions">
           <button class="workshop-forge" onclick={runForge} disabled={powerRunning || (forgePaused && !resumeAvailable)}><Anvil size={25} />{powerRunning ? "Forging…" : resumeAvailable ? "Resume Forge" : forgePaused ? "Resume unavailable" : recoveryPending ? "Review & Continue" : "Forge GPU"}</button>
-          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}><option value="clean">Clean Run · Ignores prior boundaries</option><option value="standard">Standard · Up to 1 hour</option><option value="long">Long · Exhaustive proof</option></select><ChevronDown size={20} /></label>
+          <label><select value={forgeMode} onchange={selectMode} disabled={powerRunning || forgePaused}><option value="clean">Clean Run · Ignores prior boundaries</option><option value="standard">Standard · Compact proof</option><option value="long">Long · Exhaustive proof</option></select><ChevronDown size={20} /></label>
         </div>
       </section>
 

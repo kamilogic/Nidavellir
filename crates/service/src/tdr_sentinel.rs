@@ -8,7 +8,7 @@
 //! ladder: stay stock, clear the applied profile (boot never re-applies the failed point) — if two
 //! bumps didn't fix it, the problem is not one bin.
 //!
-//! Cost: one filtered `wevtutil` query every ~15 s (sub-millisecond CPU, ZERO GPU — never touches
+//! Cost: one filtered `wevtutil` query every ~1 s (sub-millisecond CPU, ZERO GPU — never touches
 //! the card during gameplay). The GPU canary (silent-error layer) is Stage B.
 //!
 //! Safety guards: acts ONLY when (a) an F2 undervolt profile is applied, (b) the Safe Loop boot
@@ -18,10 +18,14 @@
 
 #![cfg(windows)]
 
-use tracing::{info, warn};
-use nidavellir_core::safe_loop::{BlacklistRegion, SafeLoopStore, TuningPoint, DEFAULT_BLACKLIST_RADIUS};
+use std::sync::{Mutex, OnceLock};
 
-const SENTINEL_POLL_MS: u64 = 15_000;
+use chrono::DateTime;
+use nidavellir_core::safe_loop::{BlacklistRegion, SafeLoopStore, TuningPoint, DEFAULT_BLACKLIST_RADIUS};
+use tracing::{info, warn};
+use windows::Win32::System::SystemInformation::GetTickCount64;
+
+const SENTINEL_POLL_MS: u64 = 1_000;
 /// Post-action settle time (driver just recovered + we rewrote the curve).
 const SENTINEL_COOLDOWN_MS: u64 = 60_000;
 /// TDR is the gravest failure class → +3 physical bins at the same clock.
@@ -42,6 +46,76 @@ const SENTINEL_CANARY_MIN_UTIL_PCT: f64 = 30.0;
 /// case (1815@843 → 862 exhausted at 2 strikes) the third bump would have landed 875 mV — the
 /// operator's hand-validated golden voltage.
 const SENTINEL_MAX_BUMPS_PER_SESSION: u32 = 2;
+/// Event timestamps are second-granularity while the boot estimate comes from a millisecond uptime
+/// counter. This only absorbs timestamp/initialization jitter; a real reboot is far outside it.
+const BOOT_TIME_TOLERANCE_MS: u64 = 30_000;
+
+static REBOOT_REQUIRED_EVENT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn reboot_required_slot() -> &'static Mutex<Option<String>> {
+    REBOOT_REQUIRED_EVENT.get_or_init(|| Mutex::new(None))
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn current_boot_epoch_ms() -> u64 {
+    let uptime_ms = unsafe { GetTickCount64() };
+    now_epoch_ms().saturating_sub(uptime_ms)
+}
+
+fn event_epoch_ms(timestamp: &str) -> Option<u64> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()?
+        .timestamp_millis()
+        .try_into()
+        .ok()
+}
+
+fn event_is_from_current_boot(timestamp: &str, boot_epoch_ms: u64) -> bool {
+    event_epoch_ms(timestamp)
+        .is_some_and(|event_ms| event_ms >= boot_epoch_ms.saturating_sub(BOOT_TIME_TOLERANCE_MS))
+}
+
+/// Seed the process-local reboot latch from the durable Windows Event Log. A service restart on the
+/// same boot therefore cannot make a post-TDR GPU look clean; only a newer Windows boot clears it.
+pub(crate) fn initialize_reboot_guard() {
+    let newest = query_latest_tdr_event()
+        .filter(|timestamp| event_is_from_current_boot(timestamp, current_boot_epoch_ms()));
+    if let Ok(mut slot) = reboot_required_slot().lock() {
+        *slot = newest;
+    }
+}
+
+pub(crate) fn mark_gpu_reboot_required(timestamp: &str) {
+    if let Ok(mut slot) = reboot_required_slot().lock() {
+        *slot = Some(timestamp.to_string());
+    }
+}
+
+pub(crate) fn reboot_required_event() -> Option<String> {
+    reboot_required_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+/// Return a TDR written during the current diagnostic session, ignoring its captured baseline.
+pub(crate) fn new_tdr_event_since(
+    baseline: Option<&str>,
+    session_started_epoch_ms: u64,
+) -> Option<String> {
+    let newest = query_latest_tdr_event()?;
+    if baseline == Some(newest.as_str()) {
+        return None;
+    }
+    let event_ms = event_epoch_ms(&newest)?;
+    (event_ms.saturating_add(1_000) >= session_started_epoch_ms).then_some(newest)
+}
 
 /// What the sentinel decided for a detected TDR. Pure decision — testable without hardware.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +185,46 @@ pub(crate) fn query_latest_tdr_event() -> Option<String> {
     parse_event_system_time(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Newest WER bugcheck event as `(timestamp, stop_code)`. This complements nvlddmkm-153 for full
+/// wedges that reboot with 0x133 but never let the NVIDIA provider finish logging its own event.
+fn query_latest_bugcheck_event() -> Option<(String, u64)> {
+    let out = std::process::Command::new("wevtutil")
+        .args([
+            "qe",
+            "System",
+            "/q:*[System[Provider[@Name='Microsoft-Windows-WER-SystemErrorReporting'] and (EventID=1001)]]",
+            "/c:1",
+            "/rd:true",
+            "/f:xml",
+        ])
+        .output()
+        .ok()?;
+    let xml = String::from_utf8_lossy(&out.stdout);
+    let timestamp = parse_event_system_time(&xml)?;
+    let code = nidavellir_core::safe_loop::parse_bugcheck_code(&xml)?;
+    Some((timestamp, code))
+}
+
+fn event_belongs_to_applied_session(event_ts: &str, applied_at: Option<&str>) -> bool {
+    let Some(applied_at) = applied_at else { return false };
+    fn utc_order_key(timestamp: &str) -> Option<String> {
+        let second: String = timestamp.chars().take(19).collect();
+        if second.len() != 19 {
+            return None;
+        }
+        let fraction = timestamp
+            .get(19..)
+            .and_then(|tail| tail.strip_prefix('.'))
+            .map(|tail| tail.chars().take_while(|c| c.is_ascii_digit()).take(9).collect::<String>())
+            .unwrap_or_default();
+        Some(format!("{second}{fraction:0<9}"))
+    }
+    matches!(
+        (utc_order_key(event_ts), utc_order_key(applied_at)),
+        (Some(event), Some(applied)) if event >= applied
+    )
+}
+
 /// Physical VF bins strictly above `anchor_mv` on the live sane base curve, ascending.
 fn bins_above_anchor(anchor_mv: u32) -> Vec<u32> {
     use nidavellir_gpu_nvapi as gpu;
@@ -134,6 +248,59 @@ fn persist_baseline(ts: &str) {
     let _ = std::fs::write(baseline_path(), ts);
 }
 
+fn persist_field_failure(
+    store: &SafeLoopStore,
+    target_mhz: u32,
+    failed_mv: u32,
+    note: String,
+) {
+    let intent = TuningPoint::from_axes([
+        ("gpu_freq_mhz", target_mhz as i64),
+        ("gpu_vf_bin_mv", failed_mv as i64),
+    ]);
+    let region = BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS);
+    let mut rec = store.load_record();
+    if !rec.blacklist.contains(&region) {
+        rec.blacklist.push(region);
+        if let Err(e) = store.save_record(&rec) {
+            warn!("sentinel: blacklist persist failed: {e}");
+        }
+    }
+
+    let gpu_key = crate::gpu_power_sweep::current_gpu_key();
+    let ledger = nidavellir_core::condemnation::CondemnationLedger::new(store.base_dir());
+    if !ledger.condemned_pairs(&gpu_key).rigid.contains(&(target_mhz, failed_mv)) {
+        crate::gpu_undervolt::append_condemnation(
+            store.base_dir(),
+            nidavellir_core::condemnation::CondemnationSeverity::Rigid,
+            nidavellir_core::condemnation::KIND_FIELD_TDR,
+            Some(gpu_key),
+            target_mhz,
+            failed_mv,
+            None,
+            note,
+        );
+    }
+}
+
+fn demote_after_boot_failure(
+    store: &SafeLoopStore,
+    applied: crate::gpu_apply::UndervoltApply,
+    source: &str,
+) {
+    persist_field_failure(
+        store,
+        applied.target_mhz,
+        applied.anchor_mv,
+        format!("{source} after this profile was applied; boot stays stock"),
+    );
+    crate::gpu_apply::sentinel_clear_applied();
+    append_sentinel_log(&format!(
+        "\"event\":\"boot-reconcile\",\"source\":\"{source}\",\"action\":\"stock\",\"target_mhz\":{},\"failed_mv\":{}",
+        applied.target_mhz, applied.anchor_mv
+    ));
+}
+
 /// BOOT RECONCILIATION — the hole a live sentinel cannot cover: a hard WEDGE freezes the whole
 /// machine (sentinel included), the operator power-cycles, and on the next boot the crash events
 /// are HISTORICAL (correctly inert for the live watcher) while `reapply_on_boot` would happily
@@ -145,44 +312,48 @@ fn persist_baseline(ts: &str) {
 pub fn startup_reconcile(store: &SafeLoopStore) -> bool {
     let newest = query_latest_tdr_event();
     let baseline = std::fs::read_to_string(baseline_path()).ok();
-    let Some(newest) = newest else { return false };
-    let Some(baseline) = baseline else {
-        persist_baseline(&newest);
+    let applied_profile = crate::gpu_apply::load_applied();
+    let applied = applied_profile.as_ref().and_then(|p| p.undervolt.clone());
+    let new_tdr = newest.as_deref().is_some_and(|timestamp| {
+        baseline.as_deref().is_some_and(|old| timestamp > old.trim())
+    });
+    let session_bugcheck = applied_profile
+        .as_ref()
+        .and_then(|profile| {
+            query_latest_bugcheck_event().filter(|(timestamp, code)| {
+                event_belongs_to_applied_session(timestamp, profile.applied_at.as_deref())
+                    && nidavellir_core::safe_loop::classify_bugcheck(*code)
+                        == nidavellir_core::safe_loop::CrashClass::OcInstability
+            })
+        });
+
+    let Some(applied) = applied else {
+        if let Some(newest) = newest.as_deref() {
+            persist_baseline(newest);
+        }
         return false;
     };
-    persist_baseline(&newest);
-    if newest.as_str() <= baseline.trim() {
+    if !new_tdr && session_bugcheck.is_none() {
+        if let Some(newest) = newest.as_deref() {
+            persist_baseline(newest);
+        }
         return false;
     }
-    let Some(applied) = crate::gpu_apply::load_applied().and_then(|p| p.undervolt) else {
-        return false;
-    };
+    let source = session_bugcheck
+        .as_ref()
+        .map(|(_, code)| format!("WER bugcheck 0x{code:X}"))
+        .unwrap_or_else(|| "nvlddmkm-153 TDR/wedge".into());
     warn!(
-        "sentinel: TDR/wedge at {} MHz @ {} mV happened while the service was down (event {newest}          > baseline) — blacklisting and clearing the profile; boot stays STOCK",
-        applied.target_mhz, applied.anchor_mv
-    );
-    let mut rec = store.load_record();
-    let intent = TuningPoint::from_axes([
-        ("gpu_freq_mhz", applied.target_mhz as i64),
-        ("gpu_vf_bin_mv", applied.anchor_mv as i64),
-    ]);
-    rec.blacklist.push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
-    let _ = store.save_record(&rec);
-    crate::gpu_undervolt::append_condemnation(
-        store.base_dir(),
-        nidavellir_core::condemnation::CondemnationSeverity::Rigid,
-        nidavellir_core::condemnation::KIND_FIELD_TDR,
-        Some(crate::gpu_power_sweep::current_gpu_key()),
+        "sentinel: {source} at {} MHz @ {} mV belongs to the persisted apply session — blacklisting and clearing the profile; boot stays STOCK",
         applied.target_mhz,
-        applied.anchor_mv,
-        None,
-        "TDR/wedge while the service was down with the profile applied; boot stays stock".into(),
+        applied.anchor_mv
     );
-    crate::gpu_apply::sentinel_clear_applied();
-    append_sentinel_log(&format!(
-        "\"event\":\"boot-reconcile\",\"action\":\"stock\",\"target_mhz\":{},\"failed_mv\":{}",
-        applied.target_mhz, applied.anchor_mv
-    ));
+    demote_after_boot_failure(store, applied, &source);
+    if let Some(newest) = newest.as_deref() {
+        // Commit the event cursor only AFTER the durable demotion completed. A hard interruption
+        // before this point leaves the event pending for the next boot instead of losing recovery.
+        persist_baseline(newest);
+    }
     true
 }
 
@@ -239,6 +410,36 @@ pub fn reset_sentinel_state() -> Vec<String> {
 /// "ladder exhausted" 4 s apart. Any layer that ACTS stamps this; the other skips within the window.
 static LAST_ACTION_EPOCH_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const CROSS_LAYER_DEDUP_S: u64 = 90;
+
+static SENTINEL_CANARY_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SENTINEL_CANARY_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Correlation marker sampled by Game Trace. Sequence increments for every live canary attempt;
+/// `active` brackets context creation through verdict so a future field trace can prove overlap.
+pub(crate) fn canary_trace_marker() -> (bool, u64) {
+    (
+        SENTINEL_CANARY_ACTIVE.load(std::sync::atomic::Ordering::SeqCst),
+        SENTINEL_CANARY_SEQUENCE.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
+struct CanaryTraceGuard;
+
+impl CanaryTraceGuard {
+    fn begin() -> Self {
+        SENTINEL_CANARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        SENTINEL_CANARY_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for CanaryTraceGuard {
+    fn drop(&mut self) {
+        SENTINEL_CANARY_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 fn epoch_s() -> u64 {
     std::time::SystemTime::now()
@@ -317,6 +518,14 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
             let prior = crate::gpu_apply::load_applied();
             let prior_label = prior.as_ref().map(|p| p.label.clone()).unwrap_or_default();
             let prior_mem = prior.as_ref().and_then(|p| p.mem_offset_mhz);
+            // Persist real-use failure knowledge BEFORE any hardware call. If reset itself wedges,
+            // boot reconciliation can still see the failed point and keep the machine at stock.
+            persist_field_failure(
+                store,
+                target_mhz,
+                failed_mv,
+                format!("in-game {kind}; sentinel auto-fallback to {new_anchor_mv} mV"),
+            );
             // 1. Deterministic stock (the driver already bus-reset; make our state match).
             if let Err(e) = crate::gpu_apply::reset(store) {
                 warn!("sentinel: stock reset failed ({e}) — staying stock, no re-apply");
@@ -324,28 +533,7 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
                 append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"stock\",\"reason\":\"reset-failed\""));
                 return false;
             }
-            // 2. Durable blacklist: the failed (clock, vf_bin) intent — the next forge descent
-            //    stops ABOVE it (BlacklistedBoundary), so real-world failures refine the frontier.
-            let mut rec = store.load_record();
-            let intent = TuningPoint::from_axes([
-                ("gpu_freq_mhz", target_mhz as i64),
-                ("gpu_vf_bin_mv", failed_mv as i64),
-            ]);
-            rec.blacklist.push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
-            if let Err(e) = store.save_record(&rec) {
-                warn!("sentinel: blacklist persist failed: {e}");
-            }
-            crate::gpu_undervolt::append_condemnation(
-                store.base_dir(),
-                nidavellir_core::condemnation::CondemnationSeverity::Rigid,
-                nidavellir_core::condemnation::KIND_FIELD_TDR,
-                Some(crate::gpu_power_sweep::current_gpu_key()),
-                target_mhz,
-                failed_mv,
-                None,
-                format!("in-game {kind}; sentinel auto-fallback to {new_anchor_mv} mV"),
-            );
-            // 3. Preserve-identity fallback: same clock, higher bin — through the FULL guarded
+            // 2. Preserve-identity fallback: same clock, higher bin — through the FULL guarded
             //    apply path (audit #1: arms the Safe Loop boot flag around the autonomous write +
             //    8 s survival window, so a bumped point that cold-hangs is NOT re-applied on boot;
             //    also re-applies the prior mem offset and persists the composed label).
@@ -393,24 +581,13 @@ fn handle_failure(store: &SafeLoopStore, bumps_this_session: u32, bump_bins: usi
                 "sentinel: TDR at {target_mhz} MHz @ {failed_anchor_mv} mV after a previous bump \
                  this session — staying at stock (ladder exhausted); profile cleared"
             );
-            let _ = crate::gpu_apply::reset(store);
-            let mut rec = store.load_record();
-            let intent = TuningPoint::from_axes([
-                ("gpu_freq_mhz", target_mhz as i64),
-                ("gpu_vf_bin_mv", failed_anchor_mv as i64),
-            ]);
-            rec.blacklist.push(BlacklistRegion::around(intent, DEFAULT_BLACKLIST_RADIUS));
-            let _ = store.save_record(&rec);
-            crate::gpu_undervolt::append_condemnation(
-                store.base_dir(),
-                nidavellir_core::condemnation::CondemnationSeverity::Rigid,
-                nidavellir_core::condemnation::KIND_FIELD_TDR,
-                Some(crate::gpu_power_sweep::current_gpu_key()),
+            persist_field_failure(
+                store,
                 target_mhz,
                 failed_anchor_mv,
-                None,
                 format!("{kind} after a prior bump this session; ladder exhausted, stock"),
             );
+            let _ = crate::gpu_apply::reset(store);
             crate::gpu_apply::sentinel_clear_applied();
             append_sentinel_log(&format!("\"event\":\"{kind}\",\"action\":\"stock\",\"reason\":\"ladder-exhausted\""));
             write_sentinel_status(&format!(
@@ -447,11 +624,14 @@ pub fn spawn(store: SafeLoopStore) {
                     continue;
                 }
                 let is_historical = newest.len() >= 19 && newest[..19] < start_floor[..];
-                persist_baseline(&newest);
-                last_handled = Some(newest.clone());
                 if is_historical {
+                    persist_baseline(&newest);
+                    last_handled = Some(newest);
                     continue;
                 }
+                // A driver reset can leave context/device state unreliable even after tuning was
+                // returned to stock. Keep every GPU-mutating path closed until Windows reboots.
+                mark_gpu_reboot_required(&newest);
                 // Never mutate hardware while Forge owns it. Hand the event to the run owner: it
                 // persists attribution when the boot flag is armed, otherwise records an explicitly
                 // unattributed incident, then requests a cooperative stop.
@@ -463,12 +643,18 @@ pub fn spawn(store: SafeLoopStore) {
                     append_sentinel_log(
                         "\"event\":\"tdr\",\"action\":\"forge-stop-requested\"",
                     );
+                    persist_baseline(&newest);
+                    last_handled = Some(newest);
                     continue;
                 }
                 let n = bumps.load(std::sync::atomic::Ordering::SeqCst);
                 if handle_failure(&store, n, SENTINEL_TDR_BUMP_BINS, "tdr") {
                     bumps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
+                // Transactional cursor: commit only after failure persistence + recovery returned.
+                // A hard wedge inside that transaction leaves this event pending for next boot.
+                persist_baseline(&newest);
+                last_handled = Some(newest);
                 std::thread::sleep(std::time::Duration::from_millis(SENTINEL_COOLDOWN_MS));
                 // Audit #5: absorb the SAME episode's cascade residue (multiple 153s logged while
                 // we were handling + cooling down) so it can never burn the 2nd strike — only a
@@ -508,13 +694,16 @@ pub fn spawn(store: SafeLoopStore) {
         // Keep the context and call owned by this thread for their entire lifetime. Rust threads
         // cannot be cancelled safely; a recv_timeout around an inner worker would only abandon the
         // worker and let recovery mutate the GPU while that worker was still running.
-        let verdict = match nidavellir_gpu_stress::GpuCtx::new() {
-            Ok(ctx) => {
-                ctx.run_canary_texture_selfcheck(SENTINEL_CANARY_KERNEL_MS)
-                    .result
+        let verdict = {
+            let _trace_guard = CanaryTraceGuard::begin();
+            match nidavellir_gpu_stress::GpuCtx::new() {
+                Ok(ctx) => {
+                    ctx.run_canary_texture_selfcheck(SENTINEL_CANARY_KERNEL_MS)
+                        .result
+                }
+                // Context creation failed (driver busy/hiccup) — inconclusive, never a fallback.
+                Err(_) => continue,
             }
-            // Context creation failed (driver busy/hiccup) — inconclusive, never a fallback.
-            Err(_) => continue,
         };
         if canary_returned_failure(&verdict) {
             warn!("sentinel: texture canary detected {verdict:?} at the applied point");
@@ -610,5 +799,44 @@ mod tests {
             Some("2026-07-09T07:43:40.123456700Z")
         );
         assert_eq!(parse_event_system_time("no events"), None);
+    }
+
+    #[test]
+    fn reboot_guard_only_accepts_tdrs_from_the_current_boot() {
+        let boot_ms = event_epoch_ms("2026-07-22T22:00:00.000000000Z").unwrap();
+        assert!(event_is_from_current_boot(
+            "2026-07-22T23:07:07.090086400Z",
+            boot_ms
+        ));
+        assert!(!event_is_from_current_boot(
+            "2026-07-21T23:07:07.090086400Z",
+            boot_ms
+        ));
+        assert!(!event_is_from_current_boot("invalid", boot_ms));
+    }
+
+    #[test]
+    fn bugcheck_attribution_requires_this_applied_session() {
+        let applied = "2026-07-18T21:50:00.250000000+00:00";
+        assert!(!event_belongs_to_applied_session(
+            "2026-07-18T21:49:59.999999900Z",
+            Some(applied)
+        ));
+        assert!(!event_belongs_to_applied_session(
+            "2026-07-18T21:50:00.100000000Z",
+            Some(applied)
+        ));
+        assert!(event_belongs_to_applied_session(
+            "2026-07-18T21:50:00.900000000Z",
+            Some(applied)
+        ));
+        assert!(event_belongs_to_applied_session(
+            "2026-07-18T21:53:37.000000000Z",
+            Some(applied)
+        ));
+        assert!(!event_belongs_to_applied_session(
+            "2026-07-18T21:53:37.000000000Z",
+            None
+        ));
     }
 }

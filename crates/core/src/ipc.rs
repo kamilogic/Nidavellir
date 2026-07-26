@@ -97,6 +97,14 @@ pub enum IpcRequest {
     },
     ResetManualDiagnosticPoint,
     GetManualDiagnosticPointStatus,
+    /// Run one isolated detector recipe against the active manual diagnostic point. Detector Lab
+    /// evidence is deliberately non-publishable: it never qualifies profiles or writes blacklist.
+    StartDetectorLab {
+        recipe: String,
+        duration_s: u32,
+    },
+    StopDetectorLab,
+    GetDetectorLabStatus,
 }
 
 /// Live status of the read-only game-workload telemetry logger ([`IpcRequest::StartGameTrace`]).
@@ -124,6 +132,39 @@ pub struct ManualDiagnosticPointStatus {
     pub resolved_voltage_mv: Option<u32>,
     pub applied_at_epoch_ms: Option<u64>,
     pub verified: bool,
+    pub note: String,
+}
+
+/// One completed segment from an isolated Detector Lab run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DetectorLabPhaseStatus {
+    pub phase: String,
+    pub result: String,
+    pub duration_ms: u64,
+    pub frames: u64,
+    pub checksum_count: u32,
+}
+
+/// Live state of the Advanced Diagnostics detector laboratory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DetectorLabStatus {
+    pub running: bool,
+    pub recipe: Option<String>,
+    pub target_mhz: Option<u32>,
+    pub voltage_mv: Option<u32>,
+    pub stage: String,
+    pub current_phase: Option<String>,
+    pub current_segment: Option<u32>,
+    pub duration_ms: u64,
+    pub elapsed_ms: u64,
+    pub progress_pct: f32,
+    pub result: Option<String>,
+    pub failure_phase: Option<String>,
+    pub frames: u64,
+    pub checksum_count: u32,
+    #[serde(default)]
+    pub phase_results: Vec<DetectorLabPhaseStatus>,
+    pub out_path: Option<String>,
     pub note: String,
 }
 
@@ -753,6 +794,7 @@ pub enum ResponseData {
     SentinelStatus { status: Option<String> },
     GameTrace(GameTraceStatus),
     ManualDiagnosticPoint(ManualDiagnosticPointStatus),
+    DetectorLab(DetectorLabStatus),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -826,6 +868,21 @@ mod tests {
                 target_mhz: 1800,
                 voltage_mv: 869,
             }
+        ));
+    }
+
+    #[test]
+    fn detector_lab_request_roundtrips_bounded_recipe() {
+        let req = parse_request(
+            r#"{"method":"StartDetectorLab","params":{"recipe":"dense_v14","duration_s":60}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            req,
+            IpcRequest::StartDetectorLab {
+                ref recipe,
+                duration_s: 60,
+            } if recipe == "dense_v14"
         ));
     }
 

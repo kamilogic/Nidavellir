@@ -1,12 +1,18 @@
 <script>
   import {
+    Activity,
+    AlertTriangle,
     ArrowLeft,
+    CheckCircle2,
     ExternalLink,
     FileDown,
+    FlaskConical,
     Gauge,
+    Play,
     Radio,
     RotateCcw,
     ShieldCheck,
+    Square,
     Terminal,
   } from "@lucide/svelte";
   import LogTerminal from "./LogTerminal.svelte";
@@ -31,11 +37,17 @@
     manualPoint = null,
     manualPointBusy = false,
     manualPointActionError = "",
+    detectorLab = null,
+    detectorLabBusy = false,
+    detectorLabActionError = "",
     onExportLog,
     onToggleGameTrace,
     onOpenGameTraceLog,
     onApplyManualPoint,
     onResetManualPoint,
+    onStartDetectorLab,
+    onStopDetectorLab,
+    onOpenDetectorLabLog,
     onClose,
   } = $props();
 
@@ -74,7 +86,9 @@
     {
       id: "manual-point",
       label: "Manual point",
-      detail: manualPoint?.active
+      detail: detectorLab?.running
+        ? `Lab · ${formatLabPhase(detectorLab.current_phase ?? detectorLab.stage)}`
+        : manualPoint?.active
         ? `${manualPoint.target_mhz} MHz · ${manualPoint.resolved_voltage_mv} mV`
         : "Temporary curve",
       icon: Gauge,
@@ -87,11 +101,25 @@
   const traceReady = $derived(Boolean(gameTrace));
   let manualTargetMhz = $state("");
   let manualVoltageMv = $state("");
+  let labRecipe = $state("dense_v14");
+  let labDurationS = $state(60);
   const manualPointValid = $derived(
     Number(manualTargetMhz) >= 300 &&
       Number(manualTargetMhz) <= 4000 &&
       Number(manualVoltageMv) >= 500 &&
       Number(manualVoltageMv) <= 1250,
+  );
+  const labProgress = $derived(
+    Math.max(0, Math.min(100, Number(detectorLab?.progress_pct) || 0)),
+  );
+  const gpuRebootRequired = $derived(
+    detectorLab?.stage === "reboot_required" || detectorLab?.result === "tdr",
+  );
+  const detectorLabCanStart = $derived(
+    Boolean(manualPoint?.active && manualPoint?.verified) &&
+      !gpuRebootRequired &&
+      !detectorLab?.running &&
+      !detectorLabBusy,
   );
 
   function applyManualPoint() {
@@ -100,6 +128,33 @@
       target_mhz: Number(manualTargetMhz),
       voltage_mv: Number(manualVoltageMv),
     });
+  }
+
+  function startDetectorLab() {
+    if (!detectorLabCanStart) return;
+    onStartDetectorLab?.({
+      recipe: labRecipe,
+      duration_s: Number(labDurationS),
+    });
+  }
+
+  function formatLabPhase(value) {
+    const phase = String(value ?? "idle").replaceAll("_", " ").replaceAll("-", " ");
+    return phase.replace(/\b\w/g, (letter) => letter.toUpperCase());
+  }
+
+  function detectorResultLabel(result) {
+    const labels = {
+      stable: "No error detected",
+      silent_error: "Silent error detected",
+      unstable: "Instability detected",
+      crash: "Driver or device failure",
+      tdr: "TDR detected · reboot required",
+      stopped: "Stopped safely",
+      inconclusive: "Point authority not proven",
+      environment_error: "Environment error",
+    };
+    return labels[result] ?? "Awaiting a run";
   }
 
   function formatElapsed(seconds) {
@@ -414,7 +469,7 @@
         <div>
           <span class="panel-kicker">Temporary hardware point</span>
           <h3>Manual diagnostic point</h3>
-          <p>Apply one anchored V/F point for a real game test, without starting Forge or a synthetic workload.</p>
+          <p>Apply one authoritative V/F point for a real game test, without starting Forge or a synthetic workload.</p>
         </div>
         <span class:active={Boolean(manualPoint?.active)} class="manual-state">
           <i aria-hidden="true"></i>
@@ -436,7 +491,8 @@
           <h4 id="manual-point-setup-title">Choose the clock and VF-bin request</h4>
           <p class="manual-copy">
             The voltage request is resolved to the nearest physical bin on this GPU. Requests more
-            than 8 mV from a real bin are refused instead of being guessed.
+            than 8 mV from a real bin are refused instead of being guessed. Clock may step down
+            under load, but the selected voltage is locked and cannot be exceeded.
           </p>
 
           <div class="manual-point-fields">
@@ -450,7 +506,7 @@
                   step="15"
                   placeholder="—"
                   bind:value={manualTargetMhz}
-                  disabled={manualPoint?.active}
+                  disabled={manualPoint?.active || detectorLab?.running}
                 />
                 <small>MHz</small>
               </span>
@@ -465,7 +521,7 @@
                   step="1"
                   placeholder="—"
                   bind:value={manualVoltageMv}
-                  disabled={manualPoint?.active}
+                  disabled={manualPoint?.active || detectorLab?.running}
                 />
                 <small>mV</small>
               </span>
@@ -477,17 +533,22 @@
           {/if}
 
           <div class="manual-actions">
-            {#if manualPoint?.active}
+            {#if manualPoint?.active || detectorLab?.running}
               <button
                 class="action-button reset-point"
                 type="button"
                 onclick={onResetManualPoint}
-                disabled={manualPointBusy}
+                disabled={manualPointBusy || detectorLab?.running}
               >
                 <RotateCcw size={17} strokeWidth={1.8} />
                 <span>{manualPointBusy ? "Returning to stock…" : "Return to stock"}</span>
               </button>
-              <button class="action-button" type="button" onclick={() => (activeTab = "game-trace")}>
+              <button
+                class="action-button"
+                type="button"
+                onclick={() => (activeTab = "game-trace")}
+                disabled={detectorLab?.running}
+              >
                 <Radio size={17} strokeWidth={1.8} />
                 <span>Open Game Trace</span>
               </button>
@@ -496,7 +557,7 @@
                 class="action-button primary"
                 type="button"
                 onclick={applyManualPoint}
-                disabled={manualPointBusy || !manualPointValid}
+                disabled={manualPointBusy || !manualPointValid || gpuRebootRequired}
               >
                 <Gauge size={17} strokeWidth={1.8} />
                 <span>{manualPointBusy ? "Applying…" : "Apply temporary point"}</span>
@@ -512,7 +573,11 @@
         <aside class="manual-live" aria-labelledby="manual-point-live-title" aria-live="polite">
           <span class="panel-kicker">Manual point status</span>
           <h4 id="manual-point-live-title">
-            {manualPoint?.active ? "Manual curve verified" : "No manual point applied"}
+            {detectorLab?.running
+              ? "Detector Lab owns the point"
+              : manualPoint?.active
+                ? "Manual point verified"
+                : "No manual point applied"}
           </h4>
           <p>{manualPoint?.note ?? "Enter a hardware-local point to begin."}</p>
           <dl>
@@ -533,18 +598,194 @@
               </dd>
             </div>
             <div>
-              <dt>Curve verification</dt>
+              <dt>Point authority</dt>
               <dd class:verified={Boolean(manualPoint?.verified)}>
-                {manualPoint?.verified ? "Verified" : "Not applied"}
+                {manualPoint?.verified ? "Clock ceiling + voltage lock verified" : "Not applied"}
               </dd>
             </div>
             <div>
               <dt>Next step</dt>
-              <dd>{manualPoint?.active ? "Start Game Trace, then launch the game" : "Choose a point"}</dd>
+              <dd>
+                {detectorLab?.running
+                  ? formatLabPhase(detectorLab.stage)
+                  : manualPoint?.active
+                    ? "Compare a detector or start Game Trace"
+                    : "Choose a point"}
+              </dd>
             </div>
           </dl>
         </aside>
       </div>
+
+      <section class="detector-lab" aria-labelledby="detector-lab-title">
+        <header class="lab-heading">
+          <div>
+            <span class="panel-kicker">Experimental detector bake-off</span>
+            <h4 id="detector-lab-title">Detector Lab</h4>
+            <p>
+              Compare the authoritative v25 Texture Hop with the denser v14 candidate at the same
+              hardware-local point.
+            </p>
+          </div>
+          <span class="lab-contract"><FlaskConical size={15} strokeWidth={1.8} /> Non-publishable</span>
+        </header>
+
+        <div class="manual-safety-note lab-safety-note">
+          <ShieldCheck size={17} strokeWidth={1.8} />
+          <p>
+            Results stay in Advanced Diagnostics. They never unlock Apply, qualify a profile or
+            write blacklist. A rejected point returns to stock automatically.
+          </p>
+        </div>
+
+        {#if gpuRebootRequired}
+          <p class="inline-message error lab-error" role="alert">
+            A GPU driver reset occurred during this Windows boot. Restart Windows before applying a
+            point, running Detector Lab or starting Forge again.
+          </p>
+        {/if}
+
+        <div class="lab-controls">
+          <fieldset class="recipe-picker" disabled={detectorLab?.running}>
+            <legend>Detector recipe</legend>
+            <button
+              type="button"
+              class:selected={labRecipe === "control_v25"}
+              aria-pressed={labRecipe === "control_v25"}
+              onclick={() => (labRecipe = "control_v25")}
+            >
+              <span>v25 control</span>
+              <small>Exact-clock coverage under the verified voltage lock.</small>
+            </button>
+            <button
+              type="button"
+              class:selected={labRecipe === "dense_v14"}
+              aria-pressed={labRecipe === "dense_v14"}
+              onclick={() => (labRecipe = "dense_v14")}
+            >
+              <span>v14 dense</span>
+              <small>Short perturbations followed by dense TextureRop canaries.</small>
+            </button>
+          </fieldset>
+
+          <div class="duration-control">
+            <div class="duration-label">
+              <div>
+                <span class="panel-kicker">GPU test duration</span>
+                <strong>{formatElapsed(labDurationS)}</strong>
+              </div>
+              <small>Stock calibration runs first; v25 also mirrors the full recipe at stock.</small>
+            </div>
+            <input
+              type="range"
+              min="15"
+              max="600"
+              step="15"
+              bind:value={labDurationS}
+              disabled={detectorLab?.running}
+              aria-label="Detector Lab duration in seconds"
+            />
+          </div>
+        </div>
+
+        {#if detectorLabActionError}
+          <p class="inline-message error lab-error" role="alert">{detectorLabActionError}</p>
+        {/if}
+
+        <div class="lab-runner" class:running={detectorLab?.running}>
+          <div class="lab-runner-head">
+            <div class="lab-stage">
+              {#if detectorLab?.result && detectorLab.result !== "stable"}
+                <AlertTriangle size={18} strokeWidth={1.8} />
+              {:else if detectorLab?.result === "stable"}
+                <CheckCircle2 size={18} strokeWidth={1.8} />
+              {:else}
+                <Activity size={18} strokeWidth={1.8} />
+              {/if}
+              <div>
+                <span>{formatLabPhase(detectorLab?.stage ?? "ready")}</span>
+                <small>
+                  {detectorLab?.running
+                    ? formatLabPhase(detectorLab.current_phase ?? detectorLab.stage)
+                    : detectorResultLabel(detectorLab?.result)}
+                </small>
+              </div>
+            </div>
+            <span class="lab-clock">
+              {formatElapsed(Math.floor((detectorLab?.elapsed_ms ?? 0) / 1000))}
+              {#if detectorLab?.stage === "running"}
+                / {formatElapsed(Math.floor((detectorLab?.duration_ms ?? 0) / 1000))}
+              {/if}
+            </span>
+          </div>
+
+          <div
+            class="lab-progress"
+            class:animated={detectorLab?.stage === "running"}
+            role="progressbar"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow={Math.round(labProgress)}
+          >
+            <i style={`width: ${labProgress}%`}></i>
+          </div>
+
+          <div class="lab-summary">
+            <span>{detectorLab?.note ?? "Apply a manual point to enable the laboratory."}</span>
+            {#if detectorLab?.current_segment != null}
+              <small>Segment {detectorLab.current_segment} · {detectorLab.frames ?? 0} frames</small>
+            {/if}
+          </div>
+
+          <div class="lab-actions">
+            {#if detectorLab?.running}
+              <button
+                class="action-button reset-point"
+                type="button"
+                onclick={onStopDetectorLab}
+                disabled={detectorLabBusy}
+              >
+                <Square size={15} strokeWidth={1.9} />
+                <span>{detectorLabBusy ? "Stopping…" : "Stop and return to stock"}</span>
+              </button>
+            {:else}
+              <button
+                class="action-button primary"
+                type="button"
+                onclick={startDetectorLab}
+                disabled={!detectorLabCanStart}
+              >
+                <Play size={16} strokeWidth={1.9} />
+                <span>Run detector</span>
+              </button>
+            {/if}
+            {#if detectorLab?.out_path}
+              <button class="action-button" type="button" onclick={onOpenDetectorLabLog}>
+                <ExternalLink size={16} strokeWidth={1.8} />
+                <span>Open journal</span>
+              </button>
+            {/if}
+          </div>
+        </div>
+
+        {#if detectorLab?.phase_results?.length}
+          <details class="lab-results">
+            <summary>Segment evidence · {detectorLab.phase_results.length}</summary>
+            <ol>
+              {#each detectorLab.phase_results as phase, index}
+                <li class:failed={phase.result !== "stable"}>
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <div>
+                    <strong>{formatLabPhase(phase.phase)}</strong>
+                    <small>{formatElapsed(Math.round(phase.duration_ms / 1000))} · {phase.frames} frames · {phase.checksum_count} checks</small>
+                  </div>
+                  <em>{formatLabPhase(phase.result)}</em>
+                </li>
+              {/each}
+            </ol>
+          </details>
+        {/if}
+      </section>
     </div>
   {/if}
 </section>
@@ -1340,6 +1581,348 @@
   .manual-live dd.verified {
     color: var(--forge-green);
   }
+
+  .detector-lab {
+    margin-top: 1.4rem;
+    padding-top: 1.3rem;
+    border-top: 1px solid var(--forge-line-strong);
+  }
+
+  .lab-heading,
+  .lab-runner-head,
+  .lab-summary,
+  .duration-label,
+  .lab-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .lab-heading > div,
+  .duration-label > div {
+    min-width: 0;
+  }
+
+  .lab-heading h4 {
+    margin: 0.22rem 0 0;
+    color: var(--diag-text);
+    font-size: 1.02rem;
+    font-weight: 620;
+    text-wrap: balance;
+  }
+
+  .lab-heading p {
+    margin-top: 0.45rem;
+    color: var(--diag-muted);
+    font-size: 0.76rem;
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .lab-contract {
+    display: inline-flex;
+    min-height: 36px;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.4rem 0.65rem;
+    color: var(--forge-gold);
+    font-size: 0.65rem;
+    font-weight: 760;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    border: 1px solid color-mix(in srgb, var(--forge-gold) 40%, var(--forge-line));
+  }
+
+  .lab-safety-note {
+    margin-top: 1rem;
+    margin-bottom: 0;
+  }
+
+  .lab-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(270px, 0.85fr);
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+
+  .recipe-picker {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.65rem;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .recipe-picker legend {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .recipe-picker button {
+    display: flex;
+    min-width: 0;
+    min-height: 68px;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 0.35rem;
+    padding: 0.7rem 0.8rem;
+    color: var(--diag-muted);
+    text-align: left;
+    background: color-mix(in srgb, var(--forge-void) 88%, transparent);
+    border: 1px solid var(--forge-line);
+  }
+
+  .recipe-picker button:hover:not(:disabled),
+  .recipe-picker button.selected {
+    color: var(--diag-text);
+    background: color-mix(in srgb, var(--forge-panel) 74%, transparent);
+    border-color: color-mix(in srgb, var(--forge-gold) 48%, var(--forge-line));
+  }
+
+  .recipe-picker button span {
+    font-size: 0.83rem;
+    font-weight: 650;
+  }
+
+  .recipe-picker button small {
+    color: var(--diag-dim);
+    font-size: 0.67rem;
+    line-height: 1.35;
+    text-wrap: pretty;
+  }
+
+  .duration-control {
+    min-width: 0;
+    padding: 0.7rem 0.85rem;
+    background: color-mix(in srgb, var(--forge-void) 88%, transparent);
+    border: 1px solid var(--forge-line);
+  }
+
+  .duration-label {
+    align-items: flex-end;
+  }
+
+  .duration-label strong {
+    display: block;
+    margin-top: 0.2rem;
+    color: var(--diag-text);
+    font: 650 1rem/1 "Cascadia Code", "Consolas", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .duration-label > small {
+    max-width: 24ch;
+    color: var(--diag-dim);
+    font-size: 0.64rem;
+    line-height: 1.35;
+    text-align: right;
+    text-wrap: pretty;
+  }
+
+  .duration-control input[type="range"] {
+    width: 100%;
+    min-height: 28px;
+    margin: 0.45rem 0 0.25rem;
+    accent-color: var(--forge-gold);
+    cursor: pointer;
+  }
+
+  .duration-control input[type="range"]:disabled {
+    cursor: not-allowed;
+  }
+
+  .lab-error {
+    margin: 0.85rem 0 0;
+  }
+
+  .lab-runner {
+    margin-top: 1rem;
+    padding: 0.9rem;
+    background: color-mix(in srgb, var(--forge-void) 90%, transparent);
+    border: 1px solid var(--forge-line);
+  }
+
+  .lab-runner.running {
+    border-color: color-mix(in srgb, var(--forge-gold) 38%, var(--forge-line));
+  }
+
+  .lab-stage {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 0.65rem;
+    color: var(--forge-gold);
+  }
+
+  .lab-stage > div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .lab-stage span {
+    color: var(--diag-text);
+    font-size: 0.82rem;
+    font-weight: 650;
+  }
+
+  .lab-stage small,
+  .lab-summary small {
+    color: var(--diag-dim);
+    font-size: 0.67rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .lab-clock {
+    flex: 0 0 auto;
+    color: var(--diag-muted);
+    font: 600 0.78rem/1 "Cascadia Code", "Consolas", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .lab-progress {
+    position: relative;
+    height: 8px;
+    margin-top: 0.8rem;
+    overflow: hidden;
+    background: var(--forge-graphite);
+    border: 1px solid var(--forge-line);
+  }
+
+  .lab-progress i {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: block;
+    min-width: 0;
+    background: linear-gradient(90deg, #b36a36 0%, var(--forge-gold) 52%, var(--forge-green) 100%);
+    transition: width 300ms ease;
+  }
+
+  .lab-progress.animated i::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(110deg, transparent 25%, rgba(255, 255, 255, 0.24) 45%, transparent 65%);
+    transform: translateX(-100%);
+    animation: detector-sheen 1.45s linear infinite;
+  }
+
+  .lab-summary {
+    align-items: flex-start;
+    margin-top: 0.65rem;
+  }
+
+  .lab-summary > span {
+    color: var(--diag-muted);
+    font-size: 0.7rem;
+    line-height: 1.45;
+    text-wrap: pretty;
+  }
+
+  .lab-summary small {
+    flex: 0 0 auto;
+  }
+
+  .lab-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    margin-top: 0.85rem;
+  }
+
+  .lab-results {
+    margin-top: 0.85rem;
+    border-top: 1px solid var(--forge-line);
+    border-bottom: 1px solid var(--forge-line);
+  }
+
+  .lab-results summary {
+    min-height: 44px;
+    padding: 0.8rem 0;
+    color: var(--diag-muted);
+    font-size: 0.72rem;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+  }
+
+  .lab-results ol {
+    display: grid;
+    gap: 1px;
+    margin: 0 0 0.85rem;
+    padding: 0;
+    list-style: none;
+    background: var(--forge-line);
+  }
+
+  .lab-results li {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.65rem;
+    min-height: 52px;
+    padding: 0.55rem 0.7rem;
+    background: color-mix(in srgb, var(--forge-void) 96%, transparent);
+  }
+
+  .lab-results li > span,
+  .lab-results li em,
+  .lab-results li small {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .lab-results li > span {
+    color: var(--diag-dim);
+    font: 0.68rem/1 "Cascadia Code", "Consolas", ui-monospace, monospace;
+  }
+
+  .lab-results li > div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.22rem;
+  }
+
+  .lab-results strong {
+    color: var(--diag-text);
+    font-size: 0.76rem;
+    font-weight: 580;
+  }
+
+  .lab-results small {
+    color: var(--diag-dim);
+    font-size: 0.65rem;
+  }
+
+  .lab-results em {
+    color: var(--forge-green);
+    font-size: 0.64rem;
+    font-style: normal;
+    font-weight: 720;
+    text-transform: uppercase;
+  }
+
+  .lab-results li.failed em {
+    color: var(--diag-danger);
+  }
+
+  @keyframes detector-sheen {
+    to {
+      transform: translateX(100%);
+    }
+  }
+
   @media (max-width: 980px) {
     .diagnostic-tabs {
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1362,6 +1945,10 @@
       border-top: 1px solid var(--forge-line);
       border-left: 0;
     }
+
+    .lab-controls {
+      grid-template-columns: 1fr;
+    }
   }
 
   @media (max-width: 780px) {
@@ -1381,6 +1968,18 @@
     .trace-export {
       align-items: flex-start;
       flex-direction: column;
+    }
+
+    .lab-heading,
+    .duration-label,
+    .lab-summary {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .duration-label > small {
+      max-width: none;
+      text-align: left;
     }
 
     .diagnostic-tabs button {
@@ -1410,6 +2009,22 @@
     .manual-point-fields {
       grid-template-columns: 1fr;
     }
+
+    .recipe-picker {
+      grid-template-columns: 1fr;
+    }
+
+    .lab-runner-head {
+      align-items: flex-start;
+    }
+
+    .lab-results li {
+      grid-template-columns: 28px minmax(0, 1fr);
+    }
+
+    .lab-results li em {
+      grid-column: 2;
+    }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -1417,6 +2032,14 @@
     .diagnostic-tabs button::after,
     .switch-track i {
       transition: none;
+    }
+
+    .lab-progress i {
+      transition: none;
+    }
+
+    .lab-progress.animated i::after {
+      animation: none;
     }
   }
 </style>
